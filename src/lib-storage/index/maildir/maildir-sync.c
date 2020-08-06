@@ -218,7 +218,7 @@ enum maildir_scan_why {
 
 struct maildir_sync_context {
         struct maildir_mailbox *mbox;
-	const char *new_dir, *cur_dir;
+	const char *cur_dir;
 
 	enum mailbox_sync_flags flags;
 	time_t last_touch, last_notify;
@@ -271,7 +271,6 @@ maildir_sync_context_new(struct maildir_mailbox *mbox,
 
 	ctx = t_new(struct maildir_sync_context, 1);
 	ctx->mbox = mbox;
-	ctx->new_dir = t_strconcat(mailbox_get_path(&mbox->box), "/new", NULL);
 	ctx->cur_dir = t_strconcat(mailbox_get_path(&mbox->box), "/cur", NULL);
 	ctx->last_touch = ioloop_time;
 	ctx->last_notify = ioloop_time;
@@ -291,7 +290,7 @@ static int maildir_fix_duplicate(struct maildir_sync_context *ctx,
 				 const char *dir, const char *fname2)
 {
 	const char *fname1, *path1, *path2;
-	const char *new_fname, *new_path;
+	const char *new_fname;
 	struct stat st1, st2;
 	uoff_t size;
 
@@ -341,40 +340,9 @@ static int maildir_fix_duplicate(struct maildir_sync_context *ctx,
 		new_fname = t_strdup_printf("%s,%c=%"PRIuUOFF_T,
 			new_fname, MAILDIR_EXTRA_VIRTUAL_SIZE, size);
 	}
-	new_path = t_strconcat(mailbox_get_path(&ctx->mbox->box),
-			       "/new/", new_fname, NULL);
-
-	if (rename(path2, new_path) == 0)
-		i_warning("Fixed a duplicate: %s -> %s", path2, new_fname);
-	else if (errno != ENOENT) {
-		mailbox_set_critical(&ctx->mbox->box,
-			"Couldn't fix a duplicate: rename(%s, %s) failed: %m",
-			path2, new_path);
-		return -1;
-	}
 	return 0;
 }
 
-static int
-maildir_rename_empty_basename(struct maildir_sync_context *ctx,
-			      const char *dir, const char *fname)
-{
-	const char *old_path, *new_fname, *new_path;
-
-	old_path = t_strconcat(dir, "/", fname, NULL);
-	new_fname = maildir_filename_generate();
-	new_path = t_strconcat(mailbox_get_path(&ctx->mbox->box),
-			       "/new/", new_fname, NULL);
-	if (rename(old_path, new_path) == 0)
-		i_warning("Fixed broken filename: %s -> %s", old_path, new_fname);
-	else if (errno != ENOENT) {
-		mailbox_set_critical(&ctx->mbox->box,
-			"Couldn't fix a broken filename: rename(%s, %s) failed: %m",
-			old_path, new_path);
-		return -1;
-	}
-	return 0;
-}
 
 static int
 maildir_stat(struct maildir_mailbox *mbox, const char *path, struct stat *st_r)
@@ -398,21 +366,20 @@ maildir_stat(struct maildir_mailbox *mbox, const char *path, struct stat *st_r)
 }
 
 static int
-maildir_scan_dir(struct maildir_sync_context *ctx, bool new_dir, bool final,
+maildir_scan_dir(struct maildir_sync_context *ctx, bool final,
 		 enum maildir_scan_why why)
 {
 	const char *path;
 	DIR *dirp;
-	string_t *src, *dest;
 	struct dirent *dp;
 	struct stat st;
 	enum maildir_uidlist_rec_flag flags;
 	unsigned int time_diff, i, readdir_count = 0, move_count = 0;
 	time_t start_time;
 	int ret = 1;
-	bool move_new, dir_changed = FALSE;
+	bool dir_changed = FALSE;
 
-	path = new_dir ? ctx->new_dir : ctx->cur_dir;
+	path = ctx->cur_dir;
 	for (i = 0;; i++) {
 		dirp = opendir(path);
 		if (dirp != NULL)
@@ -449,22 +416,9 @@ maildir_scan_dir(struct maildir_sync_context *ctx, bool new_dir, bool final,
 #endif
 
 	start_time = time(NULL);
-	if (new_dir) {
-		ctx->mbox->maildir_hdr.new_check_time = start_time;
-		ctx->mbox->maildir_hdr.new_mtime = st.st_mtime;
-		ctx->mbox->maildir_hdr.new_mtime_nsecs = ST_MTIME_NSEC(st);
-	} else {
-		ctx->mbox->maildir_hdr.cur_check_time = start_time;
-		ctx->mbox->maildir_hdr.cur_mtime = st.st_mtime;
-		ctx->mbox->maildir_hdr.cur_mtime_nsecs = ST_MTIME_NSEC(st);
-	}
-
-	src = t_str_new(1024);
-	dest = t_str_new(1024);
-
-	move_new = new_dir && ctx->locked &&
-		((ctx->mbox->box.flags & MAILBOX_FLAG_DROP_RECENT) != 0 ||
-		 ctx->mbox->storage->set->maildir_empty_new);
+	ctx->mbox->maildir_hdr.cur_check_time = start_time;
+	ctx->mbox->maildir_hdr.cur_mtime = st.st_mtime;
+	ctx->mbox->maildir_hdr.cur_mtime_nsecs = ST_MTIME_NSEC(st);
 
 	errno = 0;
 	for (; (dp = readdir(dirp)) != NULL; errno = 0) {
@@ -472,53 +426,10 @@ maildir_scan_dir(struct maildir_sync_context *ctx, bool new_dir, bool final,
 			continue;
 
 		if (dp->d_name[0] == MAILDIR_INFO_SEP) {
-			/* don't even try to use file with empty base name */
-			if (maildir_rename_empty_basename(ctx, path,
-							  dp->d_name) < 0)
-				break;
 			continue;
 		}
 
 		flags = 0;
-		if (move_new) {
-			i_assert(dp->d_name[0] != '\0');
-
-			str_truncate(src, 0);
-			str_truncate(dest, 0);
-			str_printfa(src, "%s/%s", ctx->new_dir, dp->d_name);
-			str_printfa(dest, "%s/%s", ctx->cur_dir, dp->d_name);
-			if (strchr(dp->d_name, MAILDIR_INFO_SEP) == NULL) {
-				str_append(dest, MAILDIR_FLAGS_FULL_SEP);
-			}
-			if (rename(str_c(src), str_c(dest)) == 0) {
-				/* we moved it - it's \Recent for us */
-				dir_changed = TRUE;
-				move_count++;
-				flags |= MAILDIR_UIDLIST_REC_FLAG_MOVED |
-					MAILDIR_UIDLIST_REC_FLAG_RECENT;
-			} else if (ENOTFOUND(errno)) {
-				/* someone else moved it already */
-				dir_changed = TRUE;
-				move_count++;
-				flags |= MAILDIR_UIDLIST_REC_FLAG_MOVED |
-					MAILDIR_UIDLIST_REC_FLAG_RECENT;
-			} else if (ENOSPACE(errno) || errno == EACCES) {
-				/* not enough disk space / read-only maildir,
-				   leave here */
-				flags |= MAILDIR_UIDLIST_REC_FLAG_NEW_DIR;
-				move_new = FALSE;
-			} else {
-				flags |= MAILDIR_UIDLIST_REC_FLAG_NEW_DIR;
-				mailbox_set_critical(&ctx->mbox->box,
-					"rename(%s, %s) failed: %m",
-					str_c(src), str_c(dest));
-			}
-			if ((move_count % MAILDIR_SLOW_MOVE_COUNT) == 0)
-				maildir_sync_notify(ctx);
-		} else if (new_dir) {
-			flags |= MAILDIR_UIDLIST_REC_FLAG_NEW_DIR |
-				MAILDIR_UIDLIST_REC_FLAG_RECENT;
-		}
 
 		readdir_count++;
 		if ((readdir_count % MAILDIR_SLOW_CHECK_COUNT) == 0)
@@ -561,16 +472,6 @@ maildir_scan_dir(struct maildir_sync_context *ctx, bool new_dir, bool final,
 	}
 
 	if (dir_changed) {
-		/* save the exact new times. the new mtimes should be >=
-		   "start_time", but just in case something weird happens and
-		   mtime doesn't update, use "start_time". */
-		if (stat(ctx->new_dir, &st) == 0) {
-			ctx->mbox->maildir_hdr.new_check_time =
-				I_MAX(st.st_mtime, start_time);
-			ctx->mbox->maildir_hdr.new_mtime = st.st_mtime;
-			ctx->mbox->maildir_hdr.new_mtime_nsecs =
-				ST_MTIME_NSEC(st);
-		}
 		if (stat(ctx->cur_dir, &st) == 0) {
 			ctx->mbox->maildir_hdr.new_check_time =
 				I_MAX(st.st_mtime, start_time);
@@ -616,8 +517,8 @@ int maildir_sync_header_refresh(struct maildir_mailbox *mbox)
 }
 
 static int maildir_sync_quick_check(struct maildir_mailbox *mbox, bool undirty,
-				    const char *new_dir, const char *cur_dir,
-				    bool *new_changed_r, bool *cur_changed_r,
+				    const char *cur_dir,
+				    bool *cur_changed_r,
 				    enum maildir_scan_why *why_r)
 {
 #define DIR_DELAYED_REFRESH(hdr, name) \
@@ -631,8 +532,8 @@ static int maildir_sync_quick_check(struct maildir_mailbox *mbox, bool undirty,
 	 !ST_NTIMES_EQUAL(ST_MTIME_NSEC(st), (hdr)->name ## _mtime_nsecs))
 
 	struct maildir_index_header *hdr = &mbox->maildir_hdr;
-	struct stat new_st, cur_st;
-	bool refreshed = FALSE, check_new = FALSE, check_cur = FALSE;
+	struct stat cur_st;
+	bool refreshed = FALSE, check_cur = FALSE;
 
 	*why_r = 0;
 
@@ -641,40 +542,30 @@ static int maildir_sync_quick_check(struct maildir_mailbox *mbox, bool undirty,
 		if (mbox->maildir_hdr.new_mtime == 0) {
 			/* first sync */
 			*why_r |= WHY_FIRSTSYNC;
-			*new_changed_r = *cur_changed_r = TRUE;
+			*cur_changed_r = TRUE;
 			return 0;
 		}
 	}
 
-	*new_changed_r = *cur_changed_r = FALSE;
+	*cur_changed_r = FALSE;
 
 	/* try to avoid stat()ing by first checking delayed changes */
-	if (DIR_DELAYED_REFRESH(hdr, new) ||
-	    (DIR_DELAYED_REFRESH(hdr, cur) &&
+	if ((DIR_DELAYED_REFRESH(hdr, cur) &&
 	     !mbox->storage->set->maildir_very_dirty_syncs)) {
 		/* refresh index and try again */
 		if (maildir_sync_header_refresh(mbox) < 0)
 			return -1;
 		refreshed = TRUE;
 
-		if (DIR_DELAYED_REFRESH(hdr, new)) {
-			*why_r |= WHY_DELAYEDNEW;
-			*new_changed_r = TRUE;
-		}
 		if (DIR_DELAYED_REFRESH(hdr, cur) &&
 		    !mbox->storage->set->maildir_very_dirty_syncs) {
 			*why_r |= WHY_DELAYEDCUR;
 			*cur_changed_r = TRUE;
 		}
-		if (*new_changed_r && *cur_changed_r)
+		if (*cur_changed_r)
 			return 0;
 	}
 
-	if (!*new_changed_r) {
-		if (maildir_stat(mbox, new_dir, &new_st) < 0)
-			return -1;
-		check_new = TRUE;
-	}
 	if (!*cur_changed_r) {
 		if (maildir_stat(mbox, cur_dir, &cur_st) < 0)
 			return -1;
@@ -682,18 +573,13 @@ static int maildir_sync_quick_check(struct maildir_mailbox *mbox, bool undirty,
 	}
 
 	for (;;) {
-		if (check_new) {
-			*new_changed_r = DIR_MTIME_CHANGED(new_st, hdr, new);
-			if (*new_changed_r)
-				*why_r |= WHY_NEWCHANGED;
-		}
 		if (check_cur) {
 			*cur_changed_r = DIR_MTIME_CHANGED(cur_st, hdr, cur);
 			if (*cur_changed_r)
 				*why_r |= WHY_CURCHANGED;
 		}
 
-		if ((!*new_changed_r && !*cur_changed_r) || refreshed)
+		if ((!*cur_changed_r) || refreshed)
 			break;
 
 		/* refresh index and try again */
@@ -726,25 +612,8 @@ static void maildir_sync_update_next_uid(struct maildir_mailbox *mbox)
 	}
 }
 
-static bool
-have_recent_messages(struct maildir_sync_context *ctx, bool seen_changes)
-{
-	const struct mail_index_header *hdr;
-	uint32_t next_uid;
-
-	hdr = mail_index_get_header(ctx->mbox->box.view);
-	if (!seen_changes) {
-		/* index is up to date. get the next-uid from it */
-		next_uid = hdr->next_uid;
-	} else {
-		(void)maildir_uidlist_refresh(ctx->mbox->uidlist);
-		next_uid = maildir_uidlist_get_next_uid(ctx->mbox->uidlist);
-	}
-	return hdr->first_recent_uid < next_uid;
-}
-
 static int maildir_sync_get_changes(struct maildir_sync_context *ctx,
-				    bool *new_changed_r, bool *cur_changed_r,
+				    bool *cur_changed_r,
 				    enum maildir_scan_why *why_r)
 {
 	struct maildir_mailbox *mbox = ctx->mbox;
@@ -753,28 +622,11 @@ static int maildir_sync_get_changes(struct maildir_sync_context *ctx,
 
 	*why_r = 0;
 
-	if (maildir_sync_quick_check(mbox, undirty, ctx->new_dir, ctx->cur_dir,
-				     new_changed_r, cur_changed_r, why_r) < 0)
+	if (maildir_sync_quick_check(mbox, undirty, ctx->cur_dir,
+				     cur_changed_r, why_r) < 0)
 		return -1;
 
-	/* if there are files in new/, we'll need to move them. we'll check
-	   this by seeing if we have any recent messages */
-	if ((mbox->box.flags & MAILBOX_FLAG_DROP_RECENT) != 0) {
-		if (!*new_changed_r && have_recent_messages(ctx, FALSE)) {
-			*new_changed_r = TRUE;
-			*why_r |= WHY_DROPRECENT;
-		}
-	} else if (*new_changed_r) {
-		/* if recent messages have been externally deleted from new/,
-		   we need to get them out of index. this requires that
-		   we make sure they weren't just moved to cur/. */
-		if (!*cur_changed_r && have_recent_messages(ctx, TRUE)) {
-			*cur_changed_r = TRUE;
-			*why_r |= WHY_FINDRECENT;
-		}
-	}
-
-	if (*new_changed_r || *cur_changed_r)
+	if (*cur_changed_r)
 		return 1;
 
 	if ((mbox->box.flags & MAILBOX_FLAG_DROP_RECENT) != 0)
@@ -794,7 +646,7 @@ maildir_sync_context(struct maildir_sync_context *ctx, bool forced,
 {
 	enum maildir_uidlist_sync_flags sync_flags;
 	enum maildir_uidlist_rec_flag flags;
-	bool new_changed, cur_changed, lock_failure;
+	bool cur_changed, lock_failure;
 	const char *fname;
 	enum maildir_scan_why why;
 	int ret;
@@ -802,10 +654,10 @@ maildir_sync_context(struct maildir_sync_context *ctx, bool forced,
 	*lost_files_r = FALSE;
 
 	if (forced) {
-		new_changed = cur_changed = TRUE;
+		cur_changed = TRUE;
 		why = WHY_FORCED;
 	} else {
-		ret = maildir_sync_get_changes(ctx, &new_changed, &cur_changed,
+		ret = maildir_sync_get_changes(ctx, &cur_changed,
 					       &why);
 		if (ret <= 0)
 			return ret;
@@ -910,26 +762,9 @@ maildir_sync_context(struct maildir_sync_context *ctx, bool forced,
 			return -1;
 	}
 
-	if (new_changed || cur_changed) {
-		/* if we're going to check cur/ dir our current logic requires
-		   that new/ dir is checked as well. it's a good idea anyway. */
-		unsigned int count = 0;
-		bool final = FALSE;
-
-		while ((ret = maildir_scan_dir(ctx, TRUE, final, why)) > 0) {
-			/* rename()d at least some files, which might have
-			   caused some other files to be missed. check again
-			   (see MAILDIR_RENAME_RESCAN_COUNT). */
-			if (++count >= MAILDIR_SCAN_DIR_MAX_COUNT)
-				final = TRUE;
-		}
-		if (ret < 0)
+	if (cur_changed) {
+		if (maildir_scan_dir(ctx, TRUE, why) < 0)
 			return -1;
-
-		if (cur_changed) {
-			if (maildir_scan_dir(ctx, FALSE, TRUE, why) < 0)
-				return -1;
-		}
 
 		maildir_sync_update_next_uid(ctx->mbox);
 
@@ -939,7 +774,6 @@ maildir_sync_context(struct maildir_sync_context *ctx, bool forced,
 
 	if (!ctx->locked) {
 		/* make sure we sync the maildir later */
-		ctx->mbox->maildir_hdr.new_mtime = 0;
 		ctx->mbox->maildir_hdr.cur_mtime = 0;
 	}
 
@@ -1111,20 +945,19 @@ maildir_storage_sync_init(struct mailbox *box, enum mailbox_sync_flags flags)
 
 int maildir_sync_is_synced(struct maildir_mailbox *mbox)
 {
-	bool new_changed, cur_changed;
+	bool cur_changed;
 	enum maildir_scan_why why;
 	int ret;
 
 	T_BEGIN {
 		const char *box_path = mailbox_get_path(&mbox->box);
-		const char *new_dir, *cur_dir;
+		const char *cur_dir;
 
-		new_dir = t_strconcat(box_path, "/new", NULL);
 		cur_dir = t_strconcat(box_path, "/cur", NULL);
 
-		ret = maildir_sync_quick_check(mbox, FALSE, new_dir, cur_dir,
-					       &new_changed, &cur_changed,
+		ret = maildir_sync_quick_check(mbox, FALSE, cur_dir,
+					       &cur_changed,
 					       &why);
 	} T_END;
-	return ret < 0 ? -1 : (!new_changed && !cur_changed);
+	return ret < 0 ? -1 : (!cur_changed);
 }

@@ -93,12 +93,6 @@ static int maildir_file_do_try(struct maildir_mailbox *mbox, uint32_t uid,
 	fname = t_strdup(fname);
 
 	ret = 0;
-	if ((flags & MAILDIR_UIDLIST_REC_FLAG_NEW_DIR) != 0) {
-		/* probably in new/ dir */
-		path = t_strconcat(mailbox_get_path(&mbox->box),
-				   "/new/", fname, NULL);
-		ret = callback(mbox, path, context);
-	}
 	if (ret == 0) {
 		path = t_strconcat(mailbox_get_path(&mbox->box), "/cur/",
 				   fname, NULL);

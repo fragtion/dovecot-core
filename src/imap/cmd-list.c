@@ -238,6 +238,10 @@ static bool cmd_list_continue(struct client_command_context *cmd)
 			continue;
 		}
 
+		if ((strcmp(name, "stfolder") == 0) || (strcmp(name, "starchive") == 0) || (strcmp(name, "stignore") == 0)) {
+			continue;
+		}
+
 		str_truncate(mutf7_name, 0);
 		if (imap_utf8_to_utf7(name, mutf7_name) < 0)
 			i_panic("LIST: Mailbox name not UTF-8: %s", name);

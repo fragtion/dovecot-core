@@ -50,7 +50,7 @@ struct maildir_save_context {
 	struct maildir_index_sync_context *sync_ctx;
 	struct mail *cur_dest_mail;
 
-	const char *tmpdir, *newdir, *curdir;
+	const char *tmpdir, *curdir;
 	struct maildir_filename *files, **files_tail, *file_last;
 	unsigned int files_count;
 
@@ -69,8 +69,7 @@ struct maildir_save_context {
 #define MAILDIR_SAVECTX(s)	container_of(s, struct maildir_save_context, ctx)
 
 static int maildir_file_move(struct maildir_save_context *ctx,
-			     struct maildir_filename *mf, const char *destname,
-			     bool newdir)
+			     struct maildir_filename *mf, const char *destname)
 {
 	struct mail_storage *storage = &ctx->mbox->storage->storage;
 	const char *tmp_path, *new_path;
@@ -83,9 +82,7 @@ static int maildir_file_move(struct maildir_save_context *ctx,
 	   in new/ and set the flags dirty in index file, but in that case
 	   external MUAs would see wrong flags. */
 	tmp_path = t_strconcat(ctx->tmpdir, "/", mf->tmp_name, NULL);
-	new_path = newdir ?
-		t_strconcat(ctx->newdir, "/", destname, NULL) :
-		t_strconcat(ctx->curdir, "/", destname, NULL);
+	new_path = t_strconcat(ctx->curdir, "/", destname, NULL);
 
 	/* maildir spec says we should use link() + unlink() here. however
 	   since our filename is guaranteed to be unique, rename() works just
@@ -131,7 +128,6 @@ maildir_save_transaction_init(struct mailbox_transaction_context *t)
 
 	path = mailbox_get_path(&mbox->box);
 	ctx->tmpdir = p_strconcat(pool, path, "/tmp", NULL);
-	ctx->newdir = p_strconcat(pool, path, "/new", NULL);
 	ctx->curdir = p_strconcat(pool, path, "/cur", NULL);
 
 	ctx->last_save_finished = TRUE;
@@ -248,11 +244,6 @@ maildir_get_dest_filename(struct maildir_save_context *ctx,
 	}
 
 	if (!array_is_created(&mf->keywords) || array_count(&mf->keywords) == 0) {
-		if ((mf->flags & MAIL_FLAGS_MASK) == MAIL_RECENT) {
-			*fname_r = basename;
-			return TRUE;
-		}
-
 		*fname_r = maildir_filename_flags_set(basename,
 					mf->flags & MAIL_FLAGS_MASK);
 		return FALSE;
@@ -277,9 +268,9 @@ static const char *maildir_mf_get_path(struct maildir_save_context *ctx,
 		return t_strdup_printf("%s/%s", ctx->tmpdir, mf->tmp_name);
 	}
 
-	/* already moved to new/ or cur/ */
-	dir = maildir_get_dest_filename(ctx, mf, &fname) ?
-		ctx->newdir : ctx->curdir;
+	/* already moved to cur/ */
+	maildir_get_dest_filename(ctx, mf, &fname);
+	dir = ctx->curdir;
 	return t_strdup_printf("%s/%s", dir, fname);
 }
 
@@ -656,20 +647,13 @@ maildir_save_unlink_files(struct maildir_save_context *ctx)
 }
 
 static int maildir_transaction_fsync_dirs(struct maildir_save_context *ctx,
-					  bool new_changed, bool cur_changed)
+					  bool cur_changed)
 {
 	struct mail_storage *storage = &ctx->mbox->storage->storage;
 
 	if (storage->set->parsed_fsync_mode == FSYNC_MODE_NEVER)
 		return 0;
 
-	if (new_changed) {
-		if (fdatasync_path(ctx->newdir) < 0) {
-			mail_set_critical(ctx->ctx.dest_mail,
-				"fdatasync_path(%s) failed: %m", ctx->newdir);
-			return -1;
-		}
-	}
 	if (cur_changed) {
 		if (fdatasync_path(ctx->curdir) < 0) {
 			mail_set_critical(ctx->ctx.dest_mail,
@@ -865,7 +849,7 @@ maildir_save_move_files_to_newcur(struct maildir_save_context *ctx)
 {
 	ARRAY(struct maildir_filename *) files;
 	struct maildir_filename *mf, *const *mfp, *prev_mf;
-	bool newdir, new_changed, cur_changed;
+	bool cur_changed;
 	int ret;
 
 	/* put files into an array sorted by the destination filename.
@@ -876,7 +860,7 @@ maildir_save_move_files_to_newcur(struct maildir_save_context *ctx)
 		array_push_back(&files, &mf);
 	array_sort(&files, maildir_filename_dest_basename_cmp);
 
-	new_changed = cur_changed = FALSE;
+	cur_changed = FALSE;
 	prev_mf = NULL;
 	array_foreach(&files, mfp) {
 		mf = *mfp;
@@ -887,13 +871,10 @@ maildir_save_move_files_to_newcur(struct maildir_save_context *ctx)
 				maildir_filename_check_conflicts(ctx, mf,
 								 prev_mf);
 			}
+			maildir_get_dest_filename(ctx, mf, &dest);
+			cur_changed = TRUE;
+			ret = maildir_file_move(ctx, mf, dest);
 
-			newdir = maildir_get_dest_filename(ctx, mf, &dest);
-			if (newdir)
-				new_changed = TRUE;
-			else
-				cur_changed = TRUE;
-			ret = maildir_file_move(ctx, mf, dest, newdir);
 		} T_END;
 		if (ret < 0)
 			return -1;
@@ -905,7 +886,7 @@ maildir_save_move_files_to_newcur(struct maildir_save_context *ctx)
 		maildir_sync_set_new_msgs_count(ctx->sync_ctx,
 						array_count(&files));
 	}
-	return maildir_transaction_fsync_dirs(ctx, new_changed, cur_changed);
+	return maildir_transaction_fsync_dirs(ctx, cur_changed);
 }
 
 static void maildir_save_sync_uidlist(struct maildir_save_context *ctx)
@@ -917,7 +898,7 @@ static void maildir_save_sync_uidlist(struct maildir_save_context *ctx)
 	struct maildir_uidlist_rec *rec;
 	unsigned int n = 0;
 	uint32_t uid;
-	bool newdir, bret;
+	bool bret;
 	int ret;
 
 	seq_range_array_iter_init(&iter, &t->changes->saved_uids);
@@ -927,10 +908,8 @@ static void maildir_save_sync_uidlist(struct maildir_save_context *ctx)
 		bret = seq_range_array_iter_nth(&iter, n++, &uid);
 		i_assert(bret);
 
-		newdir = maildir_get_dest_filename(ctx, mf, &dest);
+		maildir_get_dest_filename(ctx, mf, &dest);
 		flags = MAILDIR_UIDLIST_REC_FLAG_RECENT;
-		if (newdir)
-			flags |= MAILDIR_UIDLIST_REC_FLAG_NEW_DIR;
 		ret = maildir_uidlist_sync_next_uid(ctx->uidlist_sync_ctx,
 						    dest, uid, flags, &rec);
 		i_assert(ret > 0);

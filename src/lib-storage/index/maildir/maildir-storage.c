@@ -587,8 +587,6 @@ static void maildir_notify_changes(struct mailbox *box)
 		mailbox_watch_remove_all(&mbox->box);
 	else {
 		mailbox_watch_add(&mbox->box,
-			t_strconcat(box_path, "/new", NULL));
-		mailbox_watch_add(&mbox->box,
 			t_strconcat(box_path, "/cur", NULL));
 	}
 }
