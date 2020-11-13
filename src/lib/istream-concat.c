@@ -128,9 +128,12 @@ static void i_stream_concat_skip(struct concat_istream *cstream)
 		bytes_skipped -= cstream->prev_stream_left;
 		cstream->prev_stream_left = 0;
 	}
-	stream->pos -= bytes_skipped;
-	stream->skip -= bytes_skipped;
-	stream->buffer += bytes_skipped;
+	if (bytes_skipped > 0) {
+		i_assert(stream->buffer != NULL);
+		stream->pos -= bytes_skipped;
+		stream->skip -= bytes_skipped;
+		stream->buffer += bytes_skipped;
+	}
 	cstream->prev_skip = stream->skip;
 	i_stream_skip(cstream->cur_input, bytes_skipped);
 }
@@ -309,7 +312,7 @@ i_stream_concat_stat(struct istream_private *stream, bool exact ATTR_UNUSED)
 {
 	struct concat_istream *cstream = (struct concat_istream *)stream;
 	i_assert(cstream->cur_input == cstream->input[cstream->cur_idx]);
-	uoff_t v_offset = (uoff_t)-1;
+	uoff_t v_offset = UOFF_T_MAX;
 	unsigned int i, cur_idx;
 
 	/* make sure we have all sizes */

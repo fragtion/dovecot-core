@@ -48,7 +48,7 @@ struct service_settings old_stats_service_settings = {
 	.client_limit = 0,
 	.service_count = 0,
 	.idle_kill = UINT_MAX,
-	.vsz_limit = (uoff_t)-1,
+	.vsz_limit = UOFF_T_MAX,
 
 	.unix_listeners = { { &old_stats_unix_listeners_buf,
 			      sizeof(old_stats_unix_listeners[0]) } },
@@ -96,10 +96,10 @@ const struct setting_parser_info old_stats_setting_parser_info = {
 	.defines = old_stats_setting_defines,
 	.defaults = &old_stats_default_settings,
 
-	.type_offset = (size_t)-1,
+	.type_offset = SIZE_MAX,
 	.struct_size = sizeof(struct old_stats_settings),
 
-	.parent_offset = (size_t)-1
+	.parent_offset = SIZE_MAX
 };
 
 const struct old_stats_settings *stats_settings;

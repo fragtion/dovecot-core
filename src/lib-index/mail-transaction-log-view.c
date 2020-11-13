@@ -186,7 +186,7 @@ int mail_transaction_log_view_set(struct mail_transaction_log_view *view,
 			if (file == NULL && max_file_seq == (uint32_t)-1 &&
 			    view->head == view->log->head) {
 				/* we just wanted to sync everything */
-				i_assert(max_file_offset == (uoff_t)-1);
+				i_assert(max_file_offset == UOFF_T_MAX);
 				max_file_seq = seq-1;
 				break;
 			}
@@ -281,7 +281,7 @@ int mail_transaction_log_view_set(struct mail_transaction_log_view *view,
 		start_offset = file->hdr.file_seq == min_file_seq ?
 			min_file_offset : file->hdr.hdr_size;
 		end_offset = file->hdr.file_seq == max_file_seq ?
-			max_file_offset : (uoff_t)-1;
+			max_file_offset : UOFF_T_MAX;
 		ret = mail_transaction_log_file_map(file, start_offset,
 						    end_offset, reason_r);
 		if (ret <= 0) {
@@ -319,11 +319,11 @@ int mail_transaction_log_view_set(struct mail_transaction_log_view *view,
 
 	i_assert(max_file_seq == (uint32_t)-1 ||
 		 max_file_seq == view->head->hdr.file_seq);
-	i_assert(max_file_offset == (uoff_t)-1 ||
+	i_assert(max_file_offset == UOFF_T_MAX ||
 		 max_file_offset <= view->head->sync_offset);
 	i_assert(min_file_seq != max_file_seq ||
 		 max_file_seq != view->head->hdr.file_seq ||
-		 max_file_offset != (uoff_t)-1 ||
+		 max_file_offset != UOFF_T_MAX ||
 		 min_file_offset <= view->head->sync_offset);
 
 	view->prev_file_seq = view->cur->hdr.file_seq;
@@ -357,7 +357,7 @@ int mail_transaction_log_view_set_all(struct mail_transaction_log_view *view)
 
 	for (file = view->log->files; file != NULL; file = file->next) {
 		ret = mail_transaction_log_file_map(file, file->hdr.hdr_size,
-						    (uoff_t)-1, &reason);
+						    UOFF_T_MAX, &reason);
 		if (ret < 0) {
 			first = NULL;
 			break;
@@ -582,7 +582,7 @@ log_view_is_record_valid(struct mail_transaction_log_file *file,
 				"expunge record missing protection mask");
 			return FALSE;
 		}
-		rec_type &= ~MAIL_TRANSACTION_EXPUNGE_PROT;
+		rec_type &= ENUM_NEGATE(MAIL_TRANSACTION_EXPUNGE_PROT);
 	}
 	if ((hdr->type & MAIL_TRANSACTION_EXPUNGE_GUID) != 0) {
 		if (rec_type != (MAIL_TRANSACTION_EXPUNGE_GUID |
@@ -591,7 +591,7 @@ log_view_is_record_valid(struct mail_transaction_log_file *file,
 				"expunge guid record missing protection mask");
 			return FALSE;
 		}
-		rec_type &= ~MAIL_TRANSACTION_EXPUNGE_PROT;
+		rec_type &= ENUM_NEGATE(MAIL_TRANSACTION_EXPUNGE_PROT);
 	}
 
 	if (rec_size == 0) {
@@ -841,7 +841,7 @@ int mail_transaction_log_view_next(struct mail_transaction_log_view *view,
 	    (MAIL_TRANSACTION_EXPUNGE | MAIL_TRANSACTION_EXPUNGE_PROT) ||
 	    (hdr->type & MAIL_TRANSACTION_TYPE_MASK) ==
 	    (MAIL_TRANSACTION_EXPUNGE_GUID | MAIL_TRANSACTION_EXPUNGE_PROT))
-		view->tmp_hdr.type = hdr->type & ~MAIL_TRANSACTION_EXPUNGE_PROT;
+		view->tmp_hdr.type = hdr->type & ENUM_NEGATE(MAIL_TRANSACTION_EXPUNGE_PROT);
 	else
 		view->tmp_hdr.type = hdr->type;
 

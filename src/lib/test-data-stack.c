@@ -21,7 +21,7 @@ static void test_ds_buffers(void)
 			/* grow it */
 			unsigned char *p2 = t_buffer_get(i);
 			test_assert_idx(p == p2, i);
-			p[i-1] = i;
+			p[i-1] = i & 0xff;
 			test_assert_idx(p[i-2] == (unsigned char)(i-1), i);
 		}
 		/* now fix it permanently */
@@ -44,7 +44,7 @@ static void test_ds_buffers(void)
 	T_BEGIN {
 		size_t bigleft = t_get_bytes_available();
 		size_t i;
-		for (i = 1; i < bigleft-64; i += i_rand()%32) T_BEGIN {
+		for (i = 1; i < bigleft-64; i += i_rand_limit(32)) T_BEGIN {
 			unsigned char *p, *p2;
 			size_t left;
 			t_malloc_no0(i);
@@ -79,7 +79,7 @@ static void test_ds_realloc()
 		for (i = 2; i <= left; i++) {
 			/* grow it */
 			test_assert_idx(t_try_realloc(p, i), i);
-			p[i-1] = i;
+			p[i-1] = i & 0xff;
 			test_assert_idx(p[i-2] == (unsigned char)(i-1), i);
 		}
 		test_assert(t_get_bytes_available() < 64 + MEM_ALIGN(1));
@@ -131,8 +131,8 @@ static void test_ds_recursive(int count, int depth)
 
 	test_begin("data-stack recursive");
 	for(i = 0; i < count; i++) T_BEGIN {
-			int number=i_rand()%100+50;
-			int size=i_rand()%100+50;
+			int number=i_rand_limit(100)+50;
+			int size=i_rand_limit(100)+50;
 			test_ds_recurse(depth, number, size);
 		} T_END;
 	test_end();

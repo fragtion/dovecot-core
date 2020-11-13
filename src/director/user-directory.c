@@ -6,6 +6,7 @@
 #include "hash.h"
 #include "llist.h"
 #include "mail-host.h"
+#include "director.h"
 
 /* n% of timeout_secs */
 #define USER_NEAR_EXPIRING_PERCENTAGE 10
@@ -21,6 +22,8 @@ struct user_directory_iter {
 };
 
 struct user_directory {
+	struct director *director;
+
 	/* unsigned int username_hash => user */
 	HASH_TABLE(void *, struct user *) hash;
 	/* sorted by time. may be unsorted while handshakes are going on. */
@@ -92,7 +95,8 @@ static bool user_directory_user_has_connections(struct user_directory *dir,
 			return TRUE;
 		}
 
-		i_warning("User %u weakness appears to be stuck, removing it",
+		e_warning(dir->director->event,
+			  "User %u weakness appears to be stuck, removing it",
 			  user->username_hash);
 	}
 	return FALSE;
@@ -253,7 +257,7 @@ bool user_directory_user_is_near_expiring(struct user_directory *dir,
 }
 
 struct user_directory *
-user_directory_init(unsigned int timeout_secs,
+user_directory_init(struct director *director, unsigned int timeout_secs,
 		    user_free_hook_t *user_free_hook)
 {
 	struct user_directory *dir;
@@ -261,6 +265,7 @@ user_directory_init(unsigned int timeout_secs,
 	i_assert(timeout_secs > USER_NEAR_EXPIRING_MIN);
 
 	dir = i_new(struct user_directory, 1);
+	dir->director = director;
 	dir->timeout_secs = timeout_secs;
 	dir->user_near_expiring_secs =
 		timeout_secs * USER_NEAR_EXPIRING_PERCENTAGE / 100;

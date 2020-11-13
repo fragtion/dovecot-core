@@ -32,7 +32,6 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-sql \
 	-I$(top_srcdir)/src/lib-settings \
 	-I$(top_srcdir)/src/lib-old-stats \
-	-I$(top_srcdir)/src/lib-ntlm \
 	-I$(top_srcdir)/src/lib-otp \
 	-I$(top_srcdir)/src/lib-master \
 	-I$(top_srcdir)/src/lib-oauth2 \
@@ -56,7 +55,6 @@ libpassword_la_SOURCES = \
 	password-scheme-md5crypt.c \
 	password-scheme-scram.c \
 	password-scheme-otp.c \
-	password-scheme-rpa.c \
 	password-scheme-pbkdf2.c \
 	password-scheme-sodium.c
 libpassword_la_CFLAGS = $(AM_CPPFLAGS) $(LIBSODIUM_CFLAGS)
@@ -73,7 +71,6 @@ auth_libs = \
 	libauth.la \
 	libstats_auth.la \
 	libpassword.la \
-	../lib-ntlm/libntlm.la \
 	../lib-otp/libotp.la \
 	$(LIBDOVECOT_LUA) \
 	$(LIBDOVECOT_SQL)
@@ -93,10 +90,11 @@ libauth_la_SOURCES = \
 	auth-client-connection.c \
 	auth-master-connection.c \
 	auth-policy.c \
-	mech-otp-skey-common.c \
+	mech-otp-common.c \
 	mech-plain-common.c \
 	auth-penalty.c \
 	auth-request.c \
+	auth-request-fields.c \
 	auth-request-handler.c \
 	auth-request-stats.c \
 	auth-request-var-expand.c \
@@ -119,11 +117,8 @@ libauth_la_SOURCES = \
 	mech-digest-md5.c \
 	mech-external.c \
 	mech-gssapi.c \
-	mech-ntlm.c \
 	mech-otp.c \
 	mech-scram.c \
-	mech-skey.c \
-	mech-rpa.c \
 	mech-apop.c \
 	mech-winbind.c \
 	mech-dovecot-token.c \
@@ -139,8 +134,6 @@ libauth_la_SOURCES = \
 	passdb-passwd-file.c \
 	passdb-pam.c \
 	passdb-shadow.c \
-	passdb-sia.c \
-	passdb-vpopmail.c \
 	passdb-sql.c \
 	passdb-static.c \
 	passdb-template.c \
@@ -152,7 +145,6 @@ libauth_la_SOURCES = \
 	userdb-passwd-file.c \
 	userdb-prefetch.c \
 	userdb-static.c \
-	userdb-vpopmail.c \
 	userdb-sql.c \
 	userdb-template.c \
 	$(ldap_sources) \
@@ -164,7 +156,7 @@ headers = \
 	auth-client-connection.h \
 	auth-common.h \
 	auth-master-connection.h \
-	mech-otp-skey-common.h \
+	mech-otp-common.h \
 	mech-plain-common.h \
 	mech-digest-md5-private.h \
 	mech-scram.h \
@@ -196,8 +188,7 @@ headers = \
 	password-scheme.h \
 	userdb.h \
 	userdb-blocking.h \
-	userdb-template.h \
-	userdb-vpopmail.h
+	userdb-template.h
 
 if GSSAPI_PLUGIN
 libmech_gssapi_la_LDFLAGS = -module -avoid-version
@@ -264,7 +255,6 @@ test_libs = \
 test_libpassword_SOURCES = test-libpassword.c
 test_libpassword_LDADD = \
 	libpassword.la \
-	../lib-ntlm/libntlm.la \
         ../lib-otp/libotp.la \
 	$(CRYPT_LIBS) \
 	$(LIBDOVECOT_SQL) \
@@ -283,6 +273,7 @@ test_auth_cache_CPPFLAGS = $(AM_CPPFLAGS)
 
 test_auth_SOURCES = \
 	test-auth-request-var-expand.c \
+	test-auth-request-fields.c \
 	test-username-filter.c \
 	test-db-dict.c \
 	test-lua.c \

@@ -152,8 +152,8 @@ static struct passdb_oauth2_settings default_oauth2_settings = {
 	.introspection_mode = "",
 	.username_format = "%Lu",
 	.username_attribute = "email",
-	.active_attribute = "",
-	.active_value = "",
+	.active_attribute = "active",
+	.active_value = "true",
 	.client_id = "",
 	.client_secret = "",
 	.issuers = "",
@@ -257,6 +257,13 @@ struct db_oauth2 *db_oauth2_init(const char *config_path)
 	db->oauth2_set.send_auth_headers = db->set.send_auth_headers;
 	db->oauth2_set.use_grant_password = db->set.use_grant_password;
 	db->oauth2_set.scope = db->set.scope;
+
+	if (*db->set.active_attribute != '\0' &&
+	    *db->set.active_value == '\0')
+		i_fatal("oauth2: Cannot have empty active_value if active_attribute is set");
+	if (*db->set.active_attribute == '\0' &&
+	    *db->set.active_value != '\0')
+		i_fatal("oauth2: Cannot have empty active_attribute is active_value is set");
 
 	if (*db->set.introspection_mode == '\0' ||
 	    strcmp(db->set.introspection_mode, "auth") == 0) {
@@ -409,8 +416,8 @@ db_oauth2_value_get_var_expand_table(struct auth_request *auth_request,
 	struct var_expand_table *table;
 	unsigned int count = 1;
 
-	table = auth_request_get_var_expand_table_full(auth_request, NULL,
-						       &count);
+	table = auth_request_get_var_expand_table_full(auth_request,
+			auth_request->fields.user, NULL, &count);
 	table[0].key = '$';
 	table[0].value = oauth2_value;
 	return table;
@@ -540,13 +547,14 @@ static bool
 db_oauth2_user_is_enabled(struct db_oauth2_request *req,
 			  enum passdb_result *result_r, const char **error_r)
 {
-	if (*req->db->set.active_attribute != '\0') {
-		const char *active_value = auth_fields_find(req->fields, req->db->set.active_attribute);
-		if (active_value == NULL ||
-		    (*req->db->set.active_value != '\0' &&
-		     strcmp(req->db->set.active_value, active_value) != 0)) {
-			*error_r = "User account is not active";
-			*result_r = PASSDB_RESULT_USER_DISABLED;
+	if (*req->db->set.active_attribute != '\0' &&
+	    *req->db->set.active_value != '\0') {
+		const char *active_value =
+			auth_fields_find(req->fields, req->db->set.active_attribute);
+		if (active_value != NULL &&
+		    strcmp(req->db->set.active_value, active_value) != 0) {
+			*error_r = "Provided token is not valid";
+			*result_r = PASSDB_RESULT_PASSWORD_MISMATCH;
 			return FALSE;
 		}
 	}
@@ -588,8 +596,8 @@ static void db_oauth2_process_fields(struct db_oauth2_request *req,
 {
 	*error_r = NULL;
 
-	if (db_oauth2_validate_username(req, result_r, error_r) &&
-	    db_oauth2_user_is_enabled(req, result_r, error_r) &&
+	if (db_oauth2_user_is_enabled(req, result_r, error_r) &&
+	    db_oauth2_validate_username(req, result_r, error_r) &&
 	    db_oauth2_token_in_scope(req, result_r, error_r) &&
 	    db_oauth2_template_export(req, result_r, error_r)) {
 		*result_r = PASSDB_RESULT_OK;
@@ -631,15 +639,15 @@ static void db_oauth2_lookup_introspect(struct db_oauth2_request *req)
 		"Making introspection request to %s",
 		req->db->set.introspection_url);
 	input.token = req->token;
-	input.local_ip = req->auth_request->local_ip;
-	input.local_port = req->auth_request->local_port;
-	input.remote_ip = req->auth_request->remote_ip;
-	input.remote_port = req->auth_request->remote_port;
-	input.real_local_ip = req->auth_request->real_local_ip;
-	input.real_local_port = req->auth_request->real_local_port;
-	input.real_remote_ip = req->auth_request->real_remote_ip;
-	input.real_remote_port = req->auth_request->real_remote_port;
-	input.service = req->auth_request->service;
+	input.local_ip = req->auth_request->fields.local_ip;
+	input.local_port = req->auth_request->fields.local_port;
+	input.remote_ip = req->auth_request->fields.remote_ip;
+	input.remote_port = req->auth_request->fields.remote_port;
+	input.real_local_ip = req->auth_request->fields.real_local_ip;
+	input.real_local_port = req->auth_request->fields.real_local_port;
+	input.real_remote_ip = req->auth_request->fields.real_remote_ip;
+	input.real_remote_port = req->auth_request->fields.real_remote_port;
+	input.service = req->auth_request->fields.service;
 
 	req->req = oauth2_introspection_start(&req->db->oauth2_set, &input,
 					      db_oauth2_introspect_continue, req);
@@ -690,6 +698,8 @@ db_oauth2_lookup_continue(struct oauth2_request_result *result,
 		} else if (req->db->oauth2_set.introspection_mode == INTROSPECTION_MODE_LOCAL) {
 			db_oauth2_local_validation(req, req->token);
 			return;
+		} else if (!db_oauth2_user_is_enabled(req, &passdb_result, &error)) {
+			db_oauth2_callback(req, passdb_result, error);
 		} else if (*req->db->set.introspection_url != '\0') {
 			db_oauth2_lookup_introspect(req);
 			return;
@@ -753,15 +763,15 @@ void db_oauth2_lookup(struct db_oauth2 *db, struct db_oauth2_request *req,
 	req->auth_request = request;
 
 	input.token = token;
-	input.local_ip = req->auth_request->local_ip;
-	input.local_port = req->auth_request->local_port;
-	input.remote_ip = req->auth_request->remote_ip;
-	input.remote_port = req->auth_request->remote_port;
-	input.real_local_ip = req->auth_request->real_local_ip;
-	input.real_local_port = req->auth_request->real_local_port;
-	input.real_remote_ip = req->auth_request->real_remote_ip;
-	input.real_remote_port = req->auth_request->real_remote_port;
-	input.service = req->auth_request->service;
+	input.local_ip = req->auth_request->fields.local_ip;
+	input.local_port = req->auth_request->fields.local_port;
+	input.remote_ip = req->auth_request->fields.remote_ip;
+	input.remote_port = req->auth_request->fields.remote_port;
+	input.real_local_ip = req->auth_request->fields.real_local_ip;
+	input.real_local_port = req->auth_request->fields.real_local_port;
+	input.real_remote_ip = req->auth_request->fields.real_remote_ip;
+	input.real_remote_port = req->auth_request->fields.real_remote_port;
+	input.service = req->auth_request->fields.service;
 
 	if (db->oauth2_set.introspection_mode == INTROSPECTION_MODE_LOCAL &&
 	    !db_oauth2_uses_password_grant(db)) {
@@ -777,7 +787,7 @@ void db_oauth2_lookup(struct db_oauth2 *db, struct db_oauth2_request *req,
 			"Making grant url request to %s",
 			db->set.grant_url);
 		req->req = oauth2_passwd_grant_start(&db->oauth2_set, &input,
-						     request->user, request->mech_password,
+						     request->fields.user, request->mech_password,
 						     db_oauth2_lookup_passwd_grant, req);
 	} else if (*db->oauth2_set.tokeninfo_url == '\0') {
 		e_debug(authdb_event(req->auth_request),

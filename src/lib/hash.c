@@ -537,7 +537,8 @@ unsigned int str_hash(const char *p)
 }
 
 /* a char* hash function from ASU -- from glib */
-unsigned int strcase_hash(const char *p)
+unsigned int ATTR_NO_SANITIZE_INTEGER
+strcase_hash(const char *p)
 {
         const unsigned char *s = (const unsigned char *)p;
 	unsigned int g, h = 0;
@@ -554,7 +555,8 @@ unsigned int strcase_hash(const char *p)
 	return h;
 }
 
-unsigned int mem_hash(const void *p, unsigned int size)
+unsigned int ATTR_NO_SANITIZE_INTEGER
+mem_hash(const void *p, unsigned int size)
 {
 	const unsigned char *s = p;
 	unsigned int i, g, h = 0;
@@ -570,13 +572,14 @@ unsigned int mem_hash(const void *p, unsigned int size)
 	return h;
 }
 
-unsigned int strfastcase_hash(const char *p)
+unsigned int ATTR_NO_SANITIZE_INTEGER
+strfastcase_hash(const char *p)
 {
 	const unsigned char *s = (const unsigned char *)p;
 	unsigned int g, h = 0;
 
 	while (*s != '\0') {
-		h = (h << 4) + ((*s) & ~0x20);
+		h = (h << 4) + ((*s) & ~0x20U);
 		if ((g = h & 0xf0000000UL) != 0) {
 			h = h ^ (g >> 24);
 			h = h ^ g;

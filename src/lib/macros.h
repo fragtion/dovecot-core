@@ -64,28 +64,13 @@
 #define CONST_STRUCT_MEMBER_P(struct_p, struct_offset) \
 	((const void *) ((const char *) (struct_p) + (long) (struct_offset)))
 
-/* Provide simple macro statement wrappers (adapted from Perl):
+/* Provide simple macro statement wrappers:
    STMT_START { statements; } STMT_END;
    can be used as a single statement, as in
-   if (x) STMT_START { ... } STMT_END; else ...
-
-   For gcc we will wrap the statements within `({' and `})' braces.
-   For SunOS they will be wrapped within `if (1)' and `else (void) 0',
-   and otherwise within `do' and `while (0)'. */
+   if (x) STMT_START { ... } STMT_END; else ... */
 #if !(defined (STMT_START) && defined (STMT_END))
-#  if defined (__GNUC__) && !defined (__cplusplus) && \
-	!defined (__STRICT_ANSI__) && !defined (PEDANTIC)
-#    define STMT_START (void)(
-#    define STMT_END   )
-#  else
-#    if (defined (sun) || defined (__sun__))
-#      define STMT_START if (1)
-#      define STMT_END   else (void)0
-#    else
-#      define STMT_START do
-#      define STMT_END   while (0)
-#    endif
-#  endif
+#  define STMT_START do
+#  define STMT_END while (0)
 #endif
 
 /* Provide macros to feature the GCC function attribute. */
@@ -167,9 +152,9 @@
 
 #if (__GNUC__ > 3 || (__GNUC__ == 3 && __GNUC_MINOR__ > 0)) && !defined(__cplusplus)
 #  define COMPILE_ERROR_IF_TRUE(condition) \
-	(sizeof(char[1 - 2 * ((condition) ? 1 : 0)]) - 1)
+	(sizeof(char[1 - 2 * ((condition) ? 1 : 0)]) > 0 ? FALSE : FALSE)
 #else
-#  define COMPILE_ERROR_IF_TRUE(condition) 0
+#  define COMPILE_ERROR_IF_TRUE(condition) FALSE
 #endif
 
 #ifdef HAVE_TYPE_CHECKS
@@ -180,9 +165,12 @@
 	COMPILE_ERROR_IF_TRUE( \
 		!__builtin_types_compatible_p(typeof(_a1), typeof(_b)) && \
 		!__builtin_types_compatible_p(typeof(_a2), typeof(_b)))
+#  define TYPE_CHECKS(return_type, checks, func) \
+	(FALSE ? (return_type)(checks) : (func))
 #else
 #  define COMPILE_ERROR_IF_TYPES_NOT_COMPATIBLE(_a, _b) 0
 #  define COMPILE_ERROR_IF_TYPES2_NOT_COMPATIBLE(_a1, _a2, _b) 0
+#  define TYPE_CHECKS(return_type, checks, func) (func)
 #endif
 
 #if __GNUC__ > 2
@@ -254,3 +242,33 @@
 	 (st_a).st_ino != (st_b).st_ino)
 
 #endif
+
+#ifdef HAVE_UNDEFINED_SANITIZER
+# define ATTR_NO_SANITIZE(x) __attribute__((no_sanitize((x))))
+#else
+# define ATTR_NO_SANITIZE(x)
+#endif
+
+/* gcc and clang do this differently, see
+   https://gcc.gnu.org/onlinedocs/gcc-10.2.0/gcc/Common-Function-Attributes.html */
+#ifdef HAVE_FSANITIZE_UNDEFINED
+# ifdef __clang__
+#  define ATTR_NO_SANITIZE_UNDEFINED ATTR_NO_SANITIZE("undefined")
+# else
+#  define ATTR_NO_SANITIZE_UNDEFINED __attribute__((no_sanitize_undefined))
+# endif
+#else
+# define ATTR_NO_SANITIZE_UNDEFINED
+#endif
+
+#ifdef HAVE_FSANITIZE_INTEGER
+# define ATTR_NO_SANITIZE_INTEGER ATTR_NO_SANITIZE("integer")
+# define ATTR_NO_SANITIZE_IMPLICIT_CONVERSION ATTR_NO_SANITIZE("implicit-conversion")
+#else
+# define ATTR_NO_SANITIZE_INTEGER
+# define ATTR_NO_SANITIZE_IMPLICIT_CONVERSION
+#endif
+
+/* negate enumeration flags in a way that avoids implicit conversion */
+#define ENUM_NEGATE(x) \
+	((unsigned int)(~(x)) + COMPILE_ERROR_IF_TRUE(sizeof((x)) > sizeof(int) || (x) < 0 || (x) > INT_MAX))

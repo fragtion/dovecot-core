@@ -335,14 +335,13 @@ void auth_client_connection_create(struct auth *auth, int fd,
 	conn->connect_uid = ++connect_uid_counter;
 	conn->login_requests = login_requests;
 	conn->token_auth = token_auth;
-	conn->event = event_create(NULL);
+	conn->event = event_create(auth_event);
 	event_set_forced_debug(conn->event, auth->set->debug);
-	event_add_category(conn->event, &event_category_auth);
 	random_fill(conn->cookie, sizeof(conn->cookie));
 
 	conn->fd = fd;
 	conn->input = i_stream_create_fd(fd, AUTH_CLIENT_MAX_LINE_LENGTH);
-	conn->output = o_stream_create_fd(fd, (size_t)-1);
+	conn->output = o_stream_create_fd(fd, SIZE_MAX);
 	o_stream_set_no_error_handling(conn->output, TRUE);
 	o_stream_set_flush_callback(conn->output, auth_client_output, conn);
 	conn->io = io_add(fd, IO_READ, auth_client_input, conn);

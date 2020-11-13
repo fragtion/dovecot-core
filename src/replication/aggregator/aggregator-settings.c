@@ -46,7 +46,7 @@ struct service_settings aggregator_service_settings = {
 	.client_limit = 0,
 	.service_count = 0,
 	.idle_kill = 0,
-	.vsz_limit = (uoff_t)-1,
+	.vsz_limit = UOFF_T_MAX,
 
 	.unix_listeners = { { &aggregator_unix_listeners_buf,
 			      sizeof(aggregator_unix_listeners[0]) } },
@@ -76,10 +76,10 @@ const struct setting_parser_info aggregator_setting_parser_info = {
 	.defines = aggregator_setting_defines,
 	.defaults = &aggregator_default_settings,
 
-	.type_offset = (size_t)-1,
+	.type_offset = SIZE_MAX,
 	.struct_size = sizeof(struct aggregator_settings),
 
-	.parent_offset = (size_t)-1
+	.parent_offset = SIZE_MAX
 };
 
 const struct aggregator_settings *aggregator_settings;

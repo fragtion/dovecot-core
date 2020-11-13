@@ -7,6 +7,7 @@
 #include "base64.h"
 #include "hex-binary.h"
 #include "str.h"
+#include "strescape.h"
 #include "var-expand.h"
 #include "wildcard-match.h"
 #include "settings-parser.h"
@@ -189,10 +190,18 @@ static void auth_connected(struct auth_client *client,
 	i_zero(&info);
 	info.mech = "PLAIN";
 	info.service = input->info.service;
+	info.session_id = input->info.session_id;
+	info.local_name = input->info.local_name;
 	info.local_ip = input->info.local_ip;
 	info.local_port = input->info.local_port;
 	info.remote_ip = input->info.remote_ip;
 	info.remote_port = input->info.remote_port;
+	info.real_local_ip = input->info.real_local_ip;
+	info.real_remote_ip = input->info.real_remote_ip;
+	info.real_local_port = input->info.real_local_port;
+	info.real_remote_port = input->info.real_remote_port;
+	info.extra_fields = input->info.extra_fields;
+	info.forward_fields = input->info.forward_fields;
 	info.initial_resp_base64 = str_c(base64_resp);
 	if (doveadm_settings->auth_debug ||
 	    event_want_debug_log(event_auth))
@@ -228,6 +237,10 @@ static void auth_user_info_parse(struct auth_user_info *info, const char *arg)
 {
 	if (str_begins(arg, "service="))
 		info->service = arg + 8;
+	else if (str_begins(arg, "session="))
+		info->session_id = arg + 8;
+	else if (str_begins(arg, "local_name="))
+		info->local_name = arg + 11;
 	else if (str_begins(arg, "lip=")) {
 		if (net_addr2ip(arg + 4, &info->local_ip) < 0)
 			i_fatal("lip: Invalid ip");
@@ -240,8 +253,39 @@ static void auth_user_info_parse(struct auth_user_info *info, const char *arg)
 	} else if (str_begins(arg, "rport=")) {
 		if (net_str2port(arg + 6, &info->remote_port) < 0)
 			i_fatal("rport: Invalid port number");
+	} else if (str_begins(arg, "real_lip=")) {
+		if (net_addr2ip(arg + 9, &info->real_local_ip) < 0)
+			i_fatal("real_lip: Invalid ip");
+	} else if (str_begins(arg, "real_rip=")) {
+		if (net_addr2ip(arg + 9, &info->real_remote_ip) < 0)
+			i_fatal("real_rip: Invalid ip");
+	} else if (str_begins(arg, "real_lport=")) {
+		if (net_str2port(arg + 11, &info->real_local_port) < 0)
+			i_fatal("real_lport: Invalid port number");
+	} else if (str_begins(arg, "real_rport=")) {
+		if (net_str2port(arg + 11, &info->real_remote_port) < 0)
+			i_fatal("real_rport: Invalid port number");
+	} else if (str_begins(arg, "forward_")) {
+		const char *key = arg+8;
+		const char *value = strchr(arg+8, '=');
+
+		if (value == NULL)
+			value = "";
+		else
+			key = t_strdup_until(key, value++);
+		key = str_tabescape(key);
+		value = str_tabescape(value);
+		if (info->forward_fields == NULL) {
+			info->forward_fields =
+				t_strdup_printf("%s=%s", key, value);
+		} else {
+			info->forward_fields =
+				t_strdup_printf("%s\t%s=%s", info->forward_fields, key, value);
+		}
 	} else {
-		i_fatal("Unknown -x argument: %s", arg);
+		if (!array_is_created(&info->extra_fields))
+			t_array_init(&info->extra_fields, 4);
+		array_push_back(&info->extra_fields, &arg);
 	}
 }
 

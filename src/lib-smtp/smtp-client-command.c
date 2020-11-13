@@ -4,6 +4,7 @@
 #include "buffer.h"
 #include "array.h"
 #include "str.h"
+#include "str-sanitize.h"
 #include "llist.h"
 #include "istream.h"
 #include "ostream.h"
@@ -57,7 +58,7 @@ smtp_client_command_update_event(struct smtp_client_command *cmd)
 	event_set_append_log_prefix(
 		cmd->event,
 		t_strdup_printf("command %s: ",
-				smtp_client_command_get_label(cmd)));
+			str_sanitize(smtp_client_command_get_label(cmd), 128)));
 }
 
 static struct smtp_client_command *
@@ -562,7 +563,7 @@ static int smtp_client_command_send_stream(struct smtp_client_command *cmd)
 	/* we're sending the stream now */
 	o_stream_set_max_buffer_size(output, IO_BLOCK_SIZE);
 	res = o_stream_send_istream(output, stream);
-	o_stream_set_max_buffer_size(output, (size_t)-1);
+	o_stream_set_max_buffer_size(output, SIZE_MAX);
 
 	switch (res) {
 	case OSTREAM_SEND_ISTREAM_RESULT_FINISHED:

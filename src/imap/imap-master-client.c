@@ -9,6 +9,7 @@
 #include "str.h"
 #include "strescape.h"
 #include "str-sanitize.h"
+#include "time-util.h"
 #include "master-service.h"
 #include "mail-storage-service.h"
 #include "imap-client.h"
@@ -30,6 +31,8 @@ struct imap_master_input {
 	buffer_t *state;
 	/* command tag */
 	const char *tag;
+	/* Timestamp when hibernation started */
+	struct timeval hibernation_start_time;
 
 	dev_t peer_dev;
 	ino_t peer_ino;
@@ -90,10 +93,22 @@ imap_master_client_parse_input(const char *const *args, pool_t pool,
 					"Invalid lip value: %s", value);
 				return -1;
 			}
+		} else if (strcmp(key, "lport") == 0) {
+			if (net_str2port(value, &input_r->local_port) < 0) {
+				*error_r = t_strdup_printf(
+					"Invalid lport value: %s", value);
+				return -1;
+			}
 		} else if (strcmp(key, "rip") == 0) {
 			if (net_addr2ip(value, &input_r->remote_ip) < 0) {
 				*error_r = t_strdup_printf(
 					"Invalid rip value: %s", value);
+				return -1;
+			}
+		} else if (strcmp(key, "rport") == 0) {
+			if (net_str2port(value, &input_r->remote_port) < 0) {
+				*error_r = t_strdup_printf(
+					"Invalid rport value: %s", value);
 				return -1;
 			}
 		} else if (strcmp(key, "peer_dev_major") == 0) {
@@ -120,6 +135,12 @@ imap_master_client_parse_input(const char *const *args, pool_t pool,
 			if (str_to_time(value, &input_r->session_create_time) < 0) {
 				*error_r = t_strdup_printf(
 					"Invalid session_created value: %s", value);
+				return -1;
+			}
+		} else if (strcmp(key, "hibernation_started") == 0) {
+			if (str_to_timeval(value, &master_input_r->hibernation_start_time) < 0) {
+				*error_r = t_strdup_printf(
+					"Invalid hibernation_started value: %s", value);
 				return -1;
 			}
 		} else if (strcmp(key, "userdb_fields") == 0) {
@@ -197,44 +218,73 @@ imap_master_client_input_args(struct connection *conn, const char *const *args,
 	struct client *imap_client;
 	struct mail_storage_service_input input;
 	struct imap_master_input master_input;
-	const char *error;
+	const char *error, *reason;
 	int ret;
 
 	if (imap_master_client_parse_input(args, pool, &input, &master_input,
 					   &error) < 0) {
-		i_error("imap-master: Failed to parse client input: %s", error);
+		e_error(conn->event, "imap-master: Failed to parse client input: %s", error);
 		o_stream_nsend_str(conn->output, t_strdup_printf(
 			"-Failed to parse client input: %s\n", error));
 		i_close_fd(&fd_client);
 		return -1;
 	}
 	if (imap_master_client_verify(&master_input, fd_client, &error) < 0) {
-		i_error("imap-master: Failed to verify client input: %s", error);
+		e_error(conn->event, "imap-master: Failed to verify client input: %s", error);
 		o_stream_nsend_str(conn->output, t_strdup_printf(
 			"-Failed to verify client input: %s\n", error));
 		i_close_fd(&fd_client);
 		return -1;
 	}
-	/* Send a success notification before we start anything that lasts
-	   potentially a long time. imap-hibernate process is waiting for us
-	   to answer. Even if we fail later, we log the error anyway. */
-	o_stream_nsend_str(conn->output, "+\n");
-	(void)o_stream_flush(conn->output);
 
 	/* NOTE: before client_create_from_input() on failures we need to close
 	   fd_client, but afterward it gets closed by client_destroy() */
 	ret = client_create_from_input(&input, fd_client, fd_client,
 				       &imap_client, &error);
 	if (ret < 0) {
-		i_error("imap-master(%s): Failed to create client: %s",
+		e_error(conn->event,
+			"imap-master(%s): Failed to create client: %s",
 			input.username, error);
+		o_stream_nsend_str(conn->output, t_strdup_printf(
+			"-Failed to create client: %s\n", error));
 		i_close_fd(&fd_client);
 		return -1;
 	}
 	client->imap_client_created = TRUE;
 
+	long long hibernation_usecs =
+		timeval_diff_usecs(&ioloop_timeval,
+				   &master_input.hibernation_start_time);
+	struct event *event = event_create(imap_client->event);
+	event_set_name(event, "imap_client_unhibernated");
+	event_add_int(event, "hibernation_usecs", hibernation_usecs);
+	imap_client->state_import_bad_idle_done =
+		master_input.state_import_bad_idle_done;
+	imap_client->state_import_idle_continue =
+		master_input.state_import_idle_continue;
+	if (imap_client->state_import_bad_idle_done) {
+		reason = "IDLE was stopped with BAD command";
+		event_add_str(event, "reason", "idle_bad_reply");
+	} else if (imap_client->state_import_idle_continue) {
+		reason = "mailbox changes need to be sent";
+		event_add_str(event, "reason", "mailbox_changes");
+	} else {
+		reason = "IDLE was stopped with DONE";
+		event_add_str(event, "reason", "idle_done");
+	}
+
+	/* Send a success notification before we start anything that lasts
+	   potentially a long time. imap-hibernate process is waiting for us
+	   to answer. Even if we fail later, we log the error anyway. From now
+	   on it's our responsibility to also log the imap_client_unhibernated
+	   event. */
+	o_stream_nsend_str(conn->output, "+\n");
+	(void)o_stream_flush(conn->output);
+
 	if (client_create_finish(imap_client, &error) < 0) {
-		i_error("imap-master(%s): %s", input.username, error);
+		event_add_str(event, "error", error);
+		e_error(event, "imap-master: %s", error);
+		event_unref(&event);
 		client_destroy(imap_client, error);
 		return -1;
 	}
@@ -248,36 +298,40 @@ imap_master_client_input_args(struct connection *conn, const char *const *args,
 	    !i_stream_add_data(imap_client->input,
 			       master_input.client_input->data,
 			       master_input.client_input->used)) {
-		i_error("imap-master: Couldn't add %zu bytes to client's input stream",
+		error = t_strdup_printf(
+			"Couldn't add %zu bytes to client's input stream",
 			master_input.client_input->used);
+		event_add_str(event, "error", error);
+		e_error(event, "imap-master: %s", error);
+		event_unref(&event);
 		client_destroy(imap_client, "Client initialization failed");
 		return -1;
-	}
-	imap_client->state_import_bad_idle_done =
-		master_input.state_import_bad_idle_done;
-	imap_client->state_import_idle_continue =
-		master_input.state_import_idle_continue;
-	if (imap_client->state_import_bad_idle_done) {
-		e_debug(imap_client->event,
-			"imap-master: Unhibernated because IDLE was stopped with BAD command");
-	} else if (imap_client->state_import_idle_continue) {
-		e_debug(imap_client->event,
-			"imap-master: Unhibernated to send mailbox changes");
-	} else {
-		e_debug(imap_client->event,
-			"imap-master: Unhibernated because IDLE was stopped with DONE");
 	}
 
 	ret = imap_state_import_internal(imap_client, master_input.state->data,
 					 master_input.state->used, &error);
 	if (ret <= 0) {
-		i_error("imap-master: Failed to import client state: %s", error);
+		error = t_strdup_printf("Failed to import client state: %s", error);
+		event_add_str(event, "error", error);
+		e_error(event, "imap-master: %s", error);
+		event_unref(&event);
 		client_destroy(imap_client, "Client state initialization failed");
 		return -1;
+	}
+	if (imap_client->mailbox != NULL) {
+		/* Would be nice to set this earlier, but the previous errors
+		   happen rarely enough that it shouldn't really matter. */
+		event_add_str(event, "mailbox",
+			      mailbox_get_vname(imap_client->mailbox));
 	}
 
 	if (master_input.tag != NULL)
 		imap_state_import_idle_cmd_tag(imap_client, master_input.tag);
+
+	e_debug(event, "imap-master: Unhibernated because %s "
+		"(hibernated for %llu.%06llu secs)", reason,
+		hibernation_usecs/1000000, hibernation_usecs%1000000);
+	event_unref(&event);
 
 	/* make sure all pending input gets handled */
 	if (master_input.client_input->used > 0) {
@@ -308,12 +362,12 @@ imap_master_client_input_line(struct connection *conn, const char *line)
 
 	fd_client = i_stream_unix_get_read_fd(conn->input);
 	if (fd_client == -1) {
-		i_error("imap-master: IMAP client fd not received");
+		e_error(conn->event, "imap-master: IMAP client fd not received");
 		return -1;
 	}
 
 	if (imap_debug)
-		i_debug("imap-master: Client input: %s", line);
+		e_debug(conn->event, "imap-master: Client input: %s", line);
 
 	pool = pool_alloconly_create("imap master client cmd", 1024);
 	args = p_strsplit_tabescaped(pool, line);
@@ -341,8 +395,8 @@ static struct connection_settings client_set = {
 	.major_version = 1,
 	.minor_version = 0,
 
-	.input_max_size = (size_t)-1,
-	.output_max_size = (size_t)-1,
+	.input_max_size = SIZE_MAX,
+	.output_max_size = SIZE_MAX,
 	.client = FALSE
 };
 

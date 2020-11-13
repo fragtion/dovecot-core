@@ -475,7 +475,7 @@ static void test_fts_tokenizer_address_maxlen(void)
 
 static void test_fts_tokenizer_random(void)
 {
-	const char test_chars[] = { 0, ' ', '.', 'a', 'b', 'c', '-', '@', '\xC3', '\xA4' };
+	const unsigned char test_chars[] = { 0, ' ', '.', 'a', 'b', 'c', '-', '@', '\xC3', '\xA4' };
 	const char *const settings[] = {"algorithm", "simple", NULL};
 	const char *const email_settings[] = {"maxlen", "9", NULL};
 	unsigned int i;
@@ -490,7 +490,7 @@ static void test_fts_tokenizer_random(void)
 
 	for (i = 0; i < 10000; i++) T_BEGIN {
 		for (unsigned int j = 0; j < sizeof(addr); j++)
-			addr[j] = test_chars[i_rand() % N_ELEMENTS(test_chars)];
+			addr[j] = test_chars[i_rand_limit(N_ELEMENTS(test_chars))];
 		str_truncate(str, 0);
 		if (uni_utf8_get_valid_data(addr, sizeof(addr), str))
 			str_append_data(str, addr, sizeof(addr));

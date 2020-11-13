@@ -262,6 +262,21 @@ static void proxy_free_password(struct client *client)
 	i_free_and_null(client->proxy_password);
 }
 
+static void client_proxy_append_conn_info(string_t *str, struct client *client)
+{
+	const char *source_host;
+
+	source_host = login_proxy_get_source_host(client->login_proxy);
+	if (source_host[0] != '\0')
+		str_printfa(str, " from %s", source_host);
+	if (strcmp(client->virtual_user, client->proxy_user) != 0) {
+		/* remote username is different, log it */
+		str_printfa(str, " as user %s", client->proxy_user);
+	}
+	if (client->proxy_master_user != NULL)
+		str_printfa(str, " (master %s)", client->proxy_master_user);
+}
+
 void client_proxy_finish_destroy_client(struct client *client)
 {
 	string_t *str = t_str_new(128);
@@ -279,12 +294,7 @@ void client_proxy_finish_destroy_client(struct client *client)
 	   IP address in the prefix. */
 	str_printfa(str, "Started proxying to %s",
 		    login_proxy_get_host(client->login_proxy));
-	if (strcmp(client->virtual_user, client->proxy_user) != 0) {
-		/* remote username is different, log it */
-		str_printfa(str, " as user %s", client->proxy_user);
-	}
-	if (client->proxy_master_user != NULL)
-		str_printfa(str, " (master %s)", client->proxy_master_user);
+	client_proxy_append_conn_info(str, client);
 
 	login_proxy_append_success_log_info(client->login_proxy, str);
 	e_info(login_proxy_get_event(client->login_proxy), "%s", str_c(str));
@@ -302,12 +312,7 @@ void client_proxy_log_failure(struct client *client, const char *line)
 	string_t *str = t_str_new(128);
 
 	str_printfa(str, "Login failed");
-	if (strcmp(client->virtual_user, client->proxy_user) != 0) {
-		/* remote username is different, log it */
-		str_printfa(str, " as user %s", client->proxy_user);
-	}
-	if (client->proxy_master_user != NULL)
-		str_printfa(str, " (master %s)", client->proxy_master_user);
+	client_proxy_append_conn_info(str, client);
 	str_append(str, ": ");
 	str_append(str, line);
 	e_info(login_proxy_get_event(client->login_proxy), "%s", str_c(str));

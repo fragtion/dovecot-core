@@ -3,6 +3,7 @@
 #include "lib.h"
 #include "buffer.h"
 #include "istream.h"
+#include "iostream-temp.h"
 #include "ostream.h"
 #include "sha1.h"
 #include "randgen.h"
@@ -274,7 +275,7 @@ static void test_compression_handler(const struct compression_handler *handler)
 		if (i_rand_limit(3) == 0)
 			buf[i] = i_rand_limit(4);
 		else
-			buf[i] = i;
+			buf[i] = i % UCHAR_MAX;
 	}
 	for (i = 0; i < 1024*128 / sizeof(buf); i++) {
 		sha1_loop(&sha1, buf, sizeof(buf));
@@ -526,6 +527,64 @@ test_compression_handler_random_io(const struct compression_handler *handler)
 	buffer_free(&dec_buf);
 }
 
+static void
+test_compression_handler_large_random_io(const struct compression_handler *handler)
+{
+#define RANDOMNESS_SIZE (1024*1024)
+	unsigned char *randomness;
+	struct istream *input, *dec_input;
+	struct ostream *temp_output, *output;
+	const unsigned char *data;
+	size_t size;
+	int ret;
+
+	test_begin(t_strdup_printf("compression handler %s (large random io)", handler->name));
+	randomness = i_malloc(RANDOMNESS_SIZE);
+	random_fill(randomness, RANDOMNESS_SIZE);
+
+	/* write 1 MB of randomness to buffer */
+	input = i_stream_create_from_data(randomness, RANDOMNESS_SIZE);
+
+	temp_output = iostream_temp_create(".temp.", 0);
+	output = handler->create_ostream(temp_output, i_rand_minmax(1, 6));
+
+	switch (o_stream_send_istream(output, input)) {
+	case OSTREAM_SEND_ISTREAM_RESULT_ERROR_INPUT:
+	case OSTREAM_SEND_ISTREAM_RESULT_ERROR_OUTPUT:
+		test_assert(FALSE);
+		break;
+	case OSTREAM_SEND_ISTREAM_RESULT_WAIT_OUTPUT:
+	case OSTREAM_SEND_ISTREAM_RESULT_WAIT_INPUT:
+		i_unreached();
+	case OSTREAM_SEND_ISTREAM_RESULT_FINISHED:
+		test_assert(o_stream_finish(output) == 1);
+		break;
+	}
+	test_assert(output->offset == RANDOMNESS_SIZE);
+	test_assert(output->stream_errno == 0);
+	i_stream_unref(&input);
+
+	input = iostream_temp_finish(&temp_output, SIZE_MAX);
+	o_stream_unref(&output);
+
+	/* verify that reading the input works */
+
+	dec_input = handler->create_istream(input, FALSE);
+
+	while ((ret = i_stream_read_more(dec_input, &data, &size)) > 0) {
+		test_assert(memcmp(data, randomness + dec_input->v_offset, size) == 0);
+		i_stream_skip(dec_input, size);
+	}
+	test_assert(ret == -1);
+	test_assert(dec_input->v_offset == RANDOMNESS_SIZE);
+	test_assert(dec_input->stream_errno == 0);
+
+	i_stream_unref(&dec_input);
+	i_stream_unref(&input);
+	i_free(randomness);
+	test_end();
+}
+
 static void test_compression_handler_errors(const struct compression_handler *handler)
 {
 	test_begin(t_strdup_printf("compression handler %s (errors)", handler->name));
@@ -608,6 +667,7 @@ static void test_compression(void)
 			test_compression_handler_reset(&compression_handlers[i]);
 			test_compression_handler_partial_parent_write(&compression_handlers[i]);
 			test_compression_handler_random_io(&compression_handlers[i]);
+			test_compression_handler_large_random_io(&compression_handlers[i]);
 			test_compression_handler_errors(&compression_handlers[i]);
 		} T_END;
 	}

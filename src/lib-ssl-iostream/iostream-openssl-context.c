@@ -6,6 +6,9 @@
 #include "dovecot-openssl-common.h"
 
 #include <openssl/crypto.h>
+#include <openssl/rsa.h>
+#include <openssl/dh.h>
+#include <openssl/bn.h>
 #include <openssl/x509.h>
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
@@ -422,7 +425,7 @@ ssl_iostream_context_set(struct ssl_iostream_context *ctx,
 	if (set->ciphersuites != NULL &&
 	    SSL_CTX_set_ciphersuites(ctx->ssl_ctx, set->ciphersuites) == 0) {
 		*error_r = t_strdup_printf("Can't set ciphersuites to '%s': %s",
-			set->cipher_list, openssl_iostream_error());
+			set->ciphersuites, openssl_iostream_error());
 		return -1;
 	}
 #endif

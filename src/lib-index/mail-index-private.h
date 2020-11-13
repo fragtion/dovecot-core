@@ -48,7 +48,7 @@ typedef int mail_index_expunge_handler_t(struct mail_index_sync_map_ctx *ctx,
 typedef void mail_index_sync_lost_handler_t(struct mail_index *index);
 
 #define MAIL_INDEX_HEADER_SIZE_ALIGN(size) \
-	(((size) + 7) & ~7)
+	(((size) + 7) & ~7U)
 
 struct mail_index_ext {
 	const char *name;
@@ -186,6 +186,9 @@ struct mail_index {
 	   the main index file should be updated. */
 	uint32_t last_read_log_file_seq;
 	uint32_t last_read_log_file_tail_offset;
+
+	/* log file which last updated index_deleted */
+	uint32_t index_delete_changed_file_seq;
 
 	/* transaction log head seq/offset when we last fscked */
 	uint32_t fsck_log_head_file_seq;

@@ -101,6 +101,7 @@ struct director_kill_context {
 };
 
 struct director {
+	struct event *event;
 	const struct director_settings *set;
 
 	/* IP and port of this director. self_host->ip/port must equal these. */
@@ -172,8 +173,6 @@ struct director {
 	bool sync_frozen:1;
 	bool sync_pending:1;
 };
-
-extern bool director_debug;
 
 /* Create a new director. If listen_ip specifies an actual IP, it's used with
    listen_port for finding ourself from the director_servers setting.
@@ -266,8 +265,6 @@ director_get_username_hash(struct director *dir, const char *username,
 
 void directors_init(void);
 void directors_deinit(void);
-
-void dir_debug(const char *fmt, ...) ATTR_FORMAT(1, 2);
 
 struct director_user_iter *
 director_iterate_users_init(struct director *dir, bool iter_until_current_tail);

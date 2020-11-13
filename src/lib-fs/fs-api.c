@@ -279,12 +279,12 @@ struct fs_file *fs_file_init_with_event(struct fs *fs, struct event *event,
 	T_BEGIN {
 		file = fs->v.file_alloc();
 		file->fs = fs;
-		file->flags = mode_flags & ~FS_OPEN_MODE_MASK;
+		file->flags = mode_flags & ENUM_NEGATE(FS_OPEN_MODE_MASK);
 		file->event = fs_create_event(fs, event);
 		event_set_ptr(file->event, FS_EVENT_FIELD_FS, fs);
 		event_set_ptr(file->event, FS_EVENT_FIELD_FILE, file);
 		fs->v.file_init(file, path, mode_flags & FS_OPEN_MODE_MASK,
-				mode_flags & ~FS_OPEN_MODE_MASK);
+				mode_flags & ENUM_NEGATE(FS_OPEN_MODE_MASK));
 	} T_END;
 
 	fs->files_open_count++;
@@ -321,7 +321,8 @@ void fs_file_free(struct fs_file *file)
 		   fs_file_last_error(). Log it to make sure it's not lost.
 		   Note that the errors are always set only to the file at
 		   the root of the parent hierarchy. */
-		e_error(file->event, "%s (in file deinit)", file->last_error);
+		e_error(file->event, "%s (in file %s deinit)",
+			file->last_error, fs_file_path(file));
 	}
 
 	fs_file_deinit(&file->parent);
@@ -335,7 +336,7 @@ void fs_file_set_flags(struct fs_file *file,
 		       enum fs_open_flags remove_flags)
 {
 	file->flags |= add_flags;
-	file->flags &= ~remove_flags;
+	file->flags &= ENUM_NEGATE(remove_flags);
 
 	if (file->parent != NULL)
 		fs_file_set_flags(file->parent, add_flags, remove_flags);
@@ -600,15 +601,18 @@ fs_set_verror(struct event *event, const char *fmt, va_list args)
 
 	/* free old error after strdup in case args point to the old error */
 	if (file != NULL) {
-		char *old_error = file->last_error;
 		file = fs_file_get_error_file(file);
+		char *old_error = file->last_error;
 
-		if (old_error != NULL && strcmp(old_error, new_error) == 0) {
+		if (old_error == NULL) {
+			i_assert(!file->last_error_changed);
+		} else if (strcmp(old_error, new_error) == 0) {
 			/* identical error - ignore */
 		} else if (file->last_error_changed) {
 			/* multiple fs_set_error() calls used without
 			   fs_file_last_error() in the middle. */
-			e_error(file->event, "%s (overwriting error)", old_error);
+			e_error(file->event, "%s (overwriting error for file %s)",
+				old_error, fs_file_path(file));
 		}
 		if (errno == EAGAIN || errno == ENOENT || errno == EEXIST ||
 		    errno == ENOTEMPTY) {
@@ -630,8 +634,8 @@ fs_set_verror(struct event *event, const char *fmt, va_list args)
 		} else if (iter->last_error != NULL) {
 			/* multiple fs_set_error() calls before the iter
 			   finishes */
-			e_error(iter->fs->event, "%s (overwriting error)",
-				iter->last_error);
+			e_error(iter->fs->event, "%s (overwriting error for file %s)",
+				iter->last_error, iter->path);
 		}
 		i_free(iter->last_error);
 		iter->last_error = new_error;
@@ -741,7 +745,7 @@ struct istream *fs_read_stream(struct fs_file *file, size_t max_buffer_size)
 
 	if (file->seekable_input != NULL) {
 		/* allow multiple open streams, each in a different position */
-		input = i_stream_create_limit(file->seekable_input, (uoff_t)-1);
+		input = i_stream_create_limit(file->seekable_input, UOFF_T_MAX);
 		i_stream_seek(input, 0);
 		return input;
 	}
@@ -1242,6 +1246,7 @@ fs_iter_init_with_event(struct fs *fs, struct event *event,
 		iter = fs->v.iter_alloc();
 		iter->fs = fs;
 		iter->flags = flags;
+		iter->path = i_strdup(path);
 		iter->event = fs_create_event(fs, event);
 		event_set_ptr(iter->event, FS_EVENT_FIELD_FS, fs);
 		event_set_ptr(iter->event, FS_EVENT_FIELD_ITER, iter);
@@ -1277,6 +1282,7 @@ int fs_iter_deinit(struct fs_iter **_iter, const char **error_r)
 	if (ret < 0)
 		*error_r = t_strdup(iter->last_error);
 	i_free(iter->last_error);
+	i_free(iter->path);
 	i_free(iter);
 	event_unref(&event);
 	return ret;
@@ -1380,10 +1386,11 @@ uint64_t fs_stats_get_write_usecs(const struct fs_stats *stats)
 }
 
 struct fs_file *
-fs_file_init_parent(struct fs_file *parent, const char *path, int mode_flags)
+fs_file_init_parent(struct fs_file *parent, const char *path,
+		    enum fs_open_mode mode, enum fs_open_flags flags)
 {
 	return fs_file_init_with_event(parent->fs->parent, parent->event,
-				       path, mode_flags);
+				       path, (int)mode | (int)flags);
 }
 
 struct fs_iter *

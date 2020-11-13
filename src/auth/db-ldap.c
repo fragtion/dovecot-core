@@ -1473,8 +1473,8 @@ db_ldap_value_get_var_expand_table(struct auth_request *auth_request,
 	struct var_expand_table *table;
 	unsigned int count = 1;
 
-	table = auth_request_get_var_expand_table_full(auth_request, NULL,
-						       &count);
+	table = auth_request_get_var_expand_table_full(auth_request,
+			auth_request->fields.user, NULL, &count);
 	table[0].key = '$';
 	table[0].value = ldap_value;
 	return table;
@@ -1592,7 +1592,7 @@ db_ldap_result_iterate_init_full(struct ldap_connection *conn,
 	ctx->iter_dn_values = iter_dn_values;
 	hash_table_create(&ctx->ldap_attrs, pool, 0, strcase_hash, strcasecmp);
 	ctx->var = str_new(ctx->pool, 256);
-	if (ctx->ldap_request->auth_request->debug)
+	if (event_want_debug(ctx->ldap_request->auth_request->event))
 		ctx->debug = t_str_new(256);
 	ctx->ldap_msg = res;
 	ctx->ld = conn->ld;

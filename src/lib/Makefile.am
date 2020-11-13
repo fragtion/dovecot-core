@@ -47,6 +47,7 @@ liblib_la_SOURCES = \
 	bits.c \
 	bsearch-insert-pos.c \
 	buffer.c \
+	buffer-istream.c \
 	child-wait.c \
 	compat.c \
 	connection.c \
@@ -102,7 +103,6 @@ liblib_la_SOURCES = \
 	istream-hash.c \
 	istream-jsonstr.c \
 	istream-limit.c \
-	istream-mmap.c \
 	istream-multiplex.c \
 	istream-rawlog.c \
 	istream-seekable.c \
@@ -372,6 +372,7 @@ test_lib_SOURCES = \
 	test-bits.c \
 	test-bsearch-insert-pos.c \
 	test-buffer.c \
+	test-buffer-istream.c \
 	test-byteorder.c \
 	test-connection.c \
 	test-crc32.c \
@@ -383,6 +384,7 @@ test_lib_SOURCES = \
 	test-event-log.c \
 	test-failures.c \
 	test-fd-util.c \
+	test-file-cache.c \
 	test-file-create-locked.c \
 	test-guid.c \
 	test-hash.c \

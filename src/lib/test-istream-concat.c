@@ -69,7 +69,7 @@ static bool test_istream_concat_random(void)
 		data_len = i_rand_minmax(1, TEST_MAX_ISTREAM_SIZE);
 		w_data = t_malloc_no0(data_len);
 		for (j = 0; j < data_len; j++)
-			w_data[j] = offset++;
+			w_data[j] = (offset++) & 0xff;
 		streams[i] = test_istream_create_data(w_data, data_len);
 		test_istream_set_allow_eof(streams[i], TRUE);
 	}
@@ -83,7 +83,7 @@ static bool test_istream_concat_random(void)
 	if (simult > 0) {
 		limits = t_new(struct istream *, simult);
 		for (i = 0; i < simult; i++)
-			limits[i] = i_stream_create_limit(concat, (uoff_t)-1);
+			limits[i] = i_stream_create_limit(concat, UOFF_T_MAX);
 	}
 
 	for (i = 0; i < 1000; i++) {

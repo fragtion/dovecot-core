@@ -88,7 +88,7 @@ view_sync_set_log_view_range(struct mail_index_view *view, bool sync_expunges,
 		   we can't do this, so sync only up to the reset. */
 		mail_transaction_log_view_get_prev_pos(view->log_view,
 						       &end_seq, &end_offset);
-		end_seq--; end_offset = (uoff_t)-1;
+		end_seq--; end_offset = UOFF_T_MAX;
 		if (end_seq < start_seq) {
 			/* we have only this reset log */
 			mail_transaction_log_view_clear(view->log_view,
@@ -358,7 +358,7 @@ static int view_sync_apply_lost_changes(struct mail_index_view_sync_ctx *ctx,
 		i_zero(&flag_update);
 		flag_update.uid1 = flag_update.uid2 = new_rec->uid;
 		flag_update.add_flags = new_rec->flags;
-		flag_update.remove_flags = ~new_rec->flags & 0xff;
+		flag_update.remove_flags = ENUM_NEGATE(new_rec->flags) & 0xff;
 		if (mail_index_sync_record(&ctx->sync_map_ctx, &thdr,
 					   &flag_update) < 0)
 			return -1;

@@ -5,6 +5,7 @@
 #include "ioloop.h"
 #include "ostream.h"
 #include "istream-private.h"
+#include "str-sanitize.h"
 
 #include "http-server-private.h"
 
@@ -51,7 +52,7 @@ void http_server_request_update_event(struct http_server_request *req)
 		event_add_str(req->event, "target", req->req.target_raw);
 	event_set_append_log_prefix(
 		req->event, t_strdup_printf("request %s: ",
-					    http_server_request_label(req)));
+			str_sanitize(http_server_request_label(req), 256)));
 }
 
 struct http_server_request *
@@ -836,7 +837,7 @@ void http_server_request_forward_payload(struct http_server_request *req,
 
 	i_assert(req->req.payload != NULL);
 
-	if (max_size == (uoff_t)-1) {
+	if (max_size == UOFF_T_MAX) {
 		i_stream_ref(input);
 	} else {
 		if ((ret = i_stream_get_size(input, TRUE,

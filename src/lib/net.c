@@ -279,7 +279,7 @@ int net_connect_unix(const char *path)
 #ifdef ENAMETOOLONG
 		errno = ENAMETOOLONG;
 #else
-		errno = EINVAL;
+		errno = EOVERFLOW;
 #endif
 		return -1;
 	}
@@ -462,7 +462,7 @@ int net_listen_full(const struct ip_addr *my_ip, in_port_t *port,
 		if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT,
 			       &opt, sizeof(opt)) < 0)
 #endif
-			*flags &= ~NET_LISTEN_FLAG_REUSEPORT;
+			*flags &= ENUM_NEGATE(NET_LISTEN_FLAG_REUSEPORT);
 	}
 
 	/* If using IPv6, bind only to IPv6 if possible. This avoids
@@ -513,7 +513,11 @@ int net_listen_unix(const char *path, int backlog)
 	sa.un.sun_family = AF_UNIX;
 	if (i_strocpy(sa.un.sun_path, path, sizeof(sa.un.sun_path)) < 0) {
 		/* too long path */
+#ifdef ENAMETOOLONG
+		errno = ENAMETOOLONG;
+#else
 		errno = EOVERFLOW;
+#endif
 		return -1;
 	}
 

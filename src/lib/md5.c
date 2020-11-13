@@ -67,6 +67,8 @@
  * the bit counters.  There're no alignment requirements.
  */
 static const void * ATTR_NOWARN_UNUSED_RESULT ATTR_UNSIGNED_WRAPS
+        ATTR_NO_SANITIZE_UNDEFINED ATTR_NO_SANITIZE_INTEGER
+        ATTR_NO_SANITIZE_IMPLICIT_CONVERSION
 body(struct md5_context *ctx, const void *data, size_t size)
 {
 	const unsigned char *ptr;
@@ -215,14 +217,15 @@ md5_update(struct md5_context *ctx, const void *data, size_t size)
 	}
 
 	if (size >= 64) {
-		data = body(ctx, data, size & ~(unsigned long)0x3f);
+		data = body(ctx, data, size & ~0x3fUL);
 		size &= 0x3f;
 	}
 
 	memcpy(ctx->buffer, data, size);
 }
 
-void ATTR_UNSIGNED_WRAPS
+void ATTR_UNSIGNED_WRAPS ATTR_NO_SANITIZE_UNDEFINED
+	ATTR_NO_SANITIZE_INTEGER ATTR_NO_SANITIZE_IMPLICIT_CONVERSION
 md5_final(struct md5_context *ctx, unsigned char result[STATIC_ARRAY MD5_RESULTLEN])
 {
 	/* @UNSAFE */

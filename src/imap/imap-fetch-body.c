@@ -78,7 +78,7 @@ static string_t *get_prefix(struct imap_fetch_state *state,
 
 	str_append(str, get_body_name(body));
 
-	if (size == (uoff_t)-1)
+	if (size == UOFF_T_MAX)
 		str_append(str, " NIL");
 	else if (has_nuls && body->binary)
 		str_printfa(str, " ~{%"PRIuUOFF_T"}\r\n", size);
@@ -96,7 +96,7 @@ static int fetch_stream_continue(struct imap_fetch_context *ctx)
 
 	o_stream_set_max_buffer_size(ctx->client->output, 0);
 	res = o_stream_send_istream(ctx->client->output, state->cur_input);
-	o_stream_set_max_buffer_size(ctx->client->output, (size_t)-1);
+	o_stream_set_max_buffer_size(ctx->client->output, SIZE_MAX);
 
 	if (ctx->state.cur_stats_sizep != NULL) {
 		*ctx->state.cur_stats_sizep +=
@@ -149,9 +149,9 @@ get_body_human_name(pool_t pool, struct imap_fetch_body_data *body)
 
 	partial_offset = imap_msgpart_get_partial_offset(body->msgpart);
 	partial_size = imap_msgpart_get_partial_size(body->msgpart);
-	if (partial_offset != 0 || partial_size != (uoff_t)-1) {
+	if (partial_offset != 0 || partial_size != UOFF_T_MAX) {
 		str_printfa(str, "<%"PRIuUOFF_T, partial_offset);
-		if (partial_size != (uoff_t)-1)
+		if (partial_size != UOFF_T_MAX)
 			str_printfa(str, ".%"PRIuUOFF_T, partial_size);
 		str_append_c(str, '>');
 	}
@@ -268,7 +268,7 @@ body_header_fields_parse(struct imap_fetch_init_context *ctx,
 static int body_parse_partial(struct imap_fetch_body_data *body,
 			      const char *p, const char **error_r)
 {
-	uoff_t offset, size = (uoff_t)-1;
+	uoff_t offset, size = UOFF_T_MAX;
 
 	if (*p == '\0')
 		return 0;

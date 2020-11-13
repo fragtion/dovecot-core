@@ -351,7 +351,7 @@ static void log_record_print(const struct mail_transaction_header *hdr,
 		size_t record_size;
 
 		end = CONST_PTR_OFFSET(data, size);
-		record_size = (sizeof(*rec) + prev_intro.record_size + 3) & ~3;
+		record_size = (sizeof(*rec) + prev_intro.record_size + 3) & ~3U;
 		while (rec < end) {
 			printf(" - uid=%u: ", rec->uid);
 			if (prev_intro.record_size <= (char*)end - (char *)(rec+1))
@@ -524,7 +524,7 @@ static void cmd_dump_log(int argc ATTR_UNUSED, char *argv[])
 	unsigned int version;
 	int ret;
 
-	input = i_stream_create_file(argv[1], (size_t)-1);
+	input = i_stream_create_file(argv[1], SIZE_MAX);
 	dump_hdr(input, &modseq, &version);
 	do {
 		T_BEGIN {

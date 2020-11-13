@@ -81,11 +81,6 @@ AS_HELP_STRING([--with-gssapi=yes|plugin Build with GSSAPI authentication suppor
   TEST_WITH(gssapi, $withval, plugin),
   want_gssapi=no)
 
-AC_ARG_WITH(sia,
-AS_HELP_STRING([--with-sia], [Build with Tru64 SIA support]),
-  TEST_WITH(sia, $withval),
-  want_sia=no)
-
 AC_ARG_WITH(ldap,
 AS_HELP_STRING([--with-ldap=yes|plugin], [Build with LDAP support]),
   TEST_WITH(ldap, $withval, plugin),
@@ -95,22 +90,6 @@ AC_ARG_WITH(libunwind,
 AS_HELP_STRING([--with-libunwind], [Build with libunwind support (auto)]),
   TEST_WITH(libunwind, $withval),
   want_libunwind=auto)
-
-AC_ARG_WITH(vpopmail,
-AS_HELP_STRING([--with-vpopmail], [Build with vpopmail support (auto)]),
-	if test x$withval = xno; then
-		want_vpopmail=no
-	else
-		if test x$withval = xyes || test x$withval = xauto; then
-			vpopmail_home="`echo ~vpopmail`"
-			want_vpopmail=$withval
-		else
-			vpopmail_home="$withval"
-			want_vpopmail=yes
-		fi
-	fi, [
-		want_vpopmail=no
-	])
 
 # Berkeley DB support is more or less broken. Disabled for now.
 #AC_ARG_WITH(db,
@@ -561,7 +540,6 @@ DOVECOT_WANT_PAM
 DOVECOT_WANT_CHECKPASSWORD
 DOVECOT_WANT_BSDAUTH
 DOVECOT_WANT_GSSAPI
-DOVECOT_WANT_SIA
 DOVECOT_WANT_LDAP
 DOVECOT_WANT_DB
 DOVECOT_WANT_CDB
@@ -570,7 +548,6 @@ DOVECOT_WANT_MYSQL
 DOVECOT_WANT_SODIUM
 DOVECOT_WANT_SQLITE
 DOVECOT_WANT_CASSANDRA
-DOVECOT_WANT_VPOPMAIL
 
 DOVECOT_SQL
 
@@ -858,7 +835,6 @@ src/lib-ldap/Makefile
 src/lib-lua/Makefile
 src/lib-mail/Makefile
 src/lib-master/Makefile
-src/lib-ntlm/Makefile
 src/lib-program-client/Makefile
 src/lib-otp/Makefile
 src/lib-dovecot/Makefile

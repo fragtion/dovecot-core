@@ -39,7 +39,8 @@ static void notify_update_user(struct director *dir, struct mail_tag *tag,
 
 	diff = ioloop_time - user->timestamp;
 	if (diff >= (int)dir->set->director_user_expire) {
-		i_warning("notify: User %s refreshed too late (%d secs)",
+		e_warning(dir->event,
+			  "notify: User %s refreshed too late (%d secs)",
 			  username, diff);
 	}
 	user_directory_refresh(tag->users, user);
@@ -60,10 +61,11 @@ static void notify_connection_input(struct notify_connection *conn)
 	}
 	if (conn->input->eof) {
 		if (conn->fifo)
-			i_error("notify: read() unexpectedly returned EOF");
+			e_error(conn->dir->event,
+				"notify: read() unexpectedly returned EOF");
 		notify_connection_deinit(&conn);
 	} else if (conn->input->stream_errno != 0) {
-		i_error("notify: read() failed: %s",
+		e_error(conn->dir->event, "notify: read() failed: %s",
 			i_stream_get_error(conn->input));
 		notify_connection_deinit(&conn);
 	}
@@ -92,7 +94,7 @@ static void notify_connection_deinit(struct notify_connection **_conn)
 	io_remove(&conn->io);
 	i_stream_unref(&conn->input);
 	if (close(conn->fd) < 0)
-		i_error("close(notify connection) failed: %m");
+		e_error(conn->dir->event, "close(notify connection) failed: %m");
 	if (!conn->fifo)
 		master_service_client_connection_destroyed(master_service);
 	i_free(conn);

@@ -5,12 +5,14 @@
 #include "bsearch-insert-pos.h"
 #include "crc32.h"
 #include "md5.h"
+#include "director.h"
 #include "user-directory.h"
 #include "mail-host.h"
 
 #define VHOST_MULTIPLIER 100
 
 struct mail_host_list {
+	struct director *dir;
 	ARRAY_TYPE(mail_tag) tags;
 	ARRAY_TYPE(mail_host) hosts;
 	user_free_hook_t *user_free_hook;
@@ -141,7 +143,8 @@ mail_tag_get(struct mail_host_list *list, const char *tag_name)
 		tag = i_new(struct mail_tag, 1);
 		tag->name = i_strdup(tag_name);
 		i_array_init(&tag->vhosts, 16*VHOST_MULTIPLIER);
-		tag->users = user_directory_init(list->user_expire_secs,
+		tag->users = user_directory_init(list->dir,
+						 list->user_expire_secs,
 						 list->user_free_hook);
 		array_push_back(&list->tags, &tag);
 	}
@@ -201,7 +204,7 @@ mail_host_add(struct mail_host_list *list, const char *hostname,
 	}
 
 	if (net_gethostbyname(hostname, &ips, &ips_count) < 0) {
-		i_error("Unknown mail host: %s", hostname);
+		e_error(list->dir->event, "Unknown mail host: %s", hostname);
 		return -1;
 	}
 
@@ -220,12 +223,12 @@ mail_hosts_add_range(struct mail_host_list *list,
 	unsigned int i, j, max_bits, last_bits;
 
 	if (ip1.family != ip2.family) {
-		i_error("IP address family mismatch: %s vs %s",
+		e_error(list->dir->event, "IP address family mismatch: %s vs %s",
 			net_ip2addr(&ip1), net_ip2addr(&ip2));
 		return -1;
 	}
 	if (net_ip_cmp(&ip1, &ip2) > 0) {
-		i_error("IP addresses reversed: %s-%s",
+		e_error(list->dir->event, "IP addresses reversed: %s-%s",
 			net_ip2addr(&ip1), net_ip2addr(&ip2));
 		return -1;
 	}
@@ -244,7 +247,7 @@ mail_hosts_add_range(struct mail_host_list *list,
 	/* make sure initial bits match */
 	for (i = 0; i < (max_bits-last_bits)/32; i++) {
 		if (ip1_arr[i] != ip2_arr[i]) {
-			i_error("IP address range too large: %s-%s",
+			e_error(list->dir->event, "IP address range too large: %s-%s",
 				net_ip2addr(&ip1), net_ip2addr(&ip2));
 			return -1;
 		}
@@ -254,7 +257,7 @@ mail_hosts_add_range(struct mail_host_list *list,
 
 	for (j = last_bits; j < 32; j++) {
 		if ((i1 & (1U << j)) != (i2 & (1U << j))) {
-			i_error("IP address range too large: %s-%s",
+			e_error(list->dir->event, "IP address range too large: %s-%s",
 				net_ip2addr(&ip1), net_ip2addr(&ip2));
 			return -1;
 		}
@@ -310,9 +313,9 @@ int mail_hosts_parse_and_add(struct mail_host_list *list,
 
 	if (array_count(&list->hosts) == 0) {
 		if (ret < 0)
-			i_error("No valid servers specified");
+			e_error(list->dir->event, "No valid servers specified");
 		else
-			i_error("Empty server list");
+			e_error(list->dir->event, "Empty server list");
 		ret = -1;
 	}
 	return ret;
@@ -336,7 +339,7 @@ void mail_host_set_down(struct mail_host *host, bool down,
 {
 	if (host->down != down) {
 		const char *updown = down ? "down" : "up";
-		i_info("%sHost %s changed %s "
+		e_info(host->list->dir->event, "%sHost %s changed %s "
 		       "(vhost_count=%u last_updown_change=%ld)",
 		       log_prefix, host->ip_str, updown,
 		       host->vhost_count, (long)host->last_updown_change);
@@ -350,7 +353,8 @@ void mail_host_set_down(struct mail_host *host, bool down,
 void mail_host_set_vhost_count(struct mail_host *host, unsigned int vhost_count,
 			       const char *log_prefix)
 {
-	i_info("%sHost %s vhost count changed from %u to %u",
+	e_info(host->list->dir->event,
+	       "%sHost %s vhost count changed from %u to %u",
 	       log_prefix, host->ip_str,
 	       host->vhost_count, vhost_count);
 
@@ -404,8 +408,8 @@ mail_host_get_by_hash_ring(struct mail_tag *tag, unsigned int hash)
 	unsigned int count, idx;
 
 	vhosts = array_get(&tag->vhosts, &count);
-	array_bsearch_insert_pos(&tag->vhosts, &hash,
-				 mail_vhost_hash_cmp, &idx);
+	(void)array_bsearch_insert_pos(&tag->vhosts, &hash,
+				       mail_vhost_hash_cmp, &idx);
 	i_assert(idx <= count);
 	if (idx == count) {
 		if (count == 0)
@@ -482,12 +486,14 @@ const ARRAY_TYPE(mail_tag) *mail_hosts_get_tags(struct mail_host_list *list)
 }
 
 struct mail_host_list *
-mail_hosts_init(unsigned int user_expire_secs,
+mail_hosts_init(struct director *dir,
+		unsigned int user_expire_secs,
 		user_free_hook_t *user_free_hook)
 {
 	struct mail_host_list *list;
 
 	list = i_new(struct mail_host_list, 1);
+	list->dir = dir;
 	list->user_expire_secs = user_expire_secs;
 	list->user_free_hook = user_free_hook;
 
@@ -531,7 +537,7 @@ struct mail_host_list *mail_hosts_dup(const struct mail_host_list *src)
 	struct mail_host_list *dest;
 	struct mail_host *const *hostp, *dest_host;
 
-	dest = mail_hosts_init(src->user_expire_secs, src->user_free_hook);
+	dest = mail_hosts_init(src->dir, src->user_expire_secs, src->user_free_hook);
 	array_foreach(&src->hosts, hostp) {
 		dest_host = mail_host_dup(dest, *hostp);
 		array_push_back(&dest->hosts, &dest_host);

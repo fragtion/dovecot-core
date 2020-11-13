@@ -624,7 +624,7 @@ int lmtp_proxy_rcpt(struct client *client,
 		/* The existing "user" event field is overridden with the new
 		   user name, while old username is available as "orig_user" */
 		event_add_str(rcpt->event, "user", username);
-		event_add_str(rcpt->event, "orig_user", orig_username);
+		event_add_str(rcpt->event, "original_user", orig_username);
 
 		if (smtp_address_parse_username(pool_datastack_create(),
 						username, &user, &errstr) < 0) {
@@ -795,7 +795,7 @@ void lmtp_proxy_data(struct client *client,
 		e_error(client->event,
 			"i_stream_get_size(data_input) failed: %s",
 			i_stream_get_error(proxy->data_input));
-		size = (uoff_t)-1;
+		size = UOFF_T_MAX;
 	}
 
 	/* Create the data_input streams first */
@@ -807,9 +807,9 @@ void lmtp_proxy_data(struct client *client,
 			continue;
 		}
 
-		if (size == (uoff_t)-1) {
+		if (size == UOFF_T_MAX) {
 			conn->data_input =
-				i_stream_create_limit(data_input, (uoff_t)-1);
+				i_stream_create_limit(data_input, UOFF_T_MAX);
 		} else {
 			conn->data_input =
 				i_stream_create_sized(data_input, size);

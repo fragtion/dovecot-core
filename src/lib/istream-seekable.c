@@ -162,7 +162,8 @@ static ssize_t read_more(struct seekable_istream *sstream)
 		sstream->cur_input = sstream->input[sstream->cur_idx++];
 		if (sstream->cur_input == NULL) {
 			/* last one, EOF */
-			sstream->size = sstream->istream.istream.v_offset;
+			sstream->size = sstream->istream.istream.v_offset +
+				(sstream->istream.pos - sstream->istream.skip);
 			sstream->istream.istream.eof = TRUE;
 			/* Now that EOF is reached, the stream can't return 0
 			   anymore. Callers can now use this stream in places
@@ -238,7 +239,7 @@ static int i_stream_seekable_write_failed(struct seekable_istream *sstream)
 
 	i_assert(sstream->fd != -1);
 
-	stream->max_buffer_size = (size_t)-1;
+	stream->max_buffer_size = SIZE_MAX;
 	data = i_stream_alloc(stream, sstream->write_peak);
 
 	if (pread_full(sstream->fd, data, sstream->write_peak, 0) < 0) {
@@ -266,7 +267,7 @@ static ssize_t i_stream_seekable_read(struct istream_private *stream)
 
 		/* copy everything to temp file and use it as the stream */
 		if (copy_to_temp_file(sstream) < 0) {
-			stream->max_buffer_size = (size_t)-1;
+			stream->max_buffer_size = SIZE_MAX;
 			if (!read_from_buffer(sstream, &ret))
 				i_unreached();
 			return ret;
@@ -334,7 +335,7 @@ i_stream_seekable_stat(struct istream_private *stream, bool exact)
 	uoff_t old_offset, len;
 	ssize_t ret;
 
-	if (sstream->size != (uoff_t)-1) {
+	if (sstream->size != UOFF_T_MAX) {
 		/* we've already reached EOF and know the size */
 		stream->statbuf.st_size = sstream->size;
 		return 0;
@@ -434,7 +435,7 @@ i_streams_merge(struct istream *input[], size_t max_buffer_size,
 	sstream->context = context;
         sstream->istream.max_buffer_size = max_buffer_size;
 	sstream->fd = -1;
-	sstream->size = (uoff_t)-1;
+	sstream->size = UOFF_T_MAX;
 
 	sstream->input = i_new(struct istream *, count + 1);
 	memcpy(sstream->input, input, sizeof(*input) * count);

@@ -135,7 +135,7 @@ struct client *client_create(int fd_in, int fd_out,
 	client->fd_out = fd_out;
 	client->input = i_stream_create_fd(fd_in,
 					   set->imap_max_line_length);
-	client->output = o_stream_create_fd(fd_out, (size_t)-1);
+	client->output = o_stream_create_fd(fd_out, SIZE_MAX);
 	o_stream_set_no_error_handling(client->output, TRUE);
 	i_stream_set_name(client->input, "<imap client>");
 	o_stream_set_name(client->output, "<imap client>");
@@ -301,7 +301,8 @@ const char *client_stats(struct client *client)
 	if (var_expand_with_funcs(str, client->set->imap_logout_format,
 				  tab, mail_user_var_expand_func_table,
 				  client->user, &error) < 0) {
-		i_error("Failed to expand imap_logout_format=%s: %s",
+		e_error(client->event,
+			"Failed to expand imap_logout_format=%s: %s",
 			client->set->imap_logout_format, error);
 	}
 	return str_c(str);
@@ -424,7 +425,7 @@ static const char *client_get_commands_status(struct client *client)
 
 static void client_log_disconnect(struct client *client, const char *reason)
 {
-	i_info("%s %s", reason, client_stats(client));
+	e_info(client->event, "%s %s", reason, client_stats(client));
 }
 
 static void client_default_destroy(struct client *client, const char *reason)

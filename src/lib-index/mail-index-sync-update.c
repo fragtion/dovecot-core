@@ -448,7 +448,7 @@ static int sync_flag_update(const struct mail_transaction_flag_update *u,
 	    (view->index->flags & MAIL_INDEX_OPEN_FLAG_NO_DIRTY) == 0)
 		view->map->hdr.flags |= MAIL_INDEX_HDR_FLAG_HAVE_DIRTY;
 
-        flag_mask = ~u->remove_flags;
+        flag_mask = (unsigned char)~u->remove_flags;
 
 	if (((u->add_flags | u->remove_flags) &
 	     (MAIL_SEEN | MAIL_DELETED)) == 0) {
@@ -725,7 +725,7 @@ mail_index_sync_record_real(struct mail_index_sync_map_ctx *ctx,
 		}
 
 		/* the record is padded to 32bits in the transaction log */
-		record_size = (sizeof(*rec) + ctx->cur_ext_record_size + 3) & ~3;
+		record_size = (sizeof(*rec) + ctx->cur_ext_record_size + 3) & ~3U;
 
 		for (i = 0; i < hdr->size; i += record_size) {
 			rec = CONST_PTR_OFFSET(data, i);
@@ -947,7 +947,7 @@ int mail_index_sync_map(struct mail_index_map **_map,
 	view = mail_index_view_open_with_map(index, map);
 	ret = mail_transaction_log_view_set(view->log_view,
 					    map->hdr.log_file_seq, start_offset,
-					    (uint32_t)-1, (uoff_t)-1,
+					    (uint32_t)-1, UOFF_T_MAX,
 					    &reset, &reason);
 	if (ret <= 0) {
 		mail_index_view_close(&view);
@@ -984,7 +984,7 @@ int mail_index_sync_map(struct mail_index_map **_map,
 
 	had_dirty = (map->hdr.flags & MAIL_INDEX_HDR_FLAG_HAVE_DIRTY) != 0;
 	if (had_dirty)
-		map->hdr.flags &= ~MAIL_INDEX_HDR_FLAG_HAVE_DIRTY;
+		map->hdr.flags &= ENUM_NEGATE(MAIL_INDEX_HDR_FLAG_HAVE_DIRTY);
 
 	if (map->hdr_base != map->hdr_copy_buf->data) {
 		/* if syncing updates the header, it updates hdr_copy_buf

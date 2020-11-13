@@ -358,8 +358,7 @@ static int mailbox_list_index_parse_records(struct mailbox_list_index *ilist,
 		if (!ilist->has_backing_store && !guid_128_is_empty(irec->guid) &&
 		    (rec->flags & (MAILBOX_LIST_INDEX_FLAG_NONEXISTENT |
 				   MAILBOX_LIST_INDEX_FLAG_NOSELECT)) != 0) {
-			node->flags &= ~(MAILBOX_LIST_INDEX_FLAG_NONEXISTENT |
-					 MAILBOX_LIST_INDEX_FLAG_NOSELECT);
+			node->flags &= ENUM_NEGATE(MAILBOX_LIST_INDEX_FLAG_NONEXISTENT | MAILBOX_LIST_INDEX_FLAG_NOSELECT);
 			*error_r = t_strdup_printf(
 				"non-selectable mailbox '%s' (uid=%u) already has GUID - "
 				"marking it selectable", node->name, node->uid);
@@ -550,8 +549,15 @@ int mailbox_list_index_refresh_force(struct mailbox_list *list)
 	}
 	mail_index_view_close(&view);
 
-	if (mailbox_list_index_handle_corruption(list) < 0)
+	if (mailbox_list_index_handle_corruption(list) < 0) {
+		const char *errstr;
+		enum mail_error error;
+
+		errstr = mailbox_list_get_last_internal_error(list, &error);
+		mailbox_list_set_error(list, error, t_strdup_printf(
+			"Failed to rebuild mailbox list index: %s", errstr));
 		ret = -1;
+	}
 	return ret;
 }
 
@@ -605,16 +611,21 @@ list_handle_corruption_locked(struct mailbox_list *list,
 			      enum mail_storage_list_index_rebuild_reason reason)
 {
 	struct mail_storage *const *storagep;
+	const char *errstr;
+	enum mail_error error;
 
 	array_foreach(&list->ns->all_storages, storagep) {
-		if ((*storagep)->v.list_index_rebuild != NULL) {
-			if ((*storagep)->v.list_index_rebuild(*storagep, reason) < 0)
-				return -1;
-			else {
-				/* FIXME: implement a generic handler that
-				   just lists mailbox directories in filesystem
-				   and adds the missing ones to the index. */
-			}
+		if ((*storagep)->v.list_index_rebuild == NULL)
+			continue;
+
+		if ((*storagep)->v.list_index_rebuild(*storagep, reason) < 0) {
+			errstr = mail_storage_get_last_internal_error(*storagep, &error);
+			mailbox_list_set_error(list, error, errstr);
+			return -1;
+		} else {
+			/* FIXME: implement a generic handler that
+			   just lists mailbox directories in filesystem
+			   and adds the missing ones to the index. */
 		}
 	}
 	return mailbox_list_index_set_uncorrupted(list);

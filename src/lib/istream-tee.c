@@ -53,14 +53,14 @@ static void tee_streams_skip(struct tee_istream *tee)
 	struct tee_child_istream *tstream = tee->children;
 	size_t min_skip;
 
-	min_skip = (size_t)-1;
+	min_skip = SIZE_MAX;
 	for (; tstream != NULL; tstream = tstream->next) {
 		if (tstream->istream.skip < min_skip &&
 		    !tstream->istream.istream.closed)
 			min_skip = tstream->istream.skip;
 	}
 
-	if (min_skip > 0 && min_skip != (size_t)-1) {
+	if (min_skip > 0 && min_skip != SIZE_MAX) {
 		i_stream_skip(tee->input, min_skip);
 		tee_streams_update_buffer(tee);
 	}
@@ -205,7 +205,7 @@ struct tee_istream *tee_i_stream_create(struct istream *input)
 		i_stream_ref(input);
 		tee->input = input;
 	} else {
-		tee->input = i_stream_create_limit(input, (uoff_t)-1);
+		tee->input = i_stream_create_limit(input, UOFF_T_MAX);
 	}
 	return tee;
 }

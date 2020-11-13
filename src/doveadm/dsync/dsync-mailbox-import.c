@@ -734,7 +734,7 @@ static void newmail_link(struct dsync_mailbox_importer *importer,
 		}
 	} else {
 		if (remote_uid == 0) {
-			/* mail exists only locally. we don't want to request
+			/* mail exists locally. we don't want to request
 			   it, and we'll assume it has no duplicate
 			   instances. */
 			return;
@@ -878,7 +878,7 @@ static bool dsync_mailbox_try_save_cur(struct dsync_mailbox_importer *importer,
 
 	array_push_back(&importer->newmails, &newmail);
 	newmail_link(importer, newmail,
-		     save_change == NULL ? 0 : save_change->uid);
+		     newmail->uid_in_local ? 0 : save_change->uid);
 	return remote_saved;
 }
 
@@ -1377,7 +1377,7 @@ dsync_mailbox_import_want_change(struct dsync_mailbox_importer *importer,
 		}
 	}
 	if (importer->sync_max_size > 0) {
-		i_assert(change->virtual_size != (uoff_t)-1);
+		i_assert(change->virtual_size != UOFF_T_MAX);
 		if (change->virtual_size < importer->sync_max_size) {
 			/* mail is too large - skip it */
 			*result_r = "Ignoring missing local mail with too large size";
@@ -1674,7 +1674,7 @@ dsync_mailbox_find_common_uid(struct dsync_mailbox_importer *importer,
 		 ((change->received_timestamp > 0 ||
 		   (importer->sync_since_timestamp == 0 &&
 		    importer->sync_until_timestamp == 0)) &&
-		  (change->virtual_size != (uoff_t)-1 || importer->sync_max_size == 0)));
+		  (change->virtual_size != UOFF_T_MAX || importer->sync_max_size == 0)));
 
 	/* try to find the matching local mail */
 	if (!importer_next_mail(importer, change->uid)) {
@@ -2227,7 +2227,7 @@ dsync_mailbox_import_handle_local_mails(struct dsync_mailbox_importer *importer)
 	struct hash_iterate_context *iter;
 	const char *key;
 	void *key2;
-	struct importer_new_mail *mail;
+	struct importer_new_mail *mail, *const *mailp;
 
 	if (importer->virtual_all_box != NULL &&
 	    hash_table_count(importer->import_guids) > 0) {
@@ -2252,6 +2252,13 @@ dsync_mailbox_import_handle_local_mails(struct dsync_mailbox_importer *importer)
 		} T_END;
 	}
 	hash_table_iterate_deinit(&iter);
+	if (!importer->mails_have_guids) {
+		array_foreach(&importer->newmails, mailp) {
+			mail = *mailp;
+			if (mail->uid_in_local)
+				(void)dsync_mailbox_import_handle_mail(importer, mail);
+		}
+	}
 }
 
 int dsync_mailbox_import_changes_finish(struct dsync_mailbox_importer *importer)

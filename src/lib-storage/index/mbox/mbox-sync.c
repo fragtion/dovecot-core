@@ -343,7 +343,7 @@ static void mbox_sync_get_dirty_flags(struct mbox_sync_mail_context *mail_ctx,
 
 	/* default to undirtying the message. it gets added back if
 	   flags/keywords don't match what is in the index. */
-	mail_ctx->mail.flags &= ~MAIL_INDEX_MAIL_FLAG_DIRTY;
+	mail_ctx->mail.flags &= ENUM_NEGATE(MAIL_INDEX_MAIL_FLAG_DIRTY);
 
 	/* replace flags */
 	idx_flags = rec->flags & MAIL_FLAGS_NONRECENT;
@@ -420,10 +420,10 @@ static void mbox_sync_update_index(struct mbox_sync_mail_context *mail_ctx,
 	ARRAY_TYPE(keyword_indexes) idx_keywords;
 	uint8_t mbox_flags;
 
-	mbox_flags = mail->flags & ~MAIL_RECENT;
+	mbox_flags = mail->flags & ENUM_NEGATE(MAIL_RECENT);
 	if (!sync_ctx->delay_writes) {
 		/* changes are written to the mbox file */
-		mbox_flags &= ~MAIL_INDEX_MAIL_FLAG_DIRTY;
+		mbox_flags &= ENUM_NEGATE(MAIL_INDEX_MAIL_FLAG_DIRTY);
 	} else if (mail_ctx->need_rewrite) {
 		/* make sure this message gets written later */
 		mbox_flags |= MAIL_INDEX_MAIL_FLAG_DIRTY;
@@ -639,7 +639,7 @@ static void mbox_sync_handle_expunge(struct mbox_sync_mail_context *mail_ctx)
 static int mbox_sync_handle_header(struct mbox_sync_mail_context *mail_ctx)
 {
 	struct mbox_sync_context *sync_ctx = mail_ctx->sync_ctx;
-	uoff_t orig_from_offset, postlf_from_offset = (uoff_t)-1;
+	uoff_t orig_from_offset, postlf_from_offset = UOFF_T_MAX;
 	off_t move_diff;
 	int ret;
 
@@ -661,8 +661,8 @@ static int mbox_sync_handle_header(struct mbox_sync_mail_context *mail_ctx)
 		/* read the From-line before rewriting overwrites it */
 		if (mbox_read_from_line(mail_ctx) < 0)
 			return -1;
-		i_assert(mail_ctx->mail.from_offset + move_diff != 1 &&
-			 mail_ctx->mail.from_offset + move_diff != 2);
+		i_assert((off_t)mail_ctx->mail.from_offset + move_diff != 1 &&
+			 (off_t)mail_ctx->mail.from_offset + move_diff != 2);
 
 		mbox_sync_update_header(mail_ctx);
 		ret = mbox_sync_try_rewrite(mail_ctx, move_diff);
@@ -674,8 +674,8 @@ static int mbox_sync_handle_header(struct mbox_sync_mail_context *mail_ctx)
 			   new location */
 			i_assert((off_t)mail_ctx->mail.from_offset >=
 				 -move_diff);
-			mail_ctx->mail.from_offset += move_diff;
-			mail_ctx->mail.offset += move_diff;
+			mail_ctx->mail.from_offset = (off_t)mail_ctx->mail.from_offset + move_diff;
+			mail_ctx->mail.offset = (off_t)mail_ctx->mail.offset + move_diff;
 			if (mbox_write_from_line(mail_ctx) < 0)
 				return -1;
 		} else {
@@ -715,7 +715,7 @@ static int mbox_sync_handle_header(struct mbox_sync_mail_context *mail_ctx)
 			   from_offset to point to the beginning of the
 			   From-line, because the previous [CR]LF is already
 			   covered by expunged_space. */
-			i_assert(postlf_from_offset != (uoff_t)-1);
+			i_assert(postlf_from_offset != UOFF_T_MAX);
 			mail_ctx->mail.from_offset = postlf_from_offset;
 
 			i_zero(&mail);

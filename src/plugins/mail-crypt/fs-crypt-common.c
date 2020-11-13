@@ -150,15 +150,15 @@ fs_crypt_file_init(struct fs_file *_file, const char *path,
 	file->open_mode = mode;
 
 	/* avoid unnecessarily creating two seekable streams */
-	flags &= ~FS_OPEN_FLAG_SEEKABLE;
+	flags &= ENUM_NEGATE(FS_OPEN_FLAG_SEEKABLE);
 
-	file->file.parent = fs_file_init_parent(_file, path, mode | flags);
+	file->file.parent = fs_file_init_parent(_file, path, mode, flags);
 	if (mode == FS_OPEN_MODE_READONLY &&
 	    (flags & FS_OPEN_FLAG_ASYNC) == 0) {
 		/* use async stream for super, so fs_read_stream() won't create
 		   another seekable stream needlessly */
 		file->super_read = fs_file_init_parent(_file, path,
-			mode | flags | FS_OPEN_FLAG_ASYNC |
+			mode, flags | FS_OPEN_FLAG_ASYNC |
 			FS_OPEN_FLAG_ASYNC_NOQUEUE);
 	} else {
 		file->super_read = file->file.parent;
@@ -191,7 +191,7 @@ static int fs_crypt_read_file(const char *set_name, const char *path,
 	struct istream *input;
 	int ret;
 
-	input = i_stream_create_file(path, (size_t)-1);
+	input = i_stream_create_file(path, SIZE_MAX);
 	while (i_stream_read(input) > 0) ;
 	if (input->stream_errno != 0) {
 		*error_r = t_strdup_printf("%s: read(%s) failed: %s",

@@ -42,6 +42,8 @@ static int dict_quota_init(struct quota_root *_root, const char *args,
 	struct dict_settings set;
 	const char *username, *p, *error;
 
+	event_set_append_log_prefix(_root->backend.event, "quota-dict: ");
+
 	const struct quota_param_parser dict_params[] = {
 		{.param_name = "no-unset", .param_handler = handle_nounset_param},
 		quota_param_hidden, quota_param_ignoreunlimited, quota_param_noenforcing, quota_param_ns,
@@ -63,10 +65,8 @@ static int dict_quota_init(struct quota_root *_root, const char *args,
 	if (*username == '\0')
 		username = _root->quota->user->username;
 
-	if (_root->quota->set->debug) {
-		i_debug("dict quota: user=%s, uri=%s, noenforcing=%d",
-			username, args, _root->no_enforcing ? 1 : 0);
-	}
+	e_debug(_root->backend.event, "user=%s, uri=%s, noenforcing=%d",
+		username, args, _root->no_enforcing ? 1 : 0);
 
 	/* FIXME: we should use 64bit integer as datatype instead but before
 	   it can actually be used don't bother */
@@ -130,10 +130,8 @@ dict_quota_count(struct dict_quota_root *root,
 	dict_set(dt, DICT_QUOTA_CURRENT_BYTES_PATH, dec2str(bytes));
 	dict_set(dt, DICT_QUOTA_CURRENT_COUNT_PATH, dec2str(count));
 
-	if (root->root.quota->set->debug) {
-		i_debug("dict quota: Quota recalculated: "
-			"count=%"PRIu64" bytes=%"PRIu64, count, bytes);
-	}
+	e_debug(root->root.backend.event, "Quota recalculated: "
+		"count=%"PRIu64" bytes=%"PRIu64, count, bytes);
 
 	dict_transaction_commit_async(&dt, NULL, NULL);
 	*value_r = want_bytes ? bytes : count;
@@ -189,7 +187,8 @@ static void dict_quota_recalc_timeout(struct dict_quota_root *root)
 	timeout_remove(&root->to_update);
 	if (dict_quota_count(root, TRUE, &value, &error)
 	    <= QUOTA_GET_RESULT_INTERNAL_ERROR)
-		i_error("quota-dict: Recalculation failed: %s", error);
+		e_error(root->root.backend.event,
+			"Recalculation failed: %s", error);
 }
 
 static void dict_quota_update_callback(const struct dict_commit_result *result,
@@ -202,7 +201,8 @@ static void dict_quota_update_callback(const struct dict_commit_result *result,
 		if (root->to_update == NULL)
 			root->to_update = timeout_add_short(0, dict_quota_recalc_timeout, root);
 	} else if (result->ret < 0) {
-		i_error("dict quota: Quota update failed: %s "
+		e_error(root->root.backend.event,
+			"Quota update failed: %s "
 			"- Quota is now desynced", result->error);
 	}
 }

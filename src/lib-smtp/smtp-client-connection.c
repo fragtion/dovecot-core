@@ -297,9 +297,10 @@ void smtp_client_connection_fail(struct smtp_client_connection *conn,
 	struct smtp_reply reply;
 	const char *text_lines[] = {error, NULL};
 
+	timeout_remove(&conn->to_connect);
+
 	if (status == SMTP_CLIENT_COMMAND_ERROR_CONNECT_FAILED &&
 	    !smtp_client_connection_last_ip(conn)) {
-		i_assert(conn->to_connect == NULL);
 		conn->to_connect = timeout_add_short(
 			0, smtp_client_connection_connect_next_ip, conn);
 		return;
@@ -313,6 +314,50 @@ void smtp_client_connection_fail(struct smtp_client_connection *conn,
 	smtp_client_connection_fail_reply(conn, &reply);
 }
 
+static void
+smtp_client_connection_lost(struct smtp_client_connection *conn,
+			    const char *error, const char *user_error)
+{
+	if (error != NULL)
+		error = t_strdup_printf("Connection lost: %s", error);
+
+	if (user_error == NULL)
+		user_error = "Lost connection to remote server";
+	else {
+		user_error = t_strdup_printf(
+			"Lost connection to remote server: %s",
+			user_error);
+	}
+
+	if (conn->ssl_iostream != NULL) {
+		const char *sslerr =
+			ssl_iostream_get_last_error(conn->ssl_iostream);
+
+		if (error != NULL && sslerr != NULL) {
+			error = t_strdup_printf("%s (last SSL error: %s)",
+						error, sslerr);
+		} else if (sslerr != NULL) {
+			error = t_strdup_printf(
+				"Connection lost (last SSL error: %s)", sslerr);
+		}
+		if (ssl_iostream_has_handshake_failed(conn->ssl_iostream)) {
+			/* This isn't really a "connection lost", but that we
+			   don't trust the remote's SSL certificate. */
+			i_assert(error != NULL);
+			e_error(conn->event, "%s", error);
+			smtp_client_connection_fail(
+				conn, SMTP_CLIENT_COMMAND_ERROR_CONNECT_FAILED,
+				user_error);
+			return;
+		}
+	}
+
+	if (error != NULL)
+		e_error(conn->event, "%s", error);
+	smtp_client_connection_fail(
+		conn, SMTP_CLIENT_COMMAND_ERROR_CONNECTION_LOST, user_error);
+}
+
 void smtp_client_connection_handle_output_error(
 	struct smtp_client_connection *conn)
 {
@@ -320,18 +365,15 @@ void smtp_client_connection_handle_output_error(
 
 	if (output->stream_errno != EPIPE &&
 	    output->stream_errno != ECONNRESET) {
-		e_error(conn->event, "Connection lost: write(%s) failed: %s",
-			o_stream_get_name(conn->conn.output),
-			o_stream_get_error(conn->conn.output));
-		smtp_client_connection_fail(
-			conn, SMTP_CLIENT_COMMAND_ERROR_CONNECTION_LOST,
-			"Lost connection to remote server: "
+		smtp_client_connection_lost(
+			conn,
+			t_strdup_printf("write(%s) failed: %s",
+					o_stream_get_name(conn->conn.output),
+					o_stream_get_error(conn->conn.output)),
 			"Write failure");
 	} else {
-		e_error(conn->event, "Connection lost: Remote disconnected");
-		smtp_client_connection_fail(
-			conn, SMTP_CLIENT_COMMAND_ERROR_CONNECTION_LOST,
-			"Lost connection to remote server: "
+		smtp_client_connection_lost(
+			conn, "Remote disconnected while writing output",
 			"Remote closed connection unexpectedly");
 	}
 }
@@ -1084,16 +1126,14 @@ static void smtp_client_connection_input(struct connection *_conn)
 		if (ret < 0) {
 			/* failed somehow */
 			i_assert(ret != -2);
-			error = t_strdup_printf(
+			e_error(conn->event,
 				"SSL handshaking with %s failed: "
 				"read(%s) failed: %s", _conn->name,
 				i_stream_get_name(conn->conn.input),
 				i_stream_get_error(conn->conn.input));
-			e_debug(conn->event, "connect(%s) failed: %s",
-				_conn->name, error);
 			smtp_client_connection_fail(
 				conn, SMTP_CLIENT_COMMAND_ERROR_CONNECT_FAILED,
-				error);
+				"Failed to connect to remote server");
 			return;
 		}
 
@@ -1144,18 +1184,23 @@ static void smtp_client_connection_input(struct connection *_conn)
 				conn, SMTP_CLIENT_COMMAND_ERROR_BAD_REPLY,
 				"Command reply line too long");
 		} else if (conn->conn.input->stream_errno != 0) {
-			e_error(conn->event, "read(%s) failed: %s",
-				i_stream_get_name(conn->conn.input),
-				i_stream_get_error(conn->conn.input));
-			smtp_client_connection_fail(
-				conn, SMTP_CLIENT_COMMAND_ERROR_CONNECTION_LOST,
-				"Lost connection to remote server "
-				"(read failure)");
+			smtp_client_connection_lost(
+				conn,
+				t_strdup_printf(
+					"read(%s) failed: %s",
+					i_stream_get_name(conn->conn.input),
+					i_stream_get_error(conn->conn.input)),
+				"Read failure");
 		} else if (!i_stream_have_bytes_left(conn->conn.input)) {
-			smtp_client_connection_fail(
-				conn, SMTP_CLIENT_COMMAND_ERROR_CONNECTION_LOST,
-				"Lost connection to remote server "
-				"(disconnected in input)");
+			if (conn->sent_quit) {
+				smtp_client_connection_lost(
+					conn, NULL,
+					"Remote closed connection");
+			} else {
+				smtp_client_connection_lost(
+					conn, NULL,
+					"Remote closed connection unexpectedly");
+			}
 		} else {
 			i_assert(error != NULL);
 			smtp_client_connection_fail(
@@ -1207,7 +1252,6 @@ static void smtp_client_connection_destroy(struct connection *_conn)
 {
 	struct smtp_client_connection *conn =
 		(struct smtp_client_connection *)_conn;
-	const char *error;
 
 	switch (_conn->disconnect_reason) {
 	case CONNECTION_DISCONNECT_NOT:
@@ -1226,14 +1270,24 @@ static void smtp_client_connection_destroy(struct connection *_conn)
 		break;
 	default:
 	case CONNECTION_DISCONNECT_CONN_CLOSED:
-		if (conn->connect_failed)
+		if (conn->connect_failed) {
+			smtp_client_connection_fail(conn,
+				SMTP_CLIENT_COMMAND_ERROR_CONNECT_FAILED,
+				"Failed to connect to remote server");
 			break;
-		error = (_conn->input == NULL ?
-			 "Connection lost" :
-			 t_strdup_printf("Connection lost: %s",
-					 i_stream_get_error(_conn->input)));
-		smtp_client_connection_fail(
-			conn, SMTP_CLIENT_COMMAND_ERROR_CONNECTION_LOST, error);
+		}
+		if (_conn->input != NULL && _conn->input->stream_errno != 0) {
+			smtp_client_connection_lost(
+				conn,
+				t_strdup_printf("read(%s) failed: %s",
+					i_stream_get_name(conn->conn.input),
+					i_stream_get_error(conn->conn.input)),
+				"Read failure");
+			break;
+		}
+		smtp_client_connection_lost(
+			conn, "Remote disconnected",
+			"Remote closed connection unexpectedly");
 		break;
 	}
 }
@@ -1385,19 +1439,6 @@ smtp_client_connection_ssl_init(struct smtp_client_connection *conn,
 }
 
 static void
-smtp_client_connection_delayed_connect_failure(
-	struct smtp_client_connection *conn)
-{
-	e_debug(conn->event, "Delayed connect failure");
-
-	i_assert(conn->to_connect != NULL);
-	timeout_remove(&conn->to_connect);
-	smtp_client_connection_fail(
-		conn, SMTP_CLIENT_COMMAND_ERROR_CONNECT_FAILED,
-		"Failed to connect to remote server");
-}
-
-static void
 smtp_client_connection_connected(struct connection *_conn, bool success)
 {
 	struct smtp_client_connection *conn =
@@ -1408,10 +1449,6 @@ smtp_client_connection_connected(struct connection *_conn, bool success)
 	if (!success) {
 		e_error(conn->event, "connect(%s) failed: %m", _conn->name);
 		conn->connect_failed = TRUE;
-		timeout_remove(&conn->to_connect);
-		conn->to_connect = timeout_add_short(
-			0, smtp_client_connection_delayed_connect_failure,
-			conn);
 		return;
 	}
 
@@ -1450,11 +1487,9 @@ smtp_client_connection_connected(struct connection *_conn, bool success)
 		if (smtp_client_connection_ssl_init(conn, &error) < 0) {
 			e_error(conn->event, "connect(%s) failed: %s",
 				_conn->name, error);
-			timeout_remove(&conn->to_connect);
-			conn->to_connect = timeout_add_short(
-				0,
-				smtp_client_connection_delayed_connect_failure,
-				conn);
+			smtp_client_connection_fail(
+				conn, SMTP_CLIENT_COMMAND_ERROR_CONNECT_FAILED,
+				"Failed to connect to remote server");
 		}
 	} else {
 		smtp_client_connection_established(conn);
@@ -1497,6 +1532,19 @@ smtp_client_connection_connect_timeout(struct smtp_client_connection *conn)
 }
 
 static void
+smtp_client_connection_delayed_connect_error(struct smtp_client_connection *conn)
+{
+	e_debug(conn->event, "Delayed connect error");
+
+	timeout_remove(&conn->to_connect);
+	errno = conn->connect_errno;
+	smtp_client_connection_connected(&conn->conn, FALSE);
+	smtp_client_connection_fail(conn,
+		SMTP_CLIENT_COMMAND_ERROR_CONNECT_FAILED,
+		"Failed to connect to remote server");
+}
+
+static void
 smtp_client_connection_do_connect(struct smtp_client_connection *conn)
 {
 	unsigned int msecs;
@@ -1509,7 +1557,10 @@ smtp_client_connection_do_connect(struct smtp_client_connection *conn)
 	p_clear(conn->state_pool);
 
 	if (connection_client_connect(&conn->conn) < 0) {
-		smtp_client_connection_connected(&conn->conn, FALSE);
+		conn->connect_errno = errno;
+		e_debug(conn->event, "Connect failed: %m");
+		conn->to_connect = timeout_add_short(0,
+			smtp_client_connection_delayed_connect_error, conn);
 		return;
 	}
 
@@ -1765,8 +1816,8 @@ void smtp_client_connection_connect(
 }
 
 static const struct connection_settings smtp_client_connection_set = {
-	.input_max_size = (size_t)-1,
-	.output_max_size = (size_t)-1,
+	.input_max_size = SIZE_MAX,
+	.output_max_size = SIZE_MAX,
 	.client = TRUE,
 	.delayed_unix_client_connected_callback = TRUE,
 	.log_connection_id = TRUE,

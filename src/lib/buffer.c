@@ -46,7 +46,7 @@ buffer_check_limits(struct real_buffer *buf, size_t pos, size_t data_size)
 	unsigned int extra;
 	size_t new_size;
 
-	if (unlikely((size_t)-1 - pos < data_size))
+	if (unlikely(SIZE_MAX - pos < data_size))
 		i_panic("Buffer write out of range (%zu + %zu)", pos, data_size);
 
 	new_size = pos + data_size;
@@ -134,6 +134,15 @@ buffer_t *buffer_create_dynamic(pool_t pool, size_t init_size)
 {
 	struct real_buffer *buf;
 
+#ifdef DEBUG
+	/* we increment this by 1 later on, so if it's SIZE_MAX
+	   it turns into 0 and hides a potential bug.
+
+	   Too scary to use in production for now, though. This
+	   can change in future. */
+	i_assert(init_size < SIZE_MAX);
+#endif
+
 	buf = p_new(pool, struct real_buffer, 1);
 	buf->pool = pool;
 	buf->dynamic = TRUE;
@@ -205,7 +214,7 @@ void buffer_insert(buffer_t *_buf, size_t pos,
 	if (pos >= buf->used)
 		buffer_write(_buf, pos, data, data_size);
 	else {
-		buffer_copy(_buf, pos + data_size, _buf, pos, (size_t)-1);
+		buffer_copy(_buf, pos + data_size, _buf, pos, SIZE_MAX);
 		memcpy(buf->w_buffer + pos, data, data_size);
 	}
 }
@@ -253,7 +262,7 @@ void buffer_replace(buffer_t *_buf, size_t pos, size_t size,
 		} else {
 			/* insert */
 			buffer_copy(_buf, pos + data_size, _buf, pos + size,
-				    (size_t)-1);
+				    SIZE_MAX);
 			memcpy(buf->w_buffer + pos, data, data_size);
 		}
 	} else {
@@ -286,7 +295,7 @@ void buffer_insert_zero(buffer_t *_buf, size_t pos, size_t data_size)
 	if (pos >= buf->used)
 		buffer_write_zero(_buf, pos, data_size);
 	else {
-		buffer_copy(_buf, pos + data_size, _buf, pos, (size_t)-1);
+		buffer_copy(_buf, pos + data_size, _buf, pos, SIZE_MAX);
 		memset(buf->w_buffer + pos, 0, data_size);
 	}
 }
@@ -410,7 +419,9 @@ void buffer_verify_pool(buffer_t *_buf)
 	}
 }
 
-void buffer_truncate_rshift_bits(buffer_t *buf, size_t bits)
+void ATTR_NO_SANITIZE_IMPLICIT_CONVERSION
+	ATTR_NO_SANITIZE_INTEGER
+buffer_truncate_rshift_bits(buffer_t *buf, size_t bits)
 {
 	/* no-op if it's shorten than bits in any case.. */
 	if (buf->used * 8 < bits) return;

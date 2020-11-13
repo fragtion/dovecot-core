@@ -16,7 +16,7 @@ static void test_buffer_random(void)
 
 	buf = buffer_create_dynamic(default_pool, 1);
 	for (i = 0; i < BUF_TEST_SIZE; i++)
-		testdata[i] = i_rand();
+		testdata[i] = i_rand_uchar();
 	memset(shadowbuf, 0, sizeof(shadowbuf));
 
 	shadowbuf_size = 0;
@@ -289,7 +289,7 @@ static void test_buffer_truncate_bits(void)
 
 	for(size_t i = 0; i < N_ELEMENTS(test_cases); i++) {
 		buffer_set_used_size(buf, 0);
-		buffer_copy(buf, 0, &test_cases[i].input, 0, (size_t)-1);
+		buffer_copy(buf, 0, &test_cases[i].input, 0, SIZE_MAX);
 		buffer_truncate_rshift_bits(buf, test_cases[i].bits);
 		test_assert_idx(buffer_cmp(buf, &test_cases[i].output) == TRUE, i);
 	}

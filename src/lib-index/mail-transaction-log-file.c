@@ -1268,7 +1268,7 @@ get_modseq_next_offset_at(struct mail_transaction_log_file *file,
 	/* make sure we've read until end of file. this is especially important
 	   with non-head logs which might only have been opened without being
 	   synced. */
-	ret = mail_transaction_log_file_map(file, *cur_offset, (uoff_t)-1, &reason);
+	ret = mail_transaction_log_file_map(file, *cur_offset, UOFF_T_MAX, &reason);
 	if (ret <= 0) {
 		mail_index_set_error(file->log->index,
 			"Failed to map transaction log %s for getting offset "
@@ -1397,17 +1397,21 @@ log_file_track_sync(struct mail_transaction_log_file *file,
 			return ret < 0 ? -1 : 1;
 		break;
 	case MAIL_TRANSACTION_INDEX_DELETED:
-		if (file->sync_offset < file->index_undeleted_offset)
+		if (file->sync_offset < file->index_undeleted_offset ||
+		    file->hdr.file_seq < file->log->index->index_delete_changed_file_seq)
 			break;
 		file->log->index->index_deleted = TRUE;
 		file->log->index->index_delete_requested = FALSE;
+		file->log->index->index_delete_changed_file_seq = file->hdr.file_seq;
 		file->index_deleted_offset = file->sync_offset + trans_size;
 		break;
 	case MAIL_TRANSACTION_INDEX_UNDELETED:
-		if (file->sync_offset < file->index_deleted_offset)
+		if (file->sync_offset < file->index_deleted_offset ||
+		    file->hdr.file_seq < file->log->index->index_delete_changed_file_seq)
 			break;
 		file->log->index->index_deleted = FALSE;
 		file->log->index->index_delete_requested = FALSE;
+		file->log->index->index_delete_changed_file_seq = file->hdr.file_seq;
 		file->index_undeleted_offset = file->sync_offset + trans_size;
 		break;
 	case MAIL_TRANSACTION_BOUNDARY: {
@@ -1548,7 +1552,7 @@ mail_transaction_log_file_insert_read(struct mail_transaction_log_file *file,
 	ssize_t ret;
 
 	size = file->buffer_offset - offset;
-	buffer_copy(file->buffer, size, file->buffer, 0, (size_t)-1);
+	buffer_copy(file->buffer, size, file->buffer, 0, SIZE_MAX);
 
 	data = buffer_get_space_unsafe(file->buffer, 0, size);
 	ret = pread_full(file->fd, data, size, offset);
@@ -1559,7 +1563,7 @@ mail_transaction_log_file_insert_read(struct mail_transaction_log_file *file,
 	}
 
 	/* failure. don't leave ourself to inconsistent state */
-	buffer_copy(file->buffer, 0, file->buffer, size, (size_t)-1);
+	buffer_copy(file->buffer, 0, file->buffer, size, SIZE_MAX);
 	buffer_set_used_size(file->buffer, file->buffer->used - size);
 
 	if (ret == 0) {
@@ -1722,7 +1726,7 @@ log_file_map_check_offsets(struct mail_transaction_log_file *file,
 		}
 		return FALSE;
 	}
-	if (end_offset != (uoff_t)-1 && end_offset > file->sync_offset) {
+	if (end_offset != UOFF_T_MAX && end_offset > file->sync_offset) {
 		*reason_r = t_strdup_printf(
 			"%s: end_offset (%"PRIuUOFF_T") > "
 			"current sync_offset (%"PRIuUOFF_T")",
@@ -1858,7 +1862,7 @@ int mail_transaction_log_file_map(struct mail_transaction_log_file *file,
 		 file->sync_offset >= file->buffer_offset + file->buffer->used);
 
 	if (file->locked_sync_offset_updated && file == file->log->head &&
-	    end_offset == (uoff_t)-1) {
+	    end_offset == UOFF_T_MAX) {
 		/* we're not interested of going further than sync_offset */
 		if (!log_file_map_check_offsets(file, start_offset,
 						end_offset, reason_r))
@@ -1876,7 +1880,7 @@ int mail_transaction_log_file_map(struct mail_transaction_log_file *file,
 
 	if (file->locked) {
 		/* set this only when we've synced to end of file while locked
-		   (either end_offset=(uoff_t)-1 or we had to read anyway) */
+		   (either end_offset=UOFF_T_MAX or we had to read anyway) */
 		file->locked_sync_offset_updated = TRUE;
 	}
 

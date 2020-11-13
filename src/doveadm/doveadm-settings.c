@@ -43,7 +43,7 @@ struct service_settings doveadm_service_settings = {
 	.client_limit = 1,
 	.service_count = 1,
 	.idle_kill = 0,
-	.vsz_limit = (uoff_t)-1,
+	.vsz_limit = UOFF_T_MAX,
 
 	.unix_listeners = { { &doveadm_unix_listeners_buf,
 			      sizeof(doveadm_unix_listeners[0]) } },
@@ -122,10 +122,10 @@ const struct setting_parser_info doveadm_setting_parser_info = {
 	.defines = doveadm_setting_defines,
 	.defaults = &doveadm_default_settings,
 
-	.type_offset = (size_t)-1,
+	.type_offset = SIZE_MAX,
 	.struct_size = sizeof(struct doveadm_settings),
 
-	.parent_offset = (size_t)-1,
+	.parent_offset = SIZE_MAX,
 	.check_func = doveadm_settings_check,
 	.dependencies = doveadm_setting_dependencies
 };
