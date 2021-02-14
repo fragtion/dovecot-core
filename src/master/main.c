@@ -14,7 +14,7 @@
 #include "execv-const.h"
 #include "restrict-process-size.h"
 #include "master-instance.h"
-#include "master-service.h"
+#include "master-service-private.h"
 #include "master-service-settings.h"
 #include "askpass.h"
 #include "capabilities.h"
@@ -26,6 +26,9 @@
 #include "service-process.h"
 #include "service-log.h"
 #include "dovecot-version.h"
+#ifdef HAVE_SYSTEMD
+#  include "sd-daemon.h"
+#endif
 
 #include <stdio.h>
 #include <unistd.h>
@@ -430,6 +433,7 @@ sig_log_reopen(const siginfo_t *si ATTR_UNUSED, void *context ATTR_UNUSED)
 	unsigned int uninitialized_count;
 	service_signal(services->log, SIGUSR1, &uninitialized_count);
 
+	master_service->log_initialized = FALSE;
 	master_service_init_log(master_service);
 	i_set_fatal_handler(master_fatal_callback);
 }
@@ -544,6 +548,9 @@ static void main_init(const struct master_settings *set)
 	master_clients_init();
 
 	services_monitor_start(services);
+#ifdef HAVE_SYSTEMD
+	sd_notify(0, "READY=1");
+#endif
 	startup_finished = TRUE;
 }
 

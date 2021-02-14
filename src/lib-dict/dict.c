@@ -370,6 +370,7 @@ dict_iterate_init_multiple(struct dict *dict, const char *const *paths,
 	   passed as parameter, e.g. it can be dict-fail when
 	   iteration is not supported. */
 	ctx->event = event_create(dict->event);
+	ctx->flags = flags;
 
 	event_add_str(ctx->event, "key", paths[0]);
 	event_set_name(ctx->event, "dict_iteration_started");
@@ -381,6 +382,19 @@ dict_iterate_init_multiple(struct dict *dict, const char *const *paths,
 bool dict_iterate(struct dict_iterate_context *ctx,
 		  const char **key_r, const char **value_r)
 {
+	const char *const *values;
+
+	if (!dict_iterate_values(ctx, key_r, &values))
+		return FALSE;
+	if ((ctx->flags & DICT_ITERATE_FLAG_NO_VALUE) == 0)
+		*value_r = values[0];
+	return TRUE;
+}
+
+bool dict_iterate_values(struct dict_iterate_context *ctx,
+			 const char **key_r, const char *const **values_r)
+{
+
 	if (ctx->max_rows > 0 && ctx->row_count >= ctx->max_rows) {
 		e_debug(ctx->event, "Maximum row count (%"PRIu64") reached",
 			ctx->max_rows);
@@ -388,8 +402,15 @@ bool dict_iterate(struct dict_iterate_context *ctx,
 		ctx->has_more = FALSE;
 		return FALSE;
 	}
-	if (!ctx->dict->v.iterate(ctx, key_r, value_r))
+	if (!ctx->dict->v.iterate(ctx, key_r, values_r))
 		return FALSE;
+	if ((ctx->flags & DICT_ITERATE_FLAG_NO_VALUE) != 0) {
+		/* always return value as NULL to be consistent across
+		   drivers */
+		*values_r = NULL;
+	} else {
+		i_assert(values_r[0] != NULL);
+	}
 	ctx->row_count++;
 	return TRUE;
 }

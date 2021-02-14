@@ -172,7 +172,7 @@ AS_HELP_STRING([--with-bzlib], [Build with bzlib compression support (auto)]),
   want_bzlib=auto)
 
 AC_ARG_WITH(lzma,
-AS_HELP_STRING([--with-lzma], [Build with LZMA compression support (auto)]),
+AS_HELP_STRING([--with-lzma], [Build with LZMA decompression support (auto)]),
   TEST_WITH(lzma, $withval),
   want_lzma=auto)
 
@@ -310,6 +310,7 @@ AC_CHECK_HEADERS(strings.h stdint.h unistd.h dirent.h malloc.h \
 CC_CLANG
 AC_LD_WHOLE_ARCHIVE
 DC_DOVECOT_HARDENING
+DC_DOVECOT_FUZZER
 DC_DOVECOT_CFLAGS
 
 DOVECOT_NSL
@@ -760,7 +761,7 @@ dnl ** Settings
 dnl **
 
 dnl get a list of setting .[ch] files, but list .h files first
-FILES1=`find $srcdir/src -name '*settings.[[ch]]'|grep "$srcdir/src/lib-" | sed 's/^\(.*\)\(.\)$/\2 \1\2/' | grep -E -v 'lib-(master|smtp).*c$' | sort -r | sed s/^..//`
+FILES1=`find $srcdir/src -name '*settings.[[ch]]'|grep "$srcdir/src/lib-" | sed 's/^\(.*\)\(.\)$/\2 \1\2/' | grep -E -v 'lib-(master|smtp|settings).*c$' | sort -r | sed s/^..//`
 FILES2=`find $srcdir/src -name '*settings.[[ch]]'|grep -v "$srcdir/src/lib-" | sed 's/^\(.*\)\(.\)$/\2 \1\2/' | grep -v all-settings | sort -r | sed s/^..//`
 SETTING_FILES=`echo $FILES1 $FILES2 | sed -e s,$srcdir/src,./src,g -e 's,./src,$(top_srcdir)/src,g'`
 AC_SUBST(SETTING_FILES)
@@ -854,7 +855,6 @@ src/lib-storage/index/mbox/Makefile
 src/lib-storage/index/dbox-common/Makefile
 src/lib-storage/index/dbox-multi/Makefile
 src/lib-storage/index/dbox-single/Makefile
-src/lib-storage/index/cydir/Makefile
 src/lib-storage/index/raw/Makefile
 src/lib-storage/index/shared/Makefile
 src/anvil/Makefile
@@ -889,8 +889,6 @@ src/util/Makefile
 src/plugins/Makefile
 src/plugins/acl/Makefile
 src/plugins/imap-acl/Makefile
-src/plugins/autocreate/Makefile
-src/plugins/expire/Makefile
 src/plugins/fs-compress/Makefile
 src/plugins/fts/Makefile
 src/plugins/fts-lucene/Makefile
@@ -899,7 +897,6 @@ src/plugins/fts-squat/Makefile
 src/plugins/last-login/Makefile
 src/plugins/lazy-expunge/Makefile
 src/plugins/listescape/Makefile
-src/plugins/mail-filter/Makefile
 src/plugins/mail-log/Makefile
 src/plugins/mail-lua/Makefile
 src/plugins/mailbox-alias/Makefile
@@ -911,7 +908,6 @@ src/plugins/quota/Makefile
 src/plugins/quota-clone/Makefile
 src/plugins/imap-quota/Makefile
 src/plugins/replication/Makefile
-src/plugins/snarf/Makefile
 src/plugins/old-stats/Makefile
 src/plugins/imap-old-stats/Makefile
 src/plugins/trash/Makefile

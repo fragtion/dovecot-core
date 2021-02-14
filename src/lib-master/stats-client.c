@@ -10,6 +10,7 @@
 #include "connection.h"
 #include "stats-client.h"
 
+#define STATS_CLIENT_TIMEOUT_MSECS (5*1000)
 #define STATS_CLIENT_RECONNECT_INTERVAL_MSECS (10*1000)
 
 struct stats_client {
@@ -164,6 +165,7 @@ stats_event_write(struct event *event, const struct failure_context *ctx,
 {
 	struct event *merged_event;
 	struct event *parent_event;
+	bool update = FALSE;
 
 	merged_event = begin ? event_ref(event) : event_minimize(event);
 	parent_event = merged_event->parent;
@@ -176,16 +178,17 @@ stats_event_write(struct event *event, const struct failure_context *ctx,
 	}
 	if (begin) {
 		i_assert(event == merged_event);
-		const char *cmd = event->sent_to_stats_id == 0 ?
-			"BEGIN" : "UPDATE";
+		update = (event->sent_to_stats_id != 0);
+		const char *cmd = !update ? "BEGIN" : "UPDATE";
 		str_printfa(str, "%s\t%"PRIu64"\t", cmd, event->id);
 		event->sent_to_stats_id = event->change_id;
 	} else {
 		str_append(str, "EVENT\t");
 	}
-	str_printfa(str, "%"PRIu64"\t%u\t",
-		    parent_event == NULL ? 0 : parent_event->id,
-		    ctx->type);
+	str_printfa(str, "%"PRIu64"\t",
+		    parent_event == NULL ? 0 : parent_event->id);
+	if (!update)
+		str_printfa(str, "%u\t", ctx->type);
 	event_export(merged_event, str);
 	str_append_c(str, '\n');
 	event_unref(&merged_event);
@@ -284,13 +287,21 @@ static void stats_global_deinit(void)
 	connection_list_deinit(&stats_clients);
 }
 
+static void stats_client_timeout(struct stats_client *client)
+{
+	e_error(client->conn.event, "Timeout waiting for handshake response");
+	io_loop_stop(client->ioloop);
+}
+
 static void stats_client_wait_handshake(struct stats_client *client)
 {
 	struct ioloop *prev_ioloop = current_ioloop;
+	struct timeout *to;
 
 	i_assert(client->to_reconnect == NULL);
 
 	client->ioloop = io_loop_create();
+	to = timeout_add(STATS_CLIENT_TIMEOUT_MSECS, stats_client_timeout, client);
 	connection_switch_ioloop(&client->conn);
 	io_loop_run(client->ioloop);
 	io_loop_set_current(prev_ioloop);
@@ -298,6 +309,7 @@ static void stats_client_wait_handshake(struct stats_client *client)
 	if (client->to_reconnect != NULL)
 		client->to_reconnect = io_loop_move_timeout(&client->to_reconnect);
 	io_loop_set_current(client->ioloop);
+	timeout_remove(&to);
 	io_loop_destroy(&client->ioloop);
 }
 

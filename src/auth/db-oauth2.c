@@ -433,7 +433,7 @@ db_oauth2_template_export(struct db_oauth2_request *req,
 		{ NULL, NULL }
 	};
 	string_t *dest;
-	const char *const *args, *value;
+	const char *const *args, *value, *error;
 	struct passdb_template *tmpl = req->db->tmpl;
 	unsigned int i, count;
 
@@ -452,7 +452,10 @@ db_oauth2_template_export(struct db_oauth2_request *req,
 				table = db_oauth2_value_get_var_expand_table(req->auth_request,
 									     auth_fields_find(req->fields, args[i]));
 			if (var_expand_with_funcs(dest, args[i+1], table, funcs_table,
-						  req, error_r) < 0) {
+						  req, &error) < 0) {
+				*error_r = t_strdup_printf(
+					"var_expand(%s) failed: %s",
+					args[i+1], error);
 				*result_r = PASSDB_RESULT_INTERNAL_FAILURE;
 				return FALSE;
 			}
@@ -481,21 +484,33 @@ static void db_oauth2_fields_merge(struct db_oauth2_request *req,
 	}
 }
 
+static const char *
+db_oauth2_field_find(const ARRAY_TYPE(oauth2_field) *fields, const char *name)
+{
+	const struct oauth2_field *f;
+
+	array_foreach(fields, f) {
+		if (strcmp(f->name, name) == 0)
+			return f->value;
+	}
+	return NULL;
+}
+
 static void db_oauth2_callback(struct db_oauth2_request *req,
 			       enum passdb_result result,
-			       const char *error)
+			       const char *error_prefix, const char *error)
 {
 	db_oauth2_lookup_callback_t *callback = req->callback;
 	req->callback = NULL;
 
 	i_assert(result == PASSDB_RESULT_OK || error != NULL);
 
-	e_debug(authdb_event(req->auth_request),
-		"callback(result: %s, error: %s)",
-		passdb_result_to_string(result), error);
-
+	/* Successful lookups were logged by the caller. Failed lookups will be
+	   logged either with e_error() or e_info() by the callback. */
 	if (callback != NULL) {
 		DLLIST_REMOVE(&req->db->head, req);
+		if (result != PASSDB_RESULT_OK)
+			error = t_strconcat(error_prefix, error, NULL);
 		callback(req, result, error, req->context);
 	}
 }
@@ -615,19 +630,17 @@ db_oauth2_introspect_continue(struct oauth2_request_result *result,
 
 	req->req = NULL;
 
-	e_debug(authdb_event(req->auth_request),
-		"Introspection result: %s",
-		result->success ? "success" : "failed");
-
-	if (!result->success) {
+	if (result->error != NULL) {
 		/* fail here */
 		passdb_result = PASSDB_RESULT_INTERNAL_FAILURE;
 		error = result->error;
 	} else {
+		e_debug(authdb_event(req->auth_request),
+			"Introspection succeeded");
 		db_oauth2_fields_merge(req, result->fields);
 		db_oauth2_process_fields(req, &passdb_result, &error);
 	}
-	db_oauth2_callback(req, passdb_result, error);
+	db_oauth2_callback(req, passdb_result, "Introspection failed: ", error);
 }
 
 static void db_oauth2_lookup_introspect(struct db_oauth2_request *req)
@@ -668,45 +681,64 @@ static void db_oauth2_local_validation(struct db_oauth2_request *req,
 		db_oauth2_fields_merge(req, &fields);
 		db_oauth2_process_fields(req, &passdb_result, &error);
 	}
-	db_oauth2_callback(req, passdb_result, error);
+	if (passdb_result == PASSDB_RESULT_OK) {
+		e_debug(authdb_event(req->auth_request),
+			"Local validation succeeded");
+	}
+	db_oauth2_callback(req, passdb_result,
+			   "Local validation failed: ", error);
+}
+
+static void
+db_oauth2_lookup_continue_valid(struct db_oauth2_request *req,
+				ARRAY_TYPE(oauth2_field) *fields,
+				const char *error_prefix)
+{
+	enum passdb_result passdb_result;
+	const char *error;
+
+	db_oauth2_fields_merge(req, fields);
+	if (db_oauth2_have_all_fields(req) &&
+	    !req->db->set.force_introspection) {
+		/* pass */
+	} else if (req->db->oauth2_set.introspection_mode ==
+		   INTROSPECTION_MODE_LOCAL) {
+		e_debug(authdb_event(req->auth_request),
+			"Attempting to locally validate token");
+		db_oauth2_local_validation(req, req->token);
+		return;
+	} else if (!db_oauth2_user_is_enabled(req, &passdb_result, &error)) {
+		db_oauth2_callback(req, passdb_result,
+				   "Token is not valid: ", error);
+		return;
+	} else if (*req->db->set.introspection_url != '\0') {
+		db_oauth2_lookup_introspect(req);
+		return;
+	}
+	db_oauth2_process_fields(req, &passdb_result, &error);
+	db_oauth2_callback(req, passdb_result, error_prefix, error);
 }
 
 static void
 db_oauth2_lookup_continue(struct oauth2_request_result *result,
 			  struct db_oauth2_request *req)
 {
-	enum passdb_result passdb_result;
-	const char *error;
-
+	i_assert(req->token != NULL);
 	req->req = NULL;
 
-	if (!result->success) {
-		passdb_result = PASSDB_RESULT_INTERNAL_FAILURE;
-		error = result->error;
+	if (result->error != NULL) {
+		db_oauth2_callback(req, PASSDB_RESULT_INTERNAL_FAILURE,
+				   "Token validation failed: ", result->error);
 	} else if (!result->valid) {
-		passdb_result = PASSDB_RESULT_PASSWORD_MISMATCH;
-		error = "Invalid token";
+		db_oauth2_callback(req, PASSDB_RESULT_PASSWORD_MISMATCH,
+				   "Token validation failed: ",
+				   "Invalid token");
 	} else {
-		db_oauth2_fields_merge(req, result->fields);
-		if (req->token == NULL) {
-			db_oauth2_callback(req, PASSDB_RESULT_INTERNAL_FAILURE,
-					   "OAuth2 token missing from reply");
-			return;
-		} else if (db_oauth2_have_all_fields(req) &&
-			   !req->db->set.force_introspection) {
-			/* pass */
-		} else if (req->db->oauth2_set.introspection_mode == INTROSPECTION_MODE_LOCAL) {
-			db_oauth2_local_validation(req, req->token);
-			return;
-		} else if (!db_oauth2_user_is_enabled(req, &passdb_result, &error)) {
-			db_oauth2_callback(req, passdb_result, error);
-		} else if (*req->db->set.introspection_url != '\0') {
-			db_oauth2_lookup_introspect(req);
-			return;
-		}
-		db_oauth2_process_fields(req, &passdb_result, &error);
+		e_debug(authdb_event(req->auth_request),
+			"Token validation succeeded");
+		db_oauth2_lookup_continue_valid(req, result->fields,
+						"Token validation failed: ");
 	}
-	db_oauth2_callback(req, passdb_result, error);
 }
 
 static void
@@ -714,38 +746,40 @@ db_oauth2_lookup_passwd_grant(struct oauth2_request_result *result,
 			      struct db_oauth2_request *req)
 {
 	enum passdb_result passdb_result;
-	const char *error;
-	const struct oauth2_field *f;
+	const char *token, *error;
 
+	i_assert(req->token == NULL);
 	req->req = NULL;
 
-	if (!result->valid) {
-		passdb_result = PASSDB_RESULT_INTERNAL_FAILURE;
-		if (result->success) {
-			error = NULL;
-			array_foreach(result->fields, f) {
-				if (strcmp(f->name, "error") == 0) {
-					error = f->value;
-					break;
-				}
-			}
-			if (error != NULL &&
-			    strcmp("invalid_grant", error) == 0) {
-				passdb_result = PASSDB_RESULT_PASSWORD_MISMATCH;
-			}
-			if (error == NULL)
-				error = "Internal error";
-		} else
-			error = result->error;
-		db_oauth2_callback(req, passdb_result, error);
-	} else {
-		/* make sure token is NULL if no access_token is found */
-		req->token = NULL;
-		array_foreach(result->fields, f)
-			if (strcmp(f->name, "access_token") == 0)
-				req->token = p_strdup(req->pool, f->value);
-		db_oauth2_lookup_continue(result, req);
+	if (result->valid) {
+		e_debug(authdb_event(req->auth_request),
+			"Password grant succeeded");
+		token = db_oauth2_field_find(result->fields, "access_token");
+		if (token == NULL) {
+			db_oauth2_callback(req, PASSDB_RESULT_INTERNAL_FAILURE,
+					   "Password grant failed: ",
+					   "OAuth2 token missing from reply");
+		} else {
+			req->token = p_strdup(req->pool, token);
+			db_oauth2_lookup_continue_valid(req, result->fields,
+				"Password grant failed: ");
+		}
+		return;
 	}
+
+	passdb_result = PASSDB_RESULT_INTERNAL_FAILURE;
+	if (result->error != NULL)
+		error = result->error;
+	else {
+		passdb_result = PASSDB_RESULT_INTERNAL_FAILURE;
+		error = db_oauth2_field_find(result->fields, "error");
+		if (error == NULL)
+			error = "OAuth2 server returned failure without error field";
+		else if (strcmp("invalid_grant", error) == 0)
+			passdb_result = PASSDB_RESULT_PASSWORD_MISMATCH;
+	}
+	db_oauth2_callback(req, passdb_result,
+			   "Password grant failed: ", error);
 }
 
 #undef db_oauth2_lookup
@@ -786,6 +820,8 @@ void db_oauth2_lookup(struct db_oauth2 *db, struct db_oauth2_request *req,
 		e_debug(authdb_event(req->auth_request),
 			"Making grant url request to %s",
 			db->set.grant_url);
+		/* There is no valid token until grant looks it up. */
+		req->token = NULL;
 		req->req = oauth2_passwd_grant_start(&db->oauth2_set, &input,
 						     request->fields.user, request->mech_password,
 						     db_oauth2_lookup_passwd_grant, req);

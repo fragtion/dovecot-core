@@ -92,7 +92,7 @@ struct client_dict {
 };
 
 struct client_dict_iter_result {
-	const char *key, *value;
+	const char *key, *const *values;
 };
 
 struct client_dict_iterate_context {
@@ -1082,7 +1082,7 @@ client_dict_iter_async_callback(struct client_dict_cmd *cmd,
 	struct client_dict_iterate_context *ctx = cmd->iter;
 	struct client_dict *dict = cmd->dict;
 	struct client_dict_iter_result *result;
-	const char *iter_key = NULL, *iter_value = NULL;
+	const char *iter_key = NULL, *const *iter_values = NULL;
 
 	if (ctx->deinit) {
 		cmd->background = TRUE;
@@ -1102,7 +1102,7 @@ client_dict_iter_async_callback(struct client_dict_cmd *cmd,
 	case DICT_PROTOCOL_REPLY_OK:
 		/* key \t value */
 		iter_key = value;
-		iter_value = extra_args[0];
+		iter_values = extra_args;
 		extra_args++;
 		break;
 	case DICT_PROTOCOL_REPLY_FAIL:
@@ -1111,7 +1111,7 @@ client_dict_iter_async_callback(struct client_dict_cmd *cmd,
 	default:
 		break;
 	}
-	if (iter_value == NULL && error == NULL) {
+	if ((iter_values == NULL || iter_values[0] == NULL) && error == NULL) {
 		/* broken protocol */
 		error = t_strdup_printf("dict client (%s) sent broken iterate reply: %c%s",
 			dict->conn.conn.name, reply, value);
@@ -1136,7 +1136,7 @@ client_dict_iter_async_callback(struct client_dict_cmd *cmd,
 
 	result = array_append_space(&ctx->results);
 	result->key = p_strdup(ctx->results_pool, iter_key);
-	result->value = p_strdup(ctx->results_pool, iter_value);
+	result->values = p_strarray_dup(ctx->results_pool, iter_values);
 
 	client_dict_iter_api_callback(ctx, cmd, NULL);
 }
@@ -1184,7 +1184,7 @@ client_dict_iterate_cmd_send(struct client_dict_iterate_context *ctx)
 }
 
 static bool client_dict_iterate(struct dict_iterate_context *_ctx,
-				const char **key_r, const char **value_r)
+				const char **key_r, const char *const **values_r)
 {
 	struct client_dict_iterate_context *ctx =
 		(struct client_dict_iterate_context *)_ctx;
@@ -1199,7 +1199,7 @@ static bool client_dict_iterate(struct dict_iterate_context *_ctx,
 	results = array_get(&ctx->results, &count);
 	if (ctx->result_idx < count) {
 		*key_r = results[ctx->result_idx].key;
-		*value_r = results[ctx->result_idx].value;
+		*values_r = results[ctx->result_idx].values;
 		ctx->ctx.has_more = TRUE;
 		ctx->result_idx++;
 		ctx->seen_results = TRUE;
@@ -1208,7 +1208,7 @@ static bool client_dict_iterate(struct dict_iterate_context *_ctx,
 	if (!ctx->cmd_sent) {
 		ctx->cmd_sent = TRUE;
 		client_dict_iterate_cmd_send(ctx);
-		return client_dict_iterate(_ctx, key_r, value_r);
+		return client_dict_iterate(_ctx, key_r, values_r);
 	}
 	ctx->ctx.has_more = !ctx->finished;
 	ctx->result_idx = 0;
@@ -1217,7 +1217,7 @@ static bool client_dict_iterate(struct dict_iterate_context *_ctx,
 
 	if ((ctx->flags & DICT_ITERATE_FLAG_ASYNC) == 0 && ctx->ctx.has_more) {
 		client_dict_wait(_ctx->dict);
-		return client_dict_iterate(_ctx, key_r, value_r);
+		return client_dict_iterate(_ctx, key_r, values_r);
 	}
 	return FALSE;
 }

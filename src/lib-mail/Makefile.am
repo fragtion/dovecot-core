@@ -106,6 +106,7 @@ test_programs = \
 	test-message-part \
 	test-message-part-serialize \
 	test-message-search \
+	test-message-size \
 	test-message-snippet \
 	test-ostream-dot \
 	test-qp-decoder \
@@ -114,7 +115,22 @@ test_programs = \
 	test-rfc2231-parser \
 	test-rfc822-parser
 
-noinst_PROGRAMS = $(test_programs)
+fuzz_programs =
+
+if USE_FUZZER
+fuzz_programs += fuzz-message-parser
+
+nodist_EXTRA_fuzz_message_parser_SOURCES = force-cxx-linking.cxx
+
+fuzz_message_parser_CPPFLAGS = $(FUZZER_CPPFLAGS)
+fuzz_message_parser_LDFLAGS = $(FUZZER_LDFLAGS)
+fuzz_message_parser_SOURCES = fuzz-message-parser.c
+fuzz_message_parser_LDADD = $(test_libs)
+fuzz_message_parser_DEPENDENCIES = $(test_deps)
+
+endif
+
+noinst_PROGRAMS = $(fuzz_programs) $(test_programs)
 
 test_libs = \
 	$(noinst_LTLIBRARIES) \
@@ -195,6 +211,10 @@ test_message_part_DEPENDENCIES = $(test_deps)
 test_message_search_SOURCES = test-message-search.c
 test_message_search_LDADD = $(test_libs) ../lib-charset/libcharset.la
 test_message_search_DEPENDENCIES = $(test_deps) ../lib-charset/libcharset.la
+
+test_message_size_SOURCES = test-message-size.c
+test_message_size_LDADD = $(test_libs)
+test_message_size_DEPENDENCIES = $(test_deps)
 
 test_message_snippet_SOURCES = test-message-snippet.c
 test_message_snippet_LDADD = $(test_message_decoder_LDADD)

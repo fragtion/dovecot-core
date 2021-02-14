@@ -21,8 +21,6 @@ endif
 SUBDIRS = \
 	acl \
 	imap-acl \
-	autocreate \
-	expire \
 	fts \
 	fts-squat \
 	last-login \
@@ -31,7 +29,6 @@ SUBDIRS = \
 	notify \
 	notify-status \
 	push-notification \
-	mail-filter \
 	mail-log \
 	$(MAIL_LUA) \
 	mailbox-alias \
@@ -40,7 +37,6 @@ SUBDIRS = \
 	imap-quota \
 	pop3-migration \
 	replication \
-	snarf \
 	old-stats \
 	imap-old-stats \
 	mail-crypt \

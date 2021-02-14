@@ -893,36 +893,19 @@ void mail_index_map_check(struct mail_index_map *map)
 }
 #endif
 
-int mail_index_sync_map(struct mail_index_map **_map,
-			enum mail_index_sync_handler_type type, bool force,
-			const char *sync_reason)
+bool mail_index_sync_map_want_index_reopen(struct mail_index_map *map,
+					   enum mail_index_sync_handler_type type)
 {
-	struct mail_index_map *map = *_map;
 	struct mail_index *index = map->index;
-	struct mail_index_view *view;
-	struct mail_index_sync_map_ctx sync_map_ctx;
-	const struct mail_transaction_header *thdr;
-	const void *tdata;
-	uint32_t prev_seq;
-	uoff_t start_offset, prev_offset;
-	const char *reason, *error;
-	int ret;
-	bool had_dirty, reset;
 
-	i_assert(index->map == map || type == MAIL_INDEX_SYNC_HANDLER_VIEW);
+	if (index->log->head == NULL)
+		return TRUE;
 
-	if (index->log->head == NULL) {
-		i_assert(!force);
-		return 0;
-	}
-
-	start_offset = type == MAIL_INDEX_SYNC_HANDLER_FILE ?
+	uoff_t start_offset = type == MAIL_INDEX_SYNC_HANDLER_FILE ?
 		map->hdr.log_file_tail_offset : map->hdr.log_file_head_offset;
-	if (!force && (index->flags & MAIL_INDEX_OPEN_FLAG_MMAP_DISABLE) == 0) {
-		/* see if we'd prefer to reopen the index file instead of
-		   syncing the current map from the transaction log.
-		   don't check this if mmap is disabled, because reopening
-		   index causes sync to get lost. */
+	/* don't check this if mmap is disabled, because reopening
+	   index causes sync to get lost. */
+	if ((index->flags & MAIL_INDEX_OPEN_FLAG_MMAP_DISABLE) == 0) {
 		uoff_t log_size, index_size;
 
 		if (index->fd == -1 &&
@@ -941,8 +924,32 @@ int mail_index_sync_map(struct mail_index_map **_map,
 		log_size = index->log->head->last_size;
 		if (log_size > start_offset &&
 		    log_size - start_offset > index_size)
-			return 0;
+			return TRUE;
 	}
+	return FALSE;
+}
+
+int mail_index_sync_map(struct mail_index_map **_map,
+			enum mail_index_sync_handler_type type,
+			const char **reason_r)
+{
+	struct mail_index_map *map = *_map;
+	struct mail_index *index = map->index;
+	struct mail_index_view *view;
+	struct mail_index_sync_map_ctx sync_map_ctx;
+	const struct mail_transaction_header *thdr;
+	const void *tdata;
+	uint32_t prev_seq;
+	uoff_t start_offset, prev_offset;
+	const char *reason, *error;
+	int ret;
+	bool had_dirty, reset;
+
+	i_assert(index->log->head != NULL);
+	i_assert(index->map == map || type == MAIL_INDEX_SYNC_HANDLER_VIEW);
+
+	start_offset = type == MAIL_INDEX_SYNC_HANDLER_FILE ?
+		map->hdr.log_file_tail_offset : map->hdr.log_file_head_offset;
 
 	view = mail_index_view_open_with_map(index, map);
 	ret = mail_transaction_log_view_set(view->log_view,
@@ -951,21 +958,16 @@ int mail_index_sync_map(struct mail_index_map **_map,
 					    &reset, &reason);
 	if (ret <= 0) {
 		mail_index_view_close(&view);
-		if (force && ret < 0) {
-			/* if we failed because of a syscall error, make sure
-			   we return a failure. */
+		if (ret < 0) {
+			/* I/O failure */
 			return -1;
 		}
-		if (force && ret == 0) {
-			/* the seq/offset is probably broken */
-			mail_index_set_error(index, "Index %s: Lost log for "
-				"seq=%u offset=%"PRIuUOFF_T": %s "
-				"(initial_mapped=%d, reason=%s)", index->filepath,
-				map->hdr.log_file_seq, start_offset, reason,
-				index->initial_mapped ? 1 : 0, sync_reason);
-			(void)mail_index_fsck(index);
-		}
-		/* can't use it. sync by re-reading index. */
+		/* the seq/offset is probably broken */
+		*reason_r = t_strdup_printf(
+			"Lost log for seq=%u offset=%"PRIuUOFF_T": %s "
+			"(initial_mapped=%d)",
+			map->hdr.log_file_seq, start_offset, reason,
+			index->initial_mapped ? 1 : 0);
 		return 0;
 	}
 

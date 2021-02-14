@@ -7,10 +7,14 @@
 #include "str.h"
 #include "hex-binary.h"
 #include "eacces-error.h"
+#include "ioloop.h"
 #include "dlua-script-private.h"
 
 #include <fcntl.h>
 #include <unistd.h>
+
+/* the registry entry with a pointer to struct dlua_script */
+#define LUA_SCRIPT_REGISTRY_KEY	"DLUA_SCRIPT"
 
 #define LUA_SCRIPT_INIT_FN "script_init"
 #define LUA_SCRIPT_DEINIT_FN "script_deinit"
@@ -85,27 +89,38 @@ static const char *dlua_reader(lua_State *L, void *ctx, size_t *size_r)
 struct dlua_script *dlua_script_from_state(lua_State *L)
 {
 	struct dlua_script *script;
-	for(script = dlua_scripts; script != NULL; script = script->next)
-		if (script->L == L)
-			return script;
-	i_unreached();
+
+	/* get light pointer from globals */
+	lua_pushstring(L, LUA_SCRIPT_REGISTRY_KEY);
+	lua_gettable(L, LUA_REGISTRYINDEX);
+	script = lua_touserdata(L, -1);
+	lua_pop(L, 1);
+	i_assert(script != NULL);
+
+	if (script->L != L) {
+		static bool warned;
+
+		if (!warned) {
+			i_warning("detected threading in lua script - not supported");
+			warned = TRUE; /* warn only once */
+		}
+	}
+
+	return script;
 }
 
-int dlua_script_init(struct dlua_script *script, const char **error_r)
+static int dlua_call_init_function(struct dlua_script *script,
+				   const char **error_r)
 {
+	const char *func_name = LUA_SCRIPT_INIT_FN;
 	int ret = 0;
 
-	if (script->init)
-		return 0;
-	script->init = TRUE;
-
-	/* see if there is a symbol for init */
-	lua_getglobal(script->L, LUA_SCRIPT_INIT_FN);
+	lua_getglobal(script->L, func_name);
 
 	if (lua_isfunction(script->L, -1)) {
 		ret = lua_pcall(script->L, 0, 1, 0);
 		if (ret != 0) {
-			*error_r = t_strdup_printf("lua_pcall("LUA_SCRIPT_INIT_FN") failed: %s",
+			*error_r = t_strdup_printf("lua_pcall(%s) failed: %s", func_name,
 						   lua_tostring(script->L, -1));
 			ret = -1;
 		} else if (lua_isnumber(script->L, -1)) {
@@ -113,13 +128,41 @@ int dlua_script_init(struct dlua_script *script, const char **error_r)
 			if (ret != 0)
 				*error_r = "Script init failed";
 		} else {
-			*error_r = t_strdup_printf(LUA_SCRIPT_INIT_FN "() returned non-number");
+			*error_r = t_strdup_printf("%s() returned non-number", func_name);
 			ret = -1;
 		}
 	}
 
 	lua_pop(script->L, 1);
 	return ret;
+}
+
+static void dlua_call_deinit_function(struct dlua_script *script)
+{
+	const char *func_name = LUA_SCRIPT_DEINIT_FN;
+	int ret;
+
+	lua_getglobal(script->L, func_name);
+
+	if (lua_isfunction(script->L, -1)) {
+		ret = lua_pcall(script->L, 0, 0, 0);
+		if (ret != 0) {
+			i_error("lua_pcall(%s) failed: %s", func_name,
+				lua_tostring(script->L, -1));
+			lua_pop(script->L, 1);
+		}
+	} else {
+		lua_pop(script->L, 1);
+	}
+}
+
+int dlua_script_init(struct dlua_script *script, const char **error_r)
+{
+	if (script->init)
+		return 0;
+	script->init = TRUE;
+
+	return dlua_call_init_function(script, error_r);
 }
 
 static int dlua_atpanic(lua_State *L)
@@ -163,20 +206,15 @@ static int dlua_run_script(struct dlua_script *script, const char **error_r)
 	return 0;
 }
 
-static struct dlua_script *
-dlua_script_find_previous_script(const char *filename)
-{
-	struct dlua_script *script;
-	for(script = dlua_scripts; script != NULL; script = script->next)
-		if (strcmp(script->filename, filename)==0)
-			return script;
-	return NULL;
-}
-
 static int
 dlua_script_create_finish(struct dlua_script *script, struct dlua_script **script_r,
 			  const char **error_r)
 {
+	/* store pointer as light data to registry before calling the script */
+	lua_pushstring(script->L, LUA_SCRIPT_REGISTRY_KEY);
+	lua_pushlightuserdata(script->L, script);
+	lua_settable(script->L, LUA_REGISTRYINDEX);
+
 	if (dlua_run_script(script, error_r) < 0) {
 		dlua_script_unref(&script);
 		return -1;
@@ -202,12 +240,6 @@ int dlua_script_create_string(const char *str, struct dlua_script **script_r,
 	sha1_get_digest(str, strlen(str), scripthash);
 	fn = binary_to_hex(scripthash, sizeof(scripthash));
 
-	if ((script = dlua_script_find_previous_script(fn)) != NULL) {
-		dlua_script_ref(script);
-		*script_r = script;
-		return 0;
-	}
-
 	script = dlua_create_script(fn, event_parent);
 	if ((err = luaL_loadstring(script->L, str)) != 0) {
 		*error_r = t_strdup_printf("lua_load(<string>) failed: %s",
@@ -224,12 +256,6 @@ int dlua_script_create_file(const char *file, struct dlua_script **script_r,
 {
 	struct dlua_script *script;
 	int err;
-
-	if ((script = dlua_script_find_previous_script(file)) != NULL) {
-		dlua_script_ref(script);
-		*script_r = script;
-		return 0;
-	}
 
 	/* lua reports file access errors poorly */
 	if (access(file, O_RDONLY) < 0) {
@@ -261,12 +287,6 @@ int dlua_script_create_stream(struct istream *is, struct dlua_script **script_r,
 
 	i_assert(filename != NULL && *filename != '\0');
 
-	if ((script = dlua_script_find_previous_script(filename)) != NULL) {
-		dlua_script_ref(script);
-		*script_r = script;
-		return 0;
-	}
-
 	script = dlua_create_script(filename, event_parent);
 	script->in = is;
 	script->filename = p_strdup(script->pool, filename);
@@ -282,20 +302,8 @@ int dlua_script_create_stream(struct istream *is, struct dlua_script **script_r,
 
 static void dlua_script_destroy(struct dlua_script *script)
 {
-	/* courtesy call */
-	int ret;
-	/* see if there is a symbol for deinit */
-	lua_getglobal(script->L, LUA_SCRIPT_DEINIT_FN);
-	if (lua_isfunction(script->L, -1)) {
-		ret = lua_pcall(script->L, 0, 0, 0);
-		if (ret != 0) {
-			i_warning("lua_pcall("LUA_SCRIPT_DEINIT_FN") failed: %s",
-				  lua_tostring(script->L, -1));
-			lua_pop(script->L, 1);
-		}
-	} else {
-		lua_pop(script->L, 1);
-	}
+	dlua_call_deinit_function(script);
+
 	lua_close(script->L);
 	/* remove from list */
 	DLLIST_REMOVE(&dlua_scripts, script);
@@ -334,58 +342,65 @@ bool dlua_script_has_function(struct dlua_script *script, const char *fn)
 	return ret;
 }
 
-void dlua_setmembers(struct dlua_script *script,
-		     const struct dlua_table_values *values, int idx)
+void dlua_setmembers(lua_State *L, const struct dlua_table_values *values,
+		     int idx)
 {
-	i_assert(script != NULL);
-	i_assert(lua_istable(script->L, idx));
+	i_assert(L != NULL);
+	i_assert(lua_istable(L, idx));
 	while(values->name != NULL) {
 		switch(values->type) {
 		case DLUA_TABLE_VALUE_STRING:
-			lua_pushstring(script->L, values->v.s);
+			lua_pushstring(L, values->v.s);
 			break;
 		case DLUA_TABLE_VALUE_INTEGER:
-			lua_pushnumber(script->L, values->v.i);
+			lua_pushnumber(L, values->v.i);
 			break;
 		case DLUA_TABLE_VALUE_DOUBLE:
-			lua_pushnumber(script->L, values->v.d);
+			lua_pushnumber(L, values->v.d);
 			break;
 		case DLUA_TABLE_VALUE_BOOLEAN:
-			lua_pushboolean(script->L, values->v.b);
+			lua_pushboolean(L, values->v.b);
 			break;
 		case DLUA_TABLE_VALUE_NULL:
-			lua_pushnil(script->L);
+			lua_pushnil(L);
 			break;
 		default:
 			i_unreached();
 		}
-		lua_setfield(script->L, idx-1, values->name);
+		lua_setfield(L, idx - 1, values->name);
 		values++;
 	}
 }
 
-void dlua_dump_stack(struct dlua_script *script)
+void dlua_dump_stack(lua_State *L)
 {
 	/* get everything in stack */
-	int top = lua_gettop(script->L);
+	int top = lua_gettop(L);
 	for (int i = 1; i <= top; i++) T_BEGIN {  /* repeat for each level */
-		int t = lua_type(script->L, i);
+		int t = lua_type(L, i);
 		string_t *line = t_str_new(32);
 		str_printfa(line, "#%d: ", i);
 		switch (t) {
 		case LUA_TSTRING:  /* strings */
-			str_printfa(line, "`%s'", lua_tostring(script->L, i));
+			str_printfa(line, "`%s'", lua_tostring(L, i));
 			break;
 		case LUA_TBOOLEAN:  /* booleans */
-			str_printfa(line, "`%s'", lua_toboolean(script->L, i) ? "true" : "false");
+			str_printfa(line, "`%s'", lua_toboolean(L, i) ? "true" : "false");
 			break;
 		case LUA_TNUMBER:  /* numbers */
-			str_printfa(line, "%g", lua_tonumber(script->L, i));
+			str_printfa(line, "%g", lua_tonumber(L, i));
 			break;
 		default:  /* other values */
-			str_printfa(line, "%s", lua_typename(script->L, t));
+			str_printfa(line, "%s", lua_typename(L, t));
 			break;
 		}
 		i_debug("%s", str_c(line));
 	} T_END;
+}
+
+/* assorted wrappers */
+void dlua_register(struct dlua_script *script, const char *name,
+		   lua_CFunction f)
+{
+	lua_register(script->L, name, f);
 }

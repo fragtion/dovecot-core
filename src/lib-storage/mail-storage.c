@@ -1229,11 +1229,12 @@ int mailbox_verify_name(struct mailbox *box)
 
 	/* If namespace { separator } differs from the mailbox_list separator,
 	   the list separator can't actually be used in the mailbox name
-	   unless it's escaped with escape_char. For example if namespace
-	   separator is '/' and LAYOUT=Maildir++ has '.' as the separator,
-	   there's no way to use '.' in the mailbox name (without escaping)
-	   because it would end up becoming a hierarchy separator. */
-	if (ns_sep != list_sep && box->list->set.escape_char == '\0' &&
+	   unless it's escaped with storage_name_escape_char. For example if
+	   namespace separator is '/' and LAYOUT=Maildir++ has '.' as the
+	   separator, there's no way to use '.' in the mailbox name (without
+	   escaping) because it would end up becoming a hierarchy separator. */
+	if (ns_sep != list_sep &&
+	    box->list->set.storage_name_escape_char == '\0' &&
 	    strchr(vname, list_sep) != NULL) {
 		mail_storage_set_error(box->storage, MAIL_ERROR_PARAMS, t_strdup_printf(
 			"Character not allowed in mailbox name: '%c'", list_sep));
@@ -1385,11 +1386,6 @@ int mailbox_exists(struct mailbox *box, bool auto_boxes,
 		   exists or not, but since it can never be accessed in any way
 		   report it as if it didn't exist. */
 		*existence_r = MAILBOX_EXISTENCE_NONE;
-		return 0;
-	}
-
-	if (auto_boxes && mailbox_is_autocreated(box)) {
-		*existence_r = MAILBOX_EXISTENCE_SELECT;
 		return 0;
 	}
 

@@ -266,8 +266,10 @@ ssize_t i_stream_read(struct istream *stream)
 	}
 #endif
 
-	_stream->prev_snapshot =
-		_stream->snapshot(_stream, _stream->prev_snapshot);
+	if (_stream->skip != _stream->pos || _stream->prev_snapshot != NULL) {
+		_stream->prev_snapshot =
+			_stream->snapshot(_stream, _stream->prev_snapshot);
+	}
 	ret = i_stream_read_memarea(stream);
 	if (ret > 0)
 		i_stream_snapshot_free(&_stream->prev_snapshot);
@@ -1222,6 +1224,10 @@ struct istream *i_stream_create_error(int stream_errno)
 	stream->istream.seekable = TRUE;
 	stream->istream.eof = TRUE;
 	stream->istream.stream_errno = stream_errno;
+	/* Nothing can ever actually be read from this stream, but set a
+	   reasonable max_buffer_size anyway since some filter istreams don't
+	   behave properly otherwise. */
+	stream->max_buffer_size = IO_BLOCK_SIZE;
 	i_stream_create(stream, NULL, -1, 0);
 	i_stream_set_name(&stream->istream, "(error)");
 	return &stream->istream;

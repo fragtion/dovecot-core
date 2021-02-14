@@ -155,6 +155,7 @@ void mail_index_write(struct mail_index *index, bool want_rotate,
 		      const char *reason)
 {
 	struct mail_index_header *hdr = &index->map->hdr;
+	bool rotated = FALSE;
 
 	i_assert(index->log_sync_locked);
 
@@ -184,12 +185,13 @@ void mail_index_write(struct mail_index *index, bool want_rotate,
 			   wasn't, it just causes an extra stat() and gets
 			   fixed later on. */
 			hdr->log2_rotate_time = ioloop_time;
+			rotated = TRUE;
 		}
 	}
 
 	if (MAIL_INDEX_IS_IN_MEMORY(index))
 		;
-	else if (!mail_index_should_recreate(index)) {
+	else if (!rotated && !mail_index_should_recreate(index)) {
 		/* make sure we don't keep getting back in here */
 		index->reopen_main_index = TRUE;
 	} else {
@@ -198,8 +200,8 @@ void mail_index_write(struct mail_index *index, bool want_rotate,
 			return;
 		}
 		event_set_name(index->event, "mail_index_recreated");
-		e_debug(index->event, "Recreated %s because: %s",
-			index->filepath, reason);
+		e_debug(index->event, "Recreated %s (file_seq=%u) because: %s",
+			index->filepath, hdr->log_file_seq, reason);
 	}
 
 	index->last_read_log_file_seq = hdr->log_file_seq;
