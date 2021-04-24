@@ -46,6 +46,7 @@ struct acl_lookup_dict *acl_lookup_dict_init(struct mail_user *user)
 		i_zero(&dict_set);
 		dict_set.username = "";
 		dict_set.base_dir = user->set->base_dir;
+		dict_set.event_parent = user->event;
 		if (dict_init(uri, &dict_set, &dict->dict, &error) < 0)
 			i_error("acl: dict_init(%s) failed: %s", uri, error);
 	} else {
@@ -151,7 +152,7 @@ acl_lookup_dict_rebuild_update(struct acl_lookup_dict *dict,
 {
 	const char *username = dict->user->username;
 	struct dict_iterate_context *iter;
-	struct dict_transaction_context *dt;
+	struct dict_transaction_context *dt = NULL;
 	const char *prefix, *key, *value, *const *old_ids, *const *new_ids, *p;
 	const char *error;
 	ARRAY_TYPE(const_string) old_ids_arr;

@@ -6,18 +6,22 @@
 #include "buffer.h"
 
 struct real_buffer {
-	/* public: */
-	const unsigned char *r_buffer;
-	size_t used;
+	union {
+		struct buffer buf;
+		struct {
+			/* public: */
+			const void *r_buffer;
+			size_t used;
+			/* private: */
+			unsigned char *w_buffer;
+			size_t dirty, alloc, max_size;
 
-	/* private: */
-	unsigned char *w_buffer;
-	size_t dirty, alloc, max_size;
+			pool_t pool;
 
-	pool_t pool;
-
-	bool alloced:1;
-	bool dynamic:1;
+			bool alloced:1;
+			bool dynamic:1;
+		};
+	};
 };
 typedef int buffer_check_sizes[COMPILE_ERROR_IF_TRUE(sizeof(struct real_buffer) > sizeof(buffer_t)) ?1:1];
 
@@ -325,10 +329,10 @@ void buffer_copy(buffer_t *_dest, size_t dest_pos,
 
 	if (src == dest) {
 		memmove(dest->w_buffer + dest_pos,
-			src->r_buffer + src_pos, copy_size);
+			CONST_PTR_OFFSET(src->r_buffer, src_pos), copy_size);
 	} else {
 		memcpy(dest->w_buffer + dest_pos,
-		       src->r_buffer + src_pos, copy_size);
+		       CONST_PTR_OFFSET(src->r_buffer, src_pos), copy_size);
 	}
 }
 

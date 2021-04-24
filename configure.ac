@@ -239,19 +239,24 @@ AS_HELP_STRING([--with-statedir=DIR], [Permanent data directory (LOCALSTATEDIR/l
 )
 AC_SUBST(statedir)
 
-AC_ARG_WITH([systemdsystemunitdir],
-AS_HELP_STRING([--with-systemdsystemunitdir=DIR], [Directory for systemd service files (auto=detect)]), [
-	if test "$withval" = "auto"; then
-		systemdsystemunitdir=`$PKG_CONFIG --variable=systemdsystemunitdir systemd`
-	elif test "$withval" != "no"; then
-		systemdsystemunitdir=$withval
-	fi
-], [])
-if test "$systemdsystemunitdir" != ""; then
-        AC_SUBST(systemdsystemunitdir)
-        AC_DEFINE(HAVE_SYSTEMD,, [Define if you want to use systemd socket activation])
-fi
-AM_CONDITIONAL(HAVE_SYSTEMD, test "$systemdsystemunitdir" != "")
+AC_ARG_WITH([systemd],
+   AS_HELP_STRING([--with-systemd], [Build with systemd support (default=auto)]),
+   want_systemd="$withval"
+)
+
+AS_IF([test "$want_systemd" != "no"], [
+  PKG_CHECK_MODULES([SYSTEMD], [libsystemd], [
+    AC_DEFINE([HAVE_LIBSYSTEMD],[1], [Define to 1 if you have libsystemd])
+    systemdsystemunitdir=`$PKG_CONFIG --variable=systemdsystemunitdir systemd`
+  ], [AS_IF([test "$want_systemd" = "yes"], [
+       AC_MSG_ERROR([libsystemd not found])
+     ],
+     [want_systemd="no"])
+  ])
+])
+
+AC_SUBST(systemdsystemunitdir)
+AM_CONDITIONAL(HAVE_LIBSYSTEMD, [test "$want_systemd" != "no"])
 
 dovecot_moduledir="$libdir/dovecot"
 DC_DOVECOT_MODULEDIR
@@ -553,12 +558,13 @@ DOVECOT_WANT_CASSANDRA
 DOVECOT_SQL
 
 AM_CONDITIONAL([AUTH_LUA_PLUGIN], [test "x$with_lua_plugin" = "xyes"])
-AM_CONDITIONAL([HAVE_LUA], [test "x$with_luajit" = "xyes" || test "x$with_lua" = "xyes"])
-AS_IF([test "x$with_luajit" = "xyes" || test "x$with_lua" = "xyes"],
+AM_CONDITIONAL([HAVE_LUA], [test "x$with_lua" = "xyes"])
+AS_IF([test "x$with_lua" = "xyes"],
   AS_IF([test "x$with_lua_plugin" = "xyes"],
       [userdb="$userdb lua (plugin)"; passdb="$passdb lua (plugin)"],
       [userdb="$userdb lua"; passdb="$passdb lua"],
   ), [])
+AM_CONDITIONAL([DLUA_WITH_YIELDS], [test "$dlua_with_yields" = "yes"])
 
 if test $have_modules = yes; then
   AC_DEFINE(HAVE_MODULES,, [Define if you have dynamic module support])
@@ -657,6 +663,13 @@ LIBDOVECOT_DSYNC='$(top_builddir)/src/doveadm/dsync/libdovecot-dsync.la'
 LIBDOVECOT_SQL='$(top_builddir)/src/lib-sql/libsql.la'
 LIBDOVECOT_COMPRESS='$(top_builddir)/src/lib-compression/libcompression.la'
 LIBDOVECOT_LIBFTS='$(top_builddir)/src/lib-fts/libfts.la'
+
+if test $with_lua != no; then
+  LIBDOVECOT_LUA='$(top_builddir)/src/lib-lua/libdovecot-lua.la'
+else
+  LIBDOVECOT_LUA=''
+fi
+
 AC_SUBST(LIBDOVECOT)
 AC_SUBST(LIBDOVECOT_LA_LIBS)
 AC_SUBST(LIBDOVECOT_DEPS)
@@ -670,6 +683,8 @@ AC_SUBST(LIBDOVECOT_LDA)
 AC_SUBST(LIBDOVECOT_LDAP)
 AC_SUBST(LIBDOVECOT_LIBFTS)
 AC_SUBST(LIBDOVECOT_LIBFTS_DEPS)
+AC_SUBST(LIBDOVECOT_LUA)
+AC_SUBST(LIBDOVECOT_LUA_DEPS)
 
 dnl **
 dnl ** SQL drivers
@@ -773,7 +788,7 @@ dnl **
 dnl IDLE doesn't really belong to banner. It's there just to make Blackberries
 dnl happy, because otherwise BIS server disables push email.
 capability_banner="IMAP4rev1 SASL-IR LOGIN-REFERRALS ID ENABLE IDLE"
-capability="$capability_banner SORT SORT=DISPLAY THREAD=REFERENCES THREAD=REFS THREAD=ORDEREDSUBJECT MULTIAPPEND URL-PARTIAL CATENATE UNSELECT CHILDREN NAMESPACE UIDPLUS LIST-EXTENDED I18NLEVEL=1 CONDSTORE QRESYNC ESEARCH ESORT SEARCHRES WITHIN CONTEXT=SEARCH LIST-STATUS BINARY MOVE SNIPPET=FUZZY PREVIEW=FUZZY STATUS=SIZE SAVEDATE"
+capability="$capability_banner SORT SORT=DISPLAY THREAD=REFERENCES THREAD=REFS THREAD=ORDEREDSUBJECT MULTIAPPEND URL-PARTIAL CATENATE UNSELECT CHILDREN NAMESPACE UIDPLUS LIST-EXTENDED I18NLEVEL=1 CONDSTORE QRESYNC ESEARCH ESORT SEARCHRES WITHIN CONTEXT=SEARCH LIST-STATUS BINARY MOVE SNIPPET=FUZZY PREVIEW=FUZZY PREVIEW STATUS=SIZE SAVEDATE"
 AC_DEFINE_UNQUOTED(CAPABILITY_STRING, "$capability", [IMAP capabilities])
 AC_DEFINE_UNQUOTED(CAPABILITY_BANNER_STRING, "$capability_banner", [IMAP capabilities advertised in banner])
 

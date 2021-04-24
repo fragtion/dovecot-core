@@ -56,7 +56,9 @@ static void client_idle_timeout(struct client *client)
 {
 	if (client->output_cmd_lock == NULL)
 		client_send_line(client, "* BYE Disconnected for inactivity.");
-	client_destroy(client, "Disconnected for inactivity");
+	client_destroy(client, t_strdup_printf(
+		"Inactivity - no input for %"PRIdTIME_T" secs",
+		ioloop_time - client->last_input));
 }
 
 static void client_init_urlauth(struct client *client)
@@ -425,7 +427,7 @@ static const char *client_get_commands_status(struct client *client)
 
 static void client_log_disconnect(struct client *client, const char *reason)
 {
-	e_info(client->event, "%s %s", reason, client_stats(client));
+	e_info(client->event, "Disconnected: %s %s", reason, client_stats(client));
 }
 
 static void client_default_destroy(struct client *client, const char *reason)
@@ -461,12 +463,14 @@ static void client_default_destroy(struct client *client, const char *reason)
 	if (client->input_lock != NULL)
 		client_command_cancel(&client->input_lock);
 
-	if (client->mailbox != NULL)
-		imap_client_close_mailbox(client);
 	if (client->notify_ctx != NULL)
 		imap_notify_deinit(&client->notify_ctx);
 	if (client->urlauth_ctx != NULL)
 		imap_urlauth_deinit(&client->urlauth_ctx);
+	/* Keep mailbox closing close to last, so anything that could
+	   potentially have transactions open will close them first. */
+	if (client->mailbox != NULL)
+		imap_client_close_mailbox(client);
 	if (client->anvil_sent) {
 		master_service_anvil_send(master_service, t_strconcat(
 			"DISCONNECT\t", my_pid, "\timap/",
@@ -1146,8 +1150,9 @@ static bool client_skip_line(struct client *client)
 
 static void client_idle_output_timeout(struct client *client)
 {
-	client_destroy(client,
-		       "Disconnected for inactivity in reading our output");
+	client_destroy(client, t_strdup_printf(
+		"Client has not read server output for for %"PRIdTIME_T" secs",
+		ioloop_time - client->last_output));
 }
 
 bool client_handle_unfinished_cmd(struct client_command_context *cmd)
@@ -1627,8 +1632,8 @@ void clients_init(void)
 void clients_destroy_all(void)
 {
 	while (imap_clients != NULL) {
-		client_send_line(imap_clients, "* BYE Server shutting down.");
 		mail_storage_service_io_activate_user(imap_clients->service_user);
+		client_send_line(imap_clients, "* BYE Server shutting down.");
 		client_destroy(imap_clients, "Server shutting down.");
 	}
 }

@@ -437,7 +437,8 @@ static bool mail_user_get_mail_home(struct mail_user *user)
 				  mail_user_var_expand_table(user),
 				  mail_user_var_expand_func_table, user,
 				  &error) <= 0) {
-		i_error("Failed to expand mail_home=%s: %s", home, error);
+		e_error(user->event, "Failed to expand mail_home=%s: %s",
+			home, error);
 		return FALSE;
 	}
 	user->_home = p_strdup(user->pool, str_c(str));
@@ -654,7 +655,7 @@ mail_user_get_storage_class(struct mail_user *user, const char *name)
 
 	storage = mail_storage_find_class(name);
 	if (storage != NULL && storage->v.alloc == NULL) {
-		i_error("Storage driver '%s' exists as a stub, "
+		e_error(user->event, "Storage driver '%s' exists as a stub, "
 			"but its plugin couldn't be loaded", name);
 		return NULL;
 	}
@@ -701,7 +702,7 @@ void mail_user_init_fs_settings(struct mail_user *user,
 				struct fs_settings *fs_set,
 				struct ssl_iostream_settings *ssl_set)
 {
-	fs_set->event = user->event;
+	fs_set->event_parent = user->event;
 	fs_set->username = user->username;
 	fs_set->session_id = user->session_id;
 	fs_set->base_dir = user->set->base_dir;
@@ -774,7 +775,7 @@ int mail_user_home_mkdir(struct mail_user *user)
 	}
 	/* fallback to a safe mkdir() with 0700 mode */
 	if (mkdir_parents(home, 0700) < 0 && errno != EEXIST) {
-		i_error("mkdir_parents(%s) failed: %m", home);
+		e_error(user->event, "mkdir_parents(%s) failed: %m", home);
 		return -1;
 	}
 	return 0;

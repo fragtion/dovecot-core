@@ -321,12 +321,19 @@ mailbox_list_get_last_internal_error(struct mailbox_list *list,
 void mailbox_list_last_error_push(struct mailbox_list *list);
 void mailbox_list_last_error_pop(struct mailbox_list *list);
 
-/* Create a fs based on the settings in the given mailbox_list. */
-int mailbox_list_init_fs(struct mailbox_list *list, const char *driver,
+/* Create a fs based on the settings in the given mailbox_list. If event_parent
+   is NULL, use user->event as the parent. */
+int mailbox_list_init_fs(struct mailbox_list *list, struct event *event_parent,
+			 const char *driver,
 			 const char *args, const char *root_dir,
 			 struct fs **fs_r, const char **error_r);
 /* Return mailbox_list that was used to create the fs via
    mailbox_list_init_fs(). */
 struct mailbox_list *mailbox_list_fs_get_list(struct fs *fs);
+
+/* Escape/Unescape mailbox name in place. */
+void mailbox_list_name_unescape(const char **name, char escape_char);
+void mailbox_list_name_escape(const char *name, const char *escape_chars,
+			      string_t *dest);
 
 #endif

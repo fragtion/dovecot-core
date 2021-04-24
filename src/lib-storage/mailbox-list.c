@@ -199,7 +199,8 @@ int mailbox_list_create(const char *driver, struct mail_namespace *ns,
 		list->set.mailbox_dir_name =
 			p_strconcat(list->pool, set->mailbox_dir_name, "/", NULL);
 	}
-	list->set.storage_name_escape_char = set->storage_name_escape_char;
+	if (set->storage_name_escape_char != '\0')
+		list->set.storage_name_escape_char = set->storage_name_escape_char;
 	list->set.vname_escape_char = set->vname_escape_char;
 	list->set.utf8 = set->utf8;
 
@@ -517,8 +518,7 @@ mailbox_list_escape_name_params(const char *vname, const char *ns_prefix,
 	return str_c(escaped_name);
 }
 
-static void
-mailbox_list_name_unescape(const char **_name, char escape_char)
+void mailbox_list_name_unescape(const char **_name, char escape_char)
 {
 	const char *p, *name = *_name;
 	unsigned char chr;
@@ -619,23 +619,28 @@ const char *mailbox_list_default_get_storage_name(struct mailbox_list *list,
 						  const char *vname)
 {
 	const char *prepared_name = vname;
+	const char list_sep = mailbox_list_get_hierarchy_sep(list);
+	const char ns_sep = mail_namespace_get_sep(list->ns);
 
 	if (mailbox_list_vname_prepare(list, &prepared_name))
 		return prepared_name;
 	if (list->ns->type == MAIL_NAMESPACE_TYPE_SHARED &&
-	    (list->ns->flags & NAMESPACE_FLAG_AUTOCREATED) == 0) {
+	    (list->ns->flags & NAMESPACE_FLAG_AUTOCREATED) == 0 &&
+	    list_sep != ns_sep &&
+	    list->set.storage_name_escape_char == '\0') {
 		/* Accessing shared namespace root. This is just the initial
 		   lookup that ends up as parameter to
 		   shared_storage_get_namespace(). That then finds/creates the
 		   actual shared namespace, which gets used to generate the
 		   proper storage_name. So the only thing that's really
 		   necessary here is to just skip over the shared namespace
-		   prefix and leave the rest of the name untouched. */
+		   prefix and leave the rest of the name untouched. The only
+		   exception is if there is a storage_name_escape_char set, in
+		   this case the storage name must be handled. */
 		return prepared_name;
 	}
 
-	char list_sep = mailbox_list_get_hierarchy_sep(list);
-	char sep[] = { mail_namespace_get_sep(list->ns), '\0' };
+	const char sep[] = { ns_sep, '\0' };
 	const char *const *parts = t_strsplit(prepared_name, sep);
 	string_t *storage_name = t_str_new(128);
 	for (unsigned int i = 0; parts[i] != NULL; i++) {
@@ -725,15 +730,14 @@ mailbox_list_storage_name_prepare(struct mailbox_list *list,
 	return FALSE;
 }
 
-static void
-mailbox_list_name_escape(const char *vname, const char *escape_chars,
-			 string_t *dest)
+void mailbox_list_name_escape(const char *name, const char *escape_chars,
+			      string_t *dest)
 {
-	for (unsigned int i = 0; vname[i] != '\0'; i++) {
-		if (strchr(escape_chars, vname[i]) != NULL)
-			str_printfa(dest, "%c%02x", escape_chars[0], vname[i]);
+	for (unsigned int i = 0; name[i] != '\0'; i++) {
+		if (strchr(escape_chars, name[i]) != NULL)
+			str_printfa(dest, "%c%02x", escape_chars[0], name[i]);
 		else
-			str_append_c(dest, vname[i]);
+			str_append_c(dest, name[i]);
 	}
 }
 
@@ -1833,7 +1837,8 @@ int mailbox_list_dirent_is_alias_symlink(struct mailbox_list *list,
 		} else if (!S_ISLNK(st.st_mode)) {
 			ret = 0;
 		} else if (t_readlink(path, &linkpath, &error) < 0) {
-			i_error("t_readlink(%s) failed: %s", path, error);
+			e_error(list->ns->user->event,
+				"t_readlink(%s) failed: %s", path, error);
 			ret = -1;
 		} else {
 			/* it's an alias only if it points to the same
@@ -1992,7 +1997,7 @@ void mailbox_list_set_critical(struct mailbox_list *list, const char *fmt, ...)
 	list->last_internal_error = i_strdup_vprintf(fmt, va);
 	va_end(va);
 	list->last_error_is_internal = TRUE;
-	i_error("%s", list->last_internal_error);
+	e_error(list->ns->user->event, "%s", list->last_internal_error);
 
 	/* free the old_error and old_internal_error only after the new error
 	   is generated, because they may be one of the parameters. */
@@ -2041,7 +2046,8 @@ void mailbox_list_last_error_pop(struct mailbox_list *list)
 	array_delete(&list->error_stack, count-1, 1);
 }
 
-int mailbox_list_init_fs(struct mailbox_list *list, const char *driver,
+int mailbox_list_init_fs(struct mailbox_list *list, struct event *event_parent,
+			 const char *driver,
 			 const char *args, const char *root_dir,
 			 struct fs **fs_r, const char **error_r)
 {
@@ -2053,6 +2059,9 @@ int mailbox_list_init_fs(struct mailbox_list *list, const char *driver,
 	i_zero(&ssl_set);
 	i_zero(&fs_set);
 	mail_user_init_fs_settings(list->ns->user, &fs_set, &ssl_set);
+	/* fs_set.event_parent points to user->event by default */
+	if (event_parent != NULL)
+		fs_set.event_parent = event_parent;
 	fs_set.root_path = root_dir;
 	fs_set.temp_file_prefix = mailbox_list_get_global_temp_prefix(list);
 

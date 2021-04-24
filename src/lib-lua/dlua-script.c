@@ -109,51 +109,90 @@ struct dlua_script *dlua_script_from_state(lua_State *L)
 	return script;
 }
 
-static int dlua_call_init_function(struct dlua_script *script,
-				   const char **error_r)
+int dlua_pcall(lua_State *L, const char *func_name, int nargs, int nresults,
+	       const char **error_r)
 {
-	const char *func_name = LUA_SCRIPT_INIT_FN;
-	int ret = 0;
+	/* record the stack position */
+	int ret = 0, debugh_idx, top = lua_gettop(L) - nargs;
 
-	lua_getglobal(script->L, func_name);
+	lua_getglobal(L, func_name);
 
-	if (lua_isfunction(script->L, -1)) {
-		ret = lua_pcall(script->L, 0, 1, 0);
-		if (ret != 0) {
-			*error_r = t_strdup_printf("lua_pcall(%s) failed: %s", func_name,
-						   lua_tostring(script->L, -1));
+	if (lua_isfunction(L, -1)) {
+		/* stack on entry
+			args
+			func <-- top
+		*/
+		/* move func name before arguments */
+		lua_insert(L, -(nargs + 1));
+		/* stack now
+			func
+			args <-- top
+		*/
+		lua_getglobal(L, "debug");
+		lua_getfield(L, -1, "traceback");
+		lua_replace(L, -2);
+		/* stack now
+			func
+			args
+			traceback <-- top
+		*/
+		/* move error handler before func name */
+		lua_insert(L, -(nargs + 2));
+		/* stack now
+			traceback
+			func
+			args <-- top
+		*/
+		/* record where traceback is so it's easy to get rid of even
+		   if LUA_MULTRET is used. */
+		debugh_idx = lua_gettop(L) - nargs - 1;
+		ret = lua_pcall(L, nargs, nresults, -(nargs + 2));
+		if (ret != LUA_OK) {
+			*error_r = t_strdup_printf("lua_pcall(%s, %d, %d) failed: %s",
+						   func_name, nargs, nresults,
+						   lua_tostring(L, -1));
+			/* Remove error and debug handler */
+			lua_pop(L, 2);
 			ret = -1;
-		} else if (lua_isnumber(script->L, -1)) {
-			ret = lua_tointeger(script->L, -1);
-			if (ret != 0)
-				*error_r = "Script init failed";
 		} else {
-			*error_r = t_strdup_printf("%s() returned non-number", func_name);
-			ret = -1;
+			/* remove debug handler from known location */
+			lua_remove(L, debugh_idx);
+			if (nresults == LUA_MULTRET)
+				nresults = lua_gettop(L) - top;
+			ret = nresults;
 		}
+	} else {
+		/* ensure stack is clean, remove function and arguments */
+		lua_pop(L, nargs + 1);
+		*error_r = t_strdup_printf("'%s' is not a function",
+					   func_name);
+		ret = -1;
 	}
-
-	lua_pop(script->L, 1);
+#ifdef DEBUG
+	if ((ret == -1 && lua_gettop(L) != top) ||
+	    (ret >= 0 &&
+	     lua_gettop(L) != top + ret)) {
+		i_debug("LUA STACK UNCLEAN BEGIN for %s", func_name);
+		dlua_dump_stack(L);
+		i_debug("LUA STACK UNCLEAN END");
+	}
+#endif
+	/* enforce that stack is clean after call */
+	if (ret == -1)
+		i_assert(lua_gettop(L) == top);
+	else
+		i_assert(ret >= 0 && lua_gettop(L) == top + ret);
 	return ret;
 }
 
 static void dlua_call_deinit_function(struct dlua_script *script)
 {
-	const char *func_name = LUA_SCRIPT_DEINIT_FN;
-	int ret;
-
-	lua_getglobal(script->L, func_name);
-
-	if (lua_isfunction(script->L, -1)) {
-		ret = lua_pcall(script->L, 0, 0, 0);
-		if (ret != 0) {
-			i_error("lua_pcall(%s) failed: %s", func_name,
-				lua_tostring(script->L, -1));
-			lua_pop(script->L, 1);
-		}
-	} else {
-		lua_pop(script->L, 1);
-	}
+	const char *error;
+	if (!dlua_script_has_function(script, LUA_SCRIPT_DEINIT_FN))
+		return;
+	if (dlua_pcall(script->L, LUA_SCRIPT_DEINIT_FN, 0, 0, &error) < 0)
+		e_error(script->event, LUA_SCRIPT_DEINIT_FN"() failed: %s",
+			error);
 }
 
 int dlua_script_init(struct dlua_script *script, const char **error_r)
@@ -162,7 +201,28 @@ int dlua_script_init(struct dlua_script *script, const char **error_r)
 		return 0;
 	script->init = TRUE;
 
-	return dlua_call_init_function(script, error_r);
+	/* lets not fail on missing function... */
+	if (!dlua_script_has_function(script, LUA_SCRIPT_INIT_FN))
+		return 0;
+
+	int ret = 0;
+
+	if (dlua_pcall(script->L, LUA_SCRIPT_INIT_FN, 0, 1, error_r) < 0)
+		return -1;
+
+	if (lua_isinteger(script->L, -1) == 1) {
+		ret = lua_tointeger(script->L, -1);
+		if (ret != 0)
+			*error_r = "Script init failed";
+	} else {
+		*error_r = LUA_SCRIPT_INIT_FN"() returned non-number";
+		ret = -1;
+	}
+
+	lua_pop(script->L, 1);
+
+	i_assert(lua_gettop(script->L) == 0);
+	return ret;
 }
 
 static int dlua_atpanic(lua_State *L)
@@ -190,20 +250,37 @@ static struct dlua_script *dlua_create_script(const char *name,
 	script->event = event_create(event_parent);
 	event_add_category(script->event, &event_category_lua);
 
+	dlua_init_thread_table(script);
+
 	return script;
 }
 
 static int dlua_run_script(struct dlua_script *script, const char **error_r)
 {
-	int err = lua_pcall(script->L, 0, 0, 0);
-	if (err != 0) {
+	/* put the error handler before script being called */
+	lua_getglobal(script->L, "debug");
+	lua_getfield(script->L, -1, "traceback");
+	lua_replace(script->L, -2);
+	lua_insert(script->L, -2);
+
+	/* we don't want anything to be returned here */
+	/* stack before lua_pcall
+		debug.traceback
+		loaded script as function
+	*/
+	int err = lua_pcall(script->L, 0, 0, 1);
+	if (err != LUA_OK) {
 		*error_r = t_strdup_printf("lua_pcall(%s) failed: %s",
 					   script->filename,
 					   lua_tostring(script->L, -1));
-		lua_pop(script->L,1);
-		return -1;
+		/* pop error and debug handler */
+		lua_pop(script->L, 2);
+		err = -1;
+	} else {
+		/* pop debug handler */
+		lua_pop(script->L, 1);
 	}
-	return 0;
+	return err;
 }
 
 static int
@@ -225,6 +302,7 @@ dlua_script_create_finish(struct dlua_script *script, struct dlua_script **scrip
 
 	*script_r = script;
 
+	i_assert(lua_gettop(script->L) == 0);
 	return 0;
 }
 
@@ -241,14 +319,18 @@ int dlua_script_create_string(const char *str, struct dlua_script **script_r,
 	fn = binary_to_hex(scripthash, sizeof(scripthash));
 
 	script = dlua_create_script(fn, event_parent);
-	if ((err = luaL_loadstring(script->L, str)) != 0) {
+	err = luaL_loadstring(script->L, str);
+	switch (err) {
+	case LUA_OK:
+		return dlua_script_create_finish(script, script_r, error_r);
+	default:
 		*error_r = t_strdup_printf("lua_load(<string>) failed: %s",
-					   dlua_errstr(err));
-		dlua_script_unref(&script);
-		return -1;
+					   lua_tostring(script->L, -1));
+		lua_pop(script->L, 1);
+		break;
 	}
-
-	return dlua_script_create_finish(script, script_r, error_r);
+	dlua_script_unref(&script);
+	return -1;
 }
 
 int dlua_script_create_file(const char *file, struct dlua_script **script_r,
@@ -268,7 +350,7 @@ int dlua_script_create_file(const char *file, struct dlua_script **script_r,
 	}
 
 	script = dlua_create_script(file, event_parent);
-	if ((err = luaL_loadfile(script->L, file)) != 0) {
+	if ((err = luaL_loadfile(script->L, file)) != LUA_OK) {
 		*error_r = t_strdup_printf("lua_load(%s) failed: %s",
 					   file, dlua_errstr(err));
 		dlua_script_unref(&script);
@@ -290,7 +372,7 @@ int dlua_script_create_stream(struct istream *is, struct dlua_script **script_r,
 	script = dlua_create_script(filename, event_parent);
 	script->in = is;
 	script->filename = p_strdup(script->pool, filename);
-	if ((err = lua_load(script->L, dlua_reader, script, filename, 0)) < 0) {
+	if ((err = lua_load(script->L, dlua_reader, script, filename, 0)) != LUA_OK) {
 		*error_r = t_strdup_printf("lua_load(%s) failed: %s",
 					   filename, dlua_errstr(err));
 		dlua_script_unref(&script);
@@ -304,7 +386,12 @@ static void dlua_script_destroy(struct dlua_script *script)
 {
 	dlua_call_deinit_function(script);
 
+	/* close all threads */
+	dlua_free_thread_table(script);
+
+	/* close base lua */
 	lua_close(script->L);
+
 	/* remove from list */
 	DLLIST_REMOVE(&dlua_scripts, script);
 
