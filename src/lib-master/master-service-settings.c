@@ -168,13 +168,18 @@ master_service_settings_check(void *_set, pool_t pool ATTR_UNUSED,
 }
 /* </settings checks> */
 
+static void strarr_push(ARRAY_TYPE(const_string) *argv, const char *str)
+{
+	array_push_back(argv, &str);
+}
+
 static void ATTR_NORETURN
 master_service_exec_config(struct master_service *service,
 			   const struct master_service_settings_input *input)
 {
-	const char **conf_argv, *binary_path = service->argv[0];
+	ARRAY_TYPE(const_string) conf_argv;
+	const char *binary_path = service->argv[0];
 	const char *error = NULL;
-	unsigned int i, argv_max_count;
 
 	if (!t_binary_abspath(&binary_path, &error)) {
 		i_fatal("t_binary_abspath(%s) failed: %s", binary_path, error);
@@ -191,44 +196,49 @@ master_service_exec_config(struct master_service *service,
 		/* doveconf empties the environment before exec()ing us back
 		   if DOVECOT_PRESERVE_ENVS is set, so make sure it is. */
 		if (getenv(DOVECOT_PRESERVE_ENVS_ENV) == NULL)
-			env_put(DOVECOT_PRESERVE_ENVS_ENV"=");
+			env_put(DOVECOT_PRESERVE_ENVS_ENV, "");
 	} else {
 		/* make sure doveconf doesn't remove any environment */
 		env_remove(DOVECOT_PRESERVE_ENVS_ENV);
 	}
 	if (input->use_sysexits)
-		env_put("USE_SYSEXITS=1");
+		env_put("USE_SYSEXITS", "1");
 
-	/* @UNSAFE */
-	i = 0;
-	argv_max_count = 11 + (service->argc + 1) + 1;
-	conf_argv = t_new(const char *, argv_max_count);
-	conf_argv[i++] = DOVECOT_CONFIG_BIN_PATH;
+	t_array_init(&conf_argv, 11 + (service->argc + 1) + 1);
+	strarr_push(&conf_argv, DOVECOT_CONFIG_BIN_PATH);
 	if (input->service != NULL) {
-		conf_argv[i++] = "-f";
-		conf_argv[i++] = t_strconcat("service=", input->service, NULL);
+		strarr_push(&conf_argv, "-f");
+		strarr_push(&conf_argv,
+			    t_strconcat("service=", input->service, NULL));
 	}
-	conf_argv[i++] = "-c";
-	conf_argv[i++] = service->config_path;
+	strarr_push(&conf_argv, "-c");
+	strarr_push(&conf_argv, service->config_path);
 	if (input->module != NULL) {
-		conf_argv[i++] = "-m";
-		conf_argv[i++] = input->module;
-		if (service->want_ssl_settings) {
-			conf_argv[i++] = "-m";
-			conf_argv[i++] = "ssl";
+		strarr_push(&conf_argv, "-m");
+		strarr_push(&conf_argv, input->module);
+	}
+	if (input->extra_modules != NULL) {
+		for (unsigned int i = 0; input->extra_modules[i] != NULL; i++) {
+			strarr_push(&conf_argv, "-m");
+			strarr_push(&conf_argv, input->extra_modules[i]);
 		}
 	}
+	if (service->want_ssl_settings &&
+	    (input->module != NULL || input->extra_modules != NULL)) {
+		strarr_push(&conf_argv, "-m");
+		strarr_push(&conf_argv, "ssl");
+	}
 	if (input->parse_full_config)
-		conf_argv[i++] = "-p";
+		strarr_push(&conf_argv, "-p");
 
-	conf_argv[i++] = "-e";
-	conf_argv[i++] = binary_path;
-	memcpy(conf_argv+i, service->argv + 1,
-	       (service->argc) * sizeof(conf_argv[0]));
-	i += service->argc;
+	strarr_push(&conf_argv, "-e");
+	strarr_push(&conf_argv, binary_path);
+	array_append(&conf_argv, (const char *const *)service->argv + 1,
+		     service->argc);
+	array_append_zero(&conf_argv);
 
-	i_assert(i < argv_max_count);
-	execv_const(conf_argv[0], conf_argv);
+	const char *const *argv = array_front(&conf_argv);
+	execv_const(argv[0], argv);
 }
 
 static void
@@ -341,11 +351,15 @@ config_build_request(struct master_service *service, string_t *str,
 		     const struct master_service_settings_input *input)
 {
 	str_append(str, "REQ");
-	if (input->module != NULL) {
+	if (input->module != NULL)
 		str_printfa(str, "\tmodule=%s", input->module);
-		if (service->want_ssl_settings)
-			str_append(str, "\tmodule=ssl");
+	if (input->extra_modules != NULL) {
+		for (unsigned int i = 0; input->extra_modules[i] != NULL; i++)
+			str_printfa(str, "\tmodule=%s", input->extra_modules[i]);
 	}
+	if (service->want_ssl_settings &&
+	    (input->module != NULL || input->extra_modules != NULL))
+		str_append(str, "\tmodule=ssl");
 	if (input->service != NULL)
 		str_printfa(str, "\tservice=%s", input->service);
 	if (input->username != NULL)
@@ -760,7 +774,7 @@ int master_service_set(struct master_service *service, const char *line)
 bool master_service_set_has_config_override(struct master_service *service,
 					    const char *key)
 {
-	const char *const *override, *key_root;
+	const char *override, *key_root;
 	bool ret;
 
 	if (!array_is_created(&service->config_overrides))
@@ -770,11 +784,11 @@ bool master_service_set_has_config_override(struct master_service *service,
 	if (key_root == NULL)
 		key_root = key;
 
-	array_foreach(&service->config_overrides, override) {
+	array_foreach_elem(&service->config_overrides, override) {
 		T_BEGIN {
 			const char *okey, *okey_root;
 
-			okey = t_strcut(*override, '=');
+			okey = t_strcut(override, '=');
 			okey_root = settings_parse_unalias(service->set_parser,
 							   okey);
 			if (okey_root == NULL)

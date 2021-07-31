@@ -55,7 +55,12 @@ smtp_server_transaction_create(struct smtp_server_connection *conn,
 	smtp_params_mail_copy(pool, &trans->params, &mail_data->params);
 	trans->timestamp = mail_data->timestamp;
 
-	trans->event = event_create(conn->event);
+	if (conn->next_trans_event == NULL)
+		trans->event = event_create(conn->event);
+	else {
+		trans->event = conn->next_trans_event;
+		conn->next_trans_event = NULL;
+	}
 	smtp_server_transaction_update_event(trans);
 
 	struct event_passthrough *e =
@@ -121,12 +126,10 @@ smtp_server_transaction_find_rcpt_duplicate(
 	struct smtp_server_transaction *trans,
 	struct smtp_server_recipient *rcpt)
 {
-	struct smtp_server_recipient *const *rcptp;
+	struct smtp_server_recipient *drcpt;
 
 	i_assert(array_is_created(&trans->rcpt_to));
-	array_foreach(&trans->rcpt_to, rcptp) {
-		struct smtp_server_recipient *drcpt = *rcptp;
-
+	array_foreach_elem(&trans->rcpt_to, drcpt) {
 		if (drcpt == rcpt)
 			continue;
 		if (smtp_address_equals(drcpt->path, rcpt->path) &&
@@ -162,21 +165,17 @@ smtp_server_transaction_rcpt_count(struct smtp_server_transaction *trans)
 	return array_count(&trans->rcpt_to);
 }
 
-void smtp_server_transaction_last_data(struct smtp_server_transaction *trans,
-				       struct smtp_server_cmd_ctx *cmd)
+void smtp_server_transaction_data_command(struct smtp_server_transaction *trans,
+					  struct smtp_server_cmd_ctx *cmd)
 {
-	struct smtp_server_recipient *const *rcptp;
+	struct smtp_server_recipient *rcpt;
 
-	if (trans->cmd != NULL) {
-		i_assert(cmd == trans->cmd);
-		return;
-	}
 	trans->cmd = cmd;
 
 	if (!array_is_created(&trans->rcpt_to))
 		return;
-	array_foreach(&trans->rcpt_to, rcptp)
-		smtp_server_recipient_last_data(*rcptp, cmd);
+	array_foreach_elem(&trans->rcpt_to, rcpt)
+		smtp_server_recipient_data_command(rcpt, cmd);
 }
 
 void smtp_server_transaction_received(struct smtp_server_transaction *trans,

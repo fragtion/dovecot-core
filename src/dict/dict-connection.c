@@ -49,7 +49,6 @@ static int dict_connection_handshake_args(struct connection *_conn,
 		return -1;
 
 	conn->value_type = (enum dict_data_type)value_type_num;
-	conn->username = i_strdup(args[3]);
 	conn->name = i_strdup(args[4]);
 
 	/* try initialize the given dict */
@@ -88,14 +87,12 @@ static int dict_connection_dict_init(struct dict_connection *conn)
 			conn->name);
 		return -1;
 	}
+	event_set_append_log_prefix(conn->conn.event,
+				    t_strdup_printf("%s: ", conn->name));
 	event_add_str(conn->conn.event, "dict_name", conn->name);
-	if (conn->username[0] != '\0')
-		event_add_str(conn->conn.event, "user", conn->username);
 	uri = strlist[i+1];
 
 	i_zero(&dict_set);
-	dict_set.value_type = conn->value_type;
-	dict_set.username = conn->username;
 	dict_set.base_dir = dict_settings->base_dir;
 	dict_set.event_parent = conn->conn.event;
 	if (dict_init(uri, &dict_set, &conn->dict, &error) < 0) {
@@ -175,7 +172,6 @@ bool dict_connection_unref(struct dict_connection *conn)
 	connection_deinit(&conn->conn);
 
 	i_free(conn->name);
-	i_free(conn->username);
 	i_free(conn);
 
 	master_service_client_connection_destroyed(master_service);

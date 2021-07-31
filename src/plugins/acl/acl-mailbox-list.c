@@ -64,6 +64,9 @@ int acl_mailbox_list_have_right(struct mailbox_list *list, const char *name,
 	struct acl_object *aclobj;
 	int ret, ret2;
 
+	if (alist->ignore_acls)
+		return 1;
+
 	aclobj = !parent ?
 		acl_object_init_from_name(backend, name) :
 		acl_object_init_from_parent(backend, name);
@@ -106,6 +109,10 @@ acl_mailbox_try_list_fast(struct mailbox_list_iterate_context *_ctx)
 		   someone. we don't benefit from fast listing. */
 		return;
 	}
+
+	/* If ACLs are ignored for this namespace don't try fast listing. */
+	if (alist->ignore_acls)
+		return;
 
 	/* if this namespace's default rights contain LOOKUP, we'll need to
 	   go through all mailboxes in any case. */
@@ -524,6 +531,19 @@ static void acl_storage_rights_ctx_init(struct acl_storage_rights_context *ctx,
 	}
 }
 
+static bool acl_namespace_is_ignored(struct mailbox_list *list)
+{
+	const char *value =
+		mail_user_plugin_getenv(list->ns->user, "acl_ignore_namespace");
+	for (unsigned int i = 2; value != NULL; i++) {
+		if (wildcard_match(list->ns->prefix, value))
+			return TRUE;
+		value = mail_user_plugin_getenv(list->ns->user,
+			t_strdup_printf("acl_ignore_namespace%u", i));
+	}
+	return FALSE;
+}
+
 static void acl_mailbox_list_init_default(struct mailbox_list *list)
 {
 	struct mailbox_list_vfuncs *v = list->vlast;
@@ -542,6 +562,8 @@ static void acl_mailbox_list_init_default(struct mailbox_list *list)
 	v->iter_init = acl_mailbox_list_iter_init;
 	v->iter_next = acl_mailbox_list_iter_next;
 	v->iter_deinit = acl_mailbox_list_iter_deinit;
+	if (acl_namespace_is_ignored(list))
+		alist->ignore_acls = TRUE;
 
 	MODULE_CONTEXT_SET(list, acl_mailbox_list_module, alist);
 }
@@ -578,19 +600,6 @@ void acl_mail_namespace_storage_added(struct mail_namespace *ns)
 	acl_storage_rights_ctx_init(&alist->rights, backend);
 }
 
-static bool acl_namespace_is_ignored(struct mailbox_list *list)
-{
-	const char *value =
-		mail_user_plugin_getenv(list->ns->user, "acl_ignore_namespace");
-	for (unsigned int i = 2; value != NULL; i++) {
-		if (wildcard_match(list->ns->prefix, value))
-			return TRUE;
-		value = mail_user_plugin_getenv(list->ns->user,
-			t_strdup_printf("acl_ignore_namespace%u", i));
-	}
-	return FALSE;
-}
-
 void acl_mailbox_list_created(struct mailbox_list *list)
 {
 	struct acl_user *auser = ACL_USER_CONTEXT(list->ns->user);
@@ -605,7 +614,7 @@ void acl_mailbox_list_created(struct mailbox_list *list)
 		/* this namespace is empty. don't attempt to lookup ACLs,
 		   because they're not going to work anyway and we could
 		   crash doing it. */
-	} else if (!acl_namespace_is_ignored(list)) {
+	} else {
 		acl_mailbox_list_init_default(list);
 	}
 }

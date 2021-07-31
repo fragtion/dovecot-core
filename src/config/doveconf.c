@@ -487,8 +487,8 @@ config_dump_human_output(struct config_dump_human_context *ctx,
 
 	/* flush output before writing errors */
 	o_stream_uncork(output);
-	array_foreach(&ctx->errors, strings) {
-		i_error("%s", *strings);
+	array_foreach_elem(&ctx->errors, str) {
+		i_error("%s", str);
 		ret = -1;
 	}
 	return ret;
@@ -615,7 +615,7 @@ config_dump_one(const struct config_filter *filter, bool hide_key,
 		bool hide_passwords)
 {
 	static struct config_dump_human_context *ctx;
-	const char *const *str;
+	const char *str;
 	size_t len;
 	bool dump_section = FALSE;
 
@@ -625,20 +625,20 @@ config_dump_one(const struct config_filter *filter, bool hide_key,
 		return -1;
 
 	len = strlen(setting_name_filter);
-	array_foreach(&ctx->strings, str) {
-		if (strncmp(*str, setting_name_filter, len) != 0)
+	array_foreach_elem(&ctx->strings, str) {
+		if (strncmp(str, setting_name_filter, len) != 0)
 			continue;
 
-		if ((*str)[len] == '=') {
+		if (str[len] == '=') {
 			if (hide_key)
-				printf("%s\n", *str + len+1);
+				printf("%s\n", str + len+1);
 			else {
 				printf("%s = %s\n", setting_name_filter,
-				       *str + len+1);
+				       str + len+1);
 			}
 			dump_section = FALSE;
 			break;
-		} else if ((*str)[len] == '/') {
+		} else if (str[len] == '/') {
 			dump_section = TRUE;
 		}
 	}
@@ -675,7 +675,7 @@ static void config_request_putenv(const char *key, const char *value,
 				  void *context ATTR_UNUSED)
 {
 	T_BEGIN {
-		env_put(t_strconcat(t_str_ucase(key), "=", value, NULL));
+		env_put(t_str_ucase(key), value);
 	} T_END;
 }
 
@@ -826,13 +826,13 @@ static void hostname_verify_format(const char *arg)
 	hash_table_destroy(&hosts);
 
 	if (duplicates)
-		exit(EX_CONFIG);
+		lib_exit(EX_CONFIG);
 	else {
 		host2 = t_strdup(str_c(host));
 		hostname_format_write(host, &fmt, 0);
 		printf("No duplicate host hashes in %s .. %s\n",
 		       str_c(host), host2);
-		exit(0);
+		lib_exit(0);
 	}
 }
 
@@ -1049,7 +1049,7 @@ int main(int argc, char *argv[])
 			master_service_env_clean();
 		}
 
-		env_put("DOVECONF_ENV=1");
+		env_put("DOVECONF_ENV", "1");
 		if (config_export_finish(&ctx) < 0)
 			i_fatal("Invalid configuration");
 		execvp(exec_args[0], exec_args);

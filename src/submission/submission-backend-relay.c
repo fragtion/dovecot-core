@@ -735,14 +735,13 @@ backend_relay_cmd_data_init_callbacks(struct submission_backend_relay *backend,
 				      struct smtp_server_transaction *trans)
 {
 	struct client *client = backend->backend.client;
-	struct submission_recipient *const *rcptp;
+	struct submission_recipient *rcpt;
 
 	if (!HAS_ALL_BITS(trans->flags,
 			  SMTP_SERVER_TRANSACTION_FLAG_REPLY_PER_RCPT))
 		return;
 
-	array_foreach_modifiable(&client->rcpt_to, rcptp) {
-		struct submission_recipient *rcpt = *rcptp;
+	array_foreach_elem(&client->rcpt_to, rcpt) {
 		struct smtp_client_transaction_rcpt *relay_rcpt =
 			rcpt->backend_context;
 
@@ -1078,14 +1077,11 @@ submission_backend_relay_create(
 	}
 
 	if (set->trusted) {
-		struct smtp_server_helo_data *helo_data =
-			smtp_server_connection_get_helo_data(client->conn);
-
 		backend->trusted = TRUE;
 		smtp_set.peer_trusted = TRUE;
 
-		smtp_set.proxy_data.helo = helo_data->domain;
-		smtp_set.proxy_data.proto = SMTP_PROXY_PROTOCOL_ESMTP;
+		smtp_server_connection_get_proxy_data(client->conn,
+						      &smtp_set.proxy_data);
 
 		if (user->conn.remote_ip != NULL) {
 			smtp_set.proxy_data.source_ip =

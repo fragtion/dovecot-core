@@ -81,7 +81,7 @@ void smtp_client_connection_accept_extra_capability(
 {
 	i_assert(smtp_client_connection_find_extra_capability(conn, cap->name)
 		 == NULL);
-	
+
 	if (!array_is_created(&conn->extra_capabilities))
 		p_array_init(&conn->extra_capabilities, conn->pool, 8);
 
@@ -153,6 +153,59 @@ smtp_client_connection_commands_fail(struct smtp_client_connection *conn,
 	reply.enhanced_code.x = 9;
 
 	smtp_client_connection_commands_fail_reply(conn, &reply);
+}
+
+static void
+smtp_client_connection_transactions_abort(struct smtp_client_connection *conn)
+{
+	struct smtp_client_transaction *trans;
+
+	trans = conn->transactions_head;
+	while (trans != NULL) {
+		struct smtp_client_transaction *trans_next = trans->next;
+		smtp_client_transaction_abort(trans);
+		trans = trans_next;
+	}
+}
+
+static void
+smtp_client_connection_transactions_fail_reply(
+	struct smtp_client_connection *conn, const struct smtp_reply *reply)
+{
+	struct smtp_client_transaction *trans;
+
+	trans = conn->transactions_head;
+	while (trans != NULL) {
+		struct smtp_client_transaction *trans_next = trans->next;
+		smtp_client_transaction_connection_result(trans, reply);
+		trans = trans_next;
+	}
+}
+
+static void
+smtp_client_connection_transactions_fail(
+	struct smtp_client_connection *conn,
+	unsigned int status, const char *error)
+{
+	struct smtp_reply reply;
+
+	smtp_reply_init(&reply, status, error);
+	reply.enhanced_code.x = 9;
+
+	smtp_client_connection_transactions_fail_reply(conn, &reply);
+}
+
+static void
+smtp_client_connection_transactions_drop(struct smtp_client_connection *conn)
+{
+	struct smtp_client_transaction *trans;
+
+	trans = conn->transactions_head;
+	while (trans != NULL) {
+		struct smtp_client_transaction *trans_next = trans->next;
+		smtp_client_transaction_connection_destroyed(trans);
+		trans = trans_next;
+	}
 }
 
 static void
@@ -299,8 +352,6 @@ static void
 smtp_client_connection_fail_reply(struct smtp_client_connection *conn,
 				  const struct smtp_reply *reply)
 {
-	struct smtp_client_transaction *trans;
-
 	e_debug(conn->event, "Connection failed: %s", smtp_reply_log(reply));
 
 	smtp_client_connection_ref(conn);
@@ -309,13 +360,7 @@ smtp_client_connection_fail_reply(struct smtp_client_connection *conn,
 	smtp_client_connection_disconnect(conn);
 	smtp_client_connection_login_callback(conn, reply);
 
-	trans = conn->transactions_head;
-	while (trans != NULL) {
-		struct smtp_client_transaction *trans_next = trans->next;
-		smtp_client_transaction_connection_result(trans, reply);
-		trans = trans_next;
-	}
-
+	smtp_client_connection_transactions_fail_reply(conn, reply);
 	smtp_client_connection_commands_fail_reply(conn, reply);
 
 	conn->failing = FALSE;
@@ -487,7 +532,7 @@ smtp_client_connection_xclient_add(struct smtp_client_connection *conn,
 	if (prev_offset == offset ||
 	    str_len(str) <= SMTP_CLIENT_BASE_LINE_LENGTH_LIMIT)
 		return;
-		
+
 	/* preserve field we just added */
 	new_field = t_strdup(str_c(str) + prev_offset);
 
@@ -736,7 +781,7 @@ smtp_client_connection_get_sasl_mech(struct smtp_client_connection *conn,
 		set->sasl_mechanisms[0] == '\0') {
 		*mech_r = &dsasl_client_mech_plain;
 		return 0;
-	}		
+	}
 
 	/* find one of the specified SASL mechanisms */
 	mechanisms = t_strsplit_spaces(set->sasl_mechanisms, ", ");
@@ -1321,7 +1366,6 @@ static void smtp_client_connection_destroy(struct connection *_conn)
 		break;
 	case CONNECTION_DISCONNECT_DEINIT:
 		e_debug(conn->event, "Connection deinit");
-		smtp_client_connection_commands_abort(conn);
 		smtp_client_connection_close(&conn);
 		break;
 	case CONNECTION_DISCONNECT_CONNECT_TIMEOUT:
@@ -1595,7 +1639,8 @@ smtp_client_connection_connect_timeout(struct smtp_client_connection *conn)
 }
 
 static void
-smtp_client_connection_delayed_connect_error(struct smtp_client_connection *conn)
+smtp_client_connection_delayed_connect_error(
+	struct smtp_client_connection *conn)
 {
 	e_debug(conn->event, "Delayed connect error");
 
@@ -1940,6 +1985,9 @@ void smtp_client_connection_disconnect(struct smtp_client_connection *conn)
 		smtp_client_connection_login_fail(
 			conn, SMTP_CLIENT_COMMAND_ERROR_ABORTED,
 			"Disconnected from server");
+		smtp_client_connection_transactions_fail(
+			conn,  SMTP_CLIENT_COMMAND_ERROR_ABORTED,
+			"Disconnected from server");
 		smtp_client_connection_commands_fail(
 			conn, SMTP_CLIENT_COMMAND_ERROR_ABORTED,
 			"Disconnected from server");
@@ -2168,9 +2216,13 @@ void smtp_client_connection_unref(struct smtp_client_connection **_conn)
 	smtp_client_connection_login_fail(
 		conn, SMTP_CLIENT_COMMAND_ERROR_ABORTED,
 		"Connection destroy");
+	smtp_client_connection_transactions_fail(
+		conn,  SMTP_CLIENT_COMMAND_ERROR_ABORTED,
+		"Connection destroy");
 	smtp_client_connection_commands_fail(
 		conn, SMTP_CLIENT_COMMAND_ERROR_ABORTED,
 		"Connection destroy");
+	smtp_client_connection_transactions_drop(conn);
 
 	connection_deinit(&conn->conn);
 
@@ -2191,6 +2243,8 @@ void smtp_client_connection_close(struct smtp_client_connection **_conn)
 		return;
 	conn->closed = TRUE;
 
+	smtp_client_connection_transactions_abort(conn);
+	smtp_client_connection_commands_abort(conn);
 	smtp_client_connection_disconnect(conn);
 
 	/* could have been created while already disconnected */

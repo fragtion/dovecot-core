@@ -12,7 +12,7 @@
 #include "worker-connection.h"
 
 struct worker_request {
-	struct worker_connection *conn;
+	struct connection *conn;
 	struct indexer_request *request;
 };
 
@@ -40,10 +40,10 @@ static bool idle_die(void)
 static void client_connected(struct master_service_connection *conn)
 {
 	master_service_client_connection_accept(conn);
-	(void)indexer_client_create(conn->fd, queue);
+	indexer_client_create(conn, queue);
 }
 
-static void worker_send_request(struct worker_connection *conn,
+static void worker_send_request(struct connection *conn,
 				struct indexer_request *request)
 {
 	struct worker_request *wrequest;
@@ -58,7 +58,7 @@ static void worker_send_request(struct worker_connection *conn,
 
 static void queue_try_send_more(struct indexer_queue *queue)
 {
-	struct worker_connection *conn;
+	struct connection *conn;
 	struct indexer_request *request, *first_moved_request = NULL;
 
 	timeout_remove(&to_send_more);
@@ -66,7 +66,7 @@ static void queue_try_send_more(struct indexer_queue *queue)
 	while ((request = indexer_queue_request_peek(queue)) != NULL) {
 		conn = worker_pool_find_username_connection(worker_pool,
 							    request->username);
-		if (conn != NULL) {
+		if (conn != NULL && worker_connection_is_busy(conn)) {
 			/* There is already a connection handling a request
 			 * for this user. Move the request to the back of the
 			 * queue and handle requests from other users.
@@ -80,12 +80,11 @@ static void queue_try_send_more(struct indexer_queue *queue)
 				first_moved_request = request;
 			indexer_queue_move_head_to_tail(queue);
 			continue;
+		} else if (conn == NULL) {
+			/* create a new connection to a worker */
+			if (!worker_pool_get_connection(worker_pool, &conn))
+				break;
 		}
-
-		/* create a new connection to a worker */
-		if (!worker_pool_get_connection(worker_pool, &conn))
-			break;
-
 		indexer_queue_request_remove(queue);
 		worker_send_request(conn, request);
 	}
@@ -98,7 +97,7 @@ static void queue_listen_callback(struct indexer_queue *queue)
 
 static void worker_status_callback(int percentage, void *context)
 {
-	struct worker_connection *conn = context;
+	struct connection *conn = context;
 	struct indexer_request *request = worker_connection_get_request(conn);
 
 	if (percentage >= 0 && percentage < 100) {

@@ -80,7 +80,7 @@ static int mail_index_recreate(struct mail_index *index)
 
 	base_size = I_MIN(map->hdr.base_header_size, sizeof(map->hdr));
 	o_stream_nsend(output, &map->hdr, base_size);
-	o_stream_nsend(output, CONST_PTR_OFFSET(map->hdr_base, base_size),
+	o_stream_nsend(output, MAIL_INDEX_MAP_HDR_OFFSET(map, base_size),
 		       map->hdr.header_size - base_size);
 	o_stream_nsend(output, map->rec_map->records,
 		       map->rec_map->records_count * map->hdr.record_size);
@@ -90,7 +90,7 @@ static int mail_index_recreate(struct mail_index *index)
 	}
 	o_stream_destroy(&output);
 
-	if (ret == 0 && index->fsync_mode != FSYNC_MODE_NEVER) {
+	if (ret == 0 && index->set.fsync_mode != FSYNC_MODE_NEVER) {
 		if (fdatasync(fd) < 0) {
 			mail_index_file_set_syscall_error(index, path,
 							  "fdatasync()");
@@ -204,6 +204,6 @@ void mail_index_write(struct mail_index *index, bool want_rotate,
 			index->filepath, hdr->log_file_seq, reason);
 	}
 
-	index->last_read_log_file_seq = hdr->log_file_seq;
-	index->last_read_log_file_tail_offset = hdr->log_file_tail_offset;
+	index->main_index_hdr_log_file_seq = hdr->log_file_seq;
+	index->main_index_hdr_log_file_tail_offset = hdr->log_file_tail_offset;
 }

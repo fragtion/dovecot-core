@@ -160,7 +160,7 @@ static int lua_storage_mailbox_sync(lua_State *L)
 static int lua_storage_mailbox_status(lua_State *L)
 {
 	struct mailbox_status status;
-	const char *const *keyword;
+	const char *keyword;
 	struct mailbox *mbox = lua_check_storage_mailbox(L, 1);
 	/* get items as list of parameters */
 	enum mailbox_status_items items = 0;
@@ -174,7 +174,7 @@ static int lua_storage_mailbox_status(lua_State *L)
 	if (mailbox_get_status(mbox, items, &status) < 0) {
 		const char *error = mailbox_get_last_error(mbox, NULL);
 		return luaL_error(L, "mailbox_get_status(%s, %u) failed: %s",
-				  mbox, items, error);
+				  mailbox_get_vname(mbox), items, error);
 	}
 	/* returns a table */
 	lua_createtable(L, 0, 20);
@@ -215,8 +215,8 @@ static int lua_storage_mailbox_status(lua_State *L)
 	if (status.keywords != NULL && array_is_created(status.keywords)) {
 		int i = 1;
 		lua_createtable(L, array_count(status.keywords), 0);
-		array_foreach(status.keywords, keyword) {
-			lua_pushstring(L, *keyword);
+		array_foreach_elem(status.keywords, keyword) {
+			lua_pushstring(L, keyword);
 			lua_rawseti(L, -2, i++);
 		}
 		lua_setfield(L, -2, "keywords");
@@ -272,8 +272,7 @@ static int lua_storage_mailbox_metadata_set(lua_State *L)
 	value = lua_tolstring(L, 3, &value_len);
 
 	if (lua_storage_mailbox_attribute_set(mbox, key, value, value_len, &error) < 0)
-		return luaL_error(L,
-				  t_strdup_printf("Cannot set attribute: %s", error));
+		return luaL_error(L, "Cannot set attribute: %s", error);
 
 	return 0;
 }
@@ -286,8 +285,7 @@ static int lua_storage_mailbox_metadata_unset(lua_State *L)
 	const char *error;
 
 	if (lua_storage_mailbox_attribute_set(mbox, key, NULL, 0,  &error) < 0)
-		return luaL_error(L,
-				  t_strdup_printf("Cannot unset attribute: %s", error));
+		return luaL_error(L, "Cannot unset attribute: %s", error);
 
 	return 0;
 }

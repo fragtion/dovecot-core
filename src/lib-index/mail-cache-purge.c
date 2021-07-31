@@ -293,7 +293,7 @@ mail_cache_copy(struct mail_cache *cache, struct mail_index_transaction *trans,
 		ctx.new_msg = seq >= first_new_seq;
 		buffer_set_used_size(ctx.buffer, 0);
 
-		ctx.field_seen_value = (ctx.field_seen_value + 1) % UINT8_MAX;
+		ctx.field_seen_value = (ctx.field_seen_value + 1) & UINT8_MAX;
 		if (ctx.field_seen_value == 0) {
 			memset(buffer_get_modifiable_data(ctx.field_seen, NULL),
 			       0, buffer_get_size(ctx.field_seen));
@@ -350,7 +350,7 @@ mail_cache_copy(struct mail_cache *cache, struct mail_index_transaction *trans,
 	}
 	o_stream_destroy(&output);
 
-	if (cache->index->fsync_mode == FSYNC_MODE_ALWAYS) {
+	if (cache->index->set.fsync_mode == FSYNC_MODE_ALWAYS) {
 		if (fdatasync(fd) < 0) {
 			mail_cache_set_syscall_error(cache, "fdatasync()");
 			array_free(ext_offsets);

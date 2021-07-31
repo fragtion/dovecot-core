@@ -57,7 +57,7 @@ static int auth_request_lua_var_expand(lua_State *L)
 	const char *value, *error;
 
 	if (auth_request_lua_do_var_expand(req, tpl, &value, &error) < 0) {
-		return luaL_error(L, error);
+		return luaL_error(L, "%s", error);
 	} else {
 		lua_pushstring(L, value);
 	}
@@ -107,7 +107,7 @@ static int auth_request_lua_response_from_template(lua_State *L)
 		if (value == NULL) {
 			lua_pushnil(L);
 		} else if (auth_request_lua_do_var_expand(req, value, &expanded, &error) < 0) {
-			return luaL_error(L, error);
+			return luaL_error(L, "%s", error);
 		} else {
 			lua_pushstring(L, expanded);
 		}
@@ -228,6 +228,7 @@ static int auth_request_lua_event(lua_State *L)
 	struct event *event = event_create(authdb_event(request));
 
 	dlua_push_event(L, event);
+	event_unref(&event);
 	return 1;
 }
 
@@ -759,8 +760,8 @@ void auth_lua_userdb_iterate_next(struct userdb_iterate_context *ctx)
 		return;
 	}
 
-	const char *const *user = array_idx(&actx->users, actx->idx++);
-	ctx->callback(*user, ctx->context);
+	const char *user = array_idx_elem(&actx->users, actx->idx++);
+	ctx->callback(user, ctx->context);
 }
 
 int auth_lua_userdb_iterate_deinit(struct userdb_iterate_context *ctx)

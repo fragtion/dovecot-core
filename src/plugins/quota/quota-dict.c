@@ -71,11 +71,8 @@ static int dict_quota_init(struct quota_root *_root, const char *args,
 	/* FIXME: we should use 64bit integer as datatype instead but before
 	   it can actually be used don't bother */
 	i_zero(&set);
-	set.username = username;
 	set.base_dir = _root->quota->user->set->base_dir;
 	set.event_parent = _root->quota->user->event;
-	if (mail_user_get_home(_root->quota->user, &set.home_dir) <= 0)
-		set.home_dir = NULL;
 	if (dict_init(args, &set, &root->dict, &error) < 0) {
 		*error_r = t_strdup_printf("dict_init(%s) failed: %s", args, error);
 		return -1;
@@ -114,11 +111,13 @@ dict_quota_count(struct dict_quota_root *root,
 	struct dict_transaction_context *dt;
 	uint64_t bytes, count;
 	enum quota_get_result error_res;
+	const struct dict_op_settings *set;
 
 	if (quota_count(&root->root, &bytes, &count, &error_res, error_r) < 0)
 		return error_res;
 
-	dt = dict_transaction_begin(root->dict);
+	set = mail_user_get_dict_op_settings(root->root.quota->user);
+	dt = dict_transaction_begin(root->dict, set);
 	/* these unsets are mainly necessary for pgsql, because its
 	   trigger otherwise increases quota without deleting it.
 	   but some people with other databases want to store the
@@ -147,6 +146,7 @@ dict_quota_get_resource(struct quota_root *_root,
 	struct dict_quota_root *root = (struct dict_quota_root *)_root;
 	bool want_bytes;
 	int ret;
+	const struct dict_op_settings *set;
 
 	if (strcmp(name, QUOTA_NAME_STORAGE_BYTES) == 0)
 		want_bytes = TRUE;
@@ -157,10 +157,11 @@ dict_quota_get_resource(struct quota_root *_root,
 		return QUOTA_GET_RESULT_UNKNOWN_RESOURCE;
 	}
 
+	set = mail_user_get_dict_op_settings(root->root.quota->user);
 	const char *key, *value, *error;
 	key = want_bytes ? DICT_QUOTA_CURRENT_BYTES_PATH :
 		DICT_QUOTA_CURRENT_COUNT_PATH;
-	ret = dict_lookup(root->dict, unsafe_data_stack_pool,
+	ret = dict_lookup(root->dict, set, unsafe_data_stack_pool,
 			  key, &value, &error);
 	if (ret < 0) {
 		*error_r = t_strdup_printf(
@@ -214,13 +215,15 @@ dict_quota_update(struct quota_root *_root,
 	struct dict_quota_root *root = (struct dict_quota_root *) _root;
 	struct dict_transaction_context *dt;
 	uint64_t value;
+	const struct dict_op_settings *set;
 
 	if (ctx->recalculate != QUOTA_RECALCULATE_DONT) {
 		if (dict_quota_count(root, TRUE, &value, error_r)
 		    <= QUOTA_GET_RESULT_INTERNAL_ERROR)
 			return -1;
 	} else {
-		dt = dict_transaction_begin(root->dict);
+		set = mail_user_get_dict_op_settings(root->root.quota->user);
+		dt = dict_transaction_begin(root->dict, set);
 		if (ctx->bytes_used != 0) {
 			dict_atomic_inc(dt, DICT_QUOTA_CURRENT_BYTES_PATH,
 					ctx->bytes_used);

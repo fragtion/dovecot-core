@@ -11,6 +11,7 @@ AC_CONFIG_MACRO_DIR([m4])
 AM_INIT_AUTOMAKE([foreign])
 
 AM_MAINTAINER_MODE
+PKG_PREREQ([0.28])
 PKG_PROG_PKG_CONFIG
 
 ACLOCAL_AMFLAGS='-I $(top_srcdir)/m4'
@@ -241,22 +242,11 @@ AC_SUBST(statedir)
 
 AC_ARG_WITH([systemd],
    AS_HELP_STRING([--with-systemd], [Build with systemd support (default=auto)]),
-   want_systemd="$withval"
+   want_systemd="$withval",
+   want_systemd="auto"
 )
 
-AS_IF([test "$want_systemd" != "no"], [
-  PKG_CHECK_MODULES([SYSTEMD], [libsystemd], [
-    AC_DEFINE([HAVE_LIBSYSTEMD],[1], [Define to 1 if you have libsystemd])
-    systemdsystemunitdir=`$PKG_CONFIG --variable=systemdsystemunitdir systemd`
-  ], [AS_IF([test "$want_systemd" = "yes"], [
-       AC_MSG_ERROR([libsystemd not found])
-     ],
-     [want_systemd="no"])
-  ])
-])
-
-AC_SUBST(systemdsystemunitdir)
-AM_CONDITIONAL(HAVE_LIBSYSTEMD, [test "$want_systemd" != "no"])
+DOVECOT_WANT_SYSTEMD
 
 dovecot_moduledir="$libdir/dovecot"
 DC_DOVECOT_MODULEDIR
@@ -330,7 +320,7 @@ AC_DEFINE(PACKAGE_WEBPAGE, "http://www.dovecot.org/", [Support URL])
 
 dnl * after -lsocket and -lnsl tests, inet_aton() may be in them
 AC_CHECK_FUNCS(fcntl flock lockf inet_aton sigaction getpagesize madvise \
-               strcasecmp stricmp vsyslog writev pread uname unsetenv \
+               strcasecmp stricmp vsyslog writev pread uname \
 	       setrlimit setproctitle seteuid setreuid setegid setresgid \
 	       getmntinfo setpriority quotactl getmntent kqueue kevent \
 	       backtrace_symbols walkcontext dirfd clearenv \
@@ -496,8 +486,6 @@ DOVECOT_MMAP_WRITE
 DOVECOT_FD_PASSING
 
 DOVECOT_SENDFILE
-
-DOVECOT_UNSETENV_RET_INT
 
 DOVECOT_CRYPT_XPG6
 DOVECOT_CRYPT
@@ -956,7 +944,6 @@ echo "I/O notifys .... : $have_notify"
 echo "SSL ............ : $have_ssl"
 echo "GSSAPI ......... : $have_gssapi"
 echo "passdbs ........ :$passdb"
-echo "CFLAGS ......... : $CFLAGS"
 if test "$not_passdb" != ""; then
   echo "                 :$not_passdb"
 fi
@@ -964,6 +951,14 @@ echo "userdbs ........ :$userdb"
 if test "$not_userdb" != ""; then
   echo "                 :$not_userdb"
 fi
+echo "CFLAGS ......... : $CFLAGS"
+
+if test "$systemdsystemunitdir" != ""; then
+  echo "SYSTEMD ........ : $systemdservicetype - $systemdsystemunitdir/dovecot.service";
+else
+  echo "SYSTEMD ........ : $systemdservicetype - (no unit file)"
+fi
+
 echo "SQL drivers .... :$sql_drivers"
 if test "$not_sql_drivers" != ""; then
   echo "                 :$not_sql_drivers"

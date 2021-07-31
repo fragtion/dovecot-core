@@ -144,7 +144,7 @@ struct smtp_server_connection {
 	struct smtp_server *server;
 	pool_t pool;
 	int refcount;
-	struct event *event;
+	struct event *event, *next_trans_event;
 
 	struct smtp_server_settings set;
 
@@ -158,6 +158,7 @@ struct smtp_server_connection {
 	enum smtp_proxy_protocol proxy_proto;
 	unsigned int proxy_ttl_plus_1;
 	unsigned int proxy_timeout_secs;
+	char *proxy_helo;
 
 	struct smtp_server_helo_data helo, *pending_helo;
 	char *helo_domain, *username;
@@ -351,10 +352,6 @@ void smtp_server_connection_clear(struct smtp_server_connection *conn);
 struct smtp_server_transaction *
 smtp_server_connection_get_transaction(struct smtp_server_connection *conn);
 
-void smtp_server_connection_set_proxy_data(
-	struct smtp_server_connection *conn,
-	const struct smtp_proxy_data *proxy_data);
-
 /*
  * Recipient
  */
@@ -367,14 +364,12 @@ void smtp_server_recipient_ref(struct smtp_server_recipient *rcpt);
 bool smtp_server_recipient_unref(struct smtp_server_recipient **_rcpt);
 void smtp_server_recipient_destroy(struct smtp_server_recipient **_rcpt);
 
-void smtp_server_recipient_initialize(struct smtp_server_recipient *rcpt);
-
 bool smtp_server_recipient_approved(struct smtp_server_recipient **_rcpt);
 void smtp_server_recipient_denied(struct smtp_server_recipient *rcpt,
 				  const struct smtp_server_reply *reply);
 
-void smtp_server_recipient_last_data(struct smtp_server_recipient *rcpt,
-				     struct smtp_server_cmd_ctx *cmd);
+void smtp_server_recipient_data_command(struct smtp_server_recipient *rcpt,
+					struct smtp_server_cmd_ctx *cmd);
 void smtp_server_recipient_data_replied(struct smtp_server_recipient *rcpt);
 
 void smtp_server_recipient_reset(struct smtp_server_recipient *rcpt);
@@ -400,8 +395,8 @@ bool smtp_server_transaction_has_rcpt(struct smtp_server_transaction *trans);
 unsigned int
 smtp_server_transaction_rcpt_count(struct smtp_server_transaction *trans);
 
-void smtp_server_transaction_last_data(struct smtp_server_transaction *trans,
-				       struct smtp_server_cmd_ctx *cmd);
+void smtp_server_transaction_data_command(struct smtp_server_transaction *trans,
+					  struct smtp_server_cmd_ctx *cmd);
 
 void smtp_server_transaction_received(struct smtp_server_transaction *trans,
 				      uoff_t data_size);

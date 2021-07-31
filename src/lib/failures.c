@@ -61,7 +61,7 @@ static bool failure_ignore_errors = FALSE, log_prefix_sent = FALSE;
 static bool coredump_on_error = FALSE;
 static void log_timestamp_add(const struct failure_context *ctx, string_t *str);
 static void log_prefix_add(const struct failure_context *ctx, string_t *str);
-static void i_failure_send_option(const char *key, const char *value);
+static void i_failure_send_option_forced(const char *key, const char *value);
 static int internal_send_split(string_t *full_str, size_t prefix_len);
 
 static string_t * ATTR_FORMAT(3, 0) default_format(const struct failure_context *ctx,
@@ -192,7 +192,7 @@ static string_t * ATTR_FORMAT(3, 0) internal_format(const struct failure_context
 			log_type |= LOG_TYPE_FLAG_PREFIX_LEN;
 	} else if (!log_prefix_sent && log_prefix != NULL) {
 		log_prefix_sent = TRUE;
-		i_failure_send_option("prefix", log_prefix);
+		i_failure_send_option_forced("prefix", log_prefix);
 	}
 
 	str = t_str_new(128);
@@ -310,7 +310,7 @@ void failure_exit(int status)
 		recursed = TRUE;
 		failure_exit_callback(&status);
 	}
-	exit(status);
+	lib_exit(status);
 }
 
 static void log_timestamp_add(const struct failure_context *ctx, string_t *str)
@@ -516,6 +516,7 @@ void i_panic(const char *format, ...)
 	struct failure_context ctx;
 	va_list args;
 
+	lib_set_clean_exit(TRUE);
 	i_zero(&ctx);
 	ctx.type = LOG_TYPE_PANIC;
 
@@ -530,6 +531,7 @@ void i_fatal(const char *format, ...)
 	struct failure_context ctx;
 	va_list args;
 
+	lib_set_clean_exit(TRUE);
 	i_zero(&ctx);
 	ctx.type = LOG_TYPE_FATAL;
 	ctx.exit_status = FATAL_DEFAULT;
@@ -545,6 +547,7 @@ void i_fatal_status(int status, const char *format, ...)
 	struct failure_context ctx;
 	va_list args;
 
+	lib_set_clean_exit(TRUE);
 	i_zero(&ctx);
 	ctx.type = LOG_TYPE_FATAL;
 	ctx.exit_status = status;
@@ -717,16 +720,19 @@ void i_set_failure_file(const char *path, const char *prefix)
 	i_set_debug_handler(default_error_handler);
 }
 
-static void i_failure_send_option(const char *key, const char *value)
+static void i_failure_send_option_forced(const char *key, const char *value)
 {
 	const char *str;
-
-	if (error_handler != i_internal_error_handler)
-		return;
 
 	str = t_strdup_printf("\001%c%s %s=%s\n", LOG_TYPE_OPTION+1,
 			      my_pid, key, value);
 	(void)write_full(STDERR_FILENO, str, strlen(str));
+}
+
+static void i_failure_send_option(const char *key, const char *value)
+{
+	if (error_handler == i_internal_error_handler)
+		i_failure_send_option_forced(key, value);
 }
 
 void i_set_failure_prefix(const char *prefix_fmt, ...)

@@ -25,35 +25,8 @@ struct event_category event_category_lua = {
 
 static struct dlua_script *dlua_scripts = NULL;
 
-static const char *dlua_errstr(int err)
-{
-	switch(err) {
-#ifdef LUA_OK
-	case LUA_OK:
-		return "ok";
-#endif
-	case LUA_YIELD:
-		return "yield";
-	case LUA_ERRRUN:
-		return "runtime error";
-	case LUA_ERRSYNTAX:
-		return "syntax error";
-	case LUA_ERRMEM:
-		return "out of memory";
-#ifdef LUA_ERRGCMM
-	case LUA_ERRGCMM:
-		return "gc management error";
-#endif
-	case LUA_ERRERR:
-		return "error while handling error";
-#ifdef LUA_ERRFILE
-	case LUA_ERRFILE:
-		return "error loading file";
-#endif
-	default:
-		return "unknown error";
-	}
-}
+static int
+dlua_script_create_finish(struct dlua_script *script, const char **error_r);
 
 static void *dlua_alloc(void *ctx, void *ptr, size_t osize, size_t nsize)
 {
@@ -76,9 +49,9 @@ static const char *dlua_reader(lua_State *L, void *ctx, size_t *size_r)
 	i_stream_skip(script->in, script->last_read);
 	if (i_stream_read_more(script->in, &data, size_r) == -1 &&
 	    script->in->stream_errno != 0) {
-		luaL_error(L, t_strdup_printf("read(%s) failed: %s",
-					      script->filename,
-					      i_stream_get_error(script->in)));
+		luaL_error(L, "read(%s) failed: %s",
+			   script->filename,
+			   i_stream_get_error(script->in));
 		*size_r = 0;
 		return NULL;
 	}
@@ -96,15 +69,6 @@ struct dlua_script *dlua_script_from_state(lua_State *L)
 	script = lua_touserdata(L, -1);
 	lua_pop(L, 1);
 	i_assert(script != NULL);
-
-	if (script->L != L) {
-		static bool warned;
-
-		if (!warned) {
-			i_warning("detected threading in lua script - not supported");
-			warned = TRUE; /* warn only once */
-		}
-	}
 
 	return script;
 }
@@ -201,6 +165,9 @@ int dlua_script_init(struct dlua_script *script, const char **error_r)
 		return 0;
 	script->init = TRUE;
 
+	if (dlua_script_create_finish(script, error_r) < 0)
+		return -1;
+
 	/* lets not fail on missing function... */
 	if (!dlua_script_has_function(script, LUA_SCRIPT_INIT_FN))
 		return 0;
@@ -210,10 +177,12 @@ int dlua_script_init(struct dlua_script *script, const char **error_r)
 	if (dlua_pcall(script->L, LUA_SCRIPT_INIT_FN, 0, 1, error_r) < 0)
 		return -1;
 
-	if (lua_isinteger(script->L, -1) == 1) {
+	if (lua_isinteger(script->L, -1)) {
 		ret = lua_tointeger(script->L, -1);
-		if (ret != 0)
+		if (ret != 0) {
 			*error_r = "Script init failed";
+			ret = -1;
+		}
 	} else {
 		*error_r = LUA_SCRIPT_INIT_FN"() returned non-number";
 		ret = -1;
@@ -248,10 +217,12 @@ static struct dlua_script *dlua_create_script(const char *name,
 	lua_atpanic(script->L, dlua_atpanic);
 	luaL_openlibs(script->L);
 	script->event = event_create(event_parent);
+	event_add_str(script->event, "script", script->filename);
 	event_add_category(script->event, &event_category_lua);
 
 	dlua_init_thread_table(script);
 
+	DLLIST_PREPEND(&dlua_scripts, script);
 	return script;
 }
 
@@ -284,24 +255,15 @@ static int dlua_run_script(struct dlua_script *script, const char **error_r)
 }
 
 static int
-dlua_script_create_finish(struct dlua_script *script, struct dlua_script **script_r,
-			  const char **error_r)
+dlua_script_create_finish(struct dlua_script *script, const char **error_r)
 {
 	/* store pointer as light data to registry before calling the script */
 	lua_pushstring(script->L, LUA_SCRIPT_REGISTRY_KEY);
 	lua_pushlightuserdata(script->L, script);
 	lua_settable(script->L, LUA_REGISTRYINDEX);
 
-	if (dlua_run_script(script, error_r) < 0) {
-		dlua_script_unref(&script);
+	if (dlua_run_script(script, error_r) < 0)
 		return -1;
-	}
-
-	event_add_str(script->event, "script", script->filename);
-	DLLIST_PREPEND(&dlua_scripts, script);
-
-	*script_r = script;
-
 	i_assert(lua_gettop(script->L) == 0);
 	return 0;
 }
@@ -310,7 +272,6 @@ int dlua_script_create_string(const char *str, struct dlua_script **script_r,
 			      struct event *event_parent, const char **error_r)
 {
 	struct dlua_script *script;
-	int err;
 	unsigned char scripthash[SHA1_RESULTLEN];
 	const char *fn;
 
@@ -319,16 +280,13 @@ int dlua_script_create_string(const char *str, struct dlua_script **script_r,
 	fn = binary_to_hex(scripthash, sizeof(scripthash));
 
 	script = dlua_create_script(fn, event_parent);
-	err = luaL_loadstring(script->L, str);
-	switch (err) {
-	case LUA_OK:
-		return dlua_script_create_finish(script, script_r, error_r);
-	default:
-		*error_r = t_strdup_printf("lua_load(<string>) failed: %s",
-					   lua_tostring(script->L, -1));
-		lua_pop(script->L, 1);
-		break;
+	if (luaL_loadstring(script->L, str) == LUA_OK) {
+		*script_r = script;
+		return 0;
 	}
+	*error_r = t_strdup_printf("lua_load(<string>) failed: %s",
+				   lua_tostring(script->L, -1));
+	lua_pop(script->L, 1);
 	dlua_script_unref(&script);
 	return -1;
 }
@@ -337,7 +295,6 @@ int dlua_script_create_file(const char *file, struct dlua_script **script_r,
 			    struct event *event_parent, const char **error_r)
 {
 	struct dlua_script *script;
-	int err;
 
 	/* lua reports file access errors poorly */
 	if (access(file, O_RDONLY) < 0) {
@@ -350,14 +307,15 @@ int dlua_script_create_file(const char *file, struct dlua_script **script_r,
 	}
 
 	script = dlua_create_script(file, event_parent);
-	if ((err = luaL_loadfile(script->L, file)) != LUA_OK) {
+	if (luaL_loadfile(script->L, file) != LUA_OK) {
 		*error_r = t_strdup_printf("lua_load(%s) failed: %s",
-					   file, dlua_errstr(err));
+					   file, lua_tostring(script->L, -1));
 		dlua_script_unref(&script);
 		return -1;
 	}
 
-	return dlua_script_create_finish(script, script_r, error_r);
+	*script_r = script;
+	return 0;
 }
 
 int dlua_script_create_stream(struct istream *is, struct dlua_script **script_r,
@@ -365,21 +323,21 @@ int dlua_script_create_stream(struct istream *is, struct dlua_script **script_r,
 {
 	struct dlua_script *script;
 	const char *filename = i_stream_get_name(is);
-	int err;
 
 	i_assert(filename != NULL && *filename != '\0');
 
 	script = dlua_create_script(filename, event_parent);
 	script->in = is;
 	script->filename = p_strdup(script->pool, filename);
-	if ((err = lua_load(script->L, dlua_reader, script, filename, 0)) != LUA_OK) {
+	if (lua_load(script->L, dlua_reader, script, filename, 0) != LUA_OK) {
 		*error_r = t_strdup_printf("lua_load(%s) failed: %s",
-					   filename, dlua_errstr(err));
+					   filename, lua_tostring(script->L, -1));
 		dlua_script_unref(&script);
 		return -1;
 	}
 
-	return dlua_script_create_finish(script, script_r, error_r);
+	*script_r = script;
+	return 0;
 }
 
 static void dlua_script_destroy(struct dlua_script *script)

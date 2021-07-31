@@ -137,15 +137,14 @@ static bool auth_worker_request_send(struct auth_worker_connection *conn,
 
 static void auth_worker_request_send_next(struct auth_worker_connection *conn)
 {
-	struct auth_worker_request *request, *const *requestp;
+	struct auth_worker_request *request;
 
 	do {
 		if (aqueue_count(worker_request_queue) == 0)
 			return;
 
-		requestp = array_idx(&worker_request_array,
-				     aqueue_idx(worker_request_queue, 0));
-		request = *requestp;
+		request = array_idx_elem(&worker_request_array,
+					 aqueue_idx(worker_request_queue, 0));
 		aqueue_delete_tail(worker_request_queue);
 	} while (!auth_worker_request_send(conn, request));
 }
@@ -268,14 +267,12 @@ static void auth_worker_destroy(struct auth_worker_connection **_conn,
 
 static struct auth_worker_connection *auth_worker_find_free(void)
 {
-	struct auth_worker_connection **conns;
+	struct auth_worker_connection *conn;
 
 	if (idle_count == 0)
 		return NULL;
 
-	array_foreach_modifiable(&connections, conns) {
-		struct auth_worker_connection *conn = *conns;
-
+	array_foreach_elem(&connections, conn) {
 		if (conn->request == NULL)
 			return conn;
 	}

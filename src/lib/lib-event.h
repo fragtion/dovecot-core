@@ -94,10 +94,12 @@ typedef const char *
 event_log_message_callback_t(void *context, enum log_type log_type,
 			     const char *message);
 
-/* Returns TRUE if the event has all the categories that the "other" event has (and maybe more). */
+/* Returns TRUE if the event has all the categories that the "other" event has
+   (and maybe more). */
 bool event_has_all_categories(struct event *event, const struct event *other);
-/* Returns TRUE if the event has all the fields that the "other" event has (and maybe more).
-   Only the fields in the events themselves are checked. Parent events' fields are not checked. */
+/* Returns TRUE if the event has all the fields that the "other" event has
+   (and maybe more). Only the fields in the events themselves are checked.
+   Parent events' fields are not checked. */
 bool event_has_all_fields(struct event *event, const struct event *other);
 
 /* Returns the source event duplicated into a new event. Event pointers are
@@ -200,19 +202,20 @@ struct event *
 event_drop_parent_log_prefixes(struct event *event, unsigned int count);
 
 /* Sets event prefix callback, sets log_prefix empty */
-struct event *event_set_log_prefix_callback(struct event *event,
-					    bool replace,
-					    event_log_prefix_callback_t *callback,
-					    void *context);
+struct event *
+event_set_log_prefix_callback(struct event *event, bool replace,
+			      event_log_prefix_callback_t *callback,
+			      void *context);
 #define event_set_log_prefix_callback(event, replace, callback, context) \
 	event_set_log_prefix_callback(event, replace, \
 		(event_log_prefix_callback_t*)callback, TRUE ? context : \
 		CALLBACK_TYPECHECK(callback, const char *(*)(typeof(context))))
 
 /* Sets event message amendment callback */
-struct event *event_set_log_message_callback(struct event *event,
-					     event_log_message_callback_t *callback,
-					     void *context);
+struct event *
+event_set_log_message_callback(struct event *event,
+			       event_log_message_callback_t *callback,
+			       void *context);
 #define event_set_log_message_callback(event, callback, context) \
 	event_set_log_message_callback(event, \
 		(event_log_message_callback_t*)callback, TRUE ? context : \
@@ -298,15 +301,18 @@ bool event_get_last_send_time(const struct event *event, struct timeval *tv_r);
    the event's last sent time. */
 void event_get_last_duration(const struct event *event,
 			     uintmax_t *duration_usecs_r);
+/* Returns field for a given key, or NULL if it doesn't exist. */
+struct event_field *
+event_find_field_nonrecursive(const struct event *event, const char *key);
 /* Returns field for a given key, or NULL if it doesn't exist. If the key
    isn't found from the event itself, find it from parent events. */
 const struct event_field *
-event_find_field(const struct event *event, const char *key);
+event_find_field_recursive(const struct event *event, const char *key);
 /* Returns the given key's value as string, or NULL if it doesn't exist.
    If the field isn't stored as a string, the result is allocated from
    data stack. */
 const char *
-event_find_field_str(const struct event *event, const char *key);
+event_find_field_recursive_str(const struct event *event, const char *key);
 /* Returns all key=value fields that the event has.
    Parent events' fields aren't returned. */
 const struct event_field *
@@ -336,7 +342,11 @@ void event_send_abort(struct event *event);
 /* Enable "user_cpu_usecs" event field to event by getting current resource
    usage which will be used in consequent event_send() to calculate
    cpu time. This function can be called multiple times to update the current
-   resource usage. */
+   resource usage.
+
+   The "user_cpu_usecs" field is automatically inherited by passthrough events,
+   but not full events.
+*/
 void event_enable_user_cpu_usecs(struct event *event);
 
 void lib_event_init(void);

@@ -16,6 +16,22 @@ static void append_str(string_t *dest, const char *str)
 	str_append_c(dest, '"');
 }
 
+static void append_str_max_len(string_t *dest, const char *str,
+			       const struct metric_export_info *info)
+{
+	str_append_c(dest, '"');
+	if (info->exporter->format_max_field_len == 0)
+		json_append_escaped(dest, str);
+	else {
+		size_t len = strlen(str);
+		json_append_escaped_data(dest, (const unsigned char *)str,
+			I_MIN(len, info->exporter->format_max_field_len));
+		if (len > info->exporter->format_max_field_len)
+			str_append(dest, "...");
+	}
+	str_append_c(dest, '"');
+}
+
 static void append_int(string_t *dest, intmax_t val)
 {
 	str_printfa(dest, "%jd", val);
@@ -43,7 +59,7 @@ static void append_field_value(string_t *dest, const struct event_field *field,
 {
 	switch (field->value_type) {
 	case EVENT_FIELD_VALUE_TYPE_STR:
-		append_str(dest, field->value.str);
+		append_str_max_len(dest, field->value.str, info);
 		break;
 	case EVENT_FIELD_VALUE_TYPE_INTMAX:
 		append_int(dest, field->value.intmax);
@@ -150,7 +166,7 @@ static void json_export_fields(string_t *dest, struct event *event,
 			const char *name = fields[i].field_key;
 			const struct event_field *field;
 
-			field = event_find_field(event, name);
+			field = event_find_field_recursive(event, name);
 			if (field == NULL)
 				continue; /* doesn't exist, skip it */
 

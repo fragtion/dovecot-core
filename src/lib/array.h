@@ -66,47 +66,64 @@
 #  define ARRAY_TYPES_CHECK(array1, array2) 0
 #endif
 
-/* usage: struct foo *foo; array_foreach(foo_arr, foo) { .. } */
-#if (defined(__STDC__) && __STDC_VERSION__ >= 199901L)
-#  define array_foreach(array, elem) \
+/* Usage:
+   ARRAY(struct foo) foo_arr;
+   struct foo *foo;
+
+   array_foreach(&foo_arr, foo) {
+     ..
+   }
+
+   Note that deleting an element while iterating will cause the iteration to
+   skip over the next element. So deleting a single element and breaking out
+   of the loop is fine, but continuing the loop is likely a bug. Use
+   array_foreach_reverse() instead when deleting multiple elements.
+*/
+#define array_foreach(array, elem) \
 	for (const void *elem ## __foreach_end = \
 		(const char *)(elem = *(array)->v) + (array)->arr.buffer->used; \
 	     elem != elem ## __foreach_end; (elem)++)
-#  define array_foreach_modifiable(array, elem) \
+#define array_foreach_modifiable(array, elem) \
 	for (const void *elem ## _end = \
 		(const char *)(elem = ARRAY_TYPE_CAST_MODIFIABLE(array) \
 			buffer_get_modifiable_data((array)->arr.buffer, NULL)) + \
 			(array)->arr.buffer->used; \
 	     elem != elem ## _end; (elem)++)
-/* Bikeshed: which is better
-   array_foreach_elem(array, myvar) { ... use myvar ... }  // not clear myvar is modified
-   array_foreach_elem(array, &myvar) { ... use myvar ... } // clearer, as more pass-by-referencey
-   Latter is impossible if we want to use the variable name as the base for the other variable names
-*/
-#  define array_foreach_elem(array, elem) \
-	for (unsigned int _foreach_offset = ARRAY_TYPE_CHECK(array, &elem) + \
-				COMPILE_ERROR_IF_TRUE(sizeof(elem) > 16)\
-		     ;							\
-	     (_foreach_offset < (array)->arr.buffer->used) &&		\
-	     (memcpy(&elem, CONST_PTR_OFFSET(*(array)->v, _foreach_offset), sizeof(elem)), TRUE) \
-		;							\
-	     _foreach_offset += sizeof(elem)				\
-		)
 
-#else
-#  define array_foreach(array, elem) \
-	for (elem = *(array)->v; \
-	     elem != CONST_PTR_OFFSET(*(array)->v, (array)->arr.buffer->used); \
-	     (elem)++)
-#  define array_foreach_modifiable(array, elem) \
+/* Iterate the array in reverse order. */
+#define array_foreach_reverse(array, elem) \
+	for (elem = CONST_PTR_OFFSET(*(array)->v, (array)->arr.buffer->used); \
+	     (const char *)(elem--) > (const char *)*(array)->v; )
+#define array_foreach_reverse_modifiable(array, elem) \
 	for (elem = ARRAY_TYPE_CAST_MODIFIABLE(array) \
-			buffer_get_modifiable_data((array)->arr.buffer, NULL); \
-	     elem != CONST_PTR_OFFSET(*(array)->v, (array)->arr.buffer->used); \
-	     (elem)++)
-#endif
+		((char *)buffer_get_modifiable_data((array)->arr.buffer, NULL) + \
+		 (array)->arr.buffer->used); \
+	     (const char *)(elem--) > (const char *)*(array)->v; )
+
+/* Usage:
+   ARRAY(struct foo *) foo_ptrs_arr;
+   struct foo *foo;
+
+   array_foreach_elem(&foo_ptrs_arr, foo) {
+     ..
+   } */
+#define array_foreach_elem(array, elem) \
+	for (const void *_foreach_end = \
+		CONST_PTR_OFFSET(*(array)->v, (array)->arr.buffer->used), \
+	     *_foreach_ptr = CONST_PTR_OFFSET(*(array)->v, ARRAY_TYPE_CHECK(array, &elem) + \
+		COMPILE_ERROR_IF_TRUE(sizeof(elem) > sizeof(void *))) \
+		     ;							\
+	     (_foreach_ptr != _foreach_end &&		\
+	     (memcpy(&elem, _foreach_ptr, sizeof(elem)), TRUE)) \
+		;							\
+	     _foreach_ptr = CONST_PTR_OFFSET(_foreach_ptr, sizeof(elem)))
+
 
 #define array_ptr_to_idx(array, elem) \
 	((elem) - (array)->v[0])
+/* Return index of iterated element inside array_foreach() or
+   array_foreach_modifiable() loop. Note that this doesn't work inside
+   array_foreach_elem() loop. */
 #define array_foreach_idx(array, elem) \
 	array_ptr_to_idx(array, elem)
 
@@ -256,6 +273,16 @@ array_idx_i(const struct array *array, unsigned int idx)
 
 #define array_idx(array, idx) \
 	ARRAY_TYPE_CAST_CONST(array)array_idx_i(&(array)->arr, idx)
+/* Using *array_idx() will fail if the compiler doesn't support typeof().
+   The same can be done with array_idx_elem() for arrays that have pointers. */
+#ifdef HAVE_TYPEOF
+#  define array_idx_elem(array, idx) \
+	(TRUE ? *array_idx(array, idx) : \
+		COMPILE_ERROR_IF_TRUE(sizeof(**(array)->v) != sizeof(void *)))
+#else
+#  define array_idx_elem(array, idx) \
+	(*(void **)array_idx_i(&(array)->arr, idx))
+#endif
 
 static inline void *
 array_get_modifiable_i(struct array *array, unsigned int *count_r)
@@ -316,25 +343,6 @@ array_copy(struct array *dest, unsigned int dest_idx,
 		    src->buffer, src_idx * src->element_size,
 		    count * dest->element_size);
 }
-
-/* Exchange ownership of two arrays, which should have been allocated
-   from the same pool/context. Useful for updating an array with a
-   replacement. Can also do it with uninitialized arrays (which will
-   have .element_size == 0). */
-static inline void
-array_swap_i(struct array *array1, struct array *array2)
-{
-	buffer_t *buffer = array1->buffer;
-	size_t elsize = array1->element_size;
-
-	array1->buffer = array2->buffer;
-	array1->element_size = array2->element_size;
-	array2->buffer = buffer;
-	array2->element_size = elsize;
-}
-#define array_swap(array1, array2) \
-	TYPE_CHECKS(void, ARRAY_TYPES_CHECK(array1, array2), \
-	array_swap_i(&(array1)->arr, &(array2)->arr))
 
 bool array_cmp_i(const struct array *array1,
 		 const struct array *array2) ATTR_PURE;

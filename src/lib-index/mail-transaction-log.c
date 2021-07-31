@@ -64,11 +64,16 @@ static void mail_transaction_log_2_unlink_old(struct mail_transaction_log *log)
 	}
 
 	if (log2_rotate_time != log->index->map->hdr.log2_rotate_time) {
-		/* Write this as part of the next sync's transaction. We're
+		/* Either the log2_rotate_time in header was missing, or we
+		   just deleted the .log.2 and need to set it as nonexistent.
+		   Either way we need to update the header.
+
+		   Write this as part of the next sync's transaction. We're
 		   here because we're already opening a sync lock, so it'll
 		   always happen. It's also required especially with mdbox map
 		   index, which doesn't like changes done outside syncing. */
-		log->index->pending_log2_rotate_time = log2_rotate_time;
+		log->index->hdr_log2_rotate_time_delayed_update =
+			log2_rotate_time;
 	}
 }
 
@@ -83,11 +88,6 @@ int mail_transaction_log_open(struct mail_transaction_log *log)
 	log->filepath = i_strconcat(log->index->filepath,
 				    MAIL_TRANSACTION_LOG_SUFFIX, NULL);
 	log->filepath2 = i_strconcat(log->filepath, ".2", NULL);
-
-	/* these settings aren't available at alloc() time, so we need to
-	   set them here: */
-	log->nfs_flush =
-		(log->index->flags & MAIL_INDEX_OPEN_FLAG_NFS_FLUSH) != 0;
 
 	if (log->open_file != NULL)
 		mail_transaction_log_file_free(&log->open_file);
@@ -320,7 +320,7 @@ int mail_transaction_log_rotate(struct mail_transaction_log *log, bool reset)
 			mail_index_set_error(log->index,
 				"Transaction log %s was recreated while we had it locked - "
 				"locking is broken (lock_method=%s)", path,
-				file_lock_method_to_str(log->index->lock_method));
+				file_lock_method_to_str(log->index->set.lock_method));
 			mail_transaction_log_file_free(&file);
 			return -1;
 		}
@@ -356,7 +356,8 @@ mail_transaction_log_refresh(struct mail_transaction_log *log, bool nfs_flush,
 		return 0;
 	}
 
-	if (nfs_flush && log->nfs_flush)
+	if (nfs_flush &&
+	    (log->index->flags & MAIL_INDEX_OPEN_FLAG_NFS_FLUSH) != 0)
 		nfs_flush_file_handle_cache(log->filepath);
 	if (nfs_safe_stat(log->filepath, &st) < 0) {
 		if (errno != ENOENT) {
@@ -417,7 +418,7 @@ void mail_transaction_log_set_mailbox_sync_pos(struct mail_transaction_log *log,
 					       uoff_t file_offset)
 {
 	i_assert(file_seq == log->head->hdr.file_seq);
-	i_assert(file_offset >= log->head->saved_tail_offset);
+	i_assert(file_offset >= log->head->last_read_hdr_tail_offset);
 
 	if (file_offset >= log->head->max_tail_offset)
 		log->head->max_tail_offset = file_offset;
@@ -446,7 +447,8 @@ int mail_transaction_log_find_file(struct mail_transaction_log *log,
 			return -1;
 		}
 		if (file_seq > log->head->hdr.file_seq) {
-			if (!nfs_flush || !log->nfs_flush) {
+			if (!nfs_flush ||
+			    (log->index->flags & MAIL_INDEX_OPEN_FLAG_NFS_FLUSH) == 0) {
 				*reason_r = t_strdup_printf(
 					"Requested newer log than exists: %s", reason);
 				return 0;
@@ -539,7 +541,7 @@ int mail_transaction_log_lock_head(struct mail_transaction_log *log,
 		if (ret == 0 && log->head == file) {
 			/* success */
 			i_assert(file != NULL);
-			lock_secs = file->lock_created - lock_wait_started;
+			lock_secs = file->lock_create_time - lock_wait_started;
 			break;
 		}
 
@@ -654,8 +656,8 @@ void mail_transaction_log_get_dotlock_set(struct mail_transaction_log *log,
 
 	i_zero(set_r);
 	set_r->timeout = I_MIN(MAIL_TRANSACTION_LOG_LOCK_TIMEOUT,
-			       index->max_lock_timeout_secs);
-	set_r->stale_timeout = MAIL_TRANSACTION_LOG_LOCK_CHANGE_TIMEOUT;
+			       index->set.max_lock_timeout_secs);
+	set_r->stale_timeout = MAIL_TRANSACTION_LOG_DOTLOCK_CHANGE_TIMEOUT;
 	set_r->nfs_flush = (index->flags & MAIL_INDEX_OPEN_FLAG_NFS_FLUSH) != 0;
 	set_r->use_excl_lock =
 		(index->flags & MAIL_INDEX_OPEN_FLAG_DOTLOCK_USE_EXCL) != 0;

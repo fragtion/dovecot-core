@@ -371,7 +371,7 @@ static void driver_cassandra_set_state(struct cassandra_db *db,
 
 static void driver_cassandra_close(struct cassandra_db *db, const char *error)
 {
-	struct cassandra_sql_prepared_statement *const *prep_stmtp;
+	struct cassandra_sql_prepared_statement *prep_stmt;
 	struct cassandra_result *const *resultp;
 
 	io_remove(&db->io_pipe);
@@ -381,10 +381,10 @@ static void driver_cassandra_close(struct cassandra_db *db, const char *error)
 	}
 	driver_cassandra_set_state(db, SQL_DB_STATE_DISCONNECTED);
 
-	array_foreach(&db->pending_prepares, prep_stmtp) {
-		(*prep_stmtp)->pending = FALSE;
-		(*prep_stmtp)->error = i_strdup(error);
-		prepare_finish_pending_statements(*prep_stmtp);
+	array_foreach_elem(&db->pending_prepares, prep_stmt) {
+		prep_stmt->pending = FALSE;
+		prep_stmt->error = i_strdup(error);
+		prepare_finish_pending_statements(prep_stmt);
 	}
 	array_clear(&db->pending_prepares);
 
@@ -997,7 +997,6 @@ static int driver_cassandra_init_full_v(const struct sql_settings *set,
 					const char **error_r)
 {
 	struct cassandra_db *db;
-	char *error = NULL;
 	int ret;
 
 	db = i_new(struct cassandra_db, 1);
@@ -1008,17 +1007,11 @@ static int driver_cassandra_init_full_v(const struct sql_settings *set,
 	event_set_append_log_prefix(db->api.event, "cassandra: ");
 
 	T_BEGIN {
-		const char *tmp;
-		if ((ret = driver_cassandra_parse_connect_string(db,
-								 set->connect_string,
-								 &tmp)) < 0) {
-			error = i_strdup(tmp);
-		}
-	} T_END;
+		ret = driver_cassandra_parse_connect_string(db,
+			set->connect_string, error_r);
+	} T_END_PASS_STR_IF(ret < 0, error_r);
 
 	if (ret < 0) {
-		*error_r = t_strdup(error);
-		i_free(error);
 		driver_cassandra_free(&db);
 		return -1;
 	}
@@ -1858,10 +1851,8 @@ driver_cassandra_result_get_field_value(struct sql_result *_result,
 					unsigned int idx)
 {
 	struct cassandra_result *result = (struct cassandra_result *)_result;
-	const char *const *strp;
 
-	strp = array_idx(&result->fields, idx);
-	return *strp;
+	return array_idx_elem(&result->fields, idx);
 }
 
 static const unsigned char *
@@ -1870,13 +1861,13 @@ driver_cassandra_result_get_field_value_binary(struct sql_result *_result ATTR_U
 					       size_t *size_r ATTR_UNUSED)
 {
 	struct cassandra_result *result = (struct cassandra_result *)_result;
-	const char *const *strp;
+	const char *str;
 	const size_t *sizep;
 
-	strp = array_idx(&result->fields, idx);
+	str = array_idx_elem(&result->fields, idx);
 	sizep = array_idx(&result->field_sizes, idx);
 	*size_r = *sizep;
-	return (const void *)*strp;
+	return (const void *)str;
 }
 
 static const char *
@@ -2203,10 +2194,10 @@ static void prepare_finish_statement(struct cassandra_sql_statement *stmt)
 static void
 prepare_finish_pending_statements(struct cassandra_sql_prepared_statement *prep_stmt)
 {
-	struct cassandra_sql_statement *const *stmtp;
+	struct cassandra_sql_statement *stmt;
 
-	array_foreach(&prep_stmt->pending_statements, stmtp)
-		prepare_finish_statement(*stmtp);
+	array_foreach_elem(&prep_stmt->pending_statements, stmt)
+		prepare_finish_statement(stmt);
 	array_clear(&prep_stmt->pending_statements);
 }
 
@@ -2255,13 +2246,13 @@ static void prepare_start(struct cassandra_sql_prepared_statement *prep_stmt)
 
 static void driver_cassandra_prepare_pending(struct cassandra_db *db)
 {
-	struct cassandra_sql_prepared_statement *const *prep_stmtp;
+	struct cassandra_sql_prepared_statement *prep_stmt;
 
 	i_assert(SQL_DB_IS_READY(&db->api));
 
-	array_foreach(&db->pending_prepares, prep_stmtp) {
-		(*prep_stmtp)->pending = FALSE;
-		prepare_start(*prep_stmtp);
+	array_foreach_elem(&db->pending_prepares, prep_stmt) {
+		prep_stmt->pending = FALSE;
+		prepare_start(prep_stmt);
 	}
 	array_clear(&db->pending_prepares);
 }

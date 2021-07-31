@@ -42,7 +42,8 @@ static bool test_dump_imapzlib(const char *path)
 }
 
 #ifdef HAVE_ZLIB
-static void cmd_dump_imapzlib(int argc ATTR_UNUSED, char *argv[])
+static void
+cmd_dump_imapzlib(const char *path, const char *const *args ATTR_UNUSED)
 {
 	struct istream *input, *input2;
 	const unsigned char *data;
@@ -50,9 +51,9 @@ static void cmd_dump_imapzlib(int argc ATTR_UNUSED, char *argv[])
 	const char *line;
 	int fd;
 
-	fd = open(argv[1], O_RDONLY);
+	fd = open(path, O_RDONLY);
 	if (fd < 0)
-		i_fatal("open(%s) failed: %m", argv[1]);
+		i_fatal("open(%s) failed: %m", path);
 	input = i_stream_create_fd_autoclose(&fd, 1024*32);
 	while ((line = i_stream_read_next_line(input)) != NULL) {
 		/* skip tag */
@@ -75,10 +76,8 @@ static void cmd_dump_imapzlib(int argc ATTR_UNUSED, char *argv[])
 			break;
 		i_stream_skip(input2, size);
 	}
-	if (input2->stream_errno != 0) {
-		i_error("read(%s) failed: %s",
-			argv[1], i_stream_get_error(input));
-	}
+	if (input2->stream_errno != 0)
+		i_error("read(%s) failed: %s", path, i_stream_get_error(input));
 	i_stream_unref(&input2);
 	fflush(stdout);
 }
@@ -220,26 +219,32 @@ static void server_input(struct client *client)
 	i_stream_skip(client->input, size);
 }
 
-static void cmd_zlibconnect(int argc ATTR_UNUSED, char *argv[])
+static void cmd_zlibconnect(struct doveadm_cmd_context *cctx)
 {
 	struct client client;
+	const char *host;
 	struct ip_addr *ips;
 	unsigned int ips_count;
+	int64_t port_int64;
 	in_port_t port = 143;
 	int fd, ret;
 
-	if (argv[1] == NULL ||
-	    (argv[2] != NULL && net_str2port(argv[2], &port) < 0))
-		help(&doveadm_cmd_zlibconnect);
+	if (!doveadm_cmd_param_str(cctx, "host", &host))
+		help_ver2(&doveadm_cmd_zlibconnect);
+	if (doveadm_cmd_param_int64(cctx, "port", &port_int64)) {
+		if (port_int64 == 0 || port_int64 > 65535)
+			i_fatal("Invalid port: %"PRId64, port_int64);
+		port = (in_port_t)port_int64;
+	}
 
-	ret = net_gethostbyname(argv[1], &ips, &ips_count);
+	ret = net_gethostbyname(host, &ips, &ips_count);
 	if (ret != 0) {
-		i_fatal("Host %s lookup failed: %s", argv[1],
+		i_fatal("Host %s lookup failed: %s", host,
 			net_gethosterror(ret));
 	}
 
 	if ((fd = net_connect_ip(&ips[0], port, NULL)) == -1)
-		i_fatal("connect(%s, %u) failed: %m", argv[1], port);
+		i_fatal("connect(%s, %u) failed: %m", host, port);
 
 	i_info("Connected to %s port %u.", net_ip2addr(&ips[0]), port);
 
@@ -262,12 +267,14 @@ static void cmd_zlibconnect(int argc ATTR_UNUSED, char *argv[])
 		i_fatal("close() failed: %m");
 }
 #else
-static void cmd_dump_imapzlib(int argc ATTR_UNUSED, char *argv[] ATTR_UNUSED)
+static void
+cmd_dump_imapzlib(const char *path ATTR_UNUSED,
+		  const char *const *args ATTR_UNUSED)
 {
 	i_fatal("Dovecot compiled without zlib support");
 }
 
-static void cmd_zlibconnect(int argc ATTR_UNUSED, char *argv[] ATTR_UNUSED)
+static void cmd_zlibconnect(struct doveadm_cmd_context *cctx ATTR_UNUSED)
 {
 	i_fatal("Dovecot compiled without zlib support");
 }
@@ -279,8 +286,12 @@ struct doveadm_cmd_dump doveadm_cmd_dump_zlib = {
 	cmd_dump_imapzlib
 };
 
-struct doveadm_cmd doveadm_cmd_zlibconnect = {
-	cmd_zlibconnect,
-	"zlibconnect",
-	"<host> [<port>]"
+struct doveadm_cmd_ver2 doveadm_cmd_zlibconnect = {
+	.name = "zlibconnect",
+	.cmd = cmd_zlibconnect,
+	.usage = "<host> [<port>]",
+DOVEADM_CMD_PARAMS_START
+DOVEADM_CMD_PARAM('\0', "host", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAM('\0', "port", CMD_PARAM_INT64, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAMS_END
 };

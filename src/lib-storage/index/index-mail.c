@@ -1259,9 +1259,23 @@ void index_mail_stream_log_failure_for(struct index_mail *mail,
 		if (_mail->expunged)
 			return;
 	}
-	mail_set_critical(_mail,
-		"read(%s) failed: %s (read reason=%s)",
-		i_stream_get_name(input), i_stream_get_error(input),
+
+	const char *old_error =
+		mailbox_get_last_internal_error(_mail->box, NULL);
+	const char *new_error = t_strdup_printf("read(%s) failed: %s",
+		i_stream_get_name(input), i_stream_get_error(input));
+
+	if (mail->data.istream_error_logged &&
+	    strstr(old_error, new_error) != NULL) {
+		/* Avoid logging the same istream error multiple times
+		   (even if the read reason is different). The old_error begins
+		   with the UID=n prefix, which we can ignore since we know
+		   that this mail already logged a critical error, so it has
+		   to be about this same mail. */
+		return;
+	}
+	mail->data.istream_error_logged = TRUE;
+	mail_set_critical(_mail, "%s (read reason=%s)", new_error,
 		mail->mail.get_stream_reason == NULL ? "" :
 		mail->mail.get_stream_reason);
 }
@@ -2136,6 +2150,11 @@ void index_mail_set_seq(struct mail *_mail, uint32_t seq, bool saving)
 		mail_set_expunged(&mail->mail.mail);
 		return;
 	}
+	/* Allow callers to easily find out if this mail was already expunged
+	   by another session. It's possible that it could still be
+	   successfully accessed. */
+	if (mail_index_is_expunged(_mail->transaction->view, seq))
+		mail_set_expunged(&mail->mail.mail);
 
 	if (!mail->mail.search_mail) {
 		index_mail_update_access_parts_pre(_mail);

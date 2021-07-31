@@ -7,6 +7,7 @@
 #include "strescape.h"
 #include "stats-dist.h"
 #include "time-util.h"
+#include "dict-private.h"
 #include "dict-client.h"
 #include "dict-settings.h"
 #include "dict-connection.h"
@@ -19,7 +20,7 @@
 
 struct dict_cmd_func {
 	enum dict_protocol_cmd cmd;
-	int (*func)(struct dict_connection_cmd *cmd, const char *line);
+	int (*func)(struct dict_connection_cmd *cmd, const char *const *args);
 };
 
 struct dict_connection_cmd {
@@ -219,12 +220,24 @@ cmd_lookup_callback(const struct dict_lookup_result *result,
 	dict_connection_cmd_try_flush(&cmd);
 }
 
-static int cmd_lookup(struct dict_connection_cmd *cmd, const char *line)
+static int cmd_lookup(struct dict_connection_cmd *cmd, const char *const *args)
 {
-	/* <key> */
+	const char *username;
+
+	if (str_array_length(args) < 1) {
+		e_error(cmd->event, "LOOKUP: broken input");
+		return -1;
+	}
+	username = args[1];
+
+	/* <key> [<username>] */
 	dict_connection_cmd_async(cmd);
-	event_add_str(cmd->event, "key", line);
-	dict_lookup_async(cmd->conn->dict, line, cmd_lookup_callback, cmd);
+	event_add_str(cmd->event, "key", args[0]);
+	event_add_str(cmd->event, "user", username);
+	const struct dict_op_settings set = {
+		.username = username,
+	};
+	dict_lookup_async(cmd->conn->dict, &set, args[0], cmd_lookup_callback, cmd);
 	return 1;
 }
 
@@ -340,13 +353,12 @@ static void cmd_iterate_callback(struct dict_connection_cmd *cmd)
 	dict_connection_unref_safe(conn);
 }
 
-static int cmd_iterate(struct dict_connection_cmd *cmd, const char *line)
+static int cmd_iterate(struct dict_connection_cmd *cmd, const char *const *args)
 {
-	const char *const *args;
+	const char *username;
 	unsigned int flags;
 	uint64_t max_rows;
 
-	args = t_strsplit_tabescaped(line);
 	if (str_array_length(args) < 3 ||
 	    str_to_uint(args[0], &flags) < 0 ||
 	    str_to_uint64(args[1], &max_rows) < 0) {
@@ -354,11 +366,17 @@ static int cmd_iterate(struct dict_connection_cmd *cmd, const char *line)
 		return -1;
 	}
 	dict_connection_cmd_async(cmd);
+	username = args[3];
 
-	/* <flags> <max_rows> <path> */
+	const struct dict_op_settings set = {
+		.username = username,
+	};
+
+	/* <flags> <max_rows> <path> [<username>] */
 	flags |= DICT_ITERATE_FLAG_ASYNC;
 	event_add_str(cmd->event, "key", args[2]);
-	cmd->iter = dict_iterate_init_multiple(cmd->conn->dict, args+2, flags);
+	event_add_str(cmd->event, "user", username);
+	cmd->iter = dict_iterate_init(cmd->conn->dict, &set, args[2], flags);
 	cmd->iter_flags = flags;
 	if (max_rows > 0)
 		dict_iterate_set_limit(cmd->iter, max_rows);
@@ -401,13 +419,21 @@ dict_connection_transaction_array_remove(struct dict_connection *conn,
 	i_unreached();
 }
 
-static int cmd_begin(struct dict_connection_cmd *cmd, const char *line)
+static int cmd_begin(struct dict_connection_cmd *cmd, const char *const *args)
 {
 	struct dict_connection_transaction *trans;
 	unsigned int id;
+	const char *username;
 
-	if (str_to_uint(line, &id) < 0) {
-		e_error(cmd->event, "Invalid transaction ID %s", line);
+	if (str_array_length(args) < 1) {
+		e_error(cmd->event, "BEGIN: broken input");
+		return -1;
+	}
+	username = args[1];
+
+	/* <id> [<username>] */
+	if (str_to_uint(args[0], &id) < 0) {
+		e_error(cmd->event, "Invalid transaction ID %s", args[0]);
 		return -1;
 	}
 	if (dict_connection_transaction_lookup(cmd->conn, id) != NULL) {
@@ -418,23 +444,25 @@ static int cmd_begin(struct dict_connection_cmd *cmd, const char *line)
 	if (!array_is_created(&cmd->conn->transactions))
 		i_array_init(&cmd->conn->transactions, 4);
 
-	/* <id> */
+	struct dict_op_settings set = {
+		.username = username,
+	};
 	trans = array_append_space(&cmd->conn->transactions);
 	trans->id = id;
 	trans->conn = cmd->conn;
-	trans->ctx = dict_transaction_begin(cmd->conn->dict);
+	trans->ctx = dict_transaction_begin(cmd->conn->dict, &set);
 	return 0;
 }
 
 static int
 dict_connection_transaction_lookup_parse(struct dict_connection *conn,
-					 const char *line,
+					 const char *id_str,
 					 struct dict_connection_transaction **trans_r)
 {
 	unsigned int id;
 
-	if (str_to_uint(line, &id) < 0) {
-		e_error(conn->conn.event, "Invalid transaction ID %s", line);
+	if (str_to_uint(id_str, &id) < 0) {
+		e_error(conn->conn.event, "Invalid transaction ID %s", id_str);
 		return -1;
 	}
 	*trans_r = dict_connection_transaction_lookup(conn, id);
@@ -507,13 +535,14 @@ static void cmd_commit_callback_async(const struct dict_commit_result *result,
 }
 
 static int
-cmd_commit(struct dict_connection_cmd *cmd, const char *line)
+cmd_commit(struct dict_connection_cmd *cmd, const char *const *args)
 {
 	struct dict_connection_transaction *trans;
 
-	if (dict_connection_transaction_lookup_parse(cmd->conn, line, &trans) < 0)
+	if (dict_connection_transaction_lookup_parse(cmd->conn, args[0], &trans) < 0)
 		return -1;
 	cmd->trans_id = trans->id;
+	event_add_str(cmd->event, "user", trans->ctx->set.username);
 
 	dict_connection_cmd_async(cmd);
 	dict_transaction_commit_async(&trans->ctx, cmd_commit_callback, cmd);
@@ -521,38 +550,39 @@ cmd_commit(struct dict_connection_cmd *cmd, const char *line)
 }
 
 static int
-cmd_commit_async(struct dict_connection_cmd *cmd, const char *line)
+cmd_commit_async(struct dict_connection_cmd *cmd, const char *const *args)
 {
 	struct dict_connection_transaction *trans;
 
-	if (dict_connection_transaction_lookup_parse(cmd->conn, line, &trans) < 0)
+	if (dict_connection_transaction_lookup_parse(cmd->conn, args[0], &trans) < 0)
 		return -1;
 	cmd->trans_id = trans->id;
+	event_add_str(cmd->event, "user", trans->ctx->set.username);
 
 	dict_connection_cmd_async(cmd);
 	dict_transaction_commit_async(&trans->ctx, cmd_commit_callback_async, cmd);
 	return 1;
 }
 
-static int cmd_rollback(struct dict_connection_cmd *cmd, const char *line)
+static int
+cmd_rollback(struct dict_connection_cmd *cmd, const char *const *args)
 {
 	struct dict_connection_transaction *trans;
 
-	if (dict_connection_transaction_lookup_parse(cmd->conn, line, &trans) < 0)
+	if (dict_connection_transaction_lookup_parse(cmd->conn, args[0], &trans) < 0)
 		return -1;
 
+	event_add_str(cmd->event, "user", trans->ctx->set.username);
 	dict_transaction_rollback(&trans->ctx);
 	dict_connection_transaction_array_remove(cmd->conn, trans->id);
 	return 0;
 }
 
-static int cmd_set(struct dict_connection_cmd *cmd, const char *line)
+static int cmd_set(struct dict_connection_cmd *cmd, const char *const *args)
 {
 	struct dict_connection_transaction *trans;
-	const char *const *args;
 
 	/* <id> <key> <value> */
-	args = t_strsplit_tabescaped(line);
 	if (str_array_length(args) != 3) {
 		e_error(cmd->event, "SET: broken input");
 		return -1;
@@ -560,17 +590,16 @@ static int cmd_set(struct dict_connection_cmd *cmd, const char *line)
 
 	if (dict_connection_transaction_lookup_parse(cmd->conn, args[0], &trans) < 0)
 		return -1;
+	event_add_str(cmd->event, "user", trans->ctx->set.username);
         dict_set(trans->ctx, args[1], args[2]);
 	return 0;
 }
 
-static int cmd_unset(struct dict_connection_cmd *cmd, const char *line)
+static int cmd_unset(struct dict_connection_cmd *cmd, const char *const *args)
 {
 	struct dict_connection_transaction *trans;
-	const char *const *args;
 
 	/* <id> <key> */
-	args = t_strsplit_tabescaped(line);
 	if (str_array_length(args) != 2) {
 		e_error(cmd->event, "UNSET: broken input");
 		return -1;
@@ -582,14 +611,13 @@ static int cmd_unset(struct dict_connection_cmd *cmd, const char *line)
 	return 0;
 }
 
-static int cmd_atomic_inc(struct dict_connection_cmd *cmd, const char *line)
+static int
+cmd_atomic_inc(struct dict_connection_cmd *cmd, const char *const *args)
 {
 	struct dict_connection_transaction *trans;
-	const char *const *args;
 	long long diff;
 
 	/* <id> <key> <diff> */
-	args = t_strsplit_tabescaped(line);
 	if (str_array_length(args) != 3 ||
 	    str_to_llong(args[2], &diff) < 0) {
 		e_error(cmd->event, "ATOMIC_INC: broken input");
@@ -603,15 +631,13 @@ static int cmd_atomic_inc(struct dict_connection_cmd *cmd, const char *line)
 	return 0;
 }
 
-static int cmd_timestamp(struct dict_connection_cmd *cmd, const char *line)
+static int cmd_timestamp(struct dict_connection_cmd *cmd, const char *const *args)
 {
 	struct dict_connection_transaction *trans;
-	const char *const *args;
 	long long tv_sec;
 	unsigned int tv_nsec;
 
 	/* <id> <secs> <nsecs> */
-	args = t_strsplit_tabescaped(line);
 	if (str_array_length(args) != 3 ||
 	    str_to_llong(args[1], &tv_sec) < 0 ||
 	    str_to_uint(args[2], &tv_nsec) < 0) {
@@ -661,6 +687,7 @@ int dict_command_input(struct dict_connection *conn, const char *line)
 	const struct dict_cmd_func *cmd_func;
 	struct dict_connection_cmd *cmd;
 	int ret;
+	const char *const *args;
 
 	cmd_func = dict_command_find((enum dict_protocol_cmd)*line);
 	if (cmd_func == NULL) {
@@ -675,7 +702,9 @@ int dict_command_input(struct dict_connection *conn, const char *line)
 	cmd->start_timeval = ioloop_timeval;
 	array_push_back(&conn->cmds, &cmd);
 	dict_connection_ref(conn);
-	if ((ret = cmd_func->func(cmd, line + 1)) <= 0) {
+
+	args = t_strsplit_tabescaped(line + 1);
+	if ((ret = cmd_func->func(cmd, args)) <= 0) {
 		dict_connection_cmd_remove(cmd);
 		return ret;
 	}
@@ -684,12 +713,10 @@ int dict_command_input(struct dict_connection *conn, const char *line)
 
 static bool dict_connection_cmds_try_output_more(struct dict_connection *conn)
 {
-	struct dict_connection_cmd *const *cmdp, *cmd;
+	struct dict_connection_cmd *cmd;
 
 	/* only iterators may be returning a lot of data */
-	array_foreach(&conn->cmds, cmdp) {
-		cmd = *cmdp;
-
+	array_foreach_elem(&conn->cmds, cmd) {
 		if (cmd->iter == NULL) {
 			/* not an iterator */
 		} else if (cmd_iterate_flush(cmd) == 0) {

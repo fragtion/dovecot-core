@@ -27,9 +27,9 @@ void mail_index_transaction_hook_unregister(hook_mail_index_transaction_created_
 
 	i_assert(array_is_created(&hook_mail_index_transaction_created));
 	for(idx = 0; idx < array_count(&hook_mail_index_transaction_created); idx++) {
-		hook_mail_index_transaction_created_t *const *hook_ptr =
-			array_idx(&hook_mail_index_transaction_created, idx);
-		if (*hook_ptr == hook) {
+		hook_mail_index_transaction_created_t *arr_hook =
+			array_idx_elem(&hook_mail_index_transaction_created, idx);
+		if (arr_hook == hook) {
 			array_delete(&hook_mail_index_transaction_created, idx, 1);
 			found = TRUE;
 			break;
@@ -80,7 +80,6 @@ void mail_index_transaction_unref(struct mail_index_transaction **_t)
 
 	DLLIST_REMOVE(&t->view->transactions_list, t);
 	array_free(&t->module_contexts);
-	mail_index_view_transaction_unref(t->view);
 	if (t->latest_view != NULL)
 		mail_index_view_close(&t->latest_view);
 	mail_index_view_close(&t->view);
@@ -333,7 +332,6 @@ mail_index_transaction_begin(struct mail_index_view *view,
 	struct mail_index_transaction *t;
 
 	/* don't allow syncing view while there's ongoing transactions */
-	mail_index_view_transaction_ref(view);
  	mail_index_view_ref(view);
 
 	t = i_new(struct mail_index_transaction, 1);
@@ -359,9 +357,9 @@ mail_index_transaction_begin(struct mail_index_view *view,
 	if (array_is_created(&hook_mail_index_transaction_created)) {
 	        struct hook_build_context *ctx =
 			hook_build_init((void *)&t->v, sizeof(t->v));
-		hook_mail_index_transaction_created_t *const *ptr;
-		array_foreach(&hook_mail_index_transaction_created, ptr) {
-			(*ptr)(t);
+		hook_mail_index_transaction_created_t *callback;
+		array_foreach_elem(&hook_mail_index_transaction_created, callback) {
+			callback(t);
 			hook_build_update(ctx, t->vlast);
 		}
 		t->vlast = NULL;

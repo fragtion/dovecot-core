@@ -97,8 +97,9 @@ static int mail_index_mmap(struct mail_index_map *map, uoff_t file_size)
 	}
 
 	mail_index_map_copy_hdr(map, hdr);
+	buffer_set_used_size(map->hdr_copy_buf, 0);
+	buffer_append(map->hdr_copy_buf, rec_map->mmap_base, hdr->header_size);
 
-	map->hdr_base = rec_map->mmap_base;
 	rec_map->records = PTR_OFFSET(rec_map->mmap_base, map->hdr.header_size);
 	return 1;
 }
@@ -242,7 +243,6 @@ mail_index_try_read_map(struct mail_index_map *map,
 	map->rec_map->records_count = records_count;
 
 	mail_index_map_copy_hdr(map, hdr);
-	map->hdr_base = map->hdr_copy_buf->data;
 	i_assert(map->hdr_copy_buf->used == map->hdr.header_size);
 	return 1;
 }
@@ -250,15 +250,10 @@ mail_index_try_read_map(struct mail_index_map *map,
 static int mail_index_read_map(struct mail_index_map *map, uoff_t file_size)
 {
 	struct mail_index *index = map->index;
-	mail_index_sync_lost_handler_t *const *handlerp;
 	struct stat st;
 	unsigned int i;
 	int ret;
 	bool try_retry, retry;
-
-	/* notify all "sync lost" handlers */
-	array_foreach(&index->sync_lost_handlers, handlerp)
-		(**handlerp)(index);
 
 	for (i = 0;; i++) {
 		try_retry = i < MAIL_INDEX_ESTALE_RETRY_COUNT;
@@ -395,8 +390,8 @@ mail_index_map_latest_file(struct mail_index *index, const char **reason_r)
 	}
 	i_assert(new_map->rec_map->records != NULL);
 
-	index->last_read_log_file_seq = new_map->hdr.log_file_seq;
-	index->last_read_log_file_tail_offset =
+	index->main_index_hdr_log_file_seq = new_map->hdr.log_file_seq;
+	index->main_index_hdr_log_file_tail_offset =
 		new_map->hdr.log_file_tail_offset;
 
 	mail_index_unmap(&index->map);
@@ -450,8 +445,10 @@ mail_index_map_latest_sync(struct mail_index *index,
 				     "(reopen_reason: %s)",
 				     index->filepath, reason, map_reason,
 				     reopen_reason);
-		if (mail_index_fsck(index) < 0)
-			return -1;
+		if (!index->readonly) {
+			if (mail_index_fsck(index) < 0)
+				return -1;
+		}
 	}
 
 	ret = mail_index_map_latest_file(index, &reason);

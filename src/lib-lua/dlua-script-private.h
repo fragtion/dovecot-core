@@ -11,6 +11,7 @@
 #define lua_isnumber(L, n) (lua_isnumber((L), (n)) == 1)
 #define lua_toboolean(L, n) (lua_toboolean((L), (n)) == 1)
 #define lua_pushboolean(L, b) lua_pushboolean((L), (b) ? 1 : 0)
+#define lua_isinteger(L, n) (lua_isinteger((L), (n)) == 1)
 
 #define DLUA_TABLE_STRING(n, val) { .name = (n),\
 				    .type = DLUA_TABLE_VALUE_STRING, .v.s = (val) }
@@ -100,6 +101,14 @@ void dlua_push_event(lua_State *L, struct event *event);
 
 /* get event from given stack position */
 struct event *dlua_check_event(lua_State *L, int arg);
+
+/* improved lua_pushfstring, can handle full C format support */
+const char *dlua_pushvfstring(lua_State *L, const char *fmt, va_list argp) ATTR_FORMAT(2, 0);
+const char *dlua_pushfstring(lua_State *L, const char *fmt, ...) ATTR_FORMAT(2, 3);
+
+/* improved luaL_error, can handle full C format support */
+int dluaL_error(lua_State *L, const char *fmt, ...) ATTR_FORMAT(2, 3);
+#define luaL_error(...) dluaL_error(__VA_ARGS__)
 
 /*
  * Returns field from a Lua table

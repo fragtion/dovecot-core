@@ -76,20 +76,28 @@ mail_index_sync_move_to_private_memory(struct mail_index_sync_map_ctx *ctx)
 	struct mail_index_map *map = ctx->view->map;
 
 	if (map->refcount > 1) {
+		/* Multiple views point to this map. Make a copy of the map
+		   (but not rec_map). */
 		map = mail_index_map_clone(map);
 		mail_index_sync_replace_map(ctx, map);
+		i_assert(ctx->view->map == map);
 	}
 
-	if (!MAIL_INDEX_MAP_IS_IN_MEMORY(ctx->view->map))
+	if (!MAIL_INDEX_MAP_IS_IN_MEMORY(ctx->view->map)) {
+		/* map points to mmap()ed area, copy it into memory. */
 		mail_index_map_move_to_memory(ctx->view->map);
-	mail_index_modseq_sync_map_replaced(ctx->modseq_ctx);
+		mail_index_modseq_sync_map_replaced(ctx->modseq_ctx);
+	}
 	return map;
 }
 
 struct mail_index_map *
 mail_index_sync_get_atomic_map(struct mail_index_sync_map_ctx *ctx)
 {
+	/* First make sure we have a private map with rec_map pointing to
+	   memory. */
 	(void)mail_index_sync_move_to_private_memory(ctx);
+	/* Next make sure the rec_map is also private to us. */
 	mail_index_record_map_move_to_private(ctx->view->map);
 	mail_index_modseq_sync_map_replaced(ctx->modseq_ctx);
 	return ctx->view->map;
@@ -209,13 +217,8 @@ sync_expunge_call_handlers(struct mail_index_sync_map_ctx *ctx,
 	array_foreach(&ctx->expunge_handlers, eh) {
 		for (seq = seq1; seq <= seq2; seq++) {
 			rec = MAIL_INDEX_REC_AT_SEQ(ctx->view->map, seq);
-			/* FIXME: does expunge handler's return value matter?
-			   we probably shouldn't disallow expunges if the
-			   handler returns failure.. should it be just changed
-			   to return void? */
-			(void)eh->handler(ctx, seq,
-					  PTR_OFFSET(rec, eh->record_offset),
-					  eh->sync_context, eh->context);
+			eh->handler(ctx, PTR_OFFSET(rec, eh->record_offset),
+				    eh->sync_context);
 		}
 	}
 }
@@ -247,6 +250,7 @@ sync_expunge_range(struct mail_index_sync_map_ctx *ctx, const ARRAY_TYPE(seq_ran
 	if (count == 0)
 		return;
 
+	/* Get a private in-memory rec_map, which we can modify. */
 	map = mail_index_sync_get_atomic_map(ctx);
 
 	/* call the expunge handlers first */
@@ -387,9 +391,9 @@ static int sync_append(const struct mail_index_record *rec,
 		return -1;
 	}
 
-	/* move to memory. the mapping is written when unlocking so we don't
-	   waste time re-mmap()ing multiple times or waste space growing index
-	   file too large */
+	/* We'll need to append a new record. If map currently points to
+	   mmap()ed index, it first needs to be moved to memory since we can't
+	   write past the mmap()ed memory area. */
 	map = mail_index_sync_move_to_private_memory(ctx);
 
 	if (rec->uid <= map->rec_map->last_appended_uid) {
@@ -493,7 +497,6 @@ static int sync_header_update(const struct mail_transaction_header_update *u,
 	}
 
 	buffer_write(map->hdr_copy_buf, u->offset, u + 1, u->size);
-	map->hdr_base = map->hdr_copy_buf->data;
 	i_assert(map->hdr_copy_buf->used == map->hdr.header_size);
 
 	/* @UNSAFE */
@@ -987,17 +990,6 @@ int mail_index_sync_map(struct mail_index_map **_map,
 	had_dirty = (map->hdr.flags & MAIL_INDEX_HDR_FLAG_HAVE_DIRTY) != 0;
 	if (had_dirty)
 		map->hdr.flags &= ENUM_NEGATE(MAIL_INDEX_HDR_FLAG_HAVE_DIRTY);
-
-	if (map->hdr_base != map->hdr_copy_buf->data) {
-		/* if syncing updates the header, it updates hdr_copy_buf
-		   and updates hdr_base to hdr_copy_buf. so the buffer must
-		   initially contain a valid header or we'll break it when
-		   writing it. */
-		buffer_set_used_size(map->hdr_copy_buf, 0);
-		buffer_append(map->hdr_copy_buf, map->hdr_base,
-			      map->hdr.header_size);
-		map->hdr_base = map->hdr_copy_buf->data;
-	}
 
 	mail_transaction_log_view_get_prev_pos(view->log_view,
 					       &prev_seq, &prev_offset);

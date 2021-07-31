@@ -10,6 +10,7 @@
 
 %{
 #include "lib.h"
+#include "wildcard-match.h"
 #include "lib-event-private.h"
 #include "event-filter-private.h"
 
@@ -34,16 +35,16 @@ static struct event_filter_node *key_value(struct event_filter_parser_state *sta
 	enum event_filter_node_type type;
 
 	if (strcmp(a, "event") == 0)
-		type = EVENT_FILTER_NODE_TYPE_EVENT_NAME;
+		type = EVENT_FILTER_NODE_TYPE_EVENT_NAME_WILDCARD;
 	else if (strcmp(a, "category") == 0)
 		type = EVENT_FILTER_NODE_TYPE_EVENT_CATEGORY;
 	else if (strcmp(a, "source_location") == 0)
 		type = EVENT_FILTER_NODE_TYPE_EVENT_SOURCE_LOCATION;
 	else
-		type = EVENT_FILTER_NODE_TYPE_EVENT_FIELD;
+		type = EVENT_FILTER_NODE_TYPE_EVENT_FIELD_WILDCARD;
 
 	/* only fields support comparators other than EQ */
-	if ((type != EVENT_FILTER_NODE_TYPE_EVENT_FIELD) &&
+	if ((type != EVENT_FILTER_NODE_TYPE_EVENT_FIELD_WILDCARD) &&
 	    (op != EVENT_FILTER_OP_CMP_EQ)) {
 		state->error = "Only fields support inequality comparisons";
 		return NULL;
@@ -56,8 +57,10 @@ static struct event_filter_node *key_value(struct event_filter_parser_state *sta
 	switch (type) {
 	case EVENT_FILTER_NODE_TYPE_LOGIC:
 		i_unreached();
-	case EVENT_FILTER_NODE_TYPE_EVENT_NAME:
+	case EVENT_FILTER_NODE_TYPE_EVENT_NAME_WILDCARD:
 		node->str = p_strdup(state->pool, b);
+		if (wildcard_is_literal(node->str))
+			node->type = EVENT_FILTER_NODE_TYPE_EVENT_NAME_EXACT;
 		state->has_event_name = TRUE;
 		break;
 	case EVENT_FILTER_NODE_TYPE_EVENT_SOURCE_LOCATION: {
@@ -88,7 +91,7 @@ static struct event_filter_node *key_value(struct event_filter_parser_state *sta
 			node->category.ptr = event_category_find_registered(b);
 		}
 		break;
-	case EVENT_FILTER_NODE_TYPE_EVENT_FIELD:
+	case EVENT_FILTER_NODE_TYPE_EVENT_FIELD_WILDCARD:
 		node->field.key = p_strdup(state->pool, a);
 		node->field.value.str = p_strdup(state->pool, b);
 
@@ -99,7 +102,13 @@ static struct event_filter_node *key_value(struct event_filter_parser_state *sta
 			   Either we have a string, or a number with wildcards */
 			node->field.value.intmax = INT_MIN;
 		}
+
+		if (wildcard_is_literal(node->field.value.str))
+			node->type = EVENT_FILTER_NODE_TYPE_EVENT_FIELD_EXACT;
 		break;
+	case EVENT_FILTER_NODE_TYPE_EVENT_NAME_EXACT:
+	case EVENT_FILTER_NODE_TYPE_EVENT_FIELD_EXACT:
+		i_unreached();
 	}
 
 	return node;

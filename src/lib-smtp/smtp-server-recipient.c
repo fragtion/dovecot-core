@@ -30,14 +30,21 @@ smtp_server_recipient_create_event(struct smtp_server_recipient_private *prcpt)
 		return;
 
 	if (conn->state.trans == NULL) {
-		/* Use connection event directly if there is no transaction */
-		rcpt->event = event_create(conn->event);
+		/* Create event for the transaction early. */
+		if (conn->next_trans_event == NULL) {
+			conn->next_trans_event = event_create(conn->event);
+			event_set_append_log_prefix(conn->next_trans_event,
+						    "trans: ");
+		}
+		rcpt->event = event_create(conn->next_trans_event);
 	} else {
-		/* Use transaction event, but drop its log prefix so that the
-		   connection event prefix remains. */
+		/* Use existing transaction event. */
 		rcpt->event = event_create(conn->state.trans->event);
-		event_drop_parent_log_prefixes(rcpt->event, 1);
 	}
+	/* Drop transaction log prefix so that the connection event prefix
+	   remains. */
+	event_drop_parent_log_prefixes(rcpt->event, 1);
+
 	smtp_server_recipient_update_event(prcpt);
 }
 
@@ -57,6 +64,8 @@ smtp_server_recipient_create(struct smtp_server_cmd_ctx *cmd,
 	prcpt->rcpt.cmd = cmd;
 	prcpt->rcpt.path = smtp_address_clone(pool, rcpt_to);
 	smtp_params_rcpt_copy(pool, &prcpt->rcpt.params, params);
+
+	smtp_server_recipient_create_event(prcpt);
 
 	return &prcpt->rcpt;
 }
@@ -117,14 +126,6 @@ void smtp_server_recipient_destroy(struct smtp_server_recipient **_rcpt)
 	smtp_server_recipient_unref(_rcpt);
 }
 
-void smtp_server_recipient_initialize(struct smtp_server_recipient *rcpt)
-{
-	struct smtp_server_recipient_private *prcpt =
-		(struct smtp_server_recipient_private *)rcpt;
-
-	smtp_server_recipient_create_event(prcpt);
-}
-
 const struct smtp_address *
 smtp_server_recipient_get_original(struct smtp_server_recipient *rcpt)
 {
@@ -166,10 +167,9 @@ void smtp_server_recipient_denied(struct smtp_server_recipient *rcpt,
 	e_debug(e->event(), "Denied");
 }
 
-void smtp_server_recipient_last_data(struct smtp_server_recipient *rcpt,
-				     struct smtp_server_cmd_ctx *cmd)
+void smtp_server_recipient_data_command(struct smtp_server_recipient *rcpt,
+					struct smtp_server_cmd_ctx *cmd)
 {
-	i_assert(rcpt->cmd == NULL);
 	rcpt->cmd = cmd;
 }
 

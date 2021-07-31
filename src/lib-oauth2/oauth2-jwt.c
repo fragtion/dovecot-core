@@ -52,6 +52,34 @@ static int get_time_field(const struct json_tree *tree, const char *key,
 	return -1;
 }
 
+/* Escapes '/' and '%' in identifier to %hex */
+static const char *escape_identifier(const char *identifier)
+{
+	size_t pos = strcspn(identifier, "/%");
+	/* nothing to escape */
+	if (identifier[pos] == '\0')
+		return identifier;
+
+	size_t len = strlen(identifier);
+	string_t *new_id = t_str_new(len);
+	str_append_data(new_id, identifier, pos);
+
+	for (size_t i = pos; i < len; i++) {
+	        switch (identifier[i]) {
+	        case '/':
+	                str_append(new_id, "%2f");
+	                break;
+	        case '%':
+	                str_append(new_id, "%25");
+	                break;
+	        default:
+	                str_append_c(new_id, identifier[i]);
+	                break;
+	        }
+	}
+	return str_c(new_id);
+}
+
 static int
 oauth2_lookup_hmac_key(const struct oauth2_settings *set, const char *azp,
 		       const char *alg, const char *key_id,
@@ -70,7 +98,10 @@ oauth2_lookup_hmac_key(const struct oauth2_settings *set, const char *azp,
 	/* do a synchronous dict lookup */
 	lookup_key = t_strconcat(DICT_PATH_SHARED, azp, "/", alg, "/", key_id,
 				 NULL);
-	if ((ret = dict_lookup(set->key_dict, pool_datastack_create(),
+	struct dict_op_settings dict_set = {
+		.username = NULL,
+	};
+	if ((ret = dict_lookup(set->key_dict, &dict_set, pool_datastack_create(),
 			       lookup_key, &base64_key, error_r)) < 0) {
 		return -1;
 	} else if (ret == 0) {
@@ -150,7 +181,10 @@ oauth2_lookup_pubkey(const struct oauth2_settings *set, const char *azp,
 	/* do a synchronous dict lookup */
 	lookup_key = t_strconcat(DICT_PATH_SHARED, azp, "/", alg, "/", key_id,
 				 NULL);
-	if ((ret = dict_lookup(set->key_dict, pool_datastack_create(),
+	struct dict_op_settings dict_set = {
+		.username = NULL,
+	};
+	if ((ret = dict_lookup(set->key_dict, &dict_set, pool_datastack_create(),
 			       lookup_key, &key_str, error_r)) < 0) {
 		return -1;
 	} else if (ret == 0) {
@@ -384,6 +418,8 @@ oauth2_jwt_body_process(const struct oauth2_settings *set, const char *alg,
 	const char *azp = get_field(tree, "azp");
 	if (azp == NULL)
 		azp = "default";
+	else
+		azp = escape_identifier(azp);
 
 	if (oauth2_validate_signature(set, azp, alg, kid, blobs, error_r) < 0)
 		return -1;
@@ -436,32 +472,8 @@ int oauth2_try_parse_jwt(const struct oauth2_settings *set,
 	else if (*kid == '\0') {
 		*error_r = "'kid' field is empty";
 		return -1;
-	}
-
-	size_t pos = strcspn(kid, "./%");
-	if (pos < strlen(kid)) {
-		/* sanitize kid, cannot allow dots or / in it, so we encode them
-		 */
-		string_t *new_kid = t_str_new(strlen(kid));
-		/* put initial data */
-		str_append_data(new_kid, kid, pos);
-		for (const char *c = kid+pos; *c != '\0'; c++) {
-			switch (*c) {
-			case '.':
-				str_append(new_kid, "%2e");
-				break;
-			case '/':
-				str_append(new_kid, "%2f");
-				break;
-			case '%':
-				str_append(new_kid, "%25");
-				break;
-			default:
-				str_append_c(new_kid, *c);
-				break;
-			}
-		}
-		kid = str_c(new_kid);
+	} else {
+		kid = escape_identifier(kid);
 	}
 
 	/* parse body */

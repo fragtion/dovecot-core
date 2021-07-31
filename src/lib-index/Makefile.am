@@ -40,6 +40,7 @@ libindex_la_SOURCES = \
         mail-transaction-log.c \
         mail-transaction-log-append.c \
         mail-transaction-log-file.c \
+        mail-transaction-log-modseq.c \
         mail-transaction-log-view.c \
         mailbox-log.c
 
@@ -62,6 +63,7 @@ headers = \
 
 test_programs = \
 	test-mail-cache \
+	test-mail-cache-fields \
 	test-mail-cache-purge \
 	test-mail-index \
 	test-mail-index-map \
@@ -87,6 +89,10 @@ test_mail_cache_SOURCES = test-mail-cache-common.c test-mail-cache.c
 test_mail_cache_LDADD = $(noinst_LTLIBRARIES) $(test_libs)
 test_mail_cache_DEPENDENCIES = $(test_deps)
 
+test_mail_cache_fields_SOURCES = test-mail-cache-common.c test-mail-cache-fields.c
+test_mail_cache_fields_LDADD = $(noinst_LTLIBRARIES) $(test_libs)
+test_mail_cache_fields_DEPENDENCIES = $(test_deps)
+
 test_mail_cache_purge_SOURCES = test-mail-cache-common.c test-mail-cache-purge.c
 test_mail_cache_purge_LDADD = $(noinst_LTLIBRARIES) $(test_libs)
 test_mail_cache_purge_DEPENDENCIES = $(test_deps)
@@ -104,7 +110,7 @@ test_mail_index_modseq_LDADD = $(noinst_LTLIBRARIES) $(test_libs)
 test_mail_index_modseq_DEPENDENCIES = $(test_deps)
 
 test_mail_index_sync_ext_SOURCES = test-mail-index-sync-ext.c
-test_mail_index_sync_ext_LDADD = mail-index-sync-ext.lo $(test_libs)
+test_mail_index_sync_ext_LDADD = $(noinst_LTLIBRARIES) $(test_libs)
 test_mail_index_sync_ext_DEPENDENCIES = $(test_deps)
 
 test_mail_index_transaction_finish_SOURCES = test-mail-index-transaction-finish.c

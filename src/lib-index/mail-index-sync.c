@@ -474,8 +474,6 @@ mail_index_sync_begin_to2(struct mail_index *index,
 		return -1;
 	}
 
-	ctx->view->index_sync_view = TRUE;
-
 	/* create the transaction after the view has been updated with
 	   external transactions and marked as sync view */
 	trans_flags = MAIL_INDEX_TRANSACTION_FLAG_EXTERNAL;
@@ -835,8 +833,8 @@ static bool mail_index_sync_want_index_write(struct mail_index *index, const cha
 {
 	uint32_t log_diff;
 
-	if (index->last_read_log_file_seq != 0 &&
-	    index->last_read_log_file_seq != index->map->hdr.log_file_seq) {
+	if (index->main_index_hdr_log_file_seq != 0 &&
+	    index->main_index_hdr_log_file_seq != index->map->hdr.log_file_seq) {
 		/* dovecot.index points to an old .log file. we were supposed
 		   to rewrite the dovecot.index when rotating the log, so
 		   we shouldn't usually get here. */
@@ -845,12 +843,12 @@ static bool mail_index_sync_want_index_write(struct mail_index *index, const cha
 	}
 
 	log_diff = index->map->hdr.log_file_tail_offset -
-		index->last_read_log_file_tail_offset;
+		index->main_index_hdr_log_file_tail_offset;
 	if (log_diff > index->optimization_set.index.rewrite_max_log_bytes) {
 		*reason_r = t_strdup_printf(
 			".log read %u..%u > rewrite_max_log_bytes %"PRIuUOFF_T,
 			index->map->hdr.log_file_tail_offset,
-			index->last_read_log_file_tail_offset,
+			index->main_index_hdr_log_file_tail_offset,
 			index->optimization_set.index.rewrite_max_log_bytes);
 		return TRUE;
 	}
@@ -859,7 +857,7 @@ static bool mail_index_sync_want_index_write(struct mail_index *index, const cha
 		*reason_r = t_strdup_printf(
 			".log read %u..%u > rewrite_min_log_bytes %"PRIuUOFF_T,
 			index->map->hdr.log_file_tail_offset,
-			index->last_read_log_file_tail_offset,
+			index->main_index_hdr_log_file_tail_offset,
 			index->optimization_set.index.rewrite_min_log_bytes);
 		return TRUE;
 	}
@@ -907,13 +905,17 @@ int mail_index_sync_commit(struct mail_index_sync_ctx **_ctx)
 				&next_uid, sizeof(next_uid), FALSE);
 		}
 	}
-	if (index->pending_log2_rotate_time != 0) {
-		uint32_t log2_rotate_time = index->pending_log2_rotate_time;
+	if (index->hdr_log2_rotate_time_delayed_update != 0) {
+		/* We checked whether .log.2 should be deleted in this same
+		   sync. It resulted in wanting to change the log2_rotate_time
+		   in the header. Do it here as part of the other changes. */
+		uint32_t log2_rotate_time =
+			index->hdr_log2_rotate_time_delayed_update;
 
 		mail_index_update_header(ctx->ext_trans,
 			offsetof(struct mail_index_header, log2_rotate_time),
 			&log2_rotate_time, sizeof(log2_rotate_time), TRUE);
-		index->pending_log2_rotate_time = 0;
+		index->hdr_log2_rotate_time_delayed_update = 0;
 	}
 
 	ret2 = mail_index_transaction_commit(&ctx->ext_trans);

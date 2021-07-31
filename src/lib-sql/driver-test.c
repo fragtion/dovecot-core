@@ -85,6 +85,7 @@ const char *driver_test_result_get_error(struct sql_result *result);
 
 const struct sql_db driver_test_mysql_db = {
 	.name = "mysql",
+	.flags = SQL_DB_FLAG_BLOCKING | SQL_DB_FLAG_ON_DUPLICATE_KEY,
 
 	.v = {
 		.init = driver_test_mysql_init,
@@ -131,6 +132,7 @@ const struct sql_db driver_test_cassandra_db = {
 
 const struct sql_db driver_test_sqlite_db = {
 	.name = "sqlite",
+	.flags = SQL_DB_FLAG_ON_CONFLICT_DO | SQL_DB_FLAG_BLOCKING,
 
 	.v = {
 		.init = driver_test_sqlite_init,

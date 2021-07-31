@@ -103,6 +103,52 @@ void event_filter_unref(struct event_filter **_filter)
 	}
 }
 
+/*
+ * Look for an existing query with the same context pointer and return it.
+ *
+ * If not found, allocate a new internal query and return it.
+ */
+static struct event_filter_query_internal *
+event_filter_get_or_alloc_internal_query(struct event_filter *filter,
+					 void *context)
+{
+	struct event_filter_query_internal *query;
+
+	array_foreach_modifiable(&filter->queries, query) {
+		if (query->context == context)
+			return query;
+	}
+
+	/* no matching context, allocate a new query */
+	query = array_append_space(&filter->queries);
+	query->context = context;
+	query->expr = NULL;
+
+	return query;
+}
+
+static void add_node(pool_t pool, struct event_filter_node **root,
+		     struct event_filter_node *new,
+		     enum event_filter_node_op op)
+{
+	struct event_filter_node *parent;
+
+	i_assert((op == EVENT_FILTER_OP_AND) || (op == EVENT_FILTER_OP_OR));
+
+	if (*root == NULL) {
+		*root = new;
+		return;
+	}
+
+	parent = p_new(pool, struct event_filter_node, 1);
+	parent->type = EVENT_FILTER_NODE_TYPE_LOGIC;
+	parent->op = op;
+	parent->children[0] = *root;
+	parent->children[1] = new;
+
+	*root = parent;
+}
+
 int event_filter_parse(const char *str, struct event_filter *filter,
 		       const char **error_r)
 {
@@ -127,9 +173,10 @@ int event_filter_parse(const char *str, struct event_filter *filter,
 		/* success - non-NULL expression */
 		i_assert(state.error == NULL);
 
-		int_query = array_append_space(&filter->queries);
-		int_query->context = NULL;
-		int_query->expr = state.output;
+		int_query = event_filter_get_or_alloc_internal_query(filter, NULL);
+
+		add_node(filter->pool, &int_query->expr, state.output,
+			 EVENT_FILTER_OP_OR);
 
 		filter->named_queries_only = filter->named_queries_only && state.has_event_name;
 	} else if (ret != 0) {
@@ -173,28 +220,9 @@ event_filter_category_from_log_type(enum event_filter_log_type log_type)
 	i_unreached();
 }
 
-static void add_node(pool_t pool, struct event_filter_node **root,
-		     struct event_filter_node *new)
-{
-	struct event_filter_node *parent;
-
-	if (*root == NULL) {
-		*root = new;
-		return;
-	}
-
-	parent = p_new(pool, struct event_filter_node, 1);
-	parent->type = EVENT_FILTER_NODE_TYPE_LOGIC;
-	parent->op = EVENT_FILTER_OP_AND;
-	parent->children[0] = *root;
-	parent->children[1] = new;
-
-	*root = parent;
-}
-
 static void
 event_filter_add_categories(pool_t pool,
-			    struct event_filter_query_internal *int_query,
+			    struct event_filter_node **root,
 			    const char *const *categories)
 {
 	unsigned int categories_count = str_array_length(categories);
@@ -214,13 +242,13 @@ event_filter_add_categories(pool_t pool,
 			node->category.ptr = event_category_find_registered(categories[i]);
 		}
 
-		add_node(pool, &int_query->expr, node);
+		add_node(pool, root, node, EVENT_FILTER_OP_AND);
 	}
 }
 
 static void
 event_filter_add_fields(pool_t pool,
-			struct event_filter_query_internal *int_query,
+			struct event_filter_node **root,
 			const struct event_filter_field *fields)
 {
 	unsigned int i;
@@ -232,7 +260,7 @@ event_filter_add_fields(pool_t pool,
 		struct event_filter_node *node;
 
 		node = p_new(pool, struct event_filter_node, 1);
-		node->type = EVENT_FILTER_NODE_TYPE_EVENT_FIELD;
+		node->type = EVENT_FILTER_NODE_TYPE_EVENT_FIELD_WILDCARD;
 		node->op = EVENT_FILTER_OP_CMP_EQ;
 		node->field.key = p_strdup(pool, fields[i].key);
 		node->field.value.str = p_strdup(pool, fields[i].value);
@@ -245,7 +273,7 @@ event_filter_add_fields(pool_t pool,
 			node->field.value.intmax = INT_MIN;
 		}
 
-		add_node(pool, &int_query->expr, node);
+		add_node(pool, root, node, EVENT_FILTER_OP_AND);
 	}
 }
 
@@ -253,22 +281,19 @@ void event_filter_add(struct event_filter *filter,
 		      const struct event_filter_query *query)
 {
 	struct event_filter_query_internal *int_query;
-
-	int_query = array_append_space(&filter->queries);
-	int_query->context = query->context;
-	int_query->expr = NULL;
+	struct event_filter_node *expr = NULL;
 
 	if (query->name != NULL) {
 		struct event_filter_node *node;
 
 		node = p_new(filter->pool, struct event_filter_node, 1);
-		node->type = EVENT_FILTER_NODE_TYPE_EVENT_NAME;
+		node->type = EVENT_FILTER_NODE_TYPE_EVENT_NAME_WILDCARD;
 		node->op = EVENT_FILTER_OP_CMP_EQ;
 		node->str = p_strdup(filter->pool, query->name);
+		if (wildcard_is_literal(query->name))
+			node->type = EVENT_FILTER_NODE_TYPE_EVENT_NAME_EXACT;
 
-		add_node(filter->pool, &int_query->expr, node);
-	} else {
-		filter->named_queries_only = FALSE;
+		add_node(filter->pool, &expr, node, EVENT_FILTER_OP_AND);
 	}
 
 	if ((query->source_filename != NULL) && (query->source_filename[0] != '\0')) {
@@ -280,11 +305,22 @@ void event_filter_add(struct event_filter *filter,
 		node->str = p_strdup(filter->pool, query->source_filename);
 		node->intmax = query->source_linenum;
 
-		add_node(filter->pool, &int_query->expr, node);
+		add_node(filter->pool, &expr, node, EVENT_FILTER_OP_AND);
 	}
 
-	event_filter_add_categories(filter->pool, int_query, query->categories);
-	event_filter_add_fields(filter->pool, int_query, query->fields);
+	event_filter_add_categories(filter->pool, &expr, query->categories);
+	event_filter_add_fields(filter->pool, &expr, query->fields);
+
+	if (expr == NULL)
+		return; /* completely empty query - ignore it */
+
+	int_query = event_filter_get_or_alloc_internal_query(filter, query->context);
+
+	if (query->name == NULL)
+		filter->named_queries_only = FALSE;
+
+	/* OR the new expression with existing query */
+	add_node(filter->pool, &int_query->expr, expr, EVENT_FILTER_OP_OR);
 }
 
 static struct event_filter_node *
@@ -322,11 +358,14 @@ event_filter_merge_with_context_internal(struct event_filter *dest,
 	const struct event_filter_query_internal *int_query;
 
 	array_foreach(&src->queries, int_query) T_BEGIN {
+		void *context = with_context ? new_context : int_query->context;
 		struct event_filter_query_internal *new;
 
-		new = array_append_space(&dest->queries);
-		new->expr = clone_expr(dest->pool, int_query->expr);
-		new->context = with_context ? new_context : int_query->context;
+		new = event_filter_get_or_alloc_internal_query(dest, context);
+
+		add_node(dest->pool, &new->expr,
+			 clone_expr(dest->pool, int_query->expr),
+			 EVENT_FILTER_OP_OR);
 	} T_END;
 }
 
@@ -398,7 +437,8 @@ event_filter_export_query_expr(const struct event_filter_query_internal *query,
 		}
 		str_append_c(dest, ')');
 		break;
-	case EVENT_FILTER_NODE_TYPE_EVENT_NAME:
+	case EVENT_FILTER_NODE_TYPE_EVENT_NAME_EXACT:
+	case EVENT_FILTER_NODE_TYPE_EVENT_NAME_WILDCARD:
 		str_append(dest, "event");
 		str_append(dest, event_filter_export_query_expr_op(node->op));
 		str_append_c(dest, '"');
@@ -424,7 +464,8 @@ event_filter_export_query_expr(const struct event_filter_query_internal *query,
 		} else
 			str_append(dest, event_filter_category_from_log_type(node->category.log_type));
 		break;
-	case EVENT_FILTER_NODE_TYPE_EVENT_FIELD:
+	case EVENT_FILTER_NODE_TYPE_EVENT_FIELD_EXACT:
+	case EVENT_FILTER_NODE_TYPE_EVENT_FIELD_WILDCARD:
 		str_append_c(dest, '"');
 		event_filter_append_escaped(dest, node->field.key);
 		str_append_c(dest, '"');
@@ -481,11 +522,25 @@ event_category_match(const struct event_category *category,
 }
 
 static bool
+event_has_category_nonrecursive(struct event *event,
+				struct event_category *wanted_category)
+{
+	struct event_category *cat;
+
+	if (array_is_created(&event->categories)) {
+		array_foreach_elem(&event->categories, cat) {
+			if (event_category_match(cat, wanted_category))
+				return TRUE;
+		}
+	}
+	return FALSE;
+}
+
+static bool
 event_has_category(struct event *event, struct event_filter_node *node,
 		   enum event_filter_log_type log_type)
 {
 	struct event_category *wanted_category = node->category.ptr;
-	struct event_category *const *catp;
 
 	/* category is a log type */
 	if (node->category.name == NULL)
@@ -496,12 +551,8 @@ event_has_category(struct event *event, struct event_filter_node *node,
 		return FALSE;
 
 	while (event != NULL) {
-		if (array_is_created(&event->categories)) {
-			array_foreach(&event->categories, catp) {
-				if (event_category_match(*catp, wanted_category))
-					return TRUE;
-			}
-		}
+		if (event_has_category_nonrecursive(event, wanted_category))
+			return TRUE;
 		/* try also the parent events */
 		event = event_get_parent(event);
 	}
@@ -510,18 +561,17 @@ event_has_category(struct event *event, struct event_filter_node *node,
 
 static bool
 event_match_field(struct event *event, const struct event_field *wanted_field,
-		  enum event_filter_node_op op)
+		  enum event_filter_node_op op, bool use_strcmp)
 {
 	const struct event_field *field;
 
 	/* wanted_field has the value in all available formats */
-	while ((field = event_find_field(event, wanted_field->key)) == NULL) {
-		event = event_get_parent(event);
-		if (event == NULL) {
-			/* field="" matches nonexistent field */
-			return wanted_field->value.str[0] == '\0';
-		}
+	field = event_find_field_recursive(event, wanted_field->key);
+	if (field == NULL) {
+		/* field="" matches nonexistent field */
+		return wanted_field->value.str[0] == '\0';
 	}
+
 	switch (field->value_type) {
 	case EVENT_FIELD_VALUE_TYPE_STR:
 		if (op != EVENT_FILTER_OP_CMP_EQ) {
@@ -532,7 +582,10 @@ event_match_field(struct event *event, const struct event_field *wanted_field,
 			/* field was removed, but it matches field="" filter */
 			return wanted_field->value.str[0] == '\0';
 		}
-		return wildcard_match_icase(field->value.str, wanted_field->value.str);
+		if (use_strcmp)
+			return strcasecmp(field->value.str, wanted_field->value.str) == 0;
+		else
+			return wildcard_match_icase(field->value.str, wanted_field->value.str);
 	case EVENT_FIELD_VALUE_TYPE_INTMAX:
 		if (wanted_field->value.intmax > INT_MIN) {
 			/* compare against an integer */
@@ -561,7 +614,10 @@ event_match_field(struct event *event, const struct event_field *wanted_field,
 			}
 			char tmp[MAX_INT_STRLEN];
 			i_snprintf(tmp, sizeof(tmp), "%jd", field->value.intmax);
-			return wildcard_match_icase(tmp, wanted_field->value.str);
+			if (use_strcmp)
+				return strcasecmp(field->value.str, wanted_field->value.str) == 0;
+			else
+				return wildcard_match_icase(tmp, wanted_field->value.str);
 		}
 	case EVENT_FIELD_VALUE_TYPE_TIMEVAL:
 		/* there's no point to support matching exact timestamps */
@@ -585,7 +641,10 @@ event_filter_query_match_cmp(struct event_filter_node *node,
 	switch (node->type) {
 		case EVENT_FILTER_NODE_TYPE_LOGIC:
 			i_unreached();
-		case EVENT_FILTER_NODE_TYPE_EVENT_NAME:
+		case EVENT_FILTER_NODE_TYPE_EVENT_NAME_EXACT:
+			return (event->sending_name != NULL) &&
+			       strcmp(event->sending_name, node->str) == 0;
+		case EVENT_FILTER_NODE_TYPE_EVENT_NAME_WILDCARD:
 			return (event->sending_name != NULL) &&
 			       wildcard_match(event->sending_name, node->str);
 		case EVENT_FILTER_NODE_TYPE_EVENT_SOURCE_LOCATION:
@@ -595,8 +654,12 @@ event_filter_query_match_cmp(struct event_filter_node *node,
 				 strcmp(event->source_filename, node->str) != 0);
 		case EVENT_FILTER_NODE_TYPE_EVENT_CATEGORY:
 			return event_has_category(event, node, log_type);
-		case EVENT_FILTER_NODE_TYPE_EVENT_FIELD:
-			return event_match_field(event, &node->field, node->op);
+		case EVENT_FILTER_NODE_TYPE_EVENT_FIELD_EXACT:
+			return event_match_field(event, &node->field, node->op,
+						 TRUE);
+		case EVENT_FILTER_NODE_TYPE_EVENT_FIELD_WILDCARD:
+			return event_match_field(event, &node->field, node->op,
+						 FALSE);
 	}
 
 	i_unreached();
@@ -760,9 +823,11 @@ event_filter_query_update_category(struct event_filter_query_internal *query,
 		event_filter_query_update_category(query, node->children[0], category, add);
 		event_filter_query_update_category(query, node->children[1], category, add);
 		break;
-	case EVENT_FILTER_NODE_TYPE_EVENT_NAME:
+	case EVENT_FILTER_NODE_TYPE_EVENT_NAME_EXACT:
+	case EVENT_FILTER_NODE_TYPE_EVENT_NAME_WILDCARD:
 	case EVENT_FILTER_NODE_TYPE_EVENT_SOURCE_LOCATION:
-	case EVENT_FILTER_NODE_TYPE_EVENT_FIELD:
+	case EVENT_FILTER_NODE_TYPE_EVENT_FIELD_EXACT:
+	case EVENT_FILTER_NODE_TYPE_EVENT_FIELD_WILDCARD:
 		break;
 	case EVENT_FILTER_NODE_TYPE_EVENT_CATEGORY:
 		if (node->category.name == NULL)

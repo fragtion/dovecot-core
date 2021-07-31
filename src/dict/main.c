@@ -106,8 +106,7 @@ static void main_init(void)
 
 	if (*dict_settings->dict_db_config != '\0') {
 		/* for berkeley db library */
-		env_put(t_strconcat("DB_CONFIG=", dict_settings->dict_db_config,
-				    NULL));
+		env_put("DB_CONFIG", dict_settings->dict_db_config);
 	}
 
 	i_zero(&mod_set);
@@ -131,7 +130,7 @@ static void main_deinit(void)
 {
 	/* FIXME: we're not able to do a clean deinit currently without
 	   larger changes. */
-	exit(0);
+	lib_exit(0);
 	timeout_remove(&to_proctitle);
 
 	dict_connections_destroy_all();

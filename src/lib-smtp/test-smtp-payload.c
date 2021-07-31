@@ -31,7 +31,7 @@
 #include <unistd.h>
 #include <dirent.h>
 
-#define CLIENT_PROGRESS_TIMEOUT     30
+#define CLIENT_PROGRESS_TIMEOUT     60
 #define SERVER_KILL_TIMEOUT_SECS    20
 #define MAX_PARALLEL_PENDING        200
 
@@ -576,6 +576,8 @@ static void
 test_client_transaction_finish(struct test_client_transaction *tctrans)
 {
 	tctrans->conn->trans = NULL;
+	if (io_loop_is_running(current_ioloop))
+		test_client_finished(tctrans->files_idx);
 	test_client_transaction_destroy(tctrans);
 }
 
@@ -661,8 +663,6 @@ test_client_transaction_data(const struct smtp_reply *reply,
 			"SMTP transaction for %s failed: %s",
 			path, smtp_reply_log(reply));
 	}
-
-	test_client_finished(tctrans->files_idx);
 }
 
 static void test_client_continue(void *dummy ATTR_UNUSED)
@@ -963,7 +963,8 @@ test_run_scenarios(
 	smtp_server_set.protocol = protocol;
 	smtp_server_set.capabilities = capabilities;
 	smtp_server_set.hostname = "localhost";
-	smtp_server_set.max_client_idle_time_msecs = 10*000;
+	smtp_server_set.max_client_idle_time_msecs =
+		CLIENT_PROGRESS_TIMEOUT*1000;
 	smtp_server_set.max_pipelined_commands = 1;
 	smtp_server_set.auth_optional = TRUE;
 	smtp_server_set.ssl = &ssl_server_set;
@@ -973,6 +974,8 @@ test_run_scenarios(
 	i_zero(&smtp_client_set);
 	smtp_client_set.my_hostname = "localhost";
 	smtp_client_set.temp_path_prefix = "/tmp";
+	smtp_client_set.command_timeout_msecs = CLIENT_PROGRESS_TIMEOUT*1000;
+	smtp_client_set.connect_timeout_msecs = CLIENT_PROGRESS_TIMEOUT*1000;
 	smtp_client_set.ssl = &ssl_client_set;
 	smtp_client_set.debug = debug;
 

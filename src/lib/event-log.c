@@ -5,6 +5,8 @@
 #include "event-filter.h"
 #include "lib-event-private.h"
 
+unsigned int event_filter_replace_counter = 1;
+
 static struct event_filter *global_debug_log_filter = NULL;
 static struct event_filter *global_debug_send_filter = NULL;
 static struct event_filter *global_core_log_filter = NULL;
@@ -22,7 +24,9 @@ void e_error(struct event *event,
 	va_list args;
 
 	va_start(args, fmt);
-	event_logv(event, &params, fmt, args);
+	T_BEGIN {
+		event_logv(event, &params, fmt, args);
+	} T_END;
 	va_end(args);
 }
 
@@ -39,7 +43,9 @@ void e_warning(struct event *event,
 	va_list args;
 
 	va_start(args, fmt);
-	event_logv(event, &params, fmt, args);
+	T_BEGIN {
+		event_logv(event, &params, fmt, args);
+	} T_END;
 	va_end(args);
 }
 
@@ -56,7 +62,9 @@ void e_info(struct event *event,
 	va_list args;
 
 	va_start(args, fmt);
-	event_logv(event, &params, fmt, args);
+	T_BEGIN {
+		event_logv(event, &params, fmt, args);
+	} T_END;
 	va_end(args);
 }
 
@@ -73,7 +81,9 @@ void e_debug(struct event *event,
 	va_list args;
 
 	va_start(args, fmt);
-	event_logv(event, &params, fmt, args);
+	T_BEGIN {
+		event_logv(event, &params, fmt, args);
+	} T_END;
 	va_end(args);
 }
 
@@ -90,7 +100,9 @@ void e_log(struct event *event, enum log_type level,
 	va_list args;
 
 	va_start(args, fmt);
-	event_logv(event, &params, fmt, args);
+	T_BEGIN {
+		event_logv(event, &params, fmt, args);
+	} T_END;
 	va_end(args);
 }
 
@@ -246,9 +258,10 @@ bool event_want_log_level(struct event *event, enum log_type level,
 	if (event->min_log_level <= level)
 		return TRUE;
 
-	if (event->debug_level_checked)
+	if (event->debug_level_checked_filter_counter == event_filter_replace_counter)
 		return event->sending_debug_log;
-	event->debug_level_checked = TRUE;
+	event->debug_level_checked_filter_counter =
+		event_filter_replace_counter;
 
 	if (event->forced_debug)
 		event->sending_debug_log = TRUE;
@@ -373,14 +386,14 @@ struct event *event_set_forced_debug(struct event *event, bool force)
 {
 	if (force)
 		event->forced_debug = TRUE;
-	event->debug_level_checked = FALSE;
+	event_recalculate_debug_level(event);
 	return event;
 }
 
 struct event *event_unset_forced_debug(struct event *event)
 {
 	event->forced_debug = FALSE;
-	event->debug_level_checked = FALSE;
+	event_recalculate_debug_level(event);
 	return event;
 }
 
@@ -389,6 +402,7 @@ void event_set_global_debug_log_filter(struct event_filter *filter)
 	event_unset_global_debug_log_filter();
 	global_debug_log_filter = filter;
 	event_filter_ref(global_debug_log_filter);
+	event_filter_replace_counter++;
 }
 
 struct event_filter *event_get_global_debug_log_filter(void)
@@ -399,6 +413,7 @@ struct event_filter *event_get_global_debug_log_filter(void)
 void event_unset_global_debug_log_filter(void)
 {
 	event_filter_unref(&global_debug_log_filter);
+	event_filter_replace_counter++;
 }
 
 void event_set_global_debug_send_filter(struct event_filter *filter)
@@ -406,6 +421,7 @@ void event_set_global_debug_send_filter(struct event_filter *filter)
 	event_unset_global_debug_send_filter();
 	global_debug_send_filter = filter;
 	event_filter_ref(global_debug_send_filter);
+	event_filter_replace_counter++;
 }
 
 struct event_filter *event_get_global_debug_send_filter(void)
@@ -416,6 +432,7 @@ struct event_filter *event_get_global_debug_send_filter(void)
 void event_unset_global_debug_send_filter(void)
 {
 	event_filter_unref(&global_debug_send_filter);
+	event_filter_replace_counter++;
 }
 
 void event_set_global_core_log_filter(struct event_filter *filter)
@@ -423,6 +440,7 @@ void event_set_global_core_log_filter(struct event_filter *filter)
 	event_unset_global_core_log_filter();
 	global_core_log_filter = filter;
 	event_filter_ref(global_core_log_filter);
+	event_filter_replace_counter++;
 }
 
 struct event_filter *event_get_global_core_log_filter(void)
@@ -433,4 +451,5 @@ struct event_filter *event_get_global_core_log_filter(void)
 void event_unset_global_core_log_filter(void)
 {
 	event_filter_unref(&global_core_log_filter);
+	event_filter_replace_counter++;
 }

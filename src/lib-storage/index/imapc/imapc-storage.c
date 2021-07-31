@@ -63,7 +63,7 @@ static int imapc_mailbox_run_status(struct mailbox *box,
 				    enum mailbox_status_items items,
 				    struct mailbox_status *status_r);
 
-bool imap_resp_text_code_parse(const char *str, enum mail_error *error_r)
+bool imapc_resp_text_code_parse(const char *str, enum mail_error *error_r)
 {
 	unsigned int i;
 
@@ -73,6 +73,19 @@ bool imap_resp_text_code_parse(const char *str, enum mail_error *error_r)
 	for (i = 0; i < N_ELEMENTS(imapc_resp_code_map); i++) {
 		if (strcmp(imapc_resp_code_map[i].code, str) == 0) {
 			*error_r = imapc_resp_code_map[i].error;
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
+bool imapc_mail_error_to_resp_text_code(enum mail_error error, const char **str_r)
+{
+	unsigned int i;
+
+	for (i = 0; i < N_ELEMENTS(imapc_resp_code_map); i++) {
+		if (imapc_resp_code_map[i].error == error) {
+			*str_r = imapc_resp_code_map[i].code;
 			return TRUE;
 		}
 	}
@@ -105,7 +118,7 @@ void imapc_copy_error_from_reply(struct imapc_storage *storage,
 {
 	enum mail_error error;
 
-	if (imap_resp_text_code_parse(reply->resp_text_key, &error)) {
+	if (imapc_resp_text_code_parse(reply->resp_text_key, &error)) {
 		mail_storage_set_error(&storage->storage, error,
 				       reply->text_without_resp);
 	} else {
@@ -472,6 +485,22 @@ void imapc_storage_client_register_untagged(struct imapc_storage_client *client,
 	cb = array_append_space(&client->untagged_callbacks);
 	cb->name = i_strdup(name);
 	cb->callback = callback;
+}
+
+void imapc_storage_client_unregister_untagged(struct imapc_storage_client *client,
+					      const char *name)
+{
+	struct imapc_storage_event_callback *cb;
+	unsigned int idx;
+	array_foreach_modifiable(&client->untagged_callbacks, cb) {
+		if (strcmp(cb->name, name) == 0) {
+			 idx = array_foreach_idx(&client->untagged_callbacks, cb);
+			 i_free(cb->name);
+			 array_delete(&client->untagged_callbacks, idx, 1);
+			 return;
+		}
+	}
+	i_unreached();
 }
 
 static void
@@ -890,16 +919,9 @@ static void imapc_untagged_status(const struct imapc_untagged_reply *reply,
 	if (storage->cur_status_box == NULL)
 		return;
 
-	const char *cur_status_remote_name =
-		imapc_mailbox_get_remote_name(storage->cur_status_box);
-	if (strcmp(cur_status_remote_name, remote_name) == 0) {
-		/* match */
-	} else if (strcasecmp(storage->cur_status_box->box.name, "INBOX") == 0 &&
-		   strcasecmp(remote_name, "INBOX") == 0) {
-		/* case-insensitive INBOX */
-	} else {
+	if (!imapc_mailbox_name_equals(storage->cur_status_box,
+				       remote_name))
 		return;
-	}
 
 	status = storage->cur_status;
 	for (i = 0; list[i].type != IMAP_ARG_EOL; i += 2) {

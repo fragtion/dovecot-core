@@ -119,11 +119,11 @@ static bool
 director_has_outgoing_connection(struct director *dir,
 				 struct director_host *host)
 {
-	struct director_connection *const *connp;
+	struct director_connection *conn;
 
-	array_foreach(&dir->connections, connp) {
-		if (director_connection_get_host(*connp) == host &&
-		    !director_connection_is_incoming(*connp))
+	array_foreach_elem(&dir->connections, conn) {
+		if (director_connection_get_host(conn) == host &&
+		    !director_connection_is_incoming(conn))
 			return TRUE;
 	}
 	return FALSE;
@@ -202,7 +202,7 @@ static void director_quick_reconnect_retry(struct director *dir)
 
 static bool director_wait_for_others(struct director *dir)
 {
-	struct director_host *const *hostp;
+	struct director_host *host;
 
 	/* don't assume we're alone until we've attempted to connect
 	   to others for a while */
@@ -213,9 +213,9 @@ static bool director_wait_for_others(struct director *dir)
 	if (dir->ring_first_alone == 0)
 		dir->ring_first_alone = ioloop_time;
 	/* reset all failures and try again */
-	array_foreach(&dir->dir_hosts, hostp) {
-		(*hostp)->last_network_failure = 0;
-		(*hostp)->last_protocol_failure = 0;
+	array_foreach_elem(&dir->dir_hosts, host) {
+		host->last_network_failure = 0;
+		host->last_protocol_failure = 0;
 	}
 	timeout_remove(&dir->to_reconnect);
 	dir->to_reconnect = timeout_add(DIRECTOR_QUICK_RECONNECT_TIMEOUT_MSECS,
@@ -395,10 +395,10 @@ void director_sync_send(struct director *dir, struct director_host *host,
 static bool
 director_has_any_outgoing_connections(struct director *dir)
 {
-	struct director_connection *const *connp;
+	struct director_connection *conn;
 
-	array_foreach(&dir->connections, connp) {
-		if (!director_connection_is_incoming(*connp))
+	array_foreach_elem(&dir->connections, conn) {
+		if (!director_connection_is_incoming(conn))
 			return TRUE;
 	}
 	return FALSE;
@@ -496,19 +496,19 @@ static void director_sync(struct director *dir)
 
 void director_sync_freeze(struct director *dir)
 {
-	struct director_connection *const *connp;
+	struct director_connection *conn;
 
 	i_assert(!dir->sync_frozen);
 	i_assert(!dir->sync_pending);
 
-	array_foreach(&dir->connections, connp)
-		director_connection_cork(*connp);
+	array_foreach_elem(&dir->connections, conn)
+		director_connection_cork(conn);
 	dir->sync_frozen = TRUE;
 }
 
 void director_sync_thaw(struct director *dir)
 {
-	struct director_connection *const *connp;
+	struct director_connection *conn;
 
 	i_assert(dir->sync_frozen);
 
@@ -517,8 +517,8 @@ void director_sync_thaw(struct director *dir)
 		dir->sync_pending = FALSE;
 		director_sync(dir);
 	}
-	array_foreach(&dir->connections, connp)
-		director_connection_uncork(*connp);
+	array_foreach_elem(&dir->connections, conn)
+		director_connection_uncork(conn);
 }
 
 void director_notify_ring_added(struct director_host *added_host,
@@ -656,10 +656,10 @@ director_send_host(struct director *dir, struct director_host *src,
 
 void director_resend_hosts(struct director *dir)
 {
-	struct mail_host *const *hostp;
+	struct mail_host *host;
 
-	array_foreach(mail_hosts_get(dir->mail_hosts), hostp)
-		director_send_host(dir, dir->self_host, NULL, *hostp);
+	array_foreach_elem(mail_hosts_get(dir->mail_hosts), host)
+		director_send_host(dir, dir->self_host, NULL, host);
 }
 
 void director_update_host(struct director *dir, struct director_host *src,
@@ -729,21 +729,21 @@ void director_flush_host(struct director *dir, struct director_host *src,
 void director_update_user(struct director *dir, struct director_host *src,
 			  struct user *user)
 {
-	struct director_connection *const *connp;
+	struct director_connection *conn;
 
 	i_assert(src != NULL);
 	i_assert(!user->weak);
 
-	array_foreach(&dir->connections, connp) {
-		if (director_connection_get_host(*connp) == src)
+	array_foreach_elem(&dir->connections, conn) {
+		if (director_connection_get_host(conn) == src)
 			continue;
 
-		if (director_connection_get_minor_version(*connp) >= DIRECTOR_VERSION_USER_TIMESTAMP) {
-			director_connection_send(*connp, t_strdup_printf(
+		if (director_connection_get_minor_version(conn) >= DIRECTOR_VERSION_USER_TIMESTAMP) {
+			director_connection_send(conn, t_strdup_printf(
 				"USER\t%u\t%s\t%u\n", user->username_hash, user->host->ip_str,
 				user->timestamp));
 		} else {
-			director_connection_send(*connp, t_strdup_printf(
+			director_connection_send(conn, t_strdup_printf(
 				"USER\t%u\t%s\n", user->username_hash, user->host->ip_str));
 		}
 	}
@@ -788,7 +788,8 @@ void director_update_user_weak(struct director *dir, struct director_host *src,
 }
 
 static void
-director_flush_user_continue(int result, struct director_kill_context *ctx)
+director_flush_user_continue(enum program_client_exit_status result,
+			     struct director_kill_context *ctx)
 {
 	struct director *dir = ctx->dir;
 	ctx->callback_pending = FALSE;
@@ -796,7 +797,7 @@ director_flush_user_continue(int result, struct director_kill_context *ctx)
 	struct user *user = user_directory_lookup(ctx->tag->users,
 						  ctx->username_hash);
 
-	if (result == 0) {
+	if (result == PROGRAM_CLIENT_EXIT_STATUS_FAILURE) {
 		struct istream *is = iostream_temp_finish(&ctx->reply, SIZE_MAX);
 		char *data;
 		i_stream_set_return_partial_line(is, TRUE);
@@ -828,7 +829,8 @@ director_flush_user_continue(int result, struct director_kill_context *ctx)
 		/* ctx is freed later via user->kill_ctx */
 		e_debug(dir->event, "Flushing user %u finished, result=%d",
 			ctx->username_hash, result);
-		director_user_kill_finish_delayed(dir, user, result == 1);
+		director_user_kill_finish_delayed(dir, user,
+			result == PROGRAM_CLIENT_EXIT_STATUS_SUCCESS);
 	}
 }
 
@@ -898,7 +900,8 @@ director_flush_user(struct director *dir, struct user *user)
 			user->username_hash,
 			user->host->ip_str,
 			error);
-		director_flush_user_continue(0, ctx);
+		director_flush_user_continue(PROGRAM_CLIENT_EXIT_STATUS_FAILURE,
+					     ctx);
 		return;
 	}
 
@@ -1341,10 +1344,10 @@ director_user_tag_killed(struct director *dir, struct mail_tag *tag,
 
 void director_user_killed(struct director *dir, unsigned int username_hash)
 {
-	struct mail_tag *const *tagp;
+	struct mail_tag *tag;
 
-	array_foreach(mail_hosts_get_tags(dir->mail_hosts), tagp)
-		director_user_tag_killed(dir, *tagp, username_hash);
+	array_foreach_elem(mail_hosts_get_tags(dir->mail_hosts), tag)
+		director_user_tag_killed(dir, tag, username_hash);
 }
 
 static void
@@ -1382,10 +1385,10 @@ void director_user_killed_everywhere(struct director *dir,
 				     struct director_host *orig_src,
 				     unsigned int username_hash)
 {
-	struct mail_tag *const *tagp;
+	struct mail_tag *tag;
 
-	array_foreach(mail_hosts_get_tags(dir->mail_hosts), tagp) {
-		director_user_tag_killed_everywhere(dir, *tagp, src, orig_src,
+	array_foreach_elem(mail_hosts_get_tags(dir->mail_hosts), tag) {
+		director_user_tag_killed_everywhere(dir, tag, src, orig_src,
 						    username_hash);
 	}
 }
@@ -1416,14 +1419,14 @@ void director_update_send_version(struct director *dir,
 				  struct director_host *src,
 				  unsigned int min_version, const char *cmd)
 {
-	struct director_connection *const *connp;
+	struct director_connection *conn;
 
 	i_assert(src != NULL);
 
-	array_foreach(&dir->connections, connp) {
-		if (director_connection_get_host(*connp) != src &&
-		    director_connection_get_minor_version(*connp) >= min_version)
-			director_connection_send(*connp, cmd);
+	array_foreach_elem(&dir->connections, conn) {
+		if (director_connection_get_host(conn) != src &&
+		    director_connection_get_minor_version(conn) >= min_version)
+			director_connection_send(conn, cmd);
 	}
 }
 
@@ -1532,8 +1535,8 @@ struct user *director_iterate_users_next(struct director_user_iter *iter)
 		tags = mail_hosts_get_tags(iter->dir->mail_hosts);
 		if (iter->tag_idx >= array_count(tags))
 			return NULL;
-		struct mail_tag *const *tagp = array_idx(tags, iter->tag_idx);
-		iter->user_iter = user_directory_iter_init((*tagp)->users,
+		struct mail_tag *tag = array_idx_elem(tags, iter->tag_idx);
+		iter->user_iter = user_directory_iter_init(tag->users,
 			iter->iter_until_current_tail);
 	}
 	user = user_directory_iter_next(iter->user_iter);

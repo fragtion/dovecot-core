@@ -18,8 +18,38 @@
 #include <ctype.h>
 
 static const char *submission_proxy_state_names[SUBMISSION_PROXY_STATE_COUNT] = {
-	"banner", "ehlo", "starttls", "tls-ehlo", "xclient", "authenticate"
+	"banner", "ehlo", "starttls", "tls-ehlo", "xclient", "xclient-ehlo", "authenticate"
 };
+
+static void
+submission_proxy_success_reply_sent(
+	struct smtp_server_cmd_ctx *cmd ATTR_UNUSED,
+	struct submission_client *subm_client)
+{
+	client_proxy_finish_destroy_client(&subm_client->common);
+}
+
+static int
+proxy_send_starttls(struct submission_client *client, struct ostream *output)
+{
+	enum login_proxy_ssl_flags ssl_flags;
+
+	ssl_flags = login_proxy_get_ssl_flags(client->common.login_proxy);
+	if ((ssl_flags & PROXY_SSL_FLAG_STARTTLS) == 0)
+		return 0;
+
+	if ((client->proxy_capability & SMTP_CAPABILITY_STARTTLS) == 0) {
+		login_proxy_failed(
+			client->common.login_proxy,
+			login_proxy_get_event(client->common.login_proxy),
+			LOGIN_PROXY_FAILURE_TYPE_REMOTE_CONFIG,
+			"STARTTLS not supported");
+		return -1;
+	}
+	o_stream_nsend_str(output, "STARTTLS\r\n");
+	client->proxy_state = SUBMISSION_PROXY_STARTTLS;
+	return 1;
+}
 
 static buffer_t *
 proxy_compose_xclient_forward(struct submission_client *client)
@@ -38,46 +68,136 @@ proxy_compose_xclient_forward(struct submission_client *client)
 			str_append_tabescaped(str, (*arg)+8);
 		}
 	}
+	if (str_len(str) == 0)
+		return NULL;
 
 	return t_base64_encode(0, 0, str_data(str), str_len(str));
 }
 
 static void
+proxy_send_xclient_more_data(struct submission_client *client,
+			     struct ostream *output, string_t *buf,
+			     const char *field, const unsigned char *value,
+			     size_t value_size)
+{
+	const size_t cmd_len = strlen("XCLIENT");
+	size_t prev_len = str_len(buf);
+
+	str_append_c(buf, ' ');
+	str_append(buf, field);
+	str_append_c(buf, '=');
+	smtp_xtext_encode(buf, value, value_size);
+
+	if (str_len(buf) > 512) {
+		if (prev_len <= cmd_len)
+			prev_len = str_len(buf);
+		o_stream_nsend(output, str_data(buf), prev_len);
+		o_stream_nsend(output, "\r\n", 2);
+		client->proxy_xclient_replies_expected++;
+		str_delete(buf, cmd_len, prev_len - cmd_len);
+	}
+}
+
+static void
+proxy_send_xclient_more(struct submission_client *client,
+			struct ostream *output, string_t *buf,
+			const char *field, const char *value)
+{
+	proxy_send_xclient_more_data(client, output, buf, field,
+				     (const unsigned char *)value,
+				     strlen(value));
+}
+
+static int
 proxy_send_xclient(struct submission_client *client, struct ostream *output)
 {
 	string_t *str;
 
 	if ((client->proxy_capability & SMTP_CAPABILITY_XCLIENT) == 0 ||
 	    client->common.proxy_not_trusted)
-		return;
+		return 0;
+
+	struct smtp_proxy_data proxy_data;
+
+	smtp_server_connection_get_proxy_data(client->conn, &proxy_data);
+	i_assert(client->common.proxy_ttl > 1);
 
 	/* remote supports XCLIENT, send it */
+	client->proxy_xclient_replies_expected = 0;
 	str = t_str_new(128);
 	str_append(str, "XCLIENT");
+	if (str_array_icase_find(client->proxy_xclient, "HELO")) {
+		if (proxy_data.helo != NULL) {
+			proxy_send_xclient_more(client, output, str, "HELO",
+						proxy_data.helo);
+		} else {
+			proxy_send_xclient_more(client, output, str, "HELO",
+						"[UNAVAILABLE]");
+		}
+	}
+	if (str_array_icase_find(client->proxy_xclient, "PROTO")) {
+		const char *proto = "[UNAVAILABLE]";
+
+		switch (proxy_data.proto) {
+		case SMTP_PROXY_PROTOCOL_UNKNOWN:
+			break;
+		case SMTP_PROXY_PROTOCOL_SMTP:
+			proto = "SMTP";
+			break;
+		case SMTP_PROXY_PROTOCOL_ESMTP:
+			proto = "ESMTP";
+			break;
+		case SMTP_PROXY_PROTOCOL_LMTP:
+			proto = "LMTP";
+			break;
+		}
+		proxy_send_xclient_more(client, output, str, "PROTO", proto);
+	}
+	if (client->common.proxy_noauth &&
+	    str_array_icase_find(client->proxy_xclient, "LOGIN")) {
+		if (proxy_data.login != NULL) {
+			proxy_send_xclient_more(client, output, str, "LOGIN",
+						proxy_data.login);
+		} else if (client->common.virtual_user != NULL) {
+			proxy_send_xclient_more(client, output, str, "LOGIN",
+						client->common.virtual_user);
+		} else {
+			proxy_send_xclient_more(client, output, str, "LOGIN",
+						"[UNAVAILABLE]");
+		}
+	}
+	if (str_array_icase_find(client->proxy_xclient, "TTL")) {
+		proxy_send_xclient_more(
+			client, output, str, "TTL",
+			t_strdup_printf("%u",client->common.proxy_ttl - 1));
+	}
+	if (str_array_icase_find(client->proxy_xclient, "PORT")) {
+		proxy_send_xclient_more(
+			client, output, str, "PORT",
+			t_strdup_printf("%u", client->common.remote_port));
+	}
 	if (str_array_icase_find(client->proxy_xclient, "ADDR")) {
-		str_append(str, " ADDR=");
-		str_append(str, net_ip2addr(&client->common.ip));
+		proxy_send_xclient_more(client, output, str, "ADDR",
+					net_ip2addr(&client->common.ip));
 	}
-	if (str_array_icase_find(client->proxy_xclient, "PORT"))
-		str_printfa(str, " PORT=%u", client->common.remote_port);
 	if (str_array_icase_find(client->proxy_xclient, "SESSION")) {
-		str_append(str, " SESSION=");
-		smtp_xtext_encode_cstr(
-			str, client_get_session_id(&client->common));
+		proxy_send_xclient_more(client, output, str, "SESSION",
+					client_get_session_id(&client->common));
 	}
-	if (str_array_icase_find(client->proxy_xclient, "TTL"))
-		str_printfa(str, " TTL=%u", client->common.proxy_ttl - 1);
 	if (str_array_icase_find(client->proxy_xclient, "FORWARD")) {
 		buffer_t *fwd = proxy_compose_xclient_forward(client);
 
 		if (fwd != NULL) {
-			str_append(str, " FORWARD=");
-			smtp_xtext_encode(str, fwd->data, fwd->used);
+			proxy_send_xclient_more_data(
+				client, output, str, "FORWARD",
+				fwd->data, fwd->used);
 		}
 	}
 	str_append(str, "\r\n");
 	o_stream_nsend(output, str_data(str), str_len(str));
 	client->proxy_state = SUBMISSION_PROXY_XCLIENT;
+	client->proxy_xclient_replies_expected++;
+	return 1;
 }
 
 static int
@@ -98,9 +218,6 @@ proxy_send_login(struct submission_client *client, struct ostream *output)
 			"Authentication support not advertised (TLS required?)");
 		return -1;
 	}
-
-	i_assert(client->common.proxy_ttl > 1);
-	proxy_send_xclient(client, output);
 
 	str = t_str_new(128);
 
@@ -135,9 +252,57 @@ proxy_send_login(struct submission_client *client, struct ostream *output)
 	str_append(str, "\r\n");
 	o_stream_nsend(output, str_data(str), str_len(str));
 
-	if (client->proxy_state != SUBMISSION_PROXY_XCLIENT)
-		client->proxy_state = SUBMISSION_PROXY_AUTHENTICATE;
+	client->proxy_state = SUBMISSION_PROXY_AUTHENTICATE;
 	return 0;
+}
+
+static int
+proxy_handle_ehlo_reply(struct submission_client *client,
+			struct ostream *output)
+{
+	struct smtp_server_cmd_ctx *cmd = client->pending_auth;
+	int ret;
+
+	switch (client->proxy_state) {
+	case SUBMISSION_PROXY_EHLO:
+		ret = proxy_send_starttls(client, output);
+		if (ret < 0)
+			return -1;
+		if (ret != 0)
+			return 0;
+		/* Fall through */
+	case SUBMISSION_PROXY_TLS_EHLO:
+		ret = proxy_send_xclient(client, output);
+		if (ret < 0)
+			return -1;
+		if (ret != 0) {
+			client->proxy_capability = 0;
+			i_free_and_null(client->proxy_xclient);
+			o_stream_nsend_str(output, t_strdup_printf(
+					   "EHLO %s\r\n",
+					   client->set->hostname));
+			return 0;
+		}
+		break;
+	case SUBMISSION_PROXY_XCLIENT_EHLO:
+		break;
+	default:
+		i_unreached();
+	}
+
+	if (client->common.proxy_noauth) {
+		smtp_server_connection_input_lock(cmd->conn);
+
+		smtp_server_command_add_hook(
+			cmd->cmd, SMTP_SERVER_COMMAND_HOOK_DESTROY,
+			submission_proxy_success_reply_sent, client);
+		client->pending_auth = NULL;
+
+		smtp_server_reply(cmd, 235, "2.7.0", "Logged in.");
+		return 1;
+	}
+
+	return proxy_send_login(client, output);
 }
 
 static int
@@ -218,14 +383,6 @@ strip_enhanced_code(const char *text, const char **enh_code_r)
 	return p;
 }
 
-static void
-submission_proxy_success_reply_sent(
-	struct smtp_server_cmd_ctx *cmd ATTR_UNUSED,
-	struct submission_client *subm_client)
-{
-	client_proxy_finish_destroy_client(&subm_client->common);
-}
-
 int submission_proxy_parse_line(struct client *client, const char *line)
 {
 	struct submission_client *subm_client =
@@ -233,7 +390,6 @@ int submission_proxy_parse_line(struct client *client, const char *line)
 	struct smtp_server_cmd_ctx *cmd = subm_client->pending_auth;
 	struct smtp_server_command *command = cmd->cmd;
 	struct ostream *output;
-	enum login_proxy_ssl_flags ssl_flags;
 	bool last_line = FALSE, invalid_line = FALSE;
 	const char *text = NULL, *enh_code = NULL;
 	unsigned int status = 0;
@@ -291,6 +447,7 @@ int submission_proxy_parse_line(struct client *client, const char *line)
 		return 0;
 	case SUBMISSION_PROXY_EHLO:
 	case SUBMISSION_PROXY_TLS_EHLO:
+	case SUBMISSION_PROXY_XCLIENT_EHLO:
 		if (invalid_line || (status / 100) != 2) {
 			const char *reason = t_strdup_printf(
 				"Invalid EHLO line: %s",
@@ -321,29 +478,7 @@ int submission_proxy_parse_line(struct client *client, const char *line)
 		if (!last_line)
 			return 0;
 
-		if (subm_client->proxy_state == SUBMISSION_PROXY_TLS_EHLO) {
-			if (proxy_send_login(subm_client, output) < 0)
-				return -1;
-			return 0;
-		}
-
-		ssl_flags = login_proxy_get_ssl_flags(client->login_proxy);
-		if ((ssl_flags & PROXY_SSL_FLAG_STARTTLS) == 0) {
-			if (proxy_send_login(subm_client, output) < 0)
-				return -1;
-		} else {
-			if ((subm_client->proxy_capability &
-			     SMTP_CAPABILITY_STARTTLS) == 0) {
-				login_proxy_failed(client->login_proxy,
-					login_proxy_get_event(client->login_proxy),
-					LOGIN_PROXY_FAILURE_TYPE_REMOTE_CONFIG,
-					"STARTTLS not supported");
-				return -1;
-			}
-			o_stream_nsend_str(output, "STARTTLS\r\n");
-			subm_client->proxy_state = SUBMISSION_PROXY_STARTTLS;
-		}
-		return 0;
+		return proxy_handle_ehlo_reply(subm_client, output);
 	case SUBMISSION_PROXY_STARTTLS:
 		if (invalid_line || status != 220) {
 			const char *reason = t_strdup_printf(
@@ -378,7 +513,10 @@ int submission_proxy_parse_line(struct client *client, const char *line)
 		}
 		if (!last_line)
 			return 0;
-		subm_client->proxy_state = SUBMISSION_PROXY_AUTHENTICATE;
+		i_assert(subm_client->proxy_xclient_replies_expected > 0);
+		if (--subm_client->proxy_xclient_replies_expected > 0)
+			return 0;
+		subm_client->proxy_state = SUBMISSION_PROXY_XCLIENT_EHLO;
 		return 0;
 	case SUBMISSION_PROXY_AUTHENTICATE:
 		if (invalid_line)

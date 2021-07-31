@@ -1,15 +1,21 @@
 /* Copyright (c) 2010-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
+#include "array.h"
 #include "var-expand.h"
-#include "buffer.h"
 #include "settings-parser.h"
 #include "service-settings.h"
 #include "mail-storage-settings.h"
 #include "master-service.h"
+#include "master-service-settings.h"
 #include "master-service-ssl-settings.h"
 #include "iostream-ssl.h"
 #include "doveadm-settings.h"
+
+ARRAY_TYPE(doveadm_setting_root) doveadm_setting_roots;
+bool doveadm_verbose_proctitle;
+
+static pool_t doveadm_settings_pool = NULL;
 
 static bool doveadm_settings_check(void *_set, pool_t pool, const char **error_r);
 
@@ -220,4 +226,96 @@ void doveadm_settings_expand(struct doveadm_settings *set, pool_t pool)
 	if (settings_var_expand(&doveadm_setting_parser_info, set,
 				pool, tab, &error) <= 0)
 		i_fatal("Failed to expand settings: %s", error);
+}
+
+void doveadm_read_settings(void)
+{
+	static const struct setting_parser_info *default_set_roots[] = {
+		&master_service_ssl_setting_parser_info,
+		&doveadm_setting_parser_info,
+	};
+	struct master_service_settings_input input;
+	struct master_service_settings_output output;
+	const struct doveadm_settings *set;
+	struct doveadm_setting_root *root;
+	ARRAY(const struct setting_parser_info *) set_roots;
+	ARRAY_TYPE(const_string) module_names;
+	void **sets;
+	const char *error;
+
+	t_array_init(&set_roots, N_ELEMENTS(default_set_roots) +
+		     array_count(&doveadm_setting_roots) + 1);
+	array_append(&set_roots, default_set_roots,
+		     N_ELEMENTS(default_set_roots));
+	t_array_init(&module_names, 4);
+	array_foreach_modifiable(&doveadm_setting_roots, root) {
+		array_push_back(&module_names, &root->info->module_name);
+		array_push_back(&set_roots, &root->info);
+	}
+	array_append_zero(&module_names);
+	array_append_zero(&set_roots);
+
+	i_zero(&input);
+	input.roots = array_front(&set_roots);
+	input.module = "doveadm";
+	input.extra_modules = array_front(&module_names);
+	input.service = "doveadm";
+	input.preserve_user = TRUE;
+	input.preserve_home = TRUE;
+	if (master_service_settings_read(master_service, &input,
+					 &output, &error) < 0)
+		i_fatal("Error reading configuration: %s", error);
+
+	doveadm_settings_pool = pool_alloconly_create("doveadm settings", 1024);
+	service_set = master_service_settings_get(master_service);
+	service_set = settings_dup(&master_service_setting_parser_info,
+				   service_set, doveadm_settings_pool);
+	doveadm_verbose_proctitle = service_set->verbose_proctitle;
+
+	sets = master_service_settings_get_others(master_service);
+	set = sets[1];
+	doveadm_settings = settings_dup(&doveadm_setting_parser_info, set,
+					doveadm_settings_pool);
+	doveadm_ssl_set = settings_dup(&master_service_ssl_setting_parser_info,
+				       master_service_ssl_settings_get(master_service),
+				       doveadm_settings_pool);
+	doveadm_settings_expand(doveadm_settings, doveadm_settings_pool);
+	doveadm_settings->parsed_features = set->parsed_features; /* copy this value by hand */
+
+	array_foreach_modifiable(&doveadm_setting_roots, root) {
+		unsigned int idx =
+			array_foreach_idx(&doveadm_setting_roots, root);
+		root->settings = settings_dup(root->info, sets[2+idx],
+					      doveadm_settings_pool);
+	}
+}
+
+void doveadm_setting_roots_add(const struct setting_parser_info *info)
+{
+	struct doveadm_setting_root *root;
+
+	root = array_append_space(&doveadm_setting_roots);
+	root->info = info;
+}
+
+void *doveadm_setting_roots_get_settings(const struct setting_parser_info *info)
+{
+	const struct doveadm_setting_root *root;
+
+	array_foreach(&doveadm_setting_roots, root) {
+		if (root->info == info)
+			return root->settings;
+	}
+	i_panic("Failed to find settings for module %s", info->module_name);
+}
+
+void doveadm_settings_init(void)
+{
+	i_array_init(&doveadm_setting_roots, 8);
+}
+
+void doveadm_settings_deinit(void)
+{
+	array_free(&doveadm_setting_roots);
+	pool_unref(&doveadm_settings_pool);
 }

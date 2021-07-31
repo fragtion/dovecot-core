@@ -251,7 +251,7 @@ master_service_init(const char *name, enum master_service_flags flags,
 	   before we get to ioloop. the corresponding t_pop() is in
 	   master_service_init_finish(). */
 	if ((flags & MASTER_SERVICE_FLAG_NO_INIT_DATASTACK_FRAME) == 0)
-		datastack_frame_id = t_push(NULL);
+		datastack_frame_id = t_push("master_service_init");
 
 	/* ignore these signals as early as possible */
 	lib_signals_init();
@@ -661,6 +661,9 @@ void master_service_init_finish(struct master_service *service)
 	i_assert(!service->init_finished);
 	service->init_finished = TRUE;
 
+	/* From now on we'll abort() if exit() is called unexpectedly. */
+	lib_set_clean_exit(FALSE);
+
 	/* set default signal handlers */
 	if ((service->flags & MASTER_SERVICE_FLAG_STANDALONE) == 0)
 		sigint_flags |= LIBSIG_FLAG_RESTART;
@@ -724,15 +727,15 @@ static void master_service_import_environment_real(const char *import_environmen
 		if (value == NULL)
 			key = *envs;
 		else {
-			key = t_strdup_until(*envs, value);
-			env_put(*envs);
+			key = t_strdup_until(*envs, value++);
+			env_put(key, value);
 		}
 		array_push_back(&keys, &key);
 	}
 	array_append_zero(&keys);
 
 	value = t_strarray_join(array_front(&keys), " ");
-	env_put(t_strconcat(DOVECOT_PRESERVE_ENVS_ENV"=", value, NULL));
+	env_put(DOVECOT_PRESERVE_ENVS_ENV, value);
 }
 
 void master_service_import_environment(const char *import_environment)

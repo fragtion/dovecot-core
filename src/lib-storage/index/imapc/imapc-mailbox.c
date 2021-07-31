@@ -457,12 +457,29 @@ imapc_mailbox_msgmap_update(struct imapc_mailbox *mbox,
 	return 0;
 }
 
+bool imapc_mailbox_name_equals(struct imapc_mailbox *mbox,
+			       const char *remote_name)
+{
+	const char *imapc_remote_name =
+		imapc_mailbox_get_remote_name(mbox);
+
+	if (strcmp(imapc_remote_name, remote_name) == 0) {
+		/* match */
+		return TRUE;
+	} else if (strcasecmp(mbox->box.name, "INBOX") == 0 &&
+		   strcasecmp(remote_name, "INBOX") == 0) {
+		/* case-insensitive INBOX */
+		return TRUE;
+	}
+	return FALSE;
+}
+
 static void imapc_untagged_fetch(const struct imapc_untagged_reply *reply,
 				 struct imapc_mailbox *mbox)
 {
 	uint32_t lseq, rseq = reply->num;
-	struct imapc_fetch_request *const *fetch_requestp;
-	struct imapc_mail *const *mailp;
+	struct imapc_fetch_request *fetch_request;
+	struct imapc_mail *mail;
 	const struct imap_arg *list, *flags_list, *modseq_list;
 	const char *atom, *guid = NULL;
 	const struct mail_index_record *rec = NULL;
@@ -547,10 +564,8 @@ static void imapc_untagged_fetch(const struct imapc_untagged_reply *reply,
 	flags &= ENUM_NEGATE(MAIL_RECENT);
 
 	/* if this is a reply to some FETCH request, update the mail's fields */
-	array_foreach(&mbox->fetch_requests, fetch_requestp) {
-		array_foreach(&(*fetch_requestp)->mails, mailp) {
-			struct imapc_mail *mail = *mailp;
-
+	array_foreach_elem(&mbox->fetch_requests, fetch_request) {
+		array_foreach_elem(&fetch_request->mails, mail) {
 			if (mail->imail.mail.mail.uid == uid)
 				imapc_mail_fetch_update(mail, reply, list);
 		}

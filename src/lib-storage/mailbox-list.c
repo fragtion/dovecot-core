@@ -97,14 +97,12 @@ void mailbox_list_unregister(const struct mailbox_list *list)
 const struct mailbox_list *
 mailbox_list_find_class(const char *driver)
 {
-	const struct mailbox_list *const *class_p;
 	unsigned int idx;
 
 	if (!mailbox_list_driver_find(driver, &idx))
 		return NULL;
 
-	class_p = array_idx(&mailbox_list_drivers, idx);
-	return *class_p;
+	return array_idx_elem(&mailbox_list_drivers, idx);
 }
 
 int mailbox_list_create(const char *driver, struct mail_namespace *ns,
@@ -871,12 +869,12 @@ static int
 mailbox_list_get_storage_driver(struct mailbox_list *list, const char *driver,
 				struct mail_storage **storage_r)
 {
-	struct mail_storage *const *storagep;
+	struct mail_storage *storage;
 	const char *error, *data;
 
-	array_foreach(&list->ns->all_storages, storagep) {
-		if (strcmp((*storagep)->name, driver) == 0) {
-			*storage_r = *storagep;
+	array_foreach_elem(&list->ns->all_storages, storage) {
+		if (strcmp(storage->name, driver) == 0) {
+			*storage_r = storage;
 			return 0;
 		}
 	}

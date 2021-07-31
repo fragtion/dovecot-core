@@ -417,11 +417,30 @@ driver_sqlpool_get_sync_connection(struct sqlpool_db *db,
 	return FALSE;
 }
 
+static enum sql_db_flags driver_sqlpool_get_flags(struct sql_db *_db)
+{
+	struct sqlpool_db *db = (struct sqlpool_db *)_db;
+	const struct sqlpool_connection *conn, *last_conn = NULL;
+
+	/* try to use a connected db */
+	array_foreach(&db->all_connections, conn) {
+		if (SQL_DB_IS_READY(conn->db))
+			return sql_get_flags(conn->db);
+		last_conn = conn;
+	}
+	/* fallback to the last db, if there is any */
+	if (last_conn != NULL)
+		return sql_get_flags(last_conn->db);
+	/* Just use the default flags. The flags shouldn't be worth having
+	   to create a connection. */
+	return _db->flags;
+}
+
 static int
 driver_sqlpool_parse_hosts(struct sqlpool_db *db, const char *connect_string,
 			   const char **error_r)
 {
-	const char *const *args, *key, *value, *const *hostnamep;
+	const char *const *args, *key, *value, *hostname;
 	struct sqlpool_host *host;
 	ARRAY_TYPE(const_string) hostnames, connect_args;
 
@@ -467,10 +486,10 @@ driver_sqlpool_parse_hosts(struct sqlpool_db *db, const char *connect_string,
 		if (*connect_string == '\0')
 			connect_string = NULL;
 
-		array_foreach(&hostnames, hostnamep) {
+		array_foreach_elem(&hostnames, hostname) {
 			host = array_append_space(&db->hosts);
 			host->connect_string =
-				i_strconcat("host=", *hostnamep, " ",
+				i_strconcat("host=", hostname, " ",
 					    connect_string, NULL);
 		}
 	}
@@ -496,7 +515,6 @@ static void sqlpool_add_all_once(struct sqlpool_db *db)
 int driver_sqlpool_init_full(const struct sql_settings *set, const struct sql_db *driver,
 			     struct sql_db **db_r, const char **error_r)
 {
-	char *error;
 	struct sqlpool_db *db;
 	int ret;
 
@@ -511,15 +529,11 @@ int driver_sqlpool_init_full(const struct sql_settings *set, const struct sql_db
 	i_array_init(&db->hosts, 8);
 
 	T_BEGIN {
-		const char *tmp = NULL;
-		if ((ret = driver_sqlpool_parse_hosts(db, set->connect_string,
-						      &tmp)) < 0)
-			error = i_strdup(tmp);
-	} T_END;
+		ret = driver_sqlpool_parse_hosts(db, set->connect_string,
+						 error_r);
+	} T_END_PASS_STR_IF(ret < 0, error_r);
 
 	if (ret < 0) {
-		*error_r = t_strdup(error);
-		i_free(error);
 		driver_sqlpool_deinit(&db->api);
 		return ret;
 	}
@@ -875,6 +889,7 @@ struct sql_db driver_sqlpool_db = {
 	"",
 
 	.v = {
+		.get_flags = driver_sqlpool_get_flags,
 		.deinit = driver_sqlpool_deinit,
 		.connect = driver_sqlpool_connect,
 		.disconnect = driver_sqlpool_disconnect,

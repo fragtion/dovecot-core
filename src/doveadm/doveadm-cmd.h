@@ -32,6 +32,12 @@ typedef enum {
 	CMD_FLAG_NONE			= 0x0,
 	CMD_FLAG_HIDDEN			= 0x1,
 	CMD_FLAG_NO_PRINT		= 0x2,
+	/* Don't parse any -options for the command. */
+	CMD_FLAG_NO_OPTIONS		= 0x4,
+	/* Prevent GNU getopt() from finding options after the first
+	   non-option is seen (e.g. "-1 arg -2" would parse -1 but not -2
+	   as option). */
+	CMD_FLAG_NO_UNORDERED_OPTIONS	= 0x8,
 } doveadm_cmd_flag_t;
 
 struct doveadm_cmd_param {
@@ -53,15 +59,8 @@ ARRAY_DEFINE_TYPE(doveadm_cmd_param_arr_t, struct doveadm_cmd_param);
 
 typedef void doveadm_command_ver2_t(struct doveadm_cmd_context *cctx);
 
-struct doveadm_cmd {
-	doveadm_command_t *cmd;
-	const char *name;
-	const char *short_usage;
-};
-
 struct doveadm_cmd_ver2 {
 	doveadm_command_ver2_t *cmd;
-	doveadm_command_t *old_cmd;
 	struct doveadm_mail_cmd_context *(*mail_cmd)(void);
 	const char *name;
 	const char *usage;
@@ -84,24 +83,8 @@ struct doveadm_cmd_context {
 	struct ostream *output;
 };
 
-ARRAY_DEFINE_TYPE(doveadm_cmd, struct doveadm_cmd);
-extern ARRAY_TYPE(doveadm_cmd) doveadm_cmds;
-
 ARRAY_DEFINE_TYPE(doveadm_cmd_ver2, struct doveadm_cmd_ver2);
 extern ARRAY_TYPE(doveadm_cmd_ver2) doveadm_cmds_ver2;
-
-extern struct doveadm_cmd doveadm_cmd_dump;
-extern struct doveadm_cmd doveadm_cmd_pw;
-extern struct doveadm_cmd doveadm_cmd_mailbox_mutf7;
-extern struct doveadm_cmd doveadm_cmd_sis_deduplicate;
-extern struct doveadm_cmd doveadm_cmd_sis_find;
-extern struct doveadm_cmd doveadm_cmd_zlibconnect;
-
-void doveadm_register_cmd(const struct doveadm_cmd *cmd);
-
-const struct doveadm_cmd *
-doveadm_cmd_find_with_args(const char *cmd_name, int *argc,
-			   const char *const *argv[]);
 
 void doveadm_register_auth_commands(void);
 void doveadm_register_auth_server_commands(void);
@@ -117,7 +100,6 @@ void doveadm_register_fs_commands(void);
 void doveadm_cmds_init(void);
 void doveadm_cmds_deinit(void);
 
-void doveadm_cmd_ver2_to_cmd_wrapper(struct doveadm_cmd_context *cctx);
 void doveadm_cmd_ver2_to_mail_cmd_wrapper(struct doveadm_cmd_context *cctx);
 
 void doveadm_cmd_register_ver2(struct doveadm_cmd_ver2 *cmd);
@@ -149,17 +131,23 @@ bool doveadm_cmd_param_istream(const struct doveadm_cmd_context *cctx,
 void doveadm_cmd_params_clean(ARRAY_TYPE(doveadm_cmd_param_arr_t) *pargv);
 void doveadm_cmd_params_null_terminate_arrays(ARRAY_TYPE(doveadm_cmd_param_arr_t) *pargv);
 
+extern struct doveadm_cmd_ver2 doveadm_cmd_dump;
 extern struct doveadm_cmd_ver2 doveadm_cmd_service_stop_ver2;
 extern struct doveadm_cmd_ver2 doveadm_cmd_service_status_ver2;
 extern struct doveadm_cmd_ver2 doveadm_cmd_process_status_ver2;
 extern struct doveadm_cmd_ver2 doveadm_cmd_stop_ver2;
 extern struct doveadm_cmd_ver2 doveadm_cmd_reload_ver2;
 extern struct doveadm_cmd_ver2 doveadm_cmd_stats_dump_ver2;
+extern struct doveadm_cmd_ver2 doveadm_cmd_mailbox_mutf7;
 extern struct doveadm_cmd_ver2 doveadm_cmd_oldstats_reset_ver2;
 extern struct doveadm_cmd_ver2 doveadm_cmd_oldstats_dump_ver2;
 extern struct doveadm_cmd_ver2 doveadm_cmd_oldstats_top_ver2;
 extern struct doveadm_cmd_ver2 doveadm_cmd_penalty_ver2;
+extern struct doveadm_cmd_ver2 doveadm_cmd_pw;
 extern struct doveadm_cmd_ver2 doveadm_cmd_kick_ver2;
 extern struct doveadm_cmd_ver2 doveadm_cmd_who_ver2;
+extern struct doveadm_cmd_ver2 doveadm_cmd_sis_deduplicate;
+extern struct doveadm_cmd_ver2 doveadm_cmd_sis_find;
+extern struct doveadm_cmd_ver2 doveadm_cmd_zlibconnect;
 
 #endif

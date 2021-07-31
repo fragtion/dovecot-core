@@ -13,11 +13,11 @@
 
 #include <ctype.h>
 
+#define LOG_EXPORTER_LONG_FIELD_TRUNCATE_LEN 1000
+
 struct stats_metrics {
 	pool_t pool;
-	struct event_filter *stats_filter; /* stats-only */
-	struct event_filter *export_filter; /* export-only */
-	struct event_filter *combined_filter; /* stats & export */
+	struct event_filter *filter; /* stats & export */
 	ARRAY(struct exporter *) exporters;
 	ARRAY(struct metric *) metrics;
 };
@@ -67,6 +67,8 @@ static void stats_exporters_add_set(struct stats_metrics *metrics,
 		exporter->transport = event_export_transport_http_post;
 	} else if (strcmp(set->transport, "log") == 0) {
 		exporter->transport = event_export_transport_log;
+		exporter->format_max_field_len =
+			LOG_EXPORTER_LONG_FIELD_TRUNCATE_LEN;
 	} else {
 		i_unreached();
 	}
@@ -100,7 +102,7 @@ stats_metric_alloc(pool_t pool, const char *name,
 static void stats_metrics_add_set(struct stats_metrics *metrics,
 				  const struct stats_metric_settings *set)
 {
-	struct exporter *const *exporter;
+	struct exporter *exporter;
 	struct metric *metric;
 	const char *const *fields;
 	const char *const *tmp;
@@ -114,19 +116,18 @@ static void stats_metrics_add_set(struct stats_metrics *metrics,
 
 	array_push_back(&metrics->metrics, &metric);
 
-	event_filter_merge_with_context(metrics->stats_filter, set->parsed_filter, metric);
-	event_filter_merge_with_context(metrics->combined_filter, set->parsed_filter, metric);
+	event_filter_merge_with_context(metrics->filter, set->parsed_filter, metric);
 
 	/*
-	 * Done with statistics setup, now onto exporter setup
+	 * Metrics may also be exported - make sure exporter info is set
 	 */
 
 	if (set->exporter[0] == '\0')
 		return; /* not exported */
 
-	array_foreach(&metrics->exporters, exporter) {
-		if (strcmp(set->exporter, (*exporter)->name) == 0) {
-			metric->export_info.exporter = *exporter;
+	array_foreach_elem(&metrics->exporters, exporter) {
+		if (strcmp(set->exporter, exporter->name) == 0) {
+			metric->export_info.exporter = exporter;
 			break;
 		}
 	}
@@ -153,8 +154,6 @@ static void stats_metrics_add_set(struct stats_metrics *metrics,
 		else
 			i_warning("Ignoring unknown exporter include '%s'", *tmp);
 	}
-
-	event_filter_merge_with_context(metrics->export_filter, set->parsed_filter, metric);
 }
 
 static void
@@ -165,24 +164,24 @@ stats_metrics_add_from_settings(struct stats_metrics *metrics,
 	if (!array_is_created(&set->exporters)) {
 		p_array_init(&metrics->exporters, metrics->pool, 0);
 	} else {
-		struct stats_exporter_settings *const *exporter_setp;
+		struct stats_exporter_settings *exporter_set;
 
 		p_array_init(&metrics->exporters, metrics->pool,
 			     array_count(&set->exporters));
-		array_foreach(&set->exporters, exporter_setp)
-			stats_exporters_add_set(metrics, *exporter_setp);
+		array_foreach_elem(&set->exporters, exporter_set)
+			stats_exporters_add_set(metrics, exporter_set);
 	}
 
 	/* then add all the metrics */
 	if (!array_is_created(&set->metrics)) {
 		p_array_init(&metrics->metrics, metrics->pool, 0);
 	} else {
-		struct stats_metric_settings *const *metric_setp;
+		struct stats_metric_settings *metric_set;
 
 		p_array_init(&metrics->metrics, metrics->pool,
 			     array_count(&set->metrics));
-		array_foreach(&set->metrics, metric_setp) T_BEGIN {
-			stats_metrics_add_set(metrics, *metric_setp);
+		array_foreach_elem(&set->metrics, metric_set) T_BEGIN {
+			stats_metrics_add_set(metrics, metric_set);
 		} T_END;
 	}
 }
@@ -194,23 +193,21 @@ struct stats_metrics *stats_metrics_init(const struct stats_settings *set)
 
 	metrics = p_new(pool, struct stats_metrics, 1);
 	metrics->pool = pool;
-	metrics->stats_filter = event_filter_create();
-	metrics->export_filter = event_filter_create();
-	metrics->combined_filter = event_filter_create();
+	metrics->filter = event_filter_create();
 	stats_metrics_add_from_settings(metrics, set);
 	return metrics;
 }
 
 static void stats_metric_free(struct metric *metric)
 {
-	struct metric *const *metricp;
+	struct metric *sub_metric;
 	stats_dist_deinit(&metric->duration_stats);
 	for (unsigned int i = 0; i < metric->fields_count; i++)
 		stats_dist_deinit(&metric->fields[i].stats);
 	if (!array_is_created(&metric->sub_metrics))
 		return;
-	array_foreach(&metric->sub_metrics, metricp)
-		stats_metric_free(*metricp);
+	array_foreach_elem(&metric->sub_metrics, sub_metric)
+		stats_metric_free(sub_metric);
 }
 
 static void stats_export_deinit(void)
@@ -223,67 +220,65 @@ static void stats_export_deinit(void)
 void stats_metrics_deinit(struct stats_metrics **_metrics)
 {
 	struct stats_metrics *metrics = *_metrics;
-	struct metric *const *metricp;
+	struct metric *metric;
 
 	*_metrics = NULL;
 
 	stats_export_deinit();
 
-	array_foreach(&metrics->metrics, metricp)
-		stats_metric_free(*metricp);
-	event_filter_unref(&metrics->stats_filter);
-	event_filter_unref(&metrics->export_filter);
-	event_filter_unref(&metrics->combined_filter);
+	array_foreach_elem(&metrics->metrics, metric)
+		stats_metric_free(metric);
+	event_filter_unref(&metrics->filter);
 	pool_unref(&metrics->pool);
 }
 
 static void stats_metric_reset(struct metric *metric)
 {
-	struct metric *const *metricp;
+	struct metric *sub_metric;
 	stats_dist_reset(metric->duration_stats);
 	for (unsigned int i = 0; i < metric->fields_count; i++)
 		stats_dist_reset(metric->fields[i].stats);
 	if (!array_is_created(&metric->sub_metrics))
 		return;
-	array_foreach(&metric->sub_metrics, metricp)
-		stats_metric_reset(*metricp);
+	array_foreach_elem(&metric->sub_metrics, sub_metric)
+		stats_metric_reset(sub_metric);
 }
 
 void stats_metrics_reset(struct stats_metrics *metrics)
 {
-	struct metric *const *metricp;
+	struct metric *metric;
 
-	array_foreach(&metrics->metrics, metricp)
-		stats_metric_reset(*metricp);
+	array_foreach_elem(&metrics->metrics, metric)
+		stats_metric_reset(metric);
 }
 
 struct event_filter *
 stats_metrics_get_event_filter(struct stats_metrics *metrics)
 {
-	return metrics->combined_filter;
+	return metrics->filter;
 }
 
 static struct metric *
 stats_metric_get_sub_metric(struct metric *metric,
 			    const struct metric_value *value)
 {
-	struct metric *const *sub_metrics;
+	struct metric *sub_metrics;
 
 	/* lookup sub-metric */
-	array_foreach (&metric->sub_metrics, sub_metrics) {
-		switch ((*sub_metrics)->group_value.type) {
+	array_foreach_elem(&metric->sub_metrics, sub_metrics) {
+		switch (sub_metrics->group_value.type) {
 		case METRIC_VALUE_TYPE_STR:
-			if (memcmp((*sub_metrics)->group_value.hash, value->hash,
+			if (memcmp(sub_metrics->group_value.hash, value->hash,
 				   SHA1_RESULTLEN) == 0)
-				return *sub_metrics;
+				return sub_metrics;
 			break;
 		case METRIC_VALUE_TYPE_INT:
-			if ((*sub_metrics)->group_value.intmax == value->intmax)
-				return *sub_metrics;
+			if (sub_metrics->group_value.intmax == value->intmax)
+				return sub_metrics;
 			break;
 		case METRIC_VALUE_TYPE_BUCKET_INDEX:
-			if ((*sub_metrics)->group_value.intmax == value->intmax)
-				return *sub_metrics;
+			if (sub_metrics->group_value.intmax == value->intmax)
+				return sub_metrics;
 			break;
 		}
 	}
@@ -426,7 +421,8 @@ static void
 stats_metric_group_by(struct metric *metric, struct event *event, pool_t pool)
 {
 	const struct stats_metric_settings_group_by *group_by = &metric->group_by[0];
-	const struct event_field *field = event_find_field(event, group_by->field);
+	const struct event_field *field =
+		event_find_field_recursive(event, group_by->field);
 	struct metric *sub_metric;
 	struct metric_value value;
 
@@ -479,7 +475,8 @@ static void
 stats_metric_event_field(struct event *event, const char *fieldname,
 			 struct stats_dist *stats)
 {
-	const struct event_field *field = event_find_field(event, fieldname);
+	const struct event_field *field =
+		event_find_field_recursive(event, fieldname);
 	intmax_t num = 0;
 
 	if (field == NULL)
@@ -552,17 +549,15 @@ void stats_metrics_event(struct stats_metrics *metrics, struct event *event,
 	event_get_last_duration(event, &duration);
 	event_add_int(event, STATS_EVENT_FIELD_NAME_DURATION, duration);
 
-	/* process stats */
-	iter = event_filter_match_iter_init(metrics->stats_filter, event, ctx);
+	/* process stats & exports */
+	iter = event_filter_match_iter_init(metrics->filter, event, ctx);
 	while ((metric = event_filter_match_iter_next(iter)) != NULL) T_BEGIN {
+		/* every metric is fed into stats */
 		stats_metric_event(metric, event, metrics->pool);
-	} T_END;
-	event_filter_match_iter_deinit(&iter);
 
-	/* process exports */
-	iter = event_filter_match_iter_init(metrics->export_filter, event, ctx);
-	while ((metric = event_filter_match_iter_next(iter)) != NULL) T_BEGIN {
-		stats_export_event(metric, event);
+		/* some metrics are exported */
+		if (metric->export_info.exporter != NULL)
+			stats_export_event(metric, event);
 	} T_END;
 	event_filter_match_iter_deinit(&iter);
 }

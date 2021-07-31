@@ -6,18 +6,26 @@ AM_CPPFLAGS = \
 pkglib_LTLIBRARIES = libdovecot-lua.la
 libdovecot_lua_la_SOURCES = \
 	dlua-script.c \
+	dlua-pushstring.c \
+	dlua-error.c \
 	dlua-dovecot.c \
 	dlua-compat.c \
 	dlua-resume.c \
 	dlua-table.c \
 	dlua-thread.c
+
+LIBDICT_LUA=
+if DLUA_WITH_YIELDS
+LIBDICT_LUA += ../lib-dict/libdict_lua.la
+endif
+
 # Note: the only things this lib should depend on are libdovecot and lua.
 libdovecot_lua_la_DEPENDENCIES = \
 	../lib-dovecot/libdovecot.la \
-	../lib-dict/libdict_lua.la
+	$(LIBDICT_LUA)
 libdovecot_lua_la_LIBADD = \
 	../lib-dovecot/libdovecot.la \
-	../lib-dict/libdict_lua.la \
+	$(LIBDICT_LUA) \
 	$(LUA_LIBS)
 libdovecot_lua_la_LDFLAGS = -export-dynamic
 

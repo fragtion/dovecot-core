@@ -15,6 +15,10 @@ enum sql_db_flags {
 	   the functions can still be used, but they're just internally
 	   convered into regular statements. */
 	SQL_DB_FLAG_PREP_STATEMENTS	= 0x04,
+	/* Database supports INSERT .. ON DUPLICATE KEY syntax. */
+	SQL_DB_FLAG_ON_DUPLICATE_KEY	= 0x08,
+	/* Database supports INSERT .. ON CONFLICT DO UPDATE syntax. */
+	SQL_DB_FLAG_ON_CONFLICT_DO	= 0x10,
 };
 
 enum sql_field_type {
