@@ -122,6 +122,7 @@ struct imap_url_parser {
 	const struct imap_url *base;
 
 	bool relative:1;
+	bool partial_parse:1;
 };
 
 static int
@@ -221,17 +222,19 @@ static int imap_url_parse_iserver(struct imap_url_parser *url_parser)
 		uend = p;
 
 		if (*p == ';') {
-			if (strncasecmp(p, ";AUTH=", 6) != 0) {
+			if (!str_begins_icase(p, ";AUTH=", &p)) {
 				parser->error = t_strdup_printf(
 					"Stray ';' in userinfo `%s'",
 					auth.enc_userinfo);
 				return -1;
 			}
 
-			for (p += 6; *p != '\0'; p++) {
+			for (; *p != '\0'; p++) {
 				if (*p == ';' || *p == ':') {
 					parser->error = t_strdup_printf(
-						"Stray '%c' in userinfo `%s'", *p, auth.enc_userinfo);
+						"Stray %s in userinfo `%s'",
+						uri_char_sanitize(*p),
+						auth.enc_userinfo);
 					return -1;
 				}
 			}
@@ -289,15 +292,15 @@ imap_url_parse_urlauth(struct imap_url_parser *url_parser, const char *urlext)
 	 */
 
 	/* ";EXPIRE=" date-time */
-	if (strncasecmp(urlext, ";EXPIRE=", 8) == 0) {
+	if (str_begins_icase(urlext, ";EXPIRE=", &urlext)) {
 		if ((url_parser->flags & IMAP_URL_PARSE_ALLOW_URLAUTH) == 0) {
 			parser->error = "`;EXPIRE=' is not allowed in this context";
 			return -1;
 		}
 
-		if ((p = strchr(urlext+8, ';')) != NULL) {
-			if (!iso8601_date_parse((const unsigned char *)urlext+8,
-						p-urlext-8, &expire, &tz)) {
+		if ((p = strchr(urlext, ';')) != NULL) {
+			if (!iso8601_date_parse((const unsigned char *)urlext,
+						p-urlext, &expire, &tz)) {
 				parser->error = "invalid date-time for `;EXPIRE='";
 				return -1;
 			}
@@ -306,14 +309,13 @@ imap_url_parse_urlauth(struct imap_url_parser *url_parser, const char *urlext)
 	}
 
 	/* ";URLAUTH=" access */
-	if (strncasecmp(urlext, ";URLAUTH=", 9) != 0) {
+	if (!str_begins_icase(urlext, ";URLAUTH=", &urlext)) {
 		if (expire != (time_t)-1) {
 			parser->error = "`;EXPIRE=' without `;URLAUTH='";
 			return -1;
 		}
 		return 0;
 	}
-	urlext += 9;
 
 	if (url != NULL)
 		url->uauth_expire = expire;
@@ -433,7 +435,7 @@ imap_url_parse_path(struct imap_url_parser *url_parser,
 {
 	struct uri_parser *parser = &url_parser->parser;
 	struct imap_url *url = url_parser->url;
-	const char *const *segment;
+	const char *const *segment, *suffix;
 	string_t *mailbox, *section = NULL;
 	uint32_t uid = 0, uidvalidity = 0;
 	uoff_t partial_offset = 0, partial_size = 0;
@@ -557,7 +559,7 @@ imap_url_parse_path(struct imap_url_parser *url_parser,
 			/* Handle ';' */
 			if (p != NULL) {
 				/* [uidvalidity] */
-				if (strncasecmp(p, ";UIDVALIDITY=", 13) == 0) {
+				if (str_begins_icase(p, ";UIDVALIDITY=", &suffix)) {
 					/* append last bit of mailbox */
 					if (*segment != p) {
 						if (segment > path ||
@@ -569,17 +571,17 @@ imap_url_parse_path(struct imap_url_parser *url_parser,
 					}
 
 					/* ";UIDVALIDITY=" nz-number */
-					if (strchr(p+13, ';') != NULL) {
+					if (strchr(suffix, ';') != NULL) {
 						parser->error = "Encountered stray ';' after UIDVALIDITY";
 						return -1;
 					}
 
 					/* nz-number */
-					if (p[13] == '\0') {
+					if (suffix[0] == '\0') {
 						parser->error = "Empty UIDVALIDITY value";
 						return -1;
 					}
-					if (imap_url_parse_number(parser, p+13, &uidvalidity) <= 0)
+					if (imap_url_parse_number(parser, suffix, &uidvalidity) <= 0)
 						return -1;
 					if (uidvalidity == 0) {
 						parser->error = "UIDVALIDITY cannot be zero";
@@ -593,9 +595,9 @@ imap_url_parse_path(struct imap_url_parser *url_parser,
 			}
 
 			/* iuid */
-		 	if (*segment != NULL && strncasecmp(*segment, ";UID=", 5) == 0) {
+			if (*segment != NULL &&
+			    str_begins_icase(*segment, ";UID=", &value)) {
 				/* ";UID=" nz-number */
-				value = (*segment)+5;
 				if ((p = strchr(value,';')) != NULL) {
 					if (segment[1] != NULL ) {
 						/* not the last segment, so it cannot be extension like iurlauth */
@@ -624,11 +626,10 @@ imap_url_parse_path(struct imap_url_parser *url_parser,
 		if (*segment != NULL && uid > 0) {
 			/* [isection] */
 			if (section != NULL ||
-				  strncasecmp(*segment, ";SECTION=", 9) == 0) {
+			    str_begins_icase(*segment, ";SECTION=", &value)) {
 				/* ";SECTION=" enc-section */
 				if (section == NULL) {
 					section = t_str_new(256);
-					value = (*segment) + 9;
 				} else {
 					value = *segment;
 				}
@@ -679,11 +680,10 @@ imap_url_parse_path(struct imap_url_parser *url_parser,
 
 			/* [ipartial] */
 			if (*segment != NULL &&
-				  strncasecmp(*segment, ";PARTIAL=", 9) == 0) {
+			    str_begins_icase(*segment, ";PARTIAL=", &value)) {
 				have_partial = TRUE;
 
 				/* ";PARTIAL=" partial-range */
-				value = (*segment) + 9;
 				if ((p = strchr(value,';')) != NULL) {
 					urlext = p;
 					value = t_strdup_until(value, p);
@@ -881,17 +881,14 @@ static bool imap_url_do_parse(struct imap_url_parser *url_parser)
 		return FALSE;
 	}
 
-	/* must be at end of URL now */
-	i_assert(parser->cur == parser->end);
-
 	return TRUE;
 }
 
 /* Public API */
 
-int imap_url_parse(const char *url, const struct imap_url *base,
-		   enum imap_url_parse_flags flags,
-		   struct imap_url **url_r, const char **error_r)
+int imap_url_parse_prefix(const char *url, const struct imap_url *base,
+			  enum imap_url_parse_flags flags, const char **end_r,
+			  struct imap_url **url_r, const char **error_r)
 {
 	struct imap_url_parser url_parser;
 
@@ -902,6 +899,7 @@ int imap_url_parse(const char *url, const struct imap_url *base,
 
 	i_zero(&url_parser);
 	uri_parser_init(&url_parser.parser, pool_datastack_create(), url);
+	url_parser.parser.parse_prefix = (end_r != NULL);
 
 	url_parser.url = t_new(struct imap_url, 1);
 	url_parser.url->uauth_expire = (time_t)-1;
@@ -911,6 +909,12 @@ int imap_url_parse(const char *url, const struct imap_url *base,
 	if (!imap_url_do_parse(&url_parser)) {
 		*error_r = url_parser.parser.error;
 		return -1;
+	}
+	if (end_r != NULL)
+		*end_r = (const char *)url_parser.parser.cur;
+	else {
+		/* must be at end of URL now */
+		i_assert(url_parser.parser.cur == url_parser.parser.end);
 	}
 	*url_r = url_parser.url;
 	return 0;

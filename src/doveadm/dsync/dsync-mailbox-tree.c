@@ -16,7 +16,8 @@ struct dsync_mailbox_tree_iter {
 	string_t *name;
 };
 
-struct dsync_mailbox_tree *dsync_mailbox_tree_init(char sep, char alt_char)
+struct dsync_mailbox_tree *
+dsync_mailbox_tree_init(char sep, char escape_char, char alt_char)
 {
 	struct dsync_mailbox_tree *tree;
 	pool_t pool;
@@ -28,6 +29,7 @@ struct dsync_mailbox_tree *dsync_mailbox_tree_init(char sep, char alt_char)
 	tree = p_new(pool, struct dsync_mailbox_tree, 1);
 	tree->pool = pool;
 	tree->sep = tree->sep_str[0] = sep;
+	tree->escape_char = escape_char;
 	tree->alt_char = alt_char;
 	tree->root.name = "";
 	i_array_init(&tree->deletes, 32);
@@ -256,13 +258,37 @@ convert_name_to_remote_sep(struct dsync_mailbox_tree *tree, const char *name)
 {
 	string_t *str = t_str_new(128);
 
-	for (; *name != '\0'; name++) {
-		if (*name == tree->sep)
-			str_append_c(str, tree->remote_sep);
-		else if (*name == tree->remote_sep)
-			str_append_c(str, tree->alt_char);
-		else
-			str_append_c(str, *name);
+	char remote_escape_chars[3] = {
+		tree->remote_escape_char,
+		tree->remote_sep,
+		'\0'
+	};
+
+	for (;;) {
+		const char *end = strchr(name, tree->sep);
+		const char *name_part = end == NULL ? name :
+			t_strdup_until(name, end++);
+
+		if (tree->escape_char != '\0')
+			mailbox_list_name_unescape(&name_part, tree->escape_char);
+		if (remote_escape_chars[0] != '\0') {
+			/* The local name can be fully escaped to remote
+			   name and back. */
+			mailbox_list_name_escape(name_part, remote_escape_chars,
+						 str);
+		} else {
+			/* There is no remote escape char, so for conflicting
+			   separator use the alt_char. */
+			for (; *name_part != '\0'; name_part++) {
+				if (*name_part == tree->remote_sep)
+					str_append_c(str, tree->alt_char);
+				else
+					str_append_c(str, *name_part);
+			}
+		}
+		if (end == NULL)
+			break;
+		str_append_c(str, tree->remote_sep);
 	}
 	return str_c(str);
 }
@@ -381,12 +407,14 @@ dsync_mailbox_tree_find_delete(struct dsync_mailbox_tree *tree,
 	}
 }
 
-void dsync_mailbox_tree_set_remote_sep(struct dsync_mailbox_tree *tree,
-				       char remote_sep)
+void dsync_mailbox_tree_set_remote_chars(struct dsync_mailbox_tree *tree,
+					 char remote_sep, char escape_char)
 {
 	i_assert(tree->remote_sep == '\0');
+	i_assert(tree->remote_escape_char == '\0');
 
 	tree->remote_sep = remote_sep;
+	tree->remote_escape_char = escape_char;
 }
 
 static void
@@ -429,7 +457,8 @@ dsync_mailbox_tree_dup(const struct dsync_mailbox_tree *src)
 	struct dsync_mailbox_tree *dest;
 	string_t *str = t_str_new(128);
 
-	dest = dsync_mailbox_tree_init(src->sep, src->alt_char);
+	dest = dsync_mailbox_tree_init(src->sep, src->escape_char,
+				       src->alt_char);
 	dsync_mailbox_tree_dup_nodes(dest, &src->root, str);
 	return dest;
 }

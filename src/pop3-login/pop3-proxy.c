@@ -9,6 +9,7 @@
 #include "str.h"
 #include "str-sanitize.h"
 #include "strescape.h"
+#include "uri-util.h"
 #include "dsasl-client.h"
 #include "client.h"
 #include "pop3-proxy.h"
@@ -22,7 +23,7 @@ static int proxy_send_login(struct pop3_client *client, struct ostream *output)
 	struct dsasl_client_settings sasl_set;
 	const unsigned char *sasl_output;
 	size_t len;
-	const char *mech_name, *error;
+	const char *mech_name, *value, *error;
 	string_t *str = t_str_new(128);
 
 	i_assert(client->common.proxy_ttl > 1);
@@ -30,10 +31,10 @@ static int proxy_send_login(struct pop3_client *client, struct ostream *output)
 	    !client->common.proxy_not_trusted) {
 		string_t *fwd = t_str_new(128);
                 for(const char *const *ptr = client->common.auth_passdb_args;*ptr != NULL; ptr++) {
-                        if (strncasecmp(*ptr, "forward_", 8) == 0) {
+                        if (str_begins_icase(*ptr, "forward_", &value)) {
                                 if (str_len(fwd) > 0)
                                         str_append_c(fwd, '\t');
-                                str_append_tabescaped(fwd, (*ptr)+8);
+                                str_append_tabescaped(fwd, value);
                         }
 		}
 
@@ -109,7 +110,7 @@ pop3_proxy_continue_sasl_auth(struct client *client, struct ostream *output,
 	int ret;
 
 	str = t_str_new(128);
-	if (base64_decode(line, strlen(line), NULL, str) < 0) {
+	if (base64_decode(line, strlen(line), str) < 0) {
 		const char *reason = t_strdup_printf(
 			"Invalid base64 data in AUTH response");
 		login_proxy_failed(client->login_proxy,
@@ -141,11 +142,70 @@ pop3_proxy_continue_sasl_auth(struct client *client, struct ostream *output,
 	return 0;
 }
 
+static bool
+pop3_proxy_parse_referral(struct client *client, const char *resp,
+			  const char **line_r)
+{
+	struct uri_parser parser;
+	const char *destuser;
+	struct uri_authority uri_auth;
+
+	if (!str_begins_with(resp, "[REFERRAL/"))
+		return FALSE;
+
+	i_zero(&parser);
+	parser.pool = pool_datastack_create();
+	parser.begin = parser.cur = (const unsigned char *)(resp + 10);
+	parser.end = parser.begin + strlen(resp + 10);
+	parser.parse_prefix = TRUE;
+
+	if (uri_parse_host_authority(&parser, &uri_auth) < 0 ||
+	    !uri_data_decode(&parser, uri_auth.enc_userinfo, NULL, &destuser)) {
+		e_debug(login_proxy_get_event(client->login_proxy),
+			"Couldn't parse REFERRAL response '%s': %s",
+			str_sanitize(resp, 160), parser.error);
+		return FALSE;
+
+	}
+	if (*parser.cur == '\0'){
+		e_debug(login_proxy_get_event(client->login_proxy),
+			"Couldn't parse REFERRAL response '%s': "
+			"Premature end of response line (expected ']')",
+			str_sanitize(resp, 160));
+		return FALSE;
+	}
+	if (*parser.cur != ']') {
+		e_debug(login_proxy_get_event(client->login_proxy),
+			"Couldn't parse REFERRAL response '%s': "
+			"Invalid character %s in REFERRAL target",
+			str_sanitize(resp, 160),
+			uri_char_sanitize(*parser.cur));
+		return FALSE;
+	}
+
+	string_t *str = t_str_new(128);
+	if (destuser != NULL)
+		str_append(str, destuser);
+	str_append_c(str, '@');
+	if (uri_auth.host.ip.family == AF_INET)
+		str_append(str, net_ip2addr(&uri_auth.host.ip));
+	else if (uri_auth.host.ip.family == AF_INET6)
+		str_printfa(str, "[%s]", net_ip2addr(&uri_auth.host.ip));
+	else
+		str_append(str, uri_auth.host.name);
+	if (uri_auth.port != 0)
+		str_printfa(str, ":%u", uri_auth.port);
+
+	*line_r = str_c(str);
+	return TRUE;
+}
+
 int pop3_proxy_parse_line(struct client *client, const char *line)
 {
 	struct pop3_client *pop3_client = (struct pop3_client *)client;
 	struct ostream *output;
-	enum login_proxy_ssl_flags ssl_flags;
+	enum auth_proxy_ssl_flags ssl_flags;
+	const char *sasl_value;
 
 	i_assert(!client->destroyed);
 
@@ -153,7 +213,7 @@ int pop3_proxy_parse_line(struct client *client, const char *line)
 	switch (pop3_client->proxy_state) {
 	case POP3_PROXY_BANNER:
 		/* this is a banner */
-		if (!str_begins(line, "+OK")) {
+		if (!str_begins(line, "+OK", &line)) {
 			const char *reason = t_strdup_printf(
 				"Invalid banner: %s", str_sanitize(line, 160));
 			login_proxy_failed(client->login_proxy,
@@ -162,10 +222,10 @@ int pop3_proxy_parse_line(struct client *client, const char *line)
 			return -1;
 		}
 		pop3_client->proxy_xclient =
-			str_begins(line+3, " [XCLIENT]");
+			str_begins_with(line, " [XCLIENT]");
 
 		ssl_flags = login_proxy_get_ssl_flags(client->login_proxy);
-		if ((ssl_flags & PROXY_SSL_FLAG_STARTTLS) == 0) {
+		if ((ssl_flags & AUTH_PROXY_SSL_FLAG_STARTTLS) == 0) {
 			if (proxy_send_login(pop3_client, output) < 0)
 				return -1;
 		} else {
@@ -174,7 +234,7 @@ int pop3_proxy_parse_line(struct client *client, const char *line)
 		}
 		return 0;
 	case POP3_PROXY_STARTTLS:
-		if (!str_begins(line, "+OK")) {
+		if (!str_begins_with(line, "+OK")) {
 			const char *reason = t_strdup_printf(
 				"STLS failed: %s", str_sanitize(line, 160));
 			login_proxy_failed(client->login_proxy,
@@ -190,7 +250,7 @@ int pop3_proxy_parse_line(struct client *client, const char *line)
 			return -1;
 		return 1;
 	case POP3_PROXY_XCLIENT:
-		if (!str_begins(line, "+OK")) {
+		if (!str_begins_with(line, "+OK")) {
 			const char *reason = t_strdup_printf(
 				"XCLIENT failed: %s", str_sanitize(line, 160));
 			login_proxy_failed(client->login_proxy,
@@ -203,7 +263,7 @@ int pop3_proxy_parse_line(struct client *client, const char *line)
 		return 0;
 	case POP3_PROXY_LOGIN1:
 		i_assert(client->proxy_sasl_client == NULL);
-		if (!str_begins(line, "+OK"))
+		if (!str_begins_with(line, "+OK"))
 			break;
 
 		/* USER successful, send PASS */
@@ -212,15 +272,15 @@ int pop3_proxy_parse_line(struct client *client, const char *line)
 		pop3_client->proxy_state = POP3_PROXY_LOGIN2;
 		return 0;
 	case POP3_PROXY_LOGIN2:
-		if (str_begins(line, "+ ") &&
+		if (str_begins(line, "+ ", &sasl_value) &&
 		    client->proxy_sasl_client != NULL) {
 			/* continue SASL authentication */
 			if (pop3_proxy_continue_sasl_auth(client, output,
-							  line+2) < 0)
+							  sasl_value) < 0)
 				return -1;
 			return 0;
 		}
-		if (!str_begins(line, "+OK"))
+		if (!str_begins_with(line, "+OK"))
 			break;
 
 		/* Login successful. Send this line to client. */
@@ -250,13 +310,15 @@ int pop3_proxy_parse_line(struct client *client, const char *line)
 	   be using only Dovecot as their backend :) */
 	enum login_proxy_failure_type failure_type =
 		LOGIN_PROXY_FAILURE_TYPE_AUTH;
-	if (!str_begins(line, "-ERR ")) {
+	if (!str_begins_with(line, "-ERR ")) {
 		client_send_reply(client, POP3_CMD_REPLY_ERROR,
 				  AUTH_FAILED_MSG);
-	} else if (str_begins(line, "-ERR [SYS/TEMP]")) {
+	} else if (str_begins_with(line, "-ERR [SYS/TEMP]")) {
 		/* delay sending the reply until we know if we reconnect */
 		failure_type = LOGIN_PROXY_FAILURE_TYPE_AUTH_TEMPFAIL;
 		line += 5;
+	} else if (pop3_proxy_parse_referral(client, line + 5, &line)) {
+		failure_type = LOGIN_PROXY_FAILURE_TYPE_AUTH_REDIRECT;
 	} else {
 		client_send_raw(client, t_strconcat(line, "\r\n", NULL));
 		line += 5;
@@ -285,6 +347,7 @@ pop3_proxy_send_failure_reply(struct client *client,
 	case LOGIN_PROXY_FAILURE_TYPE_INTERNAL:
 	case LOGIN_PROXY_FAILURE_TYPE_REMOTE:
 	case LOGIN_PROXY_FAILURE_TYPE_PROTOCOL:
+	case LOGIN_PROXY_FAILURE_TYPE_AUTH_REDIRECT:
 		client_send_reply(client, POP3_CMD_REPLY_TEMPFAIL,
 				  LOGIN_PROXY_FAILURE_MSG);
 		break;

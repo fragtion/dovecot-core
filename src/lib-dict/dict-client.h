@@ -5,10 +5,8 @@
 
 #define DEFAULT_DICT_SERVER_SOCKET_FNAME "dict"
 
-#define DICT_CLIENT_PROTOCOL_MAJOR_VERSION 3
-#define DICT_CLIENT_PROTOCOL_MINOR_VERSION 2
-
-#define DICT_CLIENT_PROTOCOL_VERSION_MIN_MULTI_OK 2
+#define DICT_CLIENT_PROTOCOL_MAJOR_VERSION 4
+#define DICT_CLIENT_PROTOCOL_MINOR_VERSION 0
 
 #define DICT_CLIENT_MAX_LINE_LENGTH (64*1024)
 
@@ -19,9 +17,8 @@ enum dict_protocol_cmd {
 	DICT_PROTOCOL_CMD_LOOKUP = 'L', /* <key> */
 	DICT_PROTOCOL_CMD_ITERATE = 'I', /* <flags> <path> */
 
-	DICT_PROTOCOL_CMD_BEGIN = 'B', /* <id> */
+	DICT_PROTOCOL_CMD_BEGIN = 'B', /* <id> <user> <expire secs> */
 	DICT_PROTOCOL_CMD_COMMIT = 'C', /* <id> */
-	DICT_PROTOCOL_CMD_COMMIT_ASYNC = 'D', /* <id> */
 	DICT_PROTOCOL_CMD_ROLLBACK = 'R', /* <id> */
 
 	DICT_PROTOCOL_CMD_SET = 'S', /* <id> <key> <value> */

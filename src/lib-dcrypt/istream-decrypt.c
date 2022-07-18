@@ -6,6 +6,7 @@
 #include "safe-memset.h"
 #include "hash-method.h"
 #include "sha2.h"
+#include "memarea.h"
 #include "dcrypt.h"
 #include "istream.h"
 #include "istream-decrypt.h"
@@ -16,7 +17,11 @@
 
 #include <arpa/inet.h>
 
-#define ISTREAM_DECRYPT_READ_FIRST 15
+struct decrypt_istream_snapshot {
+	struct istream_snapshot snapshot;
+	struct decrypt_istream *dstream;
+	buffer_t *buf;
+};
 
 struct decrypt_istream {
 	struct istream_private istream;
@@ -30,6 +35,7 @@ struct decrypt_istream {
 	bool initialized;
 	bool finalized;
 	bool use_mac;
+	bool snapshot_pending;
 
 	uoff_t ftr, pos;
 	enum io_stream_encrypt_flags flags;
@@ -86,7 +92,6 @@ i_stream_decrypt_read_header_v1(struct decrypt_istream *stream,
 
 	const unsigned char *digest_pos = NULL, *key_digest_pos = NULL,
 		*key_ct_pos = NULL;
-	size_t pos = sizeof(IOSTREAM_CRYPT_MAGIC);
 	size_t digest_len = 0, key_ct_len = 0, key_digest_size = 0;
 
 	buffer_t ephemeral_key;
@@ -111,7 +116,6 @@ i_stream_decrypt_read_header_v1(struct decrypt_istream *stream,
 			break;
 		data += 2;
 		mlen -= 2;
-		pos += 2;
 
 		switch(i++) {
 		case 0:
@@ -134,7 +138,6 @@ i_stream_decrypt_read_header_v1(struct decrypt_istream *stream,
 			key_ct_len = len;
 			break;
 		}
-		pos += len;
 		data += len;
 		mlen -= len;
 	}
@@ -144,7 +147,7 @@ i_stream_decrypt_read_header_v1(struct decrypt_istream *stream,
 				    "Invalid or corrupted header");
 		/* was it consumed? */
 		stream->istream.istream.stream_errno =
-			mlen > 2 ? EINVAL : EPIPE;
+			mlen > 2 ? EIO : EPIPE;
 		return -1;
 	}
 
@@ -649,7 +652,7 @@ i_stream_decrypt_header_contents(struct decrypt_istream *stream,
 		if (!dcrypt_ctx_hmac_init(stream->ctx_mac, &error)) {
 			io_stream_set_error(&stream->istream.iostream,
 					    "MAC error: %s", error);
-			stream->istream.istream.stream_errno = EINVAL;
+			stream->istream.istream.stream_errno = EIO;
 			failed = TRUE;
 		}
 		stream->ftr = dcrypt_ctx_hmac_get_digest_length(stream->ctx_mac);
@@ -738,6 +741,23 @@ i_stream_decrypt_read_header(struct decrypt_istream *stream,
 	return hdr_len;
 }
 
+static void
+i_stream_decrypt_realloc_buf_if_needed(struct decrypt_istream *dstream)
+{
+       if (!dstream->snapshot_pending)
+               return;
+
+       /* buf exists in a snapshot. Leave it be and create a copy of it
+          that we modify. */
+       buffer_t *old_buf = dstream->buf;
+       dstream->buf = buffer_create_dynamic(default_pool,
+					    I_MAX(512, old_buf->used));
+       buffer_append(dstream->buf, old_buf->data, old_buf->used);
+       dstream->snapshot_pending = FALSE;
+
+       dstream->istream.buffer = dstream->buf->data;
+}
+
 static ssize_t
 i_stream_decrypt_read(struct istream_private *stream)
 {
@@ -753,6 +773,7 @@ i_stream_decrypt_read(struct istream_private *stream)
 	if (stream->istream.stream_errno != 0)
 		return -1;
 
+	i_stream_decrypt_realloc_buf_if_needed(dstream);
 	for (;;) {
 		/* remove skipped data from buffer */
 		if (stream->skip > 0) {
@@ -836,7 +857,7 @@ i_stream_decrypt_read(struct istream_private *stream)
 			}
 			io_stream_set_error(&stream->iostream,
 				"MAC error: %s", error);
-			stream->istream.stream_errno = EINVAL;
+			stream->istream.stream_errno = EIO;
 			return -1;
 		}
 
@@ -864,7 +885,7 @@ i_stream_decrypt_read(struct istream_private *stream)
 			if (hret == 0) {
 				/* see if we can get more data */
 				if (ret == -2) {
-					stream->istream.stream_errno = EINVAL;
+					stream->istream.stream_errno = EIO;
 					io_stream_set_error(&stream->iostream,
 						"Header too large "
 						"(more than %zu bytes)",
@@ -890,7 +911,7 @@ i_stream_decrypt_read(struct istream_private *stream)
 					io_stream_set_error(&stream->iostream,
 						"Decryption error: "
 						"footer is longer than data");
-					stream->istream.stream_errno = EINVAL;
+					stream->istream.stream_errno = EIO;
 					return -1;
 				}
 				check_mac = TRUE;
@@ -906,7 +927,7 @@ i_stream_decrypt_read(struct istream_private *stream)
 				    data, decrypt_size, &error)) {
 					io_stream_set_error(&stream->iostream,
 						"MAC error: %s", error);
-					stream->istream.stream_errno = EINVAL;
+					stream->istream.stream_errno = EIO;
 					return -1;
 				}
 			}
@@ -921,14 +942,14 @@ i_stream_decrypt_read(struct istream_private *stream)
 				if (!dcrypt_ctx_hmac_final(dstream->ctx_mac, &db, &error)) {
 					io_stream_set_error(&stream->iostream,
 						"Cannot verify MAC: %s", error);
-					stream->istream.stream_errno = EINVAL;
+					stream->istream.stream_errno = EIO;
 					return -1;
 				}
 				if (memcmp(dgst, data + decrypt_size,
 					dcrypt_ctx_hmac_get_digest_length(dstream->ctx_mac)) != 0) {
 					io_stream_set_error(&stream->iostream,
 						"Cannot verify MAC: mismatch");
-					stream->istream.stream_errno = EINVAL;
+					stream->istream.stream_errno = EIO;
 					return -1;
 				}
 			} else if ((dstream->flags & IO_STREAM_ENC_INTEGRITY_AEAD) ==
@@ -943,7 +964,7 @@ i_stream_decrypt_read(struct istream_private *stream)
 		    data, decrypt_size, dstream->buf, &error)) {
 			io_stream_set_error(&stream->iostream,
 				"Decryption error: %s", error);
-			stream->istream.stream_errno = EINVAL;
+			stream->istream.stream_errno = EIO;
 			return -1;
 		}
 		i_stream_skip(stream->parent, size);
@@ -956,6 +977,8 @@ i_stream_decrypt_seek(struct istream_private *stream, uoff_t v_offset,
 {
 	struct decrypt_istream *dstream =
 		(struct decrypt_istream *)stream;
+
+	i_stream_decrypt_realloc_buf_if_needed(dstream);
 
 	if (i_stream_nonseekable_try_seek(stream, v_offset))
 		return;
@@ -976,12 +999,58 @@ static void i_stream_decrypt_close(struct iostream_private *stream,
 		i_stream_close(dstream->istream.parent);
 }
 
+static void
+i_stream_decrypt_snapshot_free(struct istream_snapshot *_snapshot)
+{
+	struct decrypt_istream_snapshot *snapshot =
+		container_of(_snapshot, struct decrypt_istream_snapshot,
+			     snapshot);
+
+       if (snapshot->dstream->buf != snapshot->buf)
+               buffer_free(&snapshot->buf);
+       else {
+               i_assert(snapshot->dstream->snapshot_pending);
+               snapshot->dstream->snapshot_pending = FALSE;
+       }
+       i_free(snapshot);
+}
+
+static struct istream_snapshot *
+i_stream_decrypt_snapshot(struct istream_private *stream,
+			  struct istream_snapshot *prev_snapshot)
+{
+	struct decrypt_istream *dstream =
+		(struct decrypt_istream *)stream;
+	struct decrypt_istream_snapshot *snapshot;
+
+	if (stream->buffer != dstream->buf->data) {
+		/* reading body */
+		return i_stream_default_snapshot(stream, prev_snapshot);
+	}
+
+	/* snapshot the header buffer */
+	snapshot = i_new(struct decrypt_istream_snapshot, 1);
+	snapshot->dstream = dstream;
+	snapshot->buf = dstream->buf;
+	snapshot->snapshot.free = i_stream_decrypt_snapshot_free;
+	snapshot->snapshot.prev_snapshot = prev_snapshot;
+	dstream->snapshot_pending = TRUE;
+	return &snapshot->snapshot;
+}
+
 static void i_stream_decrypt_destroy(struct iostream_private *stream)
 {
 	struct decrypt_istream *dstream =
 		(struct decrypt_istream *)stream;
 
-	buffer_free(&dstream->buf);
+	if (!dstream->snapshot_pending)
+		buffer_free(&dstream->buf);
+	else {
+		/* Clear buf to make sure i_stream_decrypt_snapshot_free()
+		   frees it. */
+		dstream->buf = NULL;
+	}
+
 	if (dstream->iv != NULL)
 		i_free_and_null(dstream->iv);
 	if (dstream->ctx_sym != NULL)
@@ -1004,6 +1073,7 @@ i_stream_create_decrypt_common(struct istream *input)
 	dstream = i_new(struct decrypt_istream, 1);
 	dstream->istream.max_buffer_size = input->real_stream->max_buffer_size;
 	dstream->istream.read = i_stream_decrypt_read;
+	dstream->istream.snapshot = i_stream_decrypt_snapshot;
 	if (input->seekable)
 		dstream->istream.seek = i_stream_decrypt_seek;
 	dstream->istream.iostream.close = i_stream_decrypt_close;

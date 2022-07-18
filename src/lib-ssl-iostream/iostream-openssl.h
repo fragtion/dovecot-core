@@ -9,6 +9,7 @@
 #  define ASN1_STRING_get0_data(str) ASN1_STRING_data(str)
 #endif
 enum openssl_iostream_sync_type {
+	OPENSSL_IOSTREAM_SYNC_TYPE_NONE,
 	OPENSSL_IOSTREAM_SYNC_TYPE_FIRST_READ,
 	OPENSSL_IOSTREAM_SYNC_TYPE_CONTINUE_READ,
 	OPENSSL_IOSTREAM_SYNC_TYPE_WRITE,
@@ -38,18 +39,18 @@ struct ssl_iostream {
 	struct ostream *plain_output;
 	struct istream *ssl_input;
 	struct ostream *ssl_output;
+	struct event *event;
 
 	/* SSL clients: host where we connected to */
 	char *connected_host;
 	/* SSL servers: host requested by the client via SNI */
 	char *sni_host;
 	char *last_error;
-	char *log_prefix;
 	char *plain_stream_errstr;
 	int plain_stream_errno;
 
 	/* copied settings */
-	bool verbose, verbose_invalid_cert, allow_invalid_cert;
+	bool verbose_invalid_cert, allow_invalid_cert;
 	int username_nid;
 
 	ssl_iostream_handshake_callback_t *handshake_callback;
@@ -104,11 +105,6 @@ int openssl_min_protocol_to_options(const char *min_protocol, long *opt_r,
    occurred. */
 int openssl_iostream_bio_sync(struct ssl_iostream *ssl_io,
 			      enum openssl_iostream_sync_type type);
-/* Call when there's more data available in plain_input/plain_output.
-   Returns 1 if it's ok to continue with SSL_read/SSL_write, 0 if not
-   (still handshaking), -1 if error occurred. */
-int openssl_iostream_more(struct ssl_iostream *ssl_io,
-			  enum openssl_iostream_sync_type type);
 
 /* Returns 1 if the operation should be retried (we read/wrote more data),
    0 if the operation should retried later once more data has been

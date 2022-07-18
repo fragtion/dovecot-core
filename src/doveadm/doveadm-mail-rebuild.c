@@ -14,14 +14,15 @@ cmd_rebuild_attachment_box(struct doveadm_mail_cmd_context *ctx,
 {
 	struct doveadm_mail_iter *iter;
 	struct mail *mail;
-	int ret = 0;
 
-	if (doveadm_mail_iter_init(ctx, info, ctx->search_args,
-				   MAIL_FETCH_IMAP_BODYSTRUCTURE|
-				   MAIL_FETCH_MESSAGE_PARTS, NULL, FALSE,
-				   &iter) < 0)
-		return -1;
+	int ret = doveadm_mail_iter_init(ctx, info, ctx->search_args,
+					 MAIL_FETCH_IMAP_BODYSTRUCTURE|
+					 MAIL_FETCH_MESSAGE_PARTS, NULL, 0,
+					 &iter);
+	if (ret <= 0)
+		return ret;
 
+	ret = 0;
 	while (doveadm_mail_iter_next(iter, &mail) && ret >= 0) {
 		T_BEGIN {
 			doveadm_print(dec2str(mail->uid));
@@ -70,12 +71,17 @@ cmd_rebuild_attachment_run(struct doveadm_mail_cmd_context *ctx,
 	return ret;
 }
 
-static void cmd_rebuild_attachment_init(struct doveadm_mail_cmd_context *ctx,
-					const char *const args[])
+static void cmd_rebuild_attachment_init(struct doveadm_mail_cmd_context *_ctx)
 {
+	struct doveadm_cmd_context *cctx = _ctx->cctx;
+
+	const char *const *query;
+	if (!doveadm_cmd_param_array(cctx, "query", &query))
+		doveadm_mail_help_name("search");
+	_ctx->search_args = doveadm_mail_build_search_args(query);
+
 	doveadm_print_header_simple("uid");
 	doveadm_print_header_simple("attachment");
-	ctx->search_args = doveadm_mail_build_search_args(args);
 }
 
 

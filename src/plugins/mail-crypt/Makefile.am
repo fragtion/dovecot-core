@@ -10,14 +10,9 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-storage \
 	-I$(top_srcdir)/src/lib-dcrypt \
 	-I$(top_srcdir)/src/lib-fs \
+	-I$(top_srcdir)/src/lib-doveadm \
 	-I$(top_srcdir)/src/doveadm \
 	-I$(top_srcdir)/src/plugins/acl
-
-if SSL_VERSION_GE_102
-test_options =
-else !SSL_VERSION_GE_102
-test_options = NOUNDEF=1
-endif !SSL_VERSION_GE_102
 
 doveadm_moduledir = $(moduledir)/doveadm
 
@@ -76,8 +71,23 @@ libdoveadm_mail_crypt_plugin_la_DEPENDENCIES = $(LIBDOVECOT_DEPS)
 libdoveadm_mail_crypt_plugin_la_LDFLAGS = -module -avoid-version
 
 test_programs = \
+	test-fs-crypt \
 	test-mail-global-key \
 	test-mail-key
+
+test_fs_crypt_SOURCES = \
+	test-fs-crypt.c \
+	fs-crypt-settings.c
+test_fs_crypt_LDADD = $(LIBDOVECOT) \
+	fs-crypt.lo \
+	mail-crypt-global-key.lo \
+	mail-crypt-pluginenv.lo
+test_fs_crypt_DEPENDENCIES = $(LIBDOVECOT_DEPS) \
+	fs-crypt.lo \
+	mail-crypt-global-key.lo \
+	mail-crypt-pluginenv.lo
+test_fs_crypt_LDFLAGS = $(DOVECOT_BINARY_LDFLAGS)
+test_fs_crypt_CFLAGS = $(AM_CPPFLAGS) $(DOVECOT_BINARY_CFLAGS) -Dtop_builddir=\"$(top_builddir)\"
 
 test_mail_global_key_SOURCES = \
 	test-mail-global-key.c \
@@ -110,7 +120,7 @@ noinst_HEADERS = \
 
 check-local:
 	for bin in $(test_programs); do \
-	  if ! env $(test_options) $(RUN_TEST) ./$$bin; then exit 1; fi; \
+	  if ! $(RUN_TEST) ./$$bin; then exit 1; fi; \
 	done
 
 noinst_PROGRAMS = $(test_programs)

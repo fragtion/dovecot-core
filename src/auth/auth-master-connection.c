@@ -107,7 +107,7 @@ master_input_request(struct auth_master_connection *conn, const char *args)
 	struct auth_client_connection *client_conn;
 	const char *const *list, *const *params;
 	unsigned int id, client_pid, client_id;
-	uint8_t cookie[MASTER_AUTH_COOKIE_SIZE];
+	uint8_t cookie[LOGIN_REQUEST_COOKIE_SIZE];
 	buffer_t buf;
 
 	/* <id> <client-pid> <client-id> <cookie> [<parameters>] */
@@ -121,7 +121,8 @@ master_input_request(struct auth_master_connection *conn, const char *args)
 	}
 
 	buffer_create_from_data(&buf, cookie, sizeof(cookie));
-	if (hex_to_binary(list[3], &buf) < 0) {
+	if (strlen(list[3]) != sizeof(cookie)*2 ||
+	    hex_to_binary(list[3], &buf) < 0) {
 		e_error(conn->event, "BUG: Master sent broken REQUEST cookie");
 		return FALSE;
 	}
@@ -514,7 +515,6 @@ static void master_input_list_callback(const char *user, void *context)
 		ctx->auth_request->userdb = userdb;
 		ctx->iter = userdb_blocking_iter_init(ctx->auth_request,
 					master_input_list_callback, ctx);
-		userdb_blocking_iter_next(ctx->iter);
 		return;
 	}
 
@@ -608,7 +608,8 @@ master_input_list(struct auth_master_connection *conn, const char *args)
 	if (auth_request->fields.user == NULL)
 		auth_request_set_username_forced(auth_request, "");
 	if (auth_request->fields.service == NULL) {
-		auth_request_import(auth_request, "service", "");
+		if (!auth_request_import(auth_request, "service", ""))
+			i_unreached();
 		i_assert(auth_request->fields.service != NULL);
 	}
 
@@ -629,22 +630,24 @@ master_input_list(struct auth_master_connection *conn, const char *args)
 static bool
 auth_master_input_line(struct auth_master_connection *conn, const char *line)
 {
+	const char *args;
+
 	e_debug(auth_event, "master in: %s", line);
 
-	if (str_begins(line, "USER\t"))
-		return master_input_user(conn, line + 5);
-	if (str_begins(line, "LIST\t"))
-		return master_input_list(conn, line + 5);
-	if (str_begins(line, "PASS\t"))
-		return master_input_pass(conn, line + 5);
+	if (str_begins(line, "USER\t", &args))
+		return master_input_user(conn, args);
+	if (str_begins(line, "LIST\t", &args))
+		return master_input_list(conn, args);
+	if (str_begins(line, "PASS\t", &args))
+		return master_input_pass(conn, args);
 
 	if (!conn->userdb_only) {
 		i_assert(conn->userdb_restricted_uid == 0);
-		if (str_begins(line, "REQUEST\t"))
-			return master_input_request(conn, line + 8);
-		if (str_begins(line, "CACHE-FLUSH\t"))
-			return master_input_cache_flush(conn, line + 12);
-		if (str_begins(line, "CPID\t")) {
+		if (str_begins(line, "REQUEST\t", &args))
+			return master_input_request(conn, args);
+		if (str_begins(line, "CACHE-FLUSH\t", &args))
+			return master_input_cache_flush(conn, args);
+		if (str_begins_with(line, "CPID\t")) {
 			e_error(conn->event,
 				"Authentication client trying to connect to "
 				"master socket");
@@ -660,6 +663,7 @@ auth_master_input_line(struct auth_master_connection *conn, const char *line)
 
 static void master_input(struct auth_master_connection *conn)
 {
+	const char *args;
  	char *line;
 	bool ret;
 
@@ -684,9 +688,9 @@ static void master_input(struct auth_master_connection *conn)
 			return;
 
 		/* make sure the major version matches */
-		if (!str_begins(line, "VERSION\t") ||
-		    !str_uint_equals(t_strcut(line + 8, '\t'),
-				     AUTH_MASTER_PROTOCOL_MAJOR_VERSION)) {
+		if (!str_begins(line, "VERSION\t", &args) ||
+		    !str_uint_equals(t_strcut(args, '\t'),
+				     AUTH_CLIENT_PROTOCOL_MAJOR_VERSION)) {
 			e_error(conn->event,
 				"Master not compatible with this server "
 				"(mixed old and new binaries?)");
@@ -784,8 +788,8 @@ auth_master_connection_create(struct auth *auth, int fd,
 	event_set_log_message_callback(conn->event, auth_master_event_log_callback, conn);
 
 	line = t_strdup_printf("VERSION\t%u\t%u\nSPID\t%s\n",
-			       AUTH_MASTER_PROTOCOL_MAJOR_VERSION,
-			       AUTH_MASTER_PROTOCOL_MINOR_VERSION,
+			       AUTH_CLIENT_PROTOCOL_MAJOR_VERSION,
+			       AUTH_CLIENT_PROTOCOL_MINOR_VERSION,
 			       my_pid);
 	o_stream_nsend_str(conn->output, line);
 	DLLIST_PREPEND(&auth_master_connections, conn);

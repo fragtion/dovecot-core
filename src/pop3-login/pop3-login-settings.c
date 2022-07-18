@@ -5,14 +5,26 @@
 #include "settings-parser.h"
 #include "service-settings.h"
 #include "login-settings.h"
+#include "pop3-protocol.h"
 #include "pop3-login-settings.h"
 
 #include <stddef.h>
 
 /* <settings checks> */
+static struct file_listener_settings pop3_login_unix_listeners_array[] = {
+	{ "srv.pop3-login/%{pid}", 0600, "", "" },
+};
+static struct file_listener_settings *pop3_login_unix_listeners[] = {
+	&pop3_login_unix_listeners_array[0],
+};
+static buffer_t pop3_login_unix_listeners_buf = {
+	{ { pop3_login_unix_listeners, sizeof(pop3_login_unix_listeners) } }
+};
+
 static struct inet_listener_settings pop3_login_inet_listeners_array[] = {
-	{ .name = "pop3", .address = "", .port = 110 },
-	{ .name = "pop3s", .address = "", .port = 995, .ssl = TRUE }
+	{ .name = "pop3", .address = "", .port = POP3_DEFAULT_PORT },
+	{ .name = "pop3s", .address = "", .port = POP3S_DEFAULT_PORT,
+	  .ssl = TRUE }
 };
 static struct inet_listener_settings *pop3_login_inet_listeners[] = {
 	&pop3_login_inet_listeners_array[0],
@@ -43,7 +55,8 @@ struct service_settings pop3_login_service_settings = {
 	.idle_kill = 0,
 	.vsz_limit = UOFF_T_MAX,
 
-	.unix_listeners = ARRAY_INIT,
+	.unix_listeners = { { &pop3_login_unix_listeners_buf,
+			      sizeof(pop3_login_unix_listeners[0]) } },
 	.fifo_listeners = ARRAY_INIT,
 	.inet_listeners = { { &pop3_login_inet_listeners_buf,
 			      sizeof(pop3_login_inet_listeners[0]) } }

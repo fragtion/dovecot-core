@@ -99,7 +99,7 @@ mdbox_storage_find_root_dir(const struct mail_namespace *ns)
 			if (debug)
 				i_debug("mdbox: root exists (%s)", path);
 			return path;
-		} 
+		}
 		if (debug)
 			i_debug("mdbox: access(%s, rwx): failed: %m", path);
 	}
@@ -465,7 +465,7 @@ struct mail_storage mdbox_storage = {
 		mdbox_storage_autodetect,
 		mdbox_mailbox_alloc,
 		mdbox_purge,
-		NULL,
+		mail_storage_list_index_rebuild,
 	}
 };
 
@@ -505,6 +505,7 @@ struct mailbox mdbox_mailbox = {
 		index_storage_search_deinit,
 		index_storage_search_next_nonblock,
 		index_storage_search_next_update_seq,
+		index_storage_search_next_match_mail,
 		mdbox_save_alloc,
 		mdbox_save_begin,
 		dbox_save_continue,

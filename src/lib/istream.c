@@ -17,6 +17,7 @@ void i_stream_set_name(struct istream *stream, const char *name)
 
 const char *i_stream_get_name(struct istream *stream)
 {
+	i_assert(stream != NULL);
 	while (stream->real_stream->iostream.name == NULL) {
 		stream = stream->real_stream->parent;
 		if (stream == NULL)
@@ -57,9 +58,17 @@ void i_stream_unref(struct istream **stream)
 
 	_stream = (*stream)->real_stream;
 
-	if (!io_stream_unref(&_stream->iostream)) {
-		str_free(&_stream->line_str);
+	if (_stream->iostream.refcount > 1) {
+		if (!io_stream_unref(&_stream->iostream))
+			i_unreached();
+	} else {
+		/* The snapshot may contain pointers to the parent istreams.
+		   Free it before io_stream_unref() frees the parents. */
 		i_stream_snapshot_free(&_stream->prev_snapshot);
+
+		if (io_stream_unref(&_stream->iostream))
+			i_unreached();
+		str_free(&_stream->line_str);
 		i_stream_unref(&_stream->parent);
 		io_stream_free(&_stream->iostream);
 	}
@@ -96,6 +105,17 @@ void i_stream_copy_fd(struct istream *dest, struct istream *source)
 	i_assert(dest->real_stream->fd == -1);
 	dest->real_stream->fd = fd;
 	dest->readable_fd = source->readable_fd;
+}
+
+void i_stream_set_error(struct istream *stream, int stream_errno,
+			const char *fmt, ...)
+{
+	va_list args;
+
+	va_start(args, fmt);
+	stream->stream_errno = stream_errno;
+	io_stream_set_verror(&stream->real_stream->iostream, fmt, args);
+	va_end(args);
 }
 
 const char *i_stream_get_error(struct istream *stream)
@@ -248,6 +268,7 @@ void i_stream_snapshot_free(struct istream_snapshot **_snapshot)
 	else {
 		if (snapshot->old_memarea != NULL)
 			memarea_unref(&snapshot->old_memarea);
+		i_stream_unref(&snapshot->istream);
 		i_free(snapshot);
 	}
 }
@@ -786,6 +807,27 @@ int i_stream_read_data(struct istream *stream, const unsigned char **data_r,
 	return -1;
 }
 
+int i_stream_read_limited(struct istream *stream, const unsigned char **data_r,
+			  size_t *size_r, size_t limit)
+{
+	struct istream_private *_stream = stream->real_stream;
+	int ret;
+
+	*data_r = i_stream_get_data(stream, size_r);
+	if (*size_r >= limit) {
+		*size_r = limit;
+		return 1;
+	}
+
+	_stream->data_limit = limit;
+	ret = i_stream_read_more(stream, data_r, size_r);
+	_stream->data_limit = 0;
+
+	if (*size_r >= limit)
+		*size_r = limit;
+	return ret;
+}
+
 void i_stream_compress(struct istream_private *stream)
 {
 	i_assert(stream->memarea == NULL ||
@@ -861,6 +903,7 @@ bool i_stream_try_alloc(struct istream_private *stream,
 			size_t wanted_size, size_t *size_r)
 {
 	i_assert(wanted_size > 0);
+	i_assert(stream->buffer_size >= stream->pos);
 
 	if (wanted_size > stream->buffer_size - stream->pos) {
 		if (stream->skip > 0) {
@@ -879,10 +922,18 @@ bool i_stream_try_alloc(struct istream_private *stream,
 		}
 	}
 
-	*size_r = stream->buffer_size - stream->pos;
-	if (stream->try_alloc_limit > 0 &&
-	    *size_r > stream->try_alloc_limit)
-		*size_r = stream->try_alloc_limit;
+	if (stream->data_limit == 0 ||
+	    (stream->buffer_size - stream->skip) < stream->data_limit)
+		*size_r = stream->buffer_size - stream->pos;
+	else {
+		size_t buffered = (stream->pos - stream->skip);
+
+		if (buffered >= stream->data_limit)
+			*size_r = 0;
+		else
+			*size_r = stream->data_limit - buffered;
+	}
+	i_assert(stream->w_buffer != NULL || *size_r == 0);
 	return *size_r > 0;
 }
 
@@ -916,6 +967,18 @@ void *i_stream_alloc(struct istream_private *stream, size_t size)
 		i_assert(avail_size >= size);
 	}
 	return stream->w_buffer + stream->pos;
+}
+
+void i_stream_memarea_detach(struct istream_private *stream)
+{
+	if (stream->memarea != NULL) {
+		/* Don't overwrite data in a snapshot. Allocate a new
+		   buffer instead. */
+		memarea_unref(&stream->memarea);
+		stream->buffer_size = 0;
+		stream->buffer = NULL;
+		stream->w_buffer = NULL;
+	}
 }
 
 bool i_stream_add_data(struct istream *_stream, const unsigned char *data,

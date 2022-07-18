@@ -22,7 +22,11 @@ static void cmd_helo_reply(struct submission_client *subm_client,
 			   struct smtp_server_cmd_helo *data)
 {
 	struct client *client = &subm_client->common;
+	const struct submission_login_settings *set = subm_client->set;
 	enum smtp_capability backend_caps = subm_client->backend_capabilities;
+	bool exotic_backend =
+		HAS_ALL_BITS(set->parsed_workarounds,
+			     SUBMISSION_LOGIN_WORKAROUND_EXOTIC_BACKEND);
 	struct smtp_server_reply *reply;
 
 	reply = smtp_server_reply_create_ehlo(cmd->cmd);
@@ -50,26 +54,37 @@ static void cmd_helo_reply(struct submission_client *subm_client,
 		if ((backend_caps & SMTP_CAPABILITY_BINARYMIME) != 0 &&
 		    (backend_caps & SMTP_CAPABILITY_CHUNKING) != 0)
 			smtp_server_reply_ehlo_add(reply, "BINARYMIME");
-		smtp_server_reply_ehlo_add_param(reply,
-			"BURL", "imap");
-		smtp_server_reply_ehlo_add(reply,
-			"CHUNKING");
+		if (!exotic_backend ||
+		    (backend_caps & SMTP_CAPABILITY_BURL) != 0) {
+			smtp_server_reply_ehlo_add_param(reply, "BURL", "imap");
+		}
+		if (!exotic_backend ||
+		    (backend_caps & SMTP_CAPABILITY_CHUNKING) != 0) {
+			smtp_server_reply_ehlo_add(reply,
+				"CHUNKING");
+		}
 		if ((backend_caps & SMTP_CAPABILITY_DSN) != 0)
 			smtp_server_reply_ehlo_add(reply, "DSN");
-		smtp_server_reply_ehlo_add(reply,
-			"ENHANCEDSTATUSCODES");
+		if (!exotic_backend ||
+		    (backend_caps & SMTP_CAPABILITY_ENHANCEDSTATUSCODES) != 0) {
+			smtp_server_reply_ehlo_add(
+				reply, "ENHANCEDSTATUSCODES");
+		}
 
 		if (subm_client->set->submission_max_mail_size > 0) {
 			smtp_server_reply_ehlo_add_param(reply,
 				"SIZE", "%"PRIuUOFF_T,
 				subm_client->set->submission_max_mail_size);
-		} else {
+		} else if (!exotic_backend ||
+			   (backend_caps & SMTP_CAPABILITY_SIZE) != 0) {
 			smtp_server_reply_ehlo_add(reply, "SIZE");
 		}
 
 		if (client_is_tls_enabled(client) && !client->tls)
 			smtp_server_reply_ehlo_add(reply, "STARTTLS");
-		smtp_server_reply_ehlo_add(reply, "PIPELINING");
+		if (!exotic_backend ||
+		    (backend_caps & SMTP_CAPABILITY_PIPELINING) != 0)
+			smtp_server_reply_ehlo_add(reply, "PIPELINING");
 		if ((backend_caps & SMTP_CAPABILITY_VRFY) != 0)
 			smtp_server_reply_ehlo_add(reply, "VRFY");
 		smtp_server_reply_ehlo_add_xclient(reply);
@@ -110,6 +125,17 @@ void submission_client_auth_result(struct client *client,
 		if (client->login_proxy != NULL)
 			subm_client->pending_auth = cmd;
 		break;
+	case CLIENT_AUTH_RESULT_REFERRAL_NOLOGIN: {
+		const struct smtp_proxy_redirect predir = {
+			.username = reply->proxy.username,
+			.host = reply->proxy.host,
+			.host_ip = reply->proxy.host_ip,
+			.port = reply->proxy.port,
+		};
+		smtp_server_reply_redirect(cmd, login_binary->default_port,
+					   &predir);
+		break;
+	}
 	case CLIENT_AUTH_RESULT_TEMPFAIL:
 		/* RFC4954, Section 6:
 
@@ -262,15 +288,13 @@ void submission_client_auth_send_challenge(struct client *client,
 	smtp_server_cmd_auth_send_challenge(cmd, data);
 }
 
-int cmd_auth(void *conn_ctx, struct smtp_server_cmd_ctx *cmd,
-	     struct smtp_server_cmd_auth *data)
+static void
+cmd_auth_set_master_data_prefix(struct submission_client *subm_client,
+				const char *mail_params) ATTR_NULL(2)
 {
-	struct submission_client *subm_client = conn_ctx;
 	struct client *client = &subm_client->common;
 	struct smtp_server_helo_data *helo;
 	struct smtp_proxy_data proxy;
-
-	i_assert(subm_client->pending_auth == NULL);
 
 	buffer_t *buf = buffer_create_dynamic(default_pool, 2048);
 
@@ -289,12 +313,59 @@ int cmd_auth(void *conn_ctx, struct smtp_server_cmd_ctx *cmd,
 		buffer_append(buf, proxy.helo, strlen(proxy.helo));
 	buffer_append_c(buf, '\0');
 
+	/* Pass MAIL command to post-login service if any. */
+	if (mail_params != NULL) {
+		buffer_append(buf, "MAIL ", 5);
+		buffer_append(buf, mail_params, strlen(mail_params));
+		buffer_append(buf, "\r\n", 2);
+	}
+
 	i_free(client->master_data_prefix);
 	client->master_data_prefix_len = buf->used;
 	client->master_data_prefix = buffer_free_without_data(&buf);
+}
 
+int cmd_auth(void *conn_ctx, struct smtp_server_cmd_ctx *cmd,
+	     struct smtp_server_cmd_auth *data)
+{
+	struct submission_client *subm_client = conn_ctx;
+	struct client *client = &subm_client->common;
+
+	cmd_auth_set_master_data_prefix(subm_client, NULL);
+
+	i_assert(subm_client->pending_auth == NULL);
 	subm_client->pending_auth = cmd;
 
 	(void)client_auth_begin(client, data->sasl_mech, data->initial_response);
 	return 0;
+}
+
+void cmd_mail(struct smtp_server_cmd_ctx *cmd, const char *params)
+{
+	struct smtp_server_connection *conn = cmd->conn;
+	struct submission_client *subm_client =
+		smtp_server_connection_get_context(conn);
+	struct client *client = &subm_client->common;
+	enum submission_login_client_workarounds workarounds =
+		subm_client->set->parsed_workarounds;
+
+	if (HAS_NO_BITS(workarounds,
+			SUBMISSION_LOGIN_WORKAROUND_IMPLICIT_AUTH_EXTERNAL) ||
+	    sasl_server_find_available_mech(client, "EXTERNAL") == NULL) {
+		smtp_server_command_fail(cmd->cmd, 530, "5.7.0",
+					 "Authentication required.");
+		return;
+	}
+
+	e_debug(cmd->event,
+		"Performing implicit EXTERNAL authentication");
+
+	smtp_server_command_input_lock(cmd);
+
+	cmd_auth_set_master_data_prefix(subm_client, params);
+
+	i_assert(subm_client->pending_auth == NULL);
+	subm_client->pending_auth = cmd;
+
+	(void)client_auth_begin_implicit(client, "EXTERNAL", "=");
 }

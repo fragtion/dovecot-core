@@ -43,7 +43,7 @@ cmd_log_test(struct doveadm_cmd_context *cctx ATTR_UNUSED)
 		ctx.type = i;
 		i_log_type(&ctx, TEST_LOG_MSG_PREFIX"%s log (%u)",
 			   t_str_lcase(t_strcut(prefix, ':')),
-			   (unsigned int)ioloop_time);
+			   ioloop_time32);
 	}
 }
 
@@ -130,12 +130,12 @@ cmd_log_find_syslog_files(struct log_find_context *ctx, const char *path)
 
 static bool log_type_find(const char *str, enum log_type *type_r)
 {
+	const char *suffix;
 	unsigned int i;
-	size_t len = strlen(str);
 
 	for (i = 0; i < LAST_LOG_TYPE; i++) {
-		if (strncasecmp(str, failure_log_type_prefixes[i], len) == 0 &&
-		    failure_log_type_prefixes[i][len] == ':') {
+		if (str_begins_icase(failure_log_type_prefixes[i], str, &suffix) &&
+		    suffix[0] == ':') {
 			*type_r = i;
 			return TRUE;
 		}
@@ -153,7 +153,7 @@ static void cmd_log_find_syslog_file_messages(struct log_find_file *file)
 	fd = open(file->path, O_RDONLY);
 	if (fd == -1)
 		return;
-	
+
 	input = i_stream_create_fd_autoclose(&fd, 1024);
 	i_stream_seek(input, file->size);
 	while ((line = i_stream_read_next_line(input)) != NULL) {
@@ -289,7 +289,7 @@ static const char *t_cmd_log_error_trim(const char *orig)
 	/* Trim whitespace from suffix and remove ':' if it exists */
 	for (pos = strlen(orig); pos > 0; pos--) {
 		if (orig[pos-1] != ' ') {
-			if (orig[pos-1] == ':') 
+			if (orig[pos-1] == ':')
 				pos--;
 			break;
 		}
@@ -392,7 +392,7 @@ DOVEADM_CMD_PARAMS_END
 	.usage = "[-s <min_timestamp>]",
 	.cmd = cmd_log_errors,
 DOVEADM_CMD_PARAMS_START
-DOVEADM_CMD_PARAM('s', "since", CMD_PARAM_INT64, 0)
+DOVEADM_CMD_PARAM('s', "since", CMD_PARAM_INT64, CMD_PARAM_FLAG_UNSIGNED)
 DOVEADM_CMD_PARAMS_END
 }
 };

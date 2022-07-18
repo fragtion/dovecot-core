@@ -144,14 +144,16 @@ imapc_mail_try_merge_fetch(struct imapc_mailbox *mbox, string_t *str)
 {
 	const char *s1 = str_c(str);
 	const char *s2 = str_c(mbox->pending_fetch_cmd);
-	const char *p1, *p2;
+	const char *s1_args, *s2_args, *p1, *p2;
 
-	i_assert(str_begins(s1, "UID FETCH "));
-	i_assert(str_begins(s2, "UID FETCH "));
+	if (!str_begins(s1, "UID FETCH ", &s1_args))
+		i_unreached();
+	if (!str_begins(s2, "UID FETCH ", &s2_args))
+		i_unreached();
 
 	/* skip over UID range */
-	p1 = strchr(s1+10, ' ');
-	p2 = strchr(s2+10, ' ');
+	p1 = strchr(s1_args, ' ');
+	p2 = strchr(s2_args, ' ');
 
 	if (null_strcmp(p1, p2) != 0)
 		return FALSE;
@@ -213,11 +215,14 @@ imapc_mail_send_fetch(struct mail *_mail, enum mail_fetch_field fields,
 	i_assert(headers == NULL ||
 		 IMAPC_BOX_HAS_FEATURE(mbox, IMAPC_FEATURE_FETCH_HEADERS));
 
-	if (_mail->lookup_abort != MAIL_LOOKUP_ABORT_NEVER) {
-		mail_set_aborted(_mail);
+	if (!mbox->selected) {
+		mail_storage_set_error(_mail->box->storage,
+				MAIL_ERROR_NOTPOSSIBLE, "Can't fetch mails before selecting mailbox");
 		return -1;
 	}
-	_mail->mail_stream_opened = TRUE;
+
+	if (!mail_stream_access_start(_mail))
+		return -1;
 
 	/* drop any fields that we may already be fetching currently */
 	fields &= ENUM_NEGATE(mail->fetching_fields);
@@ -328,6 +333,9 @@ static void imapc_mail_cache_get(struct imapc_mail *mail,
 	}
 	mail->header_fetched = TRUE;
 	mail->body_fetched = TRUE;
+	/* The stream was already accessed and now it's cached.
+	   It still needs to be set accessed to avoid assert-crash. */
+	mail->imail.mail.mail.mail_stream_accessed = TRUE;
 	imapc_mail_init_stream(mail);
 }
 

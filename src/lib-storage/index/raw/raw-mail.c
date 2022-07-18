@@ -14,11 +14,8 @@ static int raw_mail_stat(struct mail *mail)
 	struct raw_mailbox *mbox = RAW_MAILBOX(mail->box);
 	const struct stat *st;
 
-	if (mail->lookup_abort >= MAIL_LOOKUP_ABORT_NOT_IN_CACHE) {
-		mail_set_aborted(mail);
+	if (!mail_metadata_access_start(mail))
 		return -1;
-	}
-	mail->mail_metadata_accessed = TRUE;
 
 	mail->transaction->stats.fstat_lookup_count++;
 	if (i_stream_stat(mail->box->input, TRUE, &st) < 0) {
@@ -85,6 +82,8 @@ raw_mail_get_stream(struct mail *_mail, bool get_body ATTR_UNUSED,
 	struct index_mail *mail = INDEX_MAIL(_mail);
 
 	if (mail->data.stream == NULL) {
+		if (!mail_stream_access_start(_mail))
+			return -1;
 		/* we can't just reference mbox->input, because
 		   index_mail_close() expects to be able to free the stream */
 		mail->data.stream =

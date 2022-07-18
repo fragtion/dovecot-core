@@ -2,6 +2,7 @@
 #define CLIENT_H
 
 #include "net.h"
+#include "guid.h"
 
 struct smtp_reply;
 
@@ -86,6 +87,7 @@ struct client {
 	const struct submission_settings *set;
 
 	struct smtp_server_connection *conn;
+	guid_128_t anvil_conn_guid;
 	struct client_state state;
 	ARRAY(struct submission_backend *) pending_backends;
 	ARRAY(struct submission_recipient *) rcpt_to;
@@ -137,9 +139,11 @@ client_create(int fd_in, int fd_out, struct mail_user *user,
 	      struct mail_storage_service_user *service_user,
 	      const struct submission_settings *set, const char *helo,
 	      const struct smtp_proxy_data *proxy_data,
-	      const unsigned char *pdata, unsigned int pdata_len);
+	      const unsigned char *pdata, unsigned int pdata_len,
+	      bool no_greeting);
 void client_destroy(struct client **client, const char *prefix,
 		    const char *reason) ATTR_NULL(2, 3);
+void client_kick(struct client *client);
 
 typedef void (*client_input_callback_t)(struct client *context);
 

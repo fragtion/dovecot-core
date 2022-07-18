@@ -46,7 +46,7 @@ struct passdb_module_interface {
 
 	/* Return authentication credentials, set in
 	   auth_request->credentials. */
-	void (*lookup_credentials)(struct auth_request *request, 
+	void (*lookup_credentials)(struct auth_request *request,
 				   lookup_credentials_callback_t *callback);
 
 	/* Update credentials */
@@ -63,10 +63,6 @@ struct passdb_module {
 	/* Default password scheme for this module.
 	   If default_cache_key is set, must not be NULL. */
 	const char *default_pass_scheme;
-	/* Supported authentication mechanisms, NULL is all, [NULL] is none*/
-	const char *const *mechanisms;
-	/* Username filter, NULL is no filter */
-	const char *const *username_filter;
 
 	/* If blocking is set to TRUE, use child processes to access
 	   this passdb. */

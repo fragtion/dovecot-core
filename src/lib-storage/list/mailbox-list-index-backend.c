@@ -2,6 +2,7 @@
 
 #include "lib.h"
 #include "hostpid.h"
+#include "str.h"
 #include "mail-index.h"
 #include "subscription-file.h"
 #include "mailbox-list-delete.h"
@@ -102,7 +103,6 @@ index_list_get_refreshed_node_seq(struct index_mailbox_list *list,
 	}
 	i_panic("mailbox list index: refreshing doesn't lose expunged uid=%u",
 		(*node_r)->uid);
-	return -1;
 }
 
 static const char *
@@ -123,7 +123,7 @@ index_list_get_path(struct mailbox_list *_list, const char *name,
 	struct mailbox_list_index_node *node;
 	struct mailbox_status status;
 	guid_128_t mailbox_guid;
-	const char *root_dir;
+	const char *root_dir, *reason;
 	uint32_t seq;
 	int ret;
 
@@ -189,7 +189,8 @@ index_list_get_path(struct mailbox_list *_list, const char *name,
 				       T_MAIL_ERR_MAILBOX_NOT_FOUND(name));
 		ret = -1;
 	} else if (!mailbox_list_index_status(_list, view, seq, 0,
-					      &status, mailbox_guid, NULL) ||
+					      &status, mailbox_guid,
+					      NULL, &reason) ||
 		   guid_128_is_empty(mailbox_guid)) {
 		mailbox_list_set_error(_list, MAIL_ERROR_NOTFOUND,
 				       T_MAIL_ERR_MAILBOX_NOT_FOUND(name));
@@ -454,7 +455,7 @@ index_list_mailbox_update(struct mailbox *box,
 	/* rename the directory */
 	if (!guid_128_is_empty(update->mailbox_guid) && old_path != NULL &&
 	    mailbox_list_set_get_root_path(&box->list->set,
-					   MAILBOX_LIST_PATH_TYPE_MAILBOX,
+					   MAILBOX_LIST_PATH_TYPE_DIR,
 					   &root_dir)) {
 		new_path = index_get_guid_path(box->list, root_dir,
 					       update->mailbox_guid);
@@ -690,6 +691,58 @@ index_list_delete_entry(struct index_mailbox_list *list, const char *name,
 }
 
 static int
+index_list_try_delete_nonexistent_parent(struct mailbox_list *_list,
+					 const char *name)
+{
+	struct index_mailbox_list *list =
+		container_of(_list, struct index_mailbox_list, list);
+	struct mailbox_list_index_node *node;
+	string_t *full_name;
+	const char *p;
+	char sep = mailbox_list_get_hierarchy_sep(_list);
+
+	if ((p = strrchr(name, sep)) == NULL) {
+		/* No occurrences of the hierarchy separator could be found
+		   in the name, so the mailbox has no parents. */
+               return 0;
+	}
+
+	/* Lookup parent node of of given "name" */
+	node = mailbox_list_index_lookup(_list, t_strdup_until(name, p));
+	full_name = t_str_new(32);
+
+	while (node != NULL) {
+		/* Attempt to delete all parent nodes that are NOSELECT or
+		   NONEXISTENT */
+		if (node->children != NULL)
+			break;
+		if ((node->flags & MAILBOX_LIST_INDEX_FLAG_NOSELECT) != 0 ||
+		    (node->flags & MAILBOX_LIST_INDEX_FLAG_NONEXISTENT) != 0) {
+			/* The parent mailbox has no other children and is not
+			   existant or not selectable, delete it */
+			str_truncate(full_name, 0);
+			mailbox_list_index_node_get_path(node, sep, full_name);
+			if (index_list_delete_entry(list, str_c(full_name), FALSE) < 0)
+				return -1;
+
+			if ((p = strrchr(str_c(full_name), sep)) == NULL) {
+				/* No occurrences of the hierarchy separator
+				   could be found in the mailbox that was
+				   just deleted. */
+				node = NULL;
+			} else {
+				/* lookup parent node of the node just deleted */
+				str_truncate(full_name, p - str_c(full_name));
+				node = mailbox_list_index_lookup(_list, str_c(full_name));
+			}
+		} else
+			break;
+
+	}
+	return 0;
+}
+
+static int
 index_list_delete_mailbox(struct mailbox_list *_list, const char *name)
 {
 	struct index_mailbox_list *list = (struct index_mailbox_list *)_list;
@@ -719,6 +772,9 @@ index_list_delete_mailbox(struct mailbox_list *_list, const char *name)
 		if (index_list_delete_entry(list, name, TRUE) < 0)
 			return -1;
 	}
+	if (!_list->set.keep_noselect && ret == 0)
+		(void)index_list_try_delete_nonexistent_parent(_list, name);
+
 	return ret;
 }
 
@@ -752,13 +808,14 @@ index_list_rename_mailbox(struct mailbox_list *_oldlist, const char *oldname,
 			  struct mailbox_list *_newlist, const char *newname)
 {
 	struct index_mailbox_list *list = (struct index_mailbox_list *)_oldlist;
-	const size_t oldname_len = strlen(oldname);
 	struct mailbox_list_index_sync_context *sync_ctx;
 	struct mailbox_list_index_record oldrec, newrec;
 	struct mailbox_list_index_node *oldnode, *newnode, *child;
 	const void *data;
+	const char *suffix;
 	bool created, expunged;
 	uint32_t oldseq, newseq;
+	int ret;
 
 	if (_oldlist != _newlist) {
 		mailbox_list_set_error(_oldlist, MAIL_ERROR_NOTPOSSIBLE,
@@ -766,8 +823,8 @@ index_list_rename_mailbox(struct mailbox_list *_oldlist, const char *oldname,
 		return -1;
 	}
 
-	if (str_begins(newname, oldname) &&
-	   newname[oldname_len] == mailbox_list_get_hierarchy_sep(_newlist)) {
+	if (str_begins(newname, oldname, &suffix) &&
+	   suffix[0] == mailbox_list_get_hierarchy_sep(_newlist)) {
 		mailbox_list_set_error(_oldlist, MAIL_ERROR_NOTPOSSIBLE,
 			"Can't rename mailbox under itself.");
 		return -1;
@@ -832,7 +889,12 @@ index_list_rename_mailbox(struct mailbox_list *_oldlist, const char *oldname,
 			      sync_ctx->ilist->ext_id, &oldrec, NULL);
 	mail_index_expunge(sync_ctx->trans, newseq);
 
-	return mailbox_list_index_sync_end(&sync_ctx, TRUE);
+	ret = mailbox_list_index_sync_end(&sync_ctx, TRUE);
+
+	if (!_oldlist->set.keep_noselect && ret == 0)
+               (void)index_list_try_delete_nonexistent_parent(_oldlist, oldname);
+
+	return ret;
 }
 
 static struct mailbox_list_iterate_context *
@@ -882,6 +944,7 @@ struct mailbox_list index_mailbox_list = {
 		.alloc = index_list_alloc,
 		.init = index_list_init,
 		.deinit = index_list_deinit,
+		.get_storage = mailbox_list_default_get_storage,
 		.get_hierarchy_sep = index_list_get_hierarchy_sep,
 		.get_vname = mailbox_list_default_get_vname,
 		.get_storage_name = mailbox_list_default_get_storage_name,

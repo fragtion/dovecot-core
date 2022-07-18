@@ -7,7 +7,6 @@
 #include "master-service-settings.h"
 #include "doveadm.h"
 #include "doveadm-settings.h"
-#include "doveadm-server.h"
 #include "client-connection-private.h"
 
 bool doveadm_client_is_allowed_command(const struct doveadm_settings *set,
@@ -95,7 +94,7 @@ void client_connection_destroy(struct client_connection **_conn)
 
 	if (doveadm_verbose_proctitle)
 		process_title_set("[idling]");
-	
+
 	pool_unref(&conn->pool);
 }
 

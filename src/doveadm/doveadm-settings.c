@@ -155,6 +155,7 @@ struct dsync_feature_list {
 
 static const struct dsync_feature_list dsync_feature_list[] = {
 	{ "empty-header-workaround", DSYNC_FEATURE_EMPTY_HDR_WORKAROUND },
+	{ "no-header-hashes", DSYNC_FEATURE_NO_HEADER_HASHES },
 	{ NULL, 0 }
 };
 
@@ -212,10 +213,8 @@ const struct master_service_ssl_settings *doveadm_ssl_set = NULL;
 
 void doveadm_get_ssl_settings(struct ssl_iostream_settings *set_r, pool_t pool)
 {
-	i_zero(set_r);
-	master_service_ssl_settings_to_iostream_set(doveadm_ssl_set, pool,
-						    MASTER_SERVICE_SSL_SETTINGS_TYPE_CLIENT,
-						    set_r);
+	master_service_ssl_client_settings_to_iostream_set(doveadm_ssl_set,
+							   pool, set_r);
 }
 
 void doveadm_settings_expand(struct doveadm_settings *set, pool_t pool)

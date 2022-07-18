@@ -19,7 +19,7 @@ struct test_subprocess {
 
 volatile sig_atomic_t test_subprocess_is_child = 0;
 static bool test_subprocess_lib_init = FALSE;
-static volatile bool test_subprocess_notification_signal_received = FALSE;
+static volatile bool test_subprocess_notification_signal_received[SIGUSR1 + 1];
 static struct event *test_subprocess_event = NULL;
 static ARRAY(struct test_subprocess *) test_subprocesses = ARRAY_INIT;
 static void (*test_subprocess_cleanup_callback)(void) = NULL;
@@ -89,15 +89,21 @@ void test_subprocess_fork(int (*func)(void *context), void *context,
 
 	lib_signals_ioloop_detach();
 
+	/* avoid races: fork the child process with test_subprocess_is_child
+	   set to 1 in case it immediately receives a signal. */
+	test_subprocess_is_child = 1;
 	if ((subprocess->pid = fork()) == (pid_t)-1)
 		i_fatal("test: sub-process: fork() failed: %m");
 	if (subprocess->pid == 0) {
-		test_subprocess_is_child = 1;
+		/* cannot include this in the list to avoid accidental
+		 * kill of PID 0, so just free it here explicitly. */
+		i_free(subprocess);
 		test_subprocess_free_all();
 
 		test_subprocess_child(func, context, continue_test);
 		i_unreached();
 	}
+	test_subprocess_is_child = 0;
 
 	array_push_back(&test_subprocesses, &subprocess);
 	lib_signals_ioloop_attach();
@@ -303,28 +309,30 @@ void test_subprocess_set_cleanup_callback(void (*callback)(void))
 	test_subprocess_cleanup_callback = callback;
 }
 
-void test_subprocess_notify_signal_send(pid_t pid)
+void test_subprocess_notify_signal_send(int signo, pid_t pid)
 {
-	if (kill(pid, SIGHUP) < 0)
+	if (kill(pid, signo) < 0)
 		i_fatal("kill(%ld, SIGHUP) failed: %m", (long)pid);
 }
 
-void test_subprocess_notify_signal_send_parent(void)
+void test_subprocess_notify_signal_send_parent(int signo)
 {
-	test_subprocess_notify_signal_send(getppid());
+	test_subprocess_notify_signal_send(signo, getppid());
 }
 
-void test_subprocess_notify_signal_reset(void)
+void test_subprocess_notify_signal_reset(int signo)
 {
-	test_subprocess_notification_signal_received = FALSE;
+	i_assert(signo >= 0 &&
+		 (unsigned int)signo < N_ELEMENTS(test_subprocess_notification_signal_received));
+	test_subprocess_notification_signal_received[signo] = FALSE;
 }
 
-void test_subprocess_notify_signal_wait(unsigned int timeout_msecs)
+void test_subprocess_notify_signal_wait(int signo, unsigned int timeout_msecs)
 {
 	unsigned int i, count = timeout_msecs / 10;
 
 	for (i = 0; i < count; i++) {
-		if (test_subprocess_notification_signal_received)
+		if (test_subprocess_notification_signal_received[signo])
 			return;
 		i_sleep_msecs(10);
 	}
@@ -332,10 +340,14 @@ void test_subprocess_notify_signal_wait(unsigned int timeout_msecs)
 }
 
 static void
-test_subprocess_notification_signal(const siginfo_t *si ATTR_UNUSED,
+test_subprocess_notification_signal(const siginfo_t *si,
 				    void *context ATTR_UNUSED)
 {
-	test_subprocess_notification_signal_received = TRUE;
+	int signo = si->si_signo;
+
+	i_assert(signo >= 0 &&
+		 (unsigned int)signo < N_ELEMENTS(test_subprocess_notification_signal_received));
+	test_subprocess_notification_signal_received[signo] = TRUE;
 }
 
 void test_subprocesses_init(bool debug)
@@ -355,6 +367,8 @@ void test_subprocesses_init(bool debug)
 	lib_signals_set_handler(SIGSEGV, 0, test_subprocess_terminate, NULL);
 	lib_signals_set_handler(SIGABRT, 0, test_subprocess_terminate, NULL);
 	lib_signals_set_handler(SIGHUP, LIBSIG_FLAG_RESTART,
+				test_subprocess_notification_signal, NULL);
+	lib_signals_set_handler(SIGUSR1, LIBSIG_FLAG_RESTART,
 				test_subprocess_notification_signal, NULL);
 
 	i_array_init(&test_subprocesses, 8);

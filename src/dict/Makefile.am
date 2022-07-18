@@ -1,6 +1,6 @@
 pkglibexecdir = $(libexecdir)/dovecot
 
-pkglibexec_PROGRAMS = dict
+pkglibexec_PROGRAMS = dict dict-expire
 
 AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib \
@@ -32,10 +32,23 @@ dict_SOURCES = \
 	dict-connection.c \
 	dict-commands.c \
 	dict-settings.c \
+	dict-init-cache.c \
 	main.c
+
+dict_expire_LDADD = \
+	$(libs) \
+	$(LIBDOVECOT) \
+	$(DICT_LIBS) \
+	$(SQL_LIBS)
+dict_expire_DEPENDENCIES = $(libs) $(LIBDOVECOT_DEPS)
+
+dict_expire_SOURCES = \
+	dict-settings.c \
+	dict-expire.c
 
 noinst_HEADERS = \
 	dict-connection.h \
 	dict-commands.h \
 	dict-settings.h \
+	dict-init-cache.h \
 	main.h

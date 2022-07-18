@@ -273,12 +273,12 @@ bool auth_request_import(struct auth_request *request,
 	} else if (strcmp(key, "mech") == 0) {
 		fields->mech_name = p_strdup(request->pool, value);
 		event_add_str(request->event, "mechanism", value);
-	} else if (str_begins(key, "passdb_"))
-		auth_fields_add(fields->extra_fields, key+7, value, 0);
-	else if (str_begins(key, "userdb_")) {
+	} else if (str_begins(key, "passdb_", &key))
+		auth_fields_add(fields->extra_fields, key, value, 0);
+	else if (str_begins(key, "userdb_", &key)) {
 		if (fields->userdb_reply == NULL)
 			auth_request_init_userdb_reply(request, FALSE);
-		auth_fields_add(fields->userdb_reply, key+7, value, 0);
+		auth_fields_add(fields->userdb_reply, key, value, 0);
 	} else
 		return FALSE;
 
@@ -293,10 +293,10 @@ auth_request_fix_username(struct auth_request *request, const char **username,
 	unsigned char *p;
 	char *user;
 
-	if (*set->default_realm != '\0' &&
+	if (*set->default_domain != '\0' &&
 	    strchr(*username, '@') == NULL) {
 		user = p_strconcat(unsafe_data_stack_pool, *username, "@",
-				   set->default_realm, NULL);
+				   set->default_domain, NULL);
 	} else {
 		user = t_strdup_noconst(*username);
 	}
@@ -475,6 +475,9 @@ void auth_request_master_user_login_finish(struct auth_request *request)
 
 	auth_request_set_username_forced(request,
 					 request->fields.requested_login_user);
+	request->fields.translated_username = request->fields.requested_login_user;
+	event_add_str(request->event, "translated_user",
+		      request->fields.translated_username);
 	request->fields.requested_login_user = NULL;
 	event_field_clear(request->event, "login_user");
 }

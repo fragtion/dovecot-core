@@ -446,6 +446,9 @@ void imapc_connection_disconnect_full(struct imapc_connection *conn,
 
 	if (conn->state == IMAPC_CONNECTION_STATE_DISCONNECTED) {
 		i_assert(array_count(&conn->cmd_wait_list) == 0);
+		if (conn->reconnect_command_count == 0)
+			imapc_connection_abort_commands(conn, NULL,
+						reconnecting);
 		return;
 	}
 
@@ -594,7 +597,7 @@ static bool last_arg_is_fetch_body(const struct imap_arg *args,
 	    imap_arg_get_list_full(&args[2], &list, &count) && count >= 2 &&
 	    list[count].type == IMAP_ARG_LITERAL_SIZE &&
 	    imap_arg_get_atom(&list[count-1], &name) &&
-	    strncasecmp(name, "BODY[", 5) == 0) {
+	    str_begins_icase_with(name, "BODY[")) {
 		*parent_arg_r = &args[2];
 		*idx_r = count;
 		return TRUE;
@@ -923,7 +926,7 @@ imapc_connection_authenticate_cb(const struct imapc_command_reply *reply,
 
 	input_len = strlen(reply->text_full);
 	buf = t_buffer_create(MAX_BASE64_DECODED_SIZE(input_len));
-	if (base64_decode(reply->text_full, input_len, NULL, buf) < 0) {
+	if (base64_decode(reply->text_full, input_len, buf) < 0) {
 		imapc_auth_failed(conn, reply,
 				  t_strdup_printf("Server sent non-base64 input for AUTHENTICATE: %s",
 						  reply->text_full));
@@ -947,11 +950,12 @@ imapc_connection_authenticate_cb(const struct imapc_command_reply *reply,
 static bool imapc_connection_have_auth(struct imapc_connection *conn,
 				       const char *mech_name)
 {
+	const char *auth;
 	char *const *capa;
 
 	for (capa = conn->capabilities_list; *capa != NULL; capa++) {
-		if (strncasecmp(*capa, "AUTH=", 5) == 0 &&
-		    strcasecmp((*capa)+5, mech_name) == 0)
+		if (str_begins_icase(*capa, "AUTH=", &auth) &&
+		    strcasecmp(auth, mech_name) == 0)
 			return TRUE;
 	}
 	return FALSE;
@@ -1666,6 +1670,7 @@ static int imapc_connection_ssl_init(struct imapc_connection *conn)
 	if (io_stream_create_ssl_client(conn->client->ssl_ctx,
 					conn->client->set.host,
 					&conn->client->set.ssl_set,
+					conn->client->event,
 					&conn->input, &conn->output,
 					&conn->ssl_iostream, &error) < 0) {
 		i_error("imapc(%s): Couldn't initialize SSL client: %s",

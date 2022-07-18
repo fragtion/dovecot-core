@@ -80,12 +80,12 @@ static void test_base64_decode(void)
 			MAX_BASE64_DECODED_SIZE(strlen(tests[i].input));
 
 		buffer_create_from_data(&buf,
-					(max_decoded_size == 0 ? NULL :
+					(max_decoded_size == 0 ? "" :
 					 t_malloc0(max_decoded_size)),
 					max_decoded_size);
 		str = &buf;
 		ret = base64_decode(tests[i].input, strlen(tests[i].input),
-				    NULL, str);
+				    str);
 
 		test_assert_idx(tests[i].ret == ret, i);
 		test_assert_idx(strlen(tests[i].output) == str_len(str) &&
@@ -119,7 +119,7 @@ static void test_base64_random(void)
 		str_truncate(dest, 0);
 		base64_encode(buf, max, str);
 		test_assert_idx(base64_decode(str_data(str), str_len(str),
-					      NULL, dest) >= 0, i);
+					      dest) >= 0, i);
 		test_assert_idx(str_len(dest) == max &&
 				memcmp(buf, str_data(dest), max) == 0, i);
 	}
@@ -204,7 +204,7 @@ static void test_base64url_decode(void)
 			MAX_BASE64_DECODED_SIZE(strlen(tests[i].input));
 
 		buffer_create_from_data(&buf,
-					(max_decoded_size == 0 ? NULL :
+					(max_decoded_size == 0 ? "" :
 					 t_malloc0(max_decoded_size)),
 					max_decoded_size);
 		str = &buf;
@@ -884,7 +884,7 @@ static void test_base64_decode_lowlevel(void)
 			MAX_BASE64_DECODED_SIZE(strlen(test->input));
 
 		buffer_create_from_data(&buf,
-					(max_decoded_size == 0 ? NULL :
+					(max_decoded_size == 0 ? "" :
 					 t_malloc0(max_decoded_size)),
 					max_decoded_size);
 		str = &buf;

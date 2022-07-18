@@ -10,6 +10,8 @@ struct ssl_ostream {
 	struct ostream_private ostream;
 	struct ssl_iostream *ssl_io;
 	buffer_t *buffer;
+
+	bool shutdown:1;
 };
 
 static void
@@ -101,6 +103,8 @@ static int o_stream_ssl_flush_buffer(struct ssl_ostream *sstream)
 	size_t pos = 0;
 	int ret = 1;
 
+	i_assert(!sstream->shutdown);
+
 	while (pos < sstream->buffer->used) {
 		/* we're writing plaintext data to OpenSSL, which it encrypts
 		   and writes to bio_int's buffer. ssl_iostream_bio_sync()
@@ -144,25 +148,55 @@ static int o_stream_ssl_flush_buffer(struct ssl_ostream *sstream)
 static int o_stream_ssl_flush(struct ostream_private *stream)
 {
 	struct ssl_ostream *sstream = (struct ssl_ostream *)stream;
-	struct ostream *plain_output = sstream->ssl_io->plain_output;
-	int ret;
+	struct ssl_iostream *ssl_io = sstream->ssl_io;
+	struct ostream *plain_output = ssl_io->plain_output;
+	int ret = 1;
 
-	if ((ret = openssl_iostream_more(sstream->ssl_io,
-				OPENSSL_IOSTREAM_SYNC_TYPE_HANDSHAKE)) < 0) {
-		/* handshake failed */
-		io_stream_set_error(&stream->iostream, "%s",
-				    sstream->ssl_io->last_error);
-		stream->ostream.stream_errno = errno;
-	} else if (ret > 0 && sstream->buffer != NULL &&
-		   sstream->buffer->used > 0) {
+	if (!ssl_io->handshaked) {
+		if ((ret = ssl_iostream_handshake(ssl_io)) < 0) {
+			/* handshake failed */
+			i_assert(errno != 0);
+			io_stream_set_error(&stream->iostream,
+					    "%s", ssl_io->last_error);
+			stream->ostream.stream_errno = errno;
+			return ret;
+		}
+	}
+	if (ret > 0 &&
+	    openssl_iostream_bio_sync(
+		ssl_io, OPENSSL_IOSTREAM_SYNC_TYPE_HANDSHAKE) < 0) {
+		i_assert(ssl_io->plain_stream_errno != 0 &&
+			 ssl_io->plain_stream_errstr != NULL);
+		io_stream_set_error(&stream->iostream,
+				    "%s", ssl_io->plain_stream_errstr);
+		stream->ostream.stream_errno = ssl_io->plain_stream_errno;
+		return -1;
+	}
+
+	if (ret > 0 && sstream->buffer != NULL && sstream->buffer->used > 0) {
 		/* we can try to send some of our buffered data */
 		ret = o_stream_ssl_flush_buffer(sstream);
 	}
 
-	if (ret == 0 && sstream->ssl_io->want_read) {
+	/* Stream is finished; shutdown the SSL write direction once our buffer
+	   is empty. */
+	if (stream->finished && !sstream->shutdown && ret >= 0 &&
+	    (sstream->buffer == NULL || sstream->buffer->used == 0)) {
+		sstream->shutdown = TRUE;
+		if (SSL_shutdown(ssl_io->ssl) < 0) {
+			io_stream_set_error(
+				&sstream->ostream.iostream, "%s",
+				t_strdup_printf("SSL_shutdown() failed: %s",
+						openssl_iostream_error()));
+			sstream->ostream.ostream.stream_errno = EIO;
+			ret = -1;
+		}
+	}
+
+	if (ret == 0 && ssl_io->want_read) {
 		/* we need to read more data until we can continue. */
 		o_stream_set_flush_pending(plain_output, FALSE);
-		sstream->ssl_io->ostream_flush_waiting_input = TRUE;
+		ssl_io->ostream_flush_waiting_input = TRUE;
 		ret = 1;
 	}
 
@@ -180,6 +214,8 @@ o_stream_ssl_sendv(struct ostream_private *stream,
 {
 	struct ssl_ostream *sstream = (struct ssl_ostream *)stream;
 	size_t bytes_sent = 0;
+
+	i_assert(!sstream->shutdown);
 
 	bytes_sent = o_stream_ssl_buffer(sstream, iov, iov_count, bytes_sent);
 	if (sstream->ssl_io->handshaked &&

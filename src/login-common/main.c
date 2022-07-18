@@ -4,17 +4,19 @@
 #include "ioloop.h"
 #include "array.h"
 #include "str.h"
+#include "strescape.h"
 #include "randgen.h"
 #include "module-dir.h"
 #include "process-title.h"
 #include "restrict-access.h"
 #include "restrict-process-size.h"
-#include "master-auth.h"
+#include "login-client.h"
 #include "master-service.h"
 #include "master-interface.h"
 #include "iostream-ssl.h"
 #include "client-common.h"
 #include "access-lookup.h"
+#include "master-admin-client.h"
 #include "anvil-client.h"
 #include "auth-client.h"
 #include "dsasl-client.h"
@@ -26,14 +28,6 @@
 
 #define AUTH_CLIENT_IDLE_TIMEOUT_MSECS (1000*60)
 
-struct login_access_lookup {
-	struct master_service_connection conn;
-	struct io *io;
-
-	char **sockets, **next_socket;
-	struct access_lookup *access;
-};
-
 struct event *event_auth;
 static struct event_category event_category_auth = {
 	.name = "auth",
@@ -41,7 +35,7 @@ static struct event_category event_category_auth = {
 
 struct login_binary *login_binary;
 struct auth_client *auth_client;
-struct master_auth *master_auth;
+struct login_client_list *login_client_list;
 bool closing_down, login_debug;
 struct anvil_client *anvil;
 const char *login_rawlog_dir = NULL;
@@ -52,6 +46,7 @@ bool login_ssl_initialized;
 
 const struct login_settings *global_login_settings;
 const struct master_service_ssl_settings *global_ssl_settings;
+const struct master_service_ssl_server_settings *global_ssl_server_settings;
 void **global_other_settings;
 
 static ARRAY(struct ip_addr) login_source_ips_array;
@@ -64,8 +59,6 @@ static const char *post_login_socket;
 static bool shutting_down = FALSE;
 static bool ssl_connections = FALSE;
 static bool auth_connected_once = FALSE;
-
-static void login_access_lookup_next(struct login_access_lookup *lookup);
 
 static bool get_first_client(struct client **client_r)
 {
@@ -159,19 +152,34 @@ static void login_die(void)
 }
 
 static void
-client_connected_finish(const struct master_service_connection *conn)
+client_connected(struct master_service_connection *conn)
 {
 	struct client *client;
 	const struct login_settings *set;
 	const struct master_service_ssl_settings *ssl_set;
+	const struct master_service_ssl_server_settings *ssl_server_set;
 	pool_t pool;
 	void **other_sets;
 
+	master_service_client_connection_accept(conn);
+
+	if (conn->remote_ip.family != 0) {
+		/* log the connection's IP address in case we crash. it's of
+		   course possible that another earlier client causes the
+		   crash, but this is better than nothing. */
+		i_set_failure_send_ip(&conn->remote_ip);
+	}
+
+	/* make sure we're connected (or attempting to connect) to auth */
+	auth_client_connect(auth_client);
+
 	pool = pool_alloconly_create("login client", 8*1024);
 	set = login_settings_read(pool, &conn->local_ip,
-				  &conn->remote_ip, NULL, &ssl_set, &other_sets);
+				  &conn->remote_ip, NULL,
+				  &ssl_set, &ssl_server_set, &other_sets);
 
-	client = client_alloc(conn->fd, pool, conn, set, ssl_set);
+	client = client_alloc(conn->fd, pool, conn, set,
+			      ssl_set, ssl_server_set);
 	if (ssl_connections || conn->ssl) {
 		if (client_init_ssl(client) < 0) {
 			client_unref(&client);
@@ -185,101 +193,15 @@ client_connected_finish(const struct master_service_connection *conn)
 	timeout_remove(&auth_client_to);
 }
 
-static void login_access_lookup_free(struct login_access_lookup *lookup)
+static unsigned int
+master_admin_cmd_kick_user(const char *user, const guid_128_t conn_guid)
 {
-	io_remove(&lookup->io);
-	if (lookup->access != NULL)
-		access_lookup_destroy(&lookup->access);
-	if (lookup->conn.fd != -1) {
-		if (close(lookup->conn.fd) < 0)
-			i_error("close(client) failed: %m");
-		master_service_client_connection_destroyed(master_service);
-	}
-
-	p_strsplit_free(default_pool, lookup->sockets);
-	i_free(lookup);
+	return login_proxy_kick_user_connection(user, conn_guid);
 }
 
-static void login_access_callback(bool success, void *context)
-{
-	struct login_access_lookup *lookup = context;
-
-	if (!success) {
-		i_info("access(%s): Client refused (rip=%s)",
-		       *lookup->next_socket,
-		       net_ip2addr(&lookup->conn.remote_ip));
-		login_access_lookup_free(lookup);
-	} else {
-		lookup->next_socket++;
-		login_access_lookup_next(lookup);
-	}
-}
-
-static void login_access_lookup_next(struct login_access_lookup *lookup)
-{
-	if (*lookup->next_socket == NULL) {
-		/* last one */
-		io_remove(&lookup->io);
-		client_connected_finish(&lookup->conn);
-		lookup->conn.fd = -1;
-		login_access_lookup_free(lookup);
-		return;
-	}
-	lookup->access = access_lookup(*lookup->next_socket, lookup->conn.fd,
-				       login_binary->protocol,
-				       login_access_callback, lookup);
-	if (lookup->access == NULL)
-		login_access_lookup_free(lookup);
-}
-
-static void client_input_error(struct login_access_lookup *lookup)
-{
-	char c;
-	int ret;
-
-	ret = recv(lookup->conn.fd, &c, 1, MSG_PEEK);
-	if (ret <= 0) {
-		i_info("access(%s): Client disconnected during lookup (rip=%s)",
-		       *lookup->next_socket,
-		       net_ip2addr(&lookup->conn.remote_ip));
-		login_access_lookup_free(lookup);
-	} else {
-		/* actual input. stop listening until lookup is done. */
-		io_remove(&lookup->io);
-	}
-}
-
-static void client_connected(struct master_service_connection *conn)
-{
-	const char *access_sockets =
-		global_login_settings->login_access_sockets;
-	struct login_access_lookup *lookup;
-
-	master_service_client_connection_accept(conn);
-	if (conn->remote_ip.family != 0) {
-		/* log the connection's IP address in case we crash. it's of
-		   course possible that another earlier client causes the
-		   crash, but this is better than nothing. */
-		i_set_failure_send_ip(&conn->remote_ip);
-	}
-
-	/* make sure we're connected (or attempting to connect) to auth */
-	auth_client_connect(auth_client);
-
-	if (*access_sockets == '\0') {
-		/* no access checks */
-		client_connected_finish(conn);
-		return;
-	}
-
-	lookup = i_new(struct login_access_lookup, 1);
-	lookup->conn = *conn;
-	lookup->io = io_add(conn->fd, IO_READ, client_input_error, lookup);
-	lookup->sockets = p_strsplit_spaces(default_pool, access_sockets, " ");
-	lookup->next_socket = lookup->sockets;
-
-	login_access_lookup_next(lookup);
-}
+static const struct master_admin_client_callback admin_callbacks = {
+	.cmd_kick_user = master_admin_cmd_kick_user,
+};
 
 static void auth_connect_notify(struct auth_client *client ATTR_UNUSED,
 				bool connected, void *context ATTR_UNUSED)
@@ -306,12 +228,47 @@ static bool anvil_reconnect_callback(void)
 	return FALSE;
 }
 
+static void anvil_cmd_input_kick_user(const char *const *args)
+{
+	/* <user> [<conn-guid>] */
+	const char *user = args[0];
+	if (user == NULL) {
+		anvil_client_send_reply(anvil, "-Missing parameters");
+		return;
+	}
+	guid_128_t conn_guid;
+	if (args[1] == NULL)
+		guid_128_empty(conn_guid);
+	else if (guid_128_from_string(args[1], conn_guid) < 0) {
+		anvil_client_send_reply(anvil, "-Invalid conn-guid parameter");
+		return;
+	} else if (args[2] != NULL) {
+		anvil_client_send_reply(anvil, "-Extra parameters");
+		return;
+	}
+	unsigned int count = login_proxy_kick_user_connection(user, conn_guid);
+	anvil_client_send_reply(anvil, t_strdup_printf("+%u", count));
+}
+
+static bool anvil_cmd_input(const char *cmd, const char *const *args)
+{
+	if (strcmp(cmd, "KICK-USER") == 0)
+		anvil_cmd_input_kick_user(args);
+	else
+		return FALSE;
+	return TRUE;
+}
+
 void login_anvil_init(void)
 {
 	if (anvil != NULL)
 		return;
 
-	anvil = anvil_client_init("anvil", anvil_reconnect_callback, 0);
+	const struct anvil_client_callbacks callbacks = {
+		.reconnect = anvil_reconnect_callback,
+		.command = anvil_cmd_input,
+	};
+	anvil = anvil_client_init("anvil", &callbacks, 0);
 	if (anvil_client_connect(anvil, TRUE) < 0)
 		i_fatal("Couldn't connect to anvil");
 }
@@ -380,9 +337,8 @@ static void login_ssl_init(void)
 	if (strcmp(global_ssl_settings->ssl, "no") == 0)
 		return;
 
-	master_service_ssl_settings_to_iostream_set(global_ssl_settings,
-		pool_datastack_create(),
-		MASTER_SERVICE_SSL_SETTINGS_TYPE_SERVER, &ssl_set);
+	master_service_ssl_server_settings_to_iostream_set(global_ssl_settings,
+		global_ssl_server_settings, pool_datastack_create(), &ssl_set);
 	if (io_stream_ssl_global_init(&ssl_set, &error) < 0)
 		i_fatal("Failed to initialize SSL library: %s", error);
 	login_ssl_initialized = TRUE;
@@ -397,6 +353,7 @@ static void main_preinit(void)
 	login_ssl_init();
 	dsasl_clients_init();
 	client_common_init();
+	master_admin_clients_init(&admin_callbacks);
 
 	/* set the number of fds we want to use. it may get increased or
 	   decreased. leave a couple of extra fds for auth sockets and such.
@@ -471,7 +428,8 @@ static void main_init(const char *login_socket)
 				       FALSE);
 	auth_client_connect(auth_client);
         auth_client_set_connect_notify(auth_client, auth_connect_notify, NULL);
-	master_auth = master_auth_init(master_service, post_login_socket);
+	login_client_list = login_client_list_init(master_service,
+						   post_login_socket);
 
 	login_binary->init();
 
@@ -487,7 +445,7 @@ static void main_deinit(void)
 	login_binary->deinit();
 	module_dir_unload(&modules);
 	auth_client_deinit(&auth_client);
-	master_auth_deinit(&master_auth);
+	login_client_list_deinit(&login_client_list);
 
 	char *str;
 	array_foreach_elem(&global_alt_usernames, str)
@@ -509,7 +467,6 @@ int login_binary_run(struct login_binary *binary,
 	enum master_service_flags service_flags =
 		MASTER_SERVICE_FLAG_KEEP_CONFIG_OPEN |
 		MASTER_SERVICE_FLAG_TRACK_LOGIN_STATE |
-		MASTER_SERVICE_FLAG_USE_SSL_SETTINGS |
 		MASTER_SERVICE_FLAG_HAVE_STARTTLS |
 		MASTER_SERVICE_FLAG_NO_SSL_INIT;
 	pool_t set_pool;
@@ -544,8 +501,6 @@ int login_binary_run(struct login_binary *binary,
 			return FATAL_DEFAULT;
 		}
 	}
-	if (argv[optind] != NULL)
-		login_socket = argv[optind];
 
 	login_binary->preinit();
 
@@ -553,7 +508,13 @@ int login_binary_run(struct login_binary *binary,
 	global_login_settings =
 		login_settings_read(set_pool, NULL, NULL, NULL,
 				    &global_ssl_settings,
+				    &global_ssl_server_settings,
 				    &global_other_settings);
+
+	if (argv[optind] != NULL)
+		login_socket = argv[optind];
+	else if (global_login_settings->login_auth_socket_path[0] != '\0')
+		login_socket = global_login_settings->login_auth_socket_path;
 
 	main_preinit();
 	main_init(login_socket);

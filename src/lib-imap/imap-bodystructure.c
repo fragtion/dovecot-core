@@ -13,6 +13,13 @@
 #include "imap-envelope.h"
 #include "imap-bodystructure.h"
 
+/* The max level of lists nesting inside the parhentesised representation of a
+   single part with no other parts inside, i.e. the max level of list nesting
+   in representing a single part. According to RFC-3501, this should be in the
+   order of a couple of nestings only, let's keep some margin just in case. */
+#define BODYSTRUCTURE_MAX_PARENTHESIS_NESTING \
+	(MESSAGE_PARSER_DEFAULT_MAX_NESTED_MIME_PARTS + 10)
+
 #define EMPTY_BODY "(\"text\" \"plain\" " \
 	"(\"charset\" \""MESSAGE_PART_DEFAULT_CHARSET"\") NIL NIL \"7bit\" 0 0)"
 #define EMPTY_BODYSTRUCTURE "(\"text\" \"plain\" " \
@@ -402,10 +409,10 @@ imap_bodystructure_parse_args_common(struct message_part *part,
 	return 0;
 }
 
-int
-imap_bodystructure_parse_args(const struct imap_arg *args, pool_t pool,
-			      struct message_part **_part,
-			      const char **error_r)
+static int
+imap_bodystructure_parse_args_int(
+	unsigned int nesting, const struct imap_arg *args, pool_t pool,
+	struct message_part **_part, const char **error_r)
 {
 	struct message_part *part = *_part, *child_part;;
 	struct message_part **child_part_p;
@@ -416,6 +423,11 @@ imap_bodystructure_parse_args(const struct imap_arg *args, pool_t pool,
 	unsigned int lines;
 	uoff_t vsize;
 
+	++nesting;
+	if (nesting > BODYSTRUCTURE_MAX_PARENTHESIS_NESTING) {
+		*error_r = "Parts hierarchy nested too deep";
+		return -1;
+	}
 	if (part != NULL) {
 		/* parsing with pre-existing message_part tree */
 		parsing_tree = FALSE;
@@ -453,8 +465,8 @@ imap_bodystructure_parse_args(const struct imap_arg *args, pool_t pool,
 			}
 
 			list_args = imap_arg_as_list(args);
-			if (imap_bodystructure_parse_args(list_args, pool,
-								&dummy_partp, error_r) < 0)
+			if (imap_bodystructure_parse_args_int(
+				nesting, list_args, pool, &dummy_partp, error_r) < 0)
 				return -1;
 			child_part = NULL;
 
@@ -472,8 +484,8 @@ imap_bodystructure_parse_args(const struct imap_arg *args, pool_t pool,
 				}
 
 				list_args = imap_arg_as_list(args);
-				if (imap_bodystructure_parse_args(list_args, pool,
-									&child_part, error_r) < 0)
+				if (imap_bodystructure_parse_args_int(
+					nesting, list_args, pool, &child_part, error_r) < 0)
 					return -1;
 				child_part = child_part->next;
 
@@ -496,8 +508,8 @@ imap_bodystructure_parse_args(const struct imap_arg *args, pool_t pool,
 		child_part_p = &part->children;
 		while (args->type == IMAP_ARG_LIST) {
 			list_args = imap_arg_as_list(args);
-			if (imap_bodystructure_parse_args(list_args, pool,
-								child_part_p, error_r) < 0)
+			if (imap_bodystructure_parse_args_int(
+				nesting, list_args, pool, child_part_p, error_r) < 0)
 				return -1;
 			(*child_part_p)->parent = part;
 			child_part_p = &(*child_part_p)->next;
@@ -629,8 +641,8 @@ imap_bodystructure_parse_args(const struct imap_arg *args, pool_t pool,
 			*error_r = "Child bodystructure list expected";
 			return -1;
 		}
-		if (imap_bodystructure_parse_args
-			(list_args, pool, &part->children, error_r) < 0)
+		if (imap_bodystructure_parse_args_int(
+			nesting, list_args, pool, &part->children, error_r) < 0)
 			return -1;
 		if (parsing_tree) {
 			i_assert(part->children != NULL &&
@@ -680,6 +692,22 @@ imap_bodystructure_parse_args(const struct imap_arg *args, pool_t pool,
 		(part, pool, args, error_r);
 }
 
+int
+imap_bodystructure_parse_args(const struct imap_arg *args, pool_t pool,
+			      struct message_part **_part,
+			      const char **error_r)
+{
+	return imap_bodystructure_parse_args_int(0, args, pool, _part, error_r);
+}
+
+static void imap_bodystructure_reset_data(struct message_part *parts)
+{
+	for (; parts != NULL; parts = parts->next) {
+		parts->data = NULL;
+		imap_bodystructure_reset_data(parts->children);
+	}
+}
+
 int imap_bodystructure_parse_full(const char *bodystructure,
 	pool_t pool, struct message_part **parts,
 	const char **error_r)
@@ -708,6 +736,13 @@ int imap_bodystructure_parse_full(const char *bodystructure,
 			ret = imap_bodystructure_parse_args
 				(args, pool, parts, error_r);
 		} T_END_PASS_STR_IF(ret < 0, error_r);
+	}
+
+	if (ret < 0) {
+		/* Don't leave partially filled data to message_parts. Some of
+		   the code expects that if the first message_part->data is
+		   filled, they all are. */
+		imap_bodystructure_reset_data(*parts);
 	}
 
 	imap_parser_unref(&parser);

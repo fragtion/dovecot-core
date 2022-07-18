@@ -23,7 +23,6 @@
 #include "http-response.h"
 #include "http-url.h"
 #include "doveadm-util.h"
-#include "doveadm-server.h"
 #include "doveadm-mail.h"
 #include "doveadm-print.h"
 #include "doveadm-settings.h"
@@ -196,6 +195,7 @@ doveadm_http_server_command_execute(struct client_request_http *req)
 
 	prev_ioloop = current_ioloop;
 	i_zero(&cctx);
+	cctx.pool = pool_alloconly_create("doveadm cmd", 256);
 	cctx.conn_type = conn->conn.type;
 	cctx.input = req->input;
 	cctx.output = req->output;
@@ -245,7 +245,10 @@ doveadm_http_server_command_execute(struct client_request_http *req)
 	else
 		o_stream_nsend_str(req->output,",");
 
-	if (doveadm_exit_code != 0) {
+	if (cctx.referral != NULL) {
+		i_error("Command requested referral: %s", cctx.referral);
+		doveadm_http_server_json_error(req, "internalError");
+	} else if (doveadm_exit_code != 0) {
 		if (doveadm_exit_code == 0 || doveadm_exit_code == EX_TEMPFAIL)
 			i_error("Command %s failed", req->cmd->name);
 		doveadm_http_server_json_error(req, "exitCode");
@@ -253,6 +256,7 @@ doveadm_http_server_command_execute(struct client_request_http *req)
 		doveadm_http_server_json_success(req, is);
 	}
 	i_stream_unref(&is);
+	pool_unref(&cctx.pool);
 }
 
 static int
@@ -774,14 +778,18 @@ doveadm_http_server_send_api_v1(struct client_request_http *req)
 	const struct doveadm_cmd_param *par;
 	unsigned int i, k;
 	string_t *tmp;
-	bool sent;
+	bool sent, first_cmd = TRUE;
 
 	tmp = str_new(req->pool, 8);
 
 	o_stream_nsend_str(output,"[\n");
 	for (i = 0; i < array_count(&doveadm_cmds_ver2); i++) {
 		cmd = array_idx(&doveadm_cmds_ver2, i);
-		if (i > 0)
+		if ((cmd->flags & CMD_FLAG_HIDDEN) != 0)
+			continue;
+		if (first_cmd)
+			first_cmd = FALSE;
+		else
 			o_stream_nsend_str(output, ",\n");
 		o_stream_nsend_str(output, "\t{\"command\":\"");
 		json_append_escaped(tmp, cmd->name);
@@ -904,7 +912,7 @@ static void doveadm_http_server_send_response(struct client_request_http *req)
 		payload = iostream_temp_finish(&req->output,
 					       IO_BLOCK_SIZE);
 	}
-	
+
 	http_resp = http_server_response_create(http_sreq, 200, "OK");
 	http_server_response_add_header(http_resp, "Content-Type",
 		"application/json; charset=utf-8");
@@ -1163,7 +1171,7 @@ client_connection_http_free(struct client_connection *_conn)
 		/* We're not in the lib-http/server's connection destroy
 		   callback. */
 		http_server_connection_close(&conn->http_conn,
-			"Server shutting down");
+			MASTER_SERVICE_SHUTTING_DOWN_MSG);
 	}
 }
 

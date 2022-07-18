@@ -4,15 +4,25 @@
 #include "array.h"
 #include "llist.h"
 #include "hash.h"
+#include "wildcard-match.h"
 #include "indexer-queue.h"
 
 struct indexer_queue {
-	indexer_status_callback_t *callback;
+	indexer_queue_callback_t *callback;
 	void (*listen_callback)(struct indexer_queue *);
 
 	/* username+mailbox -> indexer_request */
 	HASH_TABLE(struct indexer_request *, struct indexer_request *) requests;
+	/* username -> indexer_request */
+	HASH_TABLE(char *, struct indexer_request *) users;
 	struct indexer_request *head, *tail;
+};
+
+struct indexer_queue_iter {
+	struct indexer_queue *queue;
+	struct hash_iterate_context *hash_iter;
+	struct indexer_request *next;
+	bool only_working;
 };
 
 static unsigned int
@@ -29,14 +39,15 @@ static int indexer_request_cmp(const struct indexer_request *r1,
 }
 
 struct indexer_queue *
-indexer_queue_init(indexer_status_callback_t *callback)
+indexer_queue_init(indexer_queue_callback_t *callback)
 {
 	struct indexer_queue *queue;
-	
+
 	queue = i_new(struct indexer_queue, 1);
 	queue->callback = callback;
 	hash_table_create(&queue->requests, default_pool, 0,
 			  indexer_request_hash, indexer_request_cmp);
+	hash_table_create(&queue->users, default_pool, 0, str_hash, strcmp);
 	return queue;
 }
 
@@ -47,7 +58,10 @@ void indexer_queue_deinit(struct indexer_queue **_queue)
 	*_queue = NULL;
 
 	i_assert(indexer_queue_is_empty(queue));
+	i_assert(hash_table_count(queue->requests) == 0);
+	i_assert(hash_table_count(queue->users) == 0);
 
+	hash_table_destroy(&queue->users);
 	hash_table_destroy(&queue->requests);
 	i_free(queue);
 }
@@ -85,18 +99,11 @@ indexer_queue_append_request(struct indexer_queue *queue, bool append,
 			     const char *session_id,
 			     unsigned int max_recent_msgs, void *context)
 {
-	struct indexer_request *request;
+	struct indexer_request *request, *first_request;
+	char *first_username;
 
 	request = indexer_queue_lookup(queue, username, mailbox);
-	if (request == NULL) {
-		request = i_new(struct indexer_request, 1);
-		request->username = i_strdup(username);
-		request->mailbox = i_strdup(mailbox);
-		request->session_id = i_strdup(session_id);
-		request->max_recent_msgs = max_recent_msgs;
-		request_add_context(request, context);
-		hash_table_insert(queue->requests, request, request);
-	} else {
+	if (request != NULL) {
 		if (request->max_recent_msgs > max_recent_msgs)
 			request->max_recent_msgs = max_recent_msgs;
 		request_add_context(request, context);
@@ -106,14 +113,34 @@ indexer_queue_append_request(struct indexer_queue *queue, bool append,
 				request->reindex_tail = TRUE;
 			else
 				request->reindex_head = TRUE;
-			return request;
+		} else {
+			if (append) {
+				/* keep the request in its old position */
+			} else {
+				/* move request to beginning of the queue */
+				DLLIST2_REMOVE(&queue->head, &queue->tail, request);
+				DLLIST2_PREPEND(&queue->head, &queue->tail, request);
+			}
 		}
-		if (append) {
-			/* keep the request in its old position */
-			return request;
-		}
-		/* move request to beginning of the queue */
-		DLLIST2_REMOVE(&queue->head, &queue->tail, request);
+		return request;
+	}
+
+	request = i_new(struct indexer_request, 1);
+	request->username = i_strdup(username);
+	request->mailbox = i_strdup(mailbox);
+	request->session_id = i_strdup(session_id);
+	request->max_recent_msgs = max_recent_msgs;
+	request_add_context(request, context);
+	hash_table_insert(queue->requests, request, request);
+
+	if (!hash_table_lookup_full(queue->users, username,
+				    &first_username, &first_request)) {
+		first_username = i_strdup(username);
+		hash_table_insert(queue->users, first_username, request);
+	} else {
+		DLLIST_PREPEND_FULL(&first_request, request,
+				    user_prev, user_next);
+		hash_table_update(queue->users, first_username, request);
 	}
 
 	if (append)
@@ -140,7 +167,7 @@ void indexer_queue_append(struct indexer_queue *queue, bool append,
 	request = indexer_queue_append_request(queue, append, username, mailbox,
 					       session_id, max_recent_msgs,
 					       context);
-	request->index = TRUE;
+	request->type = INDEXER_REQUEST_TYPE_INDEX;
 	indexer_queue_append_finish(queue);
 }
 
@@ -152,7 +179,7 @@ void indexer_queue_append_optimize(struct indexer_queue *queue,
 
 	request = indexer_queue_append_request(queue, TRUE, username, mailbox,
 					       NULL, 0, context);
-	request->optimize = TRUE;
+	request->type = INDEXER_REQUEST_TYPE_OPTIMIZE;
 	indexer_queue_append_finish(queue);
 }
 
@@ -212,7 +239,8 @@ void indexer_queue_request_finish(struct indexer_queue *queue,
 				  struct indexer_request **_request,
 				  bool success)
 {
-	struct indexer_request *request = *_request;
+	struct indexer_request *first_request, *request = *_request;
+	char *first_username;
 
 	*_request = NULL;
 
@@ -221,8 +249,6 @@ void indexer_queue_request_finish(struct indexer_queue *queue,
 	if (request->reindex_head || request->reindex_tail) {
 		i_assert(request->working);
 		request->working = FALSE;
-		request->reindex_head = FALSE;
-		request->reindex_tail = FALSE;
 		if (request->working_context_idx > 0) {
 			array_delete(&request->contexts, 0,
 				     request->working_context_idx);
@@ -231,17 +257,73 @@ void indexer_queue_request_finish(struct indexer_queue *queue,
 			DLLIST2_PREPEND(&queue->head, &queue->tail, request);
 		else
 			DLLIST2_APPEND(&queue->head, &queue->tail, request);
+		request->reindex_head = FALSE;
+		request->reindex_tail = FALSE;
 		return;
 	}
 
+	if (!hash_table_lookup_full(queue->users, request->username,
+				    &first_username, &first_request))
+		i_unreached();
+	DLLIST_REMOVE_FULL(&first_request, request, user_prev, user_next);
+	if (first_request != NULL)
+		hash_table_update(queue->users, first_username, first_request);
+	else {
+		hash_table_remove(queue->users, first_username);
+		i_free(first_username);
+	}
 	hash_table_remove(queue->requests, request);
 	if (array_is_created(&request->contexts))
 		array_free(&request->contexts);
 	i_free(request->username);
 	i_free(request->mailbox);
+	i_free(request->session_id);
 	i_free(request);
 
 	indexer_refresh_proctitle();
+}
+
+static void
+indexer_queue_request_cancel(struct indexer_queue *queue,
+			     struct indexer_request **_request)
+{
+	struct indexer_request *request = *_request;
+
+	*_request = NULL;
+	request->reindex_head = request->reindex_tail = FALSE;
+	DLLIST2_REMOVE(&queue->head, &queue->tail, request);
+	indexer_queue_request_finish(queue, &request, FALSE);
+}
+
+void indexer_queue_cancel(struct indexer_queue *queue, const char *username,
+			  const char *mailbox_mask)
+{
+	struct indexer_request *request, *next;
+	bool single_mailbox =
+		mailbox_mask != NULL && wildcard_is_literal(mailbox_mask);
+
+	if (single_mailbox)
+		request = indexer_queue_lookup(queue, username, mailbox_mask);
+	else
+		request = hash_table_lookup(queue->users, username);
+
+	while (request != NULL) {
+		next = request->user_next;
+		if (mailbox_mask != NULL && !single_mailbox &&
+		    !wildcard_match(request->mailbox, mailbox_mask)) {
+			/* mailbox mask doesn't match - go to the next one */
+		} else if (request->working) {
+			/* Can't remove a request that is being worked on,
+			   but we can make sure it won't be added back to the
+			   queue. */
+			request->reindex_head = request->reindex_tail = FALSE;
+		} else {
+			indexer_queue_request_cancel(queue, &request);
+		}
+		if (single_mailbox)
+			break;
+		request = next;
+	}
 }
 
 void indexer_queue_cancel_all(struct indexer_queue *queue)
@@ -257,10 +339,8 @@ void indexer_queue_cancel_all(struct indexer_queue *queue)
 		request->reindex_head = request->reindex_tail = FALSE;
 	hash_table_iterate_deinit(&iter);
 
-	while ((request = indexer_queue_request_peek(queue)) != NULL) {
-		indexer_queue_request_remove(queue);
-		indexer_queue_request_finish(queue, &request, FALSE);
-	}
+	while ((request = indexer_queue_request_peek(queue)) != NULL)
+		indexer_queue_request_cancel(queue, &request);
 }
 
 bool indexer_queue_is_empty(struct indexer_queue *queue)
@@ -271,4 +351,51 @@ bool indexer_queue_is_empty(struct indexer_queue *queue)
 unsigned int indexer_queue_count(struct indexer_queue *queue)
 {
 	return hash_table_count(queue->requests);
+}
+
+struct indexer_queue_iter *
+indexer_queue_iter_init(struct indexer_queue *queue, bool only_working)
+{
+	struct indexer_queue_iter *iter;
+
+	iter = i_new(struct indexer_queue_iter, 1);
+	iter->queue = queue;
+	iter->only_working = only_working;
+
+	/* First output all the requests currently being worked on. They exist
+	   only in the hash table. */
+	iter->hash_iter = hash_table_iterate_init(queue->requests);
+	return iter;
+}
+
+struct indexer_request *indexer_queue_iter_next(struct indexer_queue_iter *iter)
+{
+	struct indexer_request *request;
+
+	if (iter->hash_iter != NULL) {
+		while (hash_table_iterate(iter->hash_iter,
+					  iter->queue->requests,
+					  &request, &request)) {
+			if (request->working)
+				return request;
+		}
+		hash_table_iterate_deinit(&iter->hash_iter);
+		if (iter->only_working)
+			return NULL;
+		iter->next = indexer_queue_request_peek(iter->queue);
+	}
+	request = iter->next;
+	if (request != NULL)
+		iter->next = request->next;
+	return request;
+}
+
+void indexer_queue_iter_deinit(struct indexer_queue_iter **_iter)
+{
+	struct indexer_queue_iter *iter = *_iter;
+
+	*_iter = NULL;
+
+	hash_table_iterate_deinit(&iter->hash_iter);
+	i_free(iter);
 }

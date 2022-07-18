@@ -218,7 +218,8 @@ static bool imapc_quota_client_init(struct imapc_quota_root *root)
 	root->initialized = TRUE;
 
 	list = root->imapc_ns->list;
-	if (mailbox_list_get_storage(&list, "", &storage) == 0 &&
+	const char *vname = "";
+	if (mailbox_list_get_storage(&list, &vname, 0, &storage) == 0 &&
 	    strcmp(storage->name, IMAPC_STORAGE_NAME) != 0) {
 		/* non-imapc namespace, skip */
 		if ((storage->class_flags &
@@ -480,6 +481,7 @@ imapc_quota_update(struct quota_root *root ATTR_UNUSED,
 
 struct quota_backend quota_backend_imapc = {
 	.name = "imapc",
+	.use_vsize = TRUE,
 
 	.v = {
 		.alloc = imapc_quota_alloc,

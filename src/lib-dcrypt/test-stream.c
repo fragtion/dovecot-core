@@ -577,6 +577,10 @@ static void test_read_increment(void)
 		i_stream_set_max_buffer_size(is_3, ++i);
 	}
 
+	/* make sure snapshotting works: */
+	i_stream_skip(is_3, 1);
+	test_assert(i_stream_read(is_3) == -1);
+
 	test_assert(total == 13534);
 	test_assert(is_3->stream_errno == 0);
 	test_assert(is_3->eof);
@@ -584,6 +588,26 @@ static void test_read_increment(void)
 	i_stream_unref(&is_3);
 
         test_end();
+}
+
+static void test_read_garbage(void)
+{
+	test_begin("test_read_garbage");
+	unsigned char buf[512];
+	for (int i = 0; i < 5; i++) {
+		random_fill(buf, sizeof(buf));
+		memcpy(buf, IOSTREAM_CRYPT_MAGIC, sizeof(IOSTREAM_CRYPT_MAGIC));
+		buf[sizeof(IOSTREAM_CRYPT_MAGIC)+1] = '\x02';
+		struct istream *is = test_istream_create_data(buf, sizeof(buf));
+		struct istream *ds = i_stream_create_decrypt_callback(is,
+					no_op_cb, NULL);
+		i_stream_unref(&is);
+		test_assert(i_stream_read(ds) == -1);
+		test_assert(ds->stream_errno == EIO ||
+			    ds->stream_errno == EPIPE);
+		i_stream_unref(&ds);
+	}
+	test_end();
 }
 
 static void test_free_keys()
@@ -628,6 +652,7 @@ int main(void)
 		test_free_keys,
 		test_read_0_to_400_byte_garbage,
 		test_read_large_header,
+		test_read_garbage,
 		NULL
 	};
 

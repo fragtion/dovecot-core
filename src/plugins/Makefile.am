@@ -2,12 +2,12 @@ if BUILD_ZLIB_PLUGIN
 ZLIB = zlib imap-zlib
 endif
 
-if BUILD_LUCENE
-FTS_LUCENE = fts-lucene
-endif
-
 if BUILD_SOLR
 FTS_SOLR = fts-solr
+endif
+
+if BUILD_FLATCURVE
+FTS_FLATCURVE = fts-flatcurve
 endif
 
 if HAVE_APPARMOR
@@ -22,7 +22,6 @@ SUBDIRS = \
 	acl \
 	imap-acl \
 	fts \
-	fts-squat \
 	last-login \
 	lazy-expunge \
 	listescape \
@@ -31,21 +30,18 @@ SUBDIRS = \
 	push-notification \
 	mail-log \
 	$(MAIL_LUA) \
-	mailbox-alias \
 	quota \
 	quota-clone \
 	imap-quota \
 	pop3-migration \
 	replication \
-	old-stats \
-	imap-old-stats \
 	mail-crypt \
 	trash \
 	virtual \
 	welcome \
 	$(ZLIB) \
-	$(FTS_LUCENE) \
 	$(FTS_SOLR) \
+	$(FTS_FLATCURVE) \
 	$(DICT_LDAP) \
 	$(APPARMOR) \
 	fs-compress \

@@ -12,6 +12,7 @@
 /* DATA/BDAT/B... commands */
 
 struct cmd_data_context {
+	struct istream *main_input;
 	struct istream *chunk_input;
 	uoff_t chunk_size;
 
@@ -135,8 +136,9 @@ cmd_data_destroy(struct smtp_server_cmd_ctx *cmd,
 
 	i_assert(data_cmd != NULL);
 
-	if (data_cmd->chunk_last ||
-		!smtp_server_command_replied_success(command)) {
+	if (data_cmd->main_input == conn->state.data_input &&
+	    (data_cmd->chunk_last ||
+	     !smtp_server_command_replied_success(command))) {
 		/* clean up */
 		i_stream_destroy(&conn->state.data_input);
 		i_stream_destroy(&conn->state.data_chain_input);
@@ -273,8 +275,11 @@ static int cmd_data_do_handle_input(struct smtp_server_cmd_ctx *cmd)
 
 	i_assert(callbacks != NULL &&
 		 callbacks->conn_cmd_data_continue != NULL);
+	struct event_reason *reason =
+		smtp_server_connection_reason_begin(conn, "cmd_data");
 	ret = callbacks->conn_cmd_data_continue(conn->context,
 		cmd, conn->state.trans);
+	event_reason_end(&reason);
 	if (ret >= 0) {
 		if (!smtp_server_cmd_data_check_size(cmd)) {
 			return -1;
@@ -348,14 +353,15 @@ cmd_data_next(struct smtp_server_cmd_ctx *cmd,
 
 	i_assert(data_cmd != NULL);
 	i_assert(trans != NULL);
+
+	/* DATA command stops the pipeline, so if it is next to reply, nothing
+	   else can be pending. */
 	i_assert(conn->state.pending_mail_cmds == 0 &&
 		conn->state.pending_rcpt_cmds == 0);
-	i_assert(trans != NULL);
 
 	e_debug(cmd->event, "Command is next to be replied");
 
-	if (trans != NULL)
-		smtp_server_transaction_data_command(trans, cmd);
+	smtp_server_transaction_data_command(trans, cmd);
 
 	/* check whether we have had successful mail and rcpt commands */
 	if (!smtp_server_connection_data_check_state(cmd))
@@ -392,8 +398,13 @@ cmd_data_next(struct smtp_server_cmd_ctx *cmd,
 		smtp_server_command_ref(cmd_temp);
 		i_assert(callbacks != NULL &&
 			 callbacks->conn_cmd_data_begin != NULL);
-		if (callbacks->conn_cmd_data_begin(conn->context,
-			cmd, conn->state.trans, conn->state.data_input) < 0) {
+		i_assert(conn->state.data_input != NULL);
+		struct event_reason *reason =
+			smtp_server_connection_reason_begin(conn, "cmd_data");
+		int ret = callbacks->conn_cmd_data_begin(conn->context,
+			cmd, conn->state.trans, conn->state.data_input);
+		event_reason_end(&reason);
+		if (ret < 0) {
 			i_assert(smtp_server_command_is_replied(cmd_temp));
 			/* command failed */
 			smtp_server_command_unref(&cmd_temp);
@@ -427,9 +438,11 @@ cmd_data_start_input(struct smtp_server_cmd_ctx *cmd,
 	i_assert(data_cmd != NULL);
 
 	if (input != NULL) {
+		i_assert(conn->state.data_input == NULL);
 		conn->state.data_input = input;
 		i_stream_ref(input);
 	}
+	data_cmd->main_input = conn->state.data_input;
 
 	if (data_cmd->client_input)
 		smtp_server_command_input_lock(cmd);
@@ -551,7 +564,8 @@ void smtp_server_connection_data_chunk_init(struct smtp_server_cmd_ctx *cmd)
 		i_assert(data_cmd->chunk_first);
 		i_assert(conn->state.data_chain_input == NULL);
 		conn->state.data_chain_input =
-			i_stream_create_chain(&conn->state.data_chain);
+			i_stream_create_chain(&conn->state.data_chain,
+					      IO_BLOCK_SIZE);
 	}
 }
 

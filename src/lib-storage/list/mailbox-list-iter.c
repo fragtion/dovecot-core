@@ -39,7 +39,7 @@ struct ns_list_iterate_context {
 };
 
 static void mailbox_list_ns_iter_failed(struct ns_list_iterate_context *ctx);
-static bool ns_match_next(struct ns_list_iterate_context *ctx, 
+static bool ns_match_next(struct ns_list_iterate_context *ctx,
 			  struct mail_namespace *ns, const char *pattern);
 static int mailbox_list_match_anything(struct ns_list_iterate_context *ctx,
 				       struct mail_namespace *ns,
@@ -183,7 +183,7 @@ ns_match_simple(struct ns_list_iterate_context *ctx, struct mail_namespace *ns)
 }
 
 static bool
-ns_is_match_within_ns(struct ns_list_iterate_context *ctx, 
+ns_is_match_within_ns(struct ns_list_iterate_context *ctx,
 		      struct mail_namespace *ns, const char *prefix_without_sep,
 		      const char *pattern, enum imap_match_result result)
 {
@@ -239,7 +239,7 @@ static bool list_pattern_has_wildcards(const char *pattern)
 	return FALSE;
 }
 
-static bool ns_match_next(struct ns_list_iterate_context *ctx, 
+static bool ns_match_next(struct ns_list_iterate_context *ctx,
 			  struct mail_namespace *ns, const char *pattern)
 {
 	struct imap_match_glob *glob;
@@ -445,10 +445,11 @@ mailbox_list_ns_prefix_return(struct ns_list_iterate_context *ctx,
 {
 	struct mailbox *box;
 	enum mailbox_existence existence;
+	const char *suffix;
 	int ret;
 
-	if (strncasecmp(ns->prefix, "INBOX", 5) == 0 &&
-	    ns->prefix[5] == mail_namespace_get_sep(ns)) {
+	if (str_begins_icase(ns->prefix, "INBOX", &suffix) &&
+	    suffix[0] == mail_namespace_get_sep(ns)) {
 		/* prefix=INBOX/ (or prefix=INBOX/something/) namespace exists.
 		   so we can create children to INBOX. */
 		ctx->inbox_info.flags &= ENUM_NEGATE(MAILBOX_NOINFERIORS);
@@ -570,6 +571,7 @@ mailbox_list_ns_iter_try_next(struct mailbox_list_iterate_context *_ctx,
 		(struct ns_list_iterate_context *)_ctx;
 	struct mail_namespace *ns;
 	const struct mailbox_info *info;
+	const char *suffix;
 	bool has_children;
 
 	if (ctx->cur_ns == NULL) {
@@ -636,8 +638,8 @@ mailbox_list_ns_iter_try_next(struct mailbox_list_iterate_context *_ctx,
 						MAILBOX_CHILD_SUBSCRIBED));
 			return FALSE;
 		}
-		if (strncasecmp(info->vname, "INBOX", 5) == 0 &&
-		    info->vname[5] == mail_namespace_get_sep(info->ns)) {
+		if (str_begins_icase(info->vname, "INBOX", &suffix) &&
+		    suffix[0] == mail_namespace_get_sep(info->ns)) {
 			/* we know now that INBOX has children */
 			ctx->inbox_info.flags |= MAILBOX_CHILDREN;
 			ctx->inbox_info.flags &= ENUM_NEGATE(MAILBOX_NOINFERIORS);
@@ -909,13 +911,12 @@ mailbox_list_iter_autocreate_filter(struct mailbox_list_iterate_context *ctx,
 		/* there are autocreate parent boxes.
 		   set their children flag states. */
 		struct autocreate_box *autobox;
-		size_t name_len;
+		const char *suffix;
 		char sep = mail_namespace_get_sep(ctx->list->ns);
 
 		array_foreach_modifiable(&actx->boxes, autobox) {
-			name_len = strlen(autobox->name);
-			if (!str_begins(info->vname, autobox->name) ||
-			    info->vname[name_len] != sep)
+			if (!str_begins(info->vname, autobox->name, &suffix) ||
+			    suffix[0] != sep)
 				continue;
 
 			if ((info->flags & MAILBOX_NONEXISTENT) == 0)

@@ -40,7 +40,7 @@ struct auth_userdb_settings {
 struct auth_settings {
 	const char *mechanisms;
 	const char *realms;
-	const char *default_realm;
+	const char *default_domain;
 	uoff_t cache_size;
 	unsigned int cache_ttl;
 	unsigned int cache_negative_ttl;
@@ -69,14 +69,12 @@ struct auth_settings {
 	bool policy_log_only;
 	unsigned int policy_hash_truncate;
 
-	bool stats;
 	bool verbose, debug, debug_passwords;
+	bool allow_weak_schemes;
 	const char *verbose_passwords;
 	bool ssl_require_client_cert;
 	bool ssl_username_from_cert;
 	bool use_winbind;
-
-	unsigned int worker_max_count;
 
 	/* settings that don't have auth_ prefix: */
 	ARRAY(struct auth_passdb_settings *) passdbs;

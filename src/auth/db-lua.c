@@ -42,7 +42,7 @@ auth_request_lua_do_var_expand(struct auth_request *req, const char *tpl,
 			       const char **value_r, const char **error_r)
 {
 	const char *error;
-	if (t_auth_request_var_expand(tpl, req, NULL, value_r, &error) < 0) {
+	if (t_auth_request_var_expand(tpl, req, NULL, value_r, &error) <= 0) {
 		*error_r = t_strdup_printf("var_expand(%s) failed: %s",
 					   tpl, error);
 		return -1;
@@ -120,11 +120,9 @@ static int auth_request_lua_response_from_template(lua_State *L)
 
 static int auth_request_lua_log_debug(lua_State *L)
 {
-	if (global_auth_settings->debug) {
-		struct auth_request *request = auth_lua_check_auth_request(L, 1);
-		const char *msg = luaL_checkstring(L, 2);
-		e_debug(authdb_event(request), "db-lua: %s", msg);
-	}
+	struct auth_request *request = auth_lua_check_auth_request(L, 1);
+	const char *msg = luaL_checkstring(L, 2);
+	e_debug(authdb_event(request), "db-lua: %s", msg);
 	return 0;
 }
 
@@ -303,14 +301,14 @@ static void auth_lua_push_auth_request(lua_State *L, struct auth_request *req)
 	lua_pushboolean(L, req->fields.skip_password_check);
 	lua_setfield(L, -2, "skip_password_check");
 
-#undef LUA_TABLE_SETBOOL
-#define LUA_TABLE_SETBOOL(field) \
+#undef LUA_TABLE_SET_BOOL
+#define LUA_TABLE_SET_BOOL(field) \
 	lua_pushboolean(L, req->field); \
 	lua_setfield(L, -2, #field);
 
-	LUA_TABLE_SETBOOL(passdbs_seen_user_unknown);
-	LUA_TABLE_SETBOOL(passdbs_seen_internal_failure);
-	LUA_TABLE_SETBOOL(userdbs_seen_internal_failure);
+	LUA_TABLE_SET_BOOL(passdbs_seen_user_unknown);
+	LUA_TABLE_SET_BOOL(passdbs_seen_internal_failure);
+	LUA_TABLE_SET_BOOL(userdbs_seen_internal_failure);
 }
 
 static struct auth_request *
@@ -370,12 +368,12 @@ static luaL_Reg auth_lua_dovecot_auth_methods[] = {
 
 static void auth_lua_dovecot_auth_register(lua_State *L)
 {
-	dlua_getdovecot(L);
+	dlua_get_dovecot(L);
 	/* Create new table for holding values */
 	lua_newtable(L);
 
 	/* register constants */
-	dlua_setmembers(L, auth_lua_dovecot_auth_values, -1);
+	dlua_set_members(L, auth_lua_dovecot_auth_values, -1);
 
 	/* push new metatable to stack */
 	luaL_newmetatable(L, AUTH_LUA_DOVECOT_AUTH);

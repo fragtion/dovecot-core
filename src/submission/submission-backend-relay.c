@@ -21,6 +21,7 @@ struct submission_backend_relay {
 
 	bool trans_started:1;
 	bool trusted:1;
+	bool quit_confirmed:1;
 };
 
 static struct submission_backend_vfuncs backend_relay_vfuncs;
@@ -47,6 +48,8 @@ backend_relay_handle_relay_reply(struct submission_backend_relay *backend,
 				 const struct smtp_reply *reply,
 				 struct smtp_reply *reply_r) ATTR_NULL(2)
 {
+	struct client *client = backend->backend.client;
+	struct mail_user *user = client->user;
 	const char *enh_code, *msg, *log_msg = NULL;
 	const char *const *reply_lines;
 	bool result = TRUE;
@@ -112,6 +115,8 @@ backend_relay_handle_relay_reply(struct submission_backend_relay *backend,
 			break;
 		case SMTP_CLIENT_COMMAND_ERROR_CONNECTION_LOST:
 		case SMTP_CLIENT_COMMAND_ERROR_CONNECTION_CLOSED:
+			if (backend->quit_confirmed)
+				return FALSE;
 			detail = " (connection lost)";
 			break;
 		case SMTP_CLIENT_COMMAND_ERROR_BAD_REPLY:
@@ -126,8 +131,15 @@ backend_relay_handle_relay_reply(struct submission_backend_relay *backend,
 
 		reason = t_strdup_printf("%s%s", msg, detail);
 		smtp_client_transaction_destroy(&backend->trans);
-		if (log_msg != NULL)
-			i_error("%s: %s", log_msg, smtp_reply_log(reply));
+		if (log_msg != NULL) {
+			if (smtp_reply_is_remote(reply)) {
+				i_error("%s: %s",
+					log_msg, smtp_reply_log(reply));
+			} else if (user->mail_debug) {
+				i_debug("%s: %s",
+					log_msg, smtp_reply_log(reply));
+			}
+		}
 		submission_backend_fail(&backend->backend, cmd,
 					enh_code, reason);
 		return FALSE;
@@ -949,6 +961,14 @@ relay_cmd_quit_destroy(struct smtp_server_cmd_ctx *cmd ATTR_UNUSED,
 		smtp_client_command_abort(&quit_cmd->cmd_relayed);
 }
 
+static void relay_cmd_quit_relayed_destroy(void *context)
+{
+	struct relay_cmd_quit_context *quit_cmd = context;
+
+	i_assert(quit_cmd != NULL);
+	quit_cmd->cmd_relayed = NULL;
+}
+
 static void
 relay_cmd_quit_replied(struct smtp_server_cmd_ctx *cmd ATTR_UNUSED,
 		       struct relay_cmd_quit_context *quit_cmd)
@@ -961,6 +981,7 @@ static void relay_cmd_quit_finish(struct relay_cmd_quit_context *quit_cmd)
 {
 	struct smtp_server_cmd_ctx *cmd = quit_cmd->cmd;
 
+	quit_cmd->backend->quit_confirmed = TRUE;
 	if (quit_cmd->cmd_relayed != NULL)
 		smtp_client_command_abort(&quit_cmd->cmd_relayed);
 	smtp_server_reply_quit(cmd);
@@ -987,6 +1008,7 @@ static void relay_cmd_quit_relay(struct relay_cmd_quit_context *quit_cmd)
 		< SMTP_CLIENT_CONNECTION_STATE_READY) {
 		/* Don't bother relaying QUIT command when relay is not
 		   fully initialized. */
+		quit_cmd->backend->quit_confirmed = TRUE;
 		smtp_server_reply_quit(cmd);
 		return;
 	}
@@ -1001,6 +1023,9 @@ static void relay_cmd_quit_relay(struct relay_cmd_quit_context *quit_cmd)
 		smtp_client_command_new(backend->conn, 0,
 					relay_cmd_quit_callback, quit_cmd);
 	smtp_client_command_write(quit_cmd->cmd_relayed, "QUIT");
+	smtp_client_command_set_abort_callback(
+		quit_cmd->cmd_relayed,
+		relay_cmd_quit_relayed_destroy, quit_cmd);
 	smtp_client_command_submit(quit_cmd->cmd_relayed);
 }
 
@@ -1057,7 +1082,6 @@ submission_backend_relay_create(
 	submission_backend_init(&backend->backend, pool, client,
 				&backend_relay_vfuncs);
 
-	i_zero(&ssl_set);
 	mail_user_init_ssl_client_settings(user, &ssl_set);
 	if (set->ssl_verify)
 		ssl_set.verbose_invalid_cert = TRUE;

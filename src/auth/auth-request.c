@@ -17,7 +17,6 @@
 #include "auth-request.h"
 #include "auth-request-handler.h"
 #include "auth-request-handler-private.h"
-#include "auth-request-stats.h"
 #include "auth-client-connection.h"
 #include "auth-master-connection.h"
 #include "auth-policy.h"
@@ -33,8 +32,6 @@
 #include <sys/stat.h>
 
 #define AUTH_SUBSYS_PROXY "proxy"
-#define AUTH_DNS_SOCKET_PATH "dns-client"
-#define AUTH_DNS_DEFAULT_TIMEOUT_MSECS (1000*10)
 #define AUTH_DNS_WARN_MSECS 500
 #define AUTH_REQUEST_MAX_DELAY_SECS (60*5)
 #define CACHED_PASSWORD_SCHEME "SHA1"
@@ -249,7 +246,6 @@ static
 void auth_request_success_continue(struct auth_policy_check_ctx *ctx)
 {
 	struct auth_request *request = ctx->request;
-	struct auth_stats *stats;
 	i_assert(request->state == AUTH_REQUEST_STATE_MECH_CONTINUE);
 
 	timeout_remove(&request->to_penalty);
@@ -279,13 +275,6 @@ void auth_request_success_continue(struct auth_policy_check_ctx *ctx)
 		return;
 	}
 
-	if (request->set->stats) {
-		stats = auth_request_stats_get(request);
-		stats->auth_success_count++;
-		if (request->fields.master_user != NULL)
-			stats->auth_master_success_count++;
-	}
-
 	auth_request_set_state(request, AUTH_REQUEST_STATE_FINISHED);
 	auth_request_refresh_last_access(request);
 	auth_request_handler_reply(request, AUTH_CLIENT_RESULT_SUCCESS,
@@ -294,14 +283,7 @@ void auth_request_success_continue(struct auth_policy_check_ctx *ctx)
 
 void auth_request_fail(struct auth_request *request)
 {
-	struct auth_stats *stats;
-
 	i_assert(request->state == AUTH_REQUEST_STATE_MECH_CONTINUE);
-
-	if (request->set->stats) {
-		stats = auth_request_stats_get(request);
-		stats->auth_failure_count++;
-	}
 
 	auth_request_set_state(request, AUTH_REQUEST_STATE_FINISHED);
 	auth_request_refresh_last_access(request);
@@ -336,7 +318,6 @@ void auth_request_unref(struct auth_request **_request)
 
 	event_unref(&request->mech_event);
 	event_unref(&request->event);
-	auth_request_stats_send(request);
 	auth_request_state_count[request->state]--;
 	auth_refresh_proctitle();
 
@@ -553,8 +534,8 @@ auth_request_want_skip_passdb(struct auth_request *request,
 			      struct auth_passdb *passdb)
 {
 	/* if mechanism is not supported, skip */
-	const char *const *mechs = passdb->passdb->mechanisms;
-	const char *const *username_filter = passdb->passdb->username_filter;
+	const char *const *mechs = passdb->mechanisms;
+	const char *const *username_filter = passdb->username_filter;
 	const char *username;
 
 	username = request->fields.user;
@@ -567,7 +548,7 @@ auth_request_want_skip_passdb(struct auth_request *request,
 		return TRUE;
 	}
 
-	if (passdb->passdb->username_filter != NULL &&
+	if (passdb->username_filter != NULL &&
 	    !auth_request_username_accepted(username_filter, username)) {
 		auth_request_log_debug(request,
 				       request->mech != NULL ? AUTH_SUBSYS_MECH
@@ -606,6 +587,21 @@ auth_request_want_skip_userdb(struct auth_request *request,
 	i_unreached();
 }
 
+static const char *
+auth_request_cache_result_to_str(enum auth_request_cache_result result)
+{
+	switch(result) {
+	case AUTH_REQUEST_CACHE_NONE:
+		return "none";
+	case AUTH_REQUEST_CACHE_HIT:
+		return "hit";
+	case AUTH_REQUEST_CACHE_MISS:
+		return "miss";
+	default:
+		i_unreached();
+	}
+}
+
 void auth_request_passdb_lookup_begin(struct auth_request *request)
 {
 	struct event *event;
@@ -613,6 +609,8 @@ void auth_request_passdb_lookup_begin(struct auth_request *request)
 
 	i_assert(request->passdb != NULL);
 	i_assert(!request->userdb_lookup);
+
+	request->passdb_cache_result = AUTH_REQUEST_CACHE_NONE;
 
 	name = (request->passdb->set->name[0] != '\0' ?
 		request->passdb->set->name :
@@ -647,6 +645,9 @@ void auth_request_passdb_lookup_end(struct auth_request *request,
 		event_create_passthrough(event)->
 		set_name("auth_passdb_request_finished")->
 		add_str("result", passdb_result_to_string(result));
+	if (request->passdb_cache_result != AUTH_REQUEST_CACHE_NONE &&
+	    request->set->cache_ttl != 0 && request->set->cache_size != 0)
+		e->add_str("cache", auth_request_cache_result_to_str(request->passdb_cache_result));
 	e_debug(e->event(), "Finished passdb lookup");
 	event_unref(&event);
 	array_pop_back(&request->authdb_event);
@@ -659,6 +660,8 @@ void auth_request_userdb_lookup_begin(struct auth_request *request)
 
 	i_assert(request->userdb != NULL);
 	i_assert(request->userdb_lookup);
+
+	request->userdb_cache_result = AUTH_REQUEST_CACHE_NONE;
 
 	name = (request->userdb->set->name[0] != '\0' ?
 		request->userdb->set->name :
@@ -693,6 +696,9 @@ void auth_request_userdb_lookup_end(struct auth_request *request,
 		event_create_passthrough(event)->
 		set_name("auth_userdb_request_finished")->
 		add_str("result", userdb_result_to_string(result));
+	if (request->userdb_cache_result != AUTH_REQUEST_CACHE_NONE &&
+	    request->set->cache_ttl != 0 && request->set->cache_size != 0)
+		e->add_str("cache", auth_request_cache_result_to_str(request->userdb_cache_result));
 	e_debug(e->event(), "Finished userdb lookup");
 	event_unref(&event);
 	array_pop_back(&request->authdb_event);
@@ -908,7 +914,6 @@ void auth_request_verify_plain_callback(enum passdb_result result,
 		   expired record. */
 		const char *cache_key = passdb->cache_key;
 
-		auth_request_stats_add_tempfail(request);
 		if (passdb_cache_verify_plain(request, cache_key,
 					      request->mech_password,
 					      &result, TRUE)) {
@@ -1177,7 +1182,6 @@ void auth_request_lookup_credentials_callback(enum passdb_result result,
 		   expired record. */
 		const char *cache_key = passdb->cache_key;
 
-		auth_request_stats_add_tempfail(request);
 		if (passdb_cache_lookup_credentials(request, cache_key,
 						    &cache_cred, &cache_scheme,
 						    &result, TRUE)) {
@@ -1253,11 +1257,14 @@ void auth_request_lookup_credentials_policy_continue(struct auth_request *reques
 		if (passdb_cache_lookup_credentials(request, cache_key,
 						    &cache_cred, &cache_scheme,
 						    &result, FALSE)) {
+			request->passdb_cache_result = AUTH_REQUEST_CACHE_HIT;
 			passdb_handle_credentials(
 				result, cache_cred, cache_scheme,
 				auth_request_lookup_credentials_finish,
 				request);
 			return;
+		} else {
+			request->passdb_cache_result = AUTH_REQUEST_CACHE_MISS;
 		}
 	}
 
@@ -1351,7 +1358,6 @@ static bool auth_request_lookup_user_cache(struct auth_request *request,
 					   enum userdb_result *result_r,
 					   bool use_expired)
 {
-	struct auth_stats *stats = auth_request_stats_get(request);
 	const char *value;
 	struct auth_cache_node *node;
 	bool expired, neg_expired;
@@ -1359,14 +1365,14 @@ static bool auth_request_lookup_user_cache(struct auth_request *request,
 	value = auth_cache_lookup(passdb_cache, request, key, &node,
 				  &expired, &neg_expired);
 	if (value == NULL || (expired && !use_expired)) {
-		stats->auth_cache_miss_count++;
+		request->userdb_cache_result = AUTH_REQUEST_CACHE_MISS;
 		e_debug(request->event,
 			value == NULL ? "%suserdb cache miss" :
 			"%suserdb cache expired",
 			auth_request_get_log_prefix_db(request));
 		return FALSE;
 	}
-	stats->auth_cache_hit_count++;
+	request->userdb_cache_result = AUTH_REQUEST_CACHE_HIT;
 	e_debug(request->event,
 		"%suserdb cache hit: %s",
 		auth_request_get_log_prefix_db(request), value);
@@ -1403,7 +1409,6 @@ void auth_request_userdb_callback(enum userdb_result result,
 		result_rule = userdb->result_success;
 		break;
 	case USERDB_RESULT_INTERNAL_FAILURE:
-		auth_request_stats_add_tempfail(request);
 		result_rule = userdb->result_internalfail;
 		break;
 	case USERDB_RESULT_USER_UNKNOWN:
@@ -1506,7 +1511,7 @@ void auth_request_userdb_callback(enum userdb_result result,
 	if (request->userdb_lookup_tempfailed) {
 		/* no caching */
 	} else if (result != USERDB_RESULT_INTERNAL_FAILURE) {
-		if (!request->userdb_result_from_cache)
+		if (request->userdb_cache_result != AUTH_REQUEST_CACHE_HIT)
 			auth_request_userdb_save_cache(request, result);
 	} else if (passdb_cache != NULL && userdb->cache_key != NULL) {
 		/* lookup failed. if we're looking here only because the
@@ -1534,7 +1539,7 @@ void auth_request_lookup_user(struct auth_request *request,
 	request->private_callback.userdb = callback;
 	request->user_changed_by_lookup = FALSE;
 	request->userdb_lookup = TRUE;
-	request->userdb_result_from_cache = FALSE;
+	request->userdb_cache_result = AUTH_REQUEST_CACHE_NONE;
 	if (request->fields.userdb_reply == NULL)
 		auth_request_init_userdb_reply(request, TRUE);
 	else {
@@ -1560,9 +1565,11 @@ void auth_request_lookup_user(struct auth_request *request,
 
 		if (auth_request_lookup_user_cache(request, cache_key,
 						   &result, FALSE)) {
-			request->userdb_result_from_cache = TRUE;
+			request->userdb_cache_result = AUTH_REQUEST_CACHE_HIT;
 			auth_request_userdb_callback(result, request);
 			return;
+		} else {
+			request->userdb_cache_result = AUTH_REQUEST_CACHE_MISS;
 		}
 	}
 
@@ -1718,6 +1725,7 @@ void auth_request_set_field(struct auth_request *request,
 			    const char *name, const char *value,
 			    const char *default_scheme)
 {
+	const char *suffix;
 	size_t name_len = strlen(name);
 
 	i_assert(*name != '\0');
@@ -1793,7 +1801,7 @@ void auth_request_set_field(struct auth_request *request,
 	} else if (strcmp(name, "allow_real_nets") == 0) {
 		auth_request_validate_networks(request, name, value,
 					       &request->fields.real_remote_ip);
-	} else if (str_begins(name, "userdb_")) {
+	} else if (str_begins(name, "userdb_", &suffix)) {
 		/* for prefetch userdb */
 		request->userdb_prefetch_set = TRUE;
 		if (request->fields.userdb_reply == NULL)
@@ -1806,7 +1814,7 @@ void auth_request_set_field(struct auth_request *request,
 						   "userdb_", default_scheme);
 			return;
 		}
-		auth_request_set_userdb_field(request, name + 7, value);
+		auth_request_set_userdb_field(request, suffix, value);
 	} else if (strcmp(name, "noauthenticate") == 0) {
 		/* add "nopassword" also so that passdbs won't try to verify
 		   the password. */
@@ -1848,7 +1856,7 @@ void auth_request_set_field(struct auth_request *request,
 
 void auth_request_set_null_field(struct auth_request *request, const char *name)
 {
-	if (str_begins(name, "userdb_")) {
+	if (str_begins_with(name, "userdb_")) {
 		/* make sure userdb prefetch is used even if all the fields
 		   were returned as NULL. */
 		request->userdb_prefetch_set = TRUE;
@@ -2137,23 +2145,17 @@ static int auth_request_proxy_host_lookup(struct auth_request *request,
 					  const char *host,
 					  auth_request_proxy_cb_t *callback)
 {
+	struct auth *auth = auth_default_service();
 	struct auth_request_proxy_dns_lookup_ctx *ctx;
-	struct dns_lookup_settings dns_set;
 	const char *value;
 	unsigned int secs;
 
 	/* need to do dns lookup for the host */
-	i_zero(&dns_set);
-	dns_set.dns_client_socket_path = AUTH_DNS_SOCKET_PATH;
-	dns_set.timeout_msecs = AUTH_DNS_DEFAULT_TIMEOUT_MSECS;
-	dns_set.event_parent = request->event;
 	value = auth_fields_find(request->fields.extra_fields, "proxy_timeout");
 	if (value != NULL) {
 		if (str_to_uint(value, &secs) < 0) {
 			auth_request_log_error(request, AUTH_SUBSYS_PROXY,
 				"Invalid proxy_timeout value: %s", value);
-		} else {
-			dns_set.timeout_msecs = secs*1000;
 		}
 	}
 
@@ -2162,8 +2164,9 @@ static int auth_request_proxy_host_lookup(struct auth_request *request,
 	auth_request_ref(request);
 	request->dns_lookup_ctx = ctx;
 
-	if (dns_lookup(host, &dns_set, auth_request_proxy_dns_callback, ctx,
-			&ctx->dns_lookup) < 0) {
+	if (dns_client_lookup(auth->dns_client, host, request->event,
+			      auth_request_proxy_dns_callback, ctx,
+			      &ctx->dns_lookup) < 0) {
 		/* failed early */
 		return -1;
 	}

@@ -141,15 +141,16 @@ static void pop3c_login_callback(enum pop3c_command_state state,
 				 const char *reply, void *context)
 {
 	struct pop3c_mailbox *mbox = context;
+	const char *suffix;
 
 	switch (state) {
 	case POP3C_COMMAND_STATE_OK:
 		mbox->logged_in = TRUE;
 		break;
 	case POP3C_COMMAND_STATE_ERR:
-		if (str_begins(reply, "[IN-USE] ")) {
+		if (str_begins(reply, "[IN-USE] ", &suffix)) {
 			mail_storage_set_error(mbox->box.storage,
-					       MAIL_ERROR_INUSE, reply + 9);
+					       MAIL_ERROR_INUSE, suffix);
 		} else {
 			/* authentication failure probably */
 			mail_storage_set_error(mbox->box.storage,
@@ -353,6 +354,7 @@ struct mailbox pop3c_mailbox = {
 		index_storage_search_deinit,
 		index_storage_search_next_nonblock,
 		index_storage_search_next_update_seq,
+		index_storage_search_next_match_mail,
 		pop3c_save_alloc,
 		pop3c_save_begin,
 		pop3c_save_continue,

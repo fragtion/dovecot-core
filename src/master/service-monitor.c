@@ -26,6 +26,7 @@
 #define SERVICE_LOG_DROP_WARNING_DELAY_MSECS 500
 #define MAX_DIE_WAIT_MSECS 5000
 #define SERVICE_MAX_EXIT_FAILURES_IN_SEC 10
+#define SERVICE_MIN_SUCCESSFUL_AGE_SECS 10
 #define SERVICE_PREFORK_MAX_AT_ONCE 10
 
 static void service_monitor_start_extra_avail(struct service *service);
@@ -197,6 +198,9 @@ static void service_status_input(struct service *service)
 	count = ret / sizeof(struct master_status);
 	for (i = 0; i < count; i++)
 		service_status_input_one(service, &status[i]);
+	/* If ret==sizeof(status) there may be more input available, but do it
+	   in the next ioloop run. This way a single service can't flood the
+	   master process and cause it to hang entirely. */
 }
 
 static void service_log_drop_warning(struct service *service)
@@ -351,7 +355,7 @@ service_monitor_start_count(struct service *service, unsigned int limit)
 		/* we created some processes, they'll do the listening now */
 		service_monitor_listen_stop(service);
 	}
-	return i == count;
+	return i >= limit;
 }
 
 static void service_monitor_prefork_timeout(struct service *service)
@@ -365,8 +369,12 @@ static void service_monitor_prefork_timeout(struct service *service)
 	}
 	if (service->process_avail < service->set->process_min_avail) {
 		if (service_monitor_start_count(service, SERVICE_PREFORK_MAX_AT_ONCE) &&
-		    service->process_avail < service->set->process_min_avail)
+		    service->process_avail < service->set->process_min_avail) {
+			/* All SERVICE_PREFORK_MAX_AT_ONCE were created, but
+			   it still wasn't enough. Launch more in the next
+			   timeout. */
 			return;
+		}
 	}
 	timeout_remove(&service->to_prefork);
 }
@@ -374,6 +382,7 @@ static void service_monitor_prefork_timeout(struct service *service)
 static void service_monitor_start_extra_avail(struct service *service)
 {
 	if (service->process_avail >= service->set->process_min_avail ||
+	    service->process_count >= service->process_limit ||
 	    service->list->destroying)
 		return;
 
@@ -677,6 +686,28 @@ void services_monitor_stop(struct service_list *service_list, bool wait)
 	services_log_deinit(service_list);
 }
 
+static bool service_has_successful_processes(struct service *service)
+{
+	if (service->have_successful_exits)
+		return TRUE;
+
+	/* See if there is a process that has existed for a while and has
+	   received the initial status notification. The oldest processes are
+	   last in the list, so just scan through all of them. */
+	struct service_process *process = service->processes;
+	for (; process != NULL; process = process->next) {
+		time_t age_secs = ioloop_time - process->create_time;
+		if (age_secs >= SERVICE_MIN_SUCCESSFUL_AGE_SECS &&
+		    process->to_status == NULL) {
+			/* Remember this so this list doesn't have to be
+			   scanned again. */
+			service->have_successful_exits = TRUE;
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
 static bool
 service_process_failure(struct service_process *process, int status)
 {
@@ -685,12 +716,14 @@ service_process_failure(struct service_process *process, int status)
 
 	service_process_log_status_error(process, status);
 	throttle = process->to_status != NULL;
-	if (!throttle && !service->have_successful_exits) {
-		/* this service has seen no successful exits yet.
-		   try to avoid failure storms by throttling the service if it
-		   only keeps failing rapidly. this is no longer done after
-		   one success to avoid intentional DoSing, in case attacker
-		   finds a way to quickly crash his own session. */
+	if (!throttle && !service_has_successful_processes(service)) {
+		/* This service has seen no successful exits yet and no
+		   processes that were already running for a while.
+		   Try to avoid failure storms at Dovecot startup by throttling
+		   the service if it only keeps failing rapidly. This is no
+		   longer done after the service looks to be generailly working,
+		   in case an attacker finds a way to quickly crash their own
+		   session. */
 		if (service->exit_failure_last != ioloop_time) {
 			service->exit_failure_last = ioloop_time;
 			service->exit_failures_in_sec = 0;

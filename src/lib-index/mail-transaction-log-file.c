@@ -230,7 +230,7 @@ mail_transaction_log_init_hdr(struct mail_transaction_log *log,
 	hdr->minor_version = MAIL_TRANSACTION_LOG_MINOR_VERSION;
 	hdr->hdr_size = sizeof(struct mail_transaction_log_header);
 	hdr->indexid = log->index->indexid;
-	hdr->create_stamp = ioloop_time;
+	hdr->create_stamp = ioloop_time32;
 #ifndef WORDS_BIGENDIAN
 	hdr->compat_flags |= MAIL_INDEX_COMPAT_LITTLE_ENDIAN;
 #endif
@@ -760,7 +760,7 @@ mail_transaction_log_file_create2(struct mail_transaction_log_file *file,
 		return -1;
 
 	if (reset) {
-		/* don't reset modseqs. if we're reseting due to rebuilding
+		/* don't reset modseqs. if we're resetting due to rebuilding
 		   indexes we'll probably want to keep uidvalidity and in such
 		   cases we really don't want to shrink modseqs. */
 		file->hdr.prev_file_seq = 0;
@@ -1056,7 +1056,6 @@ void mail_transaction_update_modseq(const struct mail_transaction_header *hdr,
 		return;
 	}
 
-	/* NOTE: keep in sync with mail_index_transaction_get_highest_modseq() */
 	switch (hdr->type & MAIL_TRANSACTION_TYPE_MASK) {
 	case MAIL_TRANSACTION_EXPUNGE | MAIL_TRANSACTION_EXPUNGE_PROT:
 	case MAIL_TRANSACTION_EXPUNGE_GUID | MAIL_TRANSACTION_EXPUNGE_PROT:
@@ -1189,8 +1188,8 @@ mail_transaction_log_file_sync(struct mail_transaction_log_file *file,
 				       file->buffer_offset);
 		trans_size = mail_index_offset_to_uint32(hdr->size);
 		if (trans_size == 0) {
-			/* unfinished */
-			return 1;
+			/* unfinished or corrupted */
+			break;
 		}
 		if (trans_size < sizeof(*hdr)) {
 			*reason_r = t_strdup_printf(
@@ -1484,9 +1483,10 @@ mail_transaction_log_file_mmap(struct mail_transaction_log_file *file,
 	}
 
 	if (file->mmap_size > mmap_get_page_size()) {
-		if (madvise(file->mmap_base, file->mmap_size,
-			    MADV_SEQUENTIAL) < 0)
-			log_file_set_syscall_error(file, "madvise()");
+		errno = posix_madvise(file->mmap_base, file->mmap_size,
+					POSIX_MADV_SEQUENTIAL);
+		if (errno != 0)
+			log_file_set_syscall_error(file, "posix_madvise()");
 	}
 
 	buffer_create_from_const_data(&file->mmap_buffer,

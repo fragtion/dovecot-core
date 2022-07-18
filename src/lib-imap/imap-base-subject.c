@@ -129,13 +129,9 @@ static bool remove_subj_leader(buffer_t *buf, size_t *start_pos,
 			return ret;
 	}
 
-	if (str_begins(data, "RE"))
-		data += 2;
-	else if (str_begins(data, "FWD"))
-		data += 3;
-	else if (str_begins(data, "FW"))
-		data += 2;
-	else
+	if (!str_begins(data, "RE", &data) &&
+	    !str_begins(data, "FWD", &data) &&
+	    !str_begins(data, "FW", &data))
 		return ret;
 
 	if (*data == ' ')
@@ -178,7 +174,7 @@ static bool remove_subj_fwd_hdr(buffer_t *buf, size_t *start_pos,
 	   subj-fwd-hdr    = "[fwd:"
 	   subj-fwd-trl    = "]" */
 
-	if (!str_begins(data + *start_pos, "[FWD:"))
+	if (!str_begins_with(data + *start_pos, "[FWD:"))
 		return FALSE;
 
 	if (data[size-2] != ']')

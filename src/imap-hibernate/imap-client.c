@@ -141,8 +141,8 @@ imap_client_parse_userdb_fields(struct imap_client *client,
 
 	field = t_strsplit_tabescaped(client->state.userdb_fields);
 	for (i = 0; field[i] != NULL; i++) {
-		if (str_begins(field[i], "auth_user="))
-			*auth_user_r = field[i] + 10;
+		if (str_begins(field[i], "auth_user=", auth_user_r))
+			break;
 	}
 }
 
@@ -544,10 +544,8 @@ imap_client_var_expand_func_userdb(const char *data, void *context,
 	const char *value = NULL;
 
 	for(;*fields != NULL; fields++) {
-		if (str_begins(*fields, field_name)) {
-			value = *fields+strlen(field_name);
+		if (str_begins(*fields, field_name, &value))
 			break;
-		}
 	}
 
 	*value_r = value != NULL ? value : default_value;
@@ -565,14 +563,6 @@ static void imap_client_io_deactivate_user(struct imap_client *client ATTR_UNUSE
 	i_set_failure_prefix("imap-hibernate: ");
 }
 
-static const char *imap_client_get_anvil_userip_ident(struct imap_client_state *state)
-{
-	if (state->remote_ip.family == 0)
-		return NULL;
-	return t_strconcat(net_ip2addr(&state->remote_ip), "/",
-			   str_tabescape(state->username), NULL);
-}
-
 struct imap_client *
 imap_client_create(int fd, const struct imap_client_state *state)
 {
@@ -583,7 +573,7 @@ imap_client_create(int fd, const struct imap_client_state *state)
 	struct imap_client *client;
 	pool_t pool = pool_alloconly_create("imap client", 256);
 	void *statebuf;
-	const char *ident, *error;
+	const char *error;
 
 	i_assert(state->username != NULL);
 	i_assert(state->mail_log_prefix != NULL);
@@ -595,6 +585,7 @@ imap_client_create(int fd, const struct imap_client_state *state)
 	client->fd = fd;
 	client->input = i_stream_create_fd(fd, IMAP_MAX_INBUF);
 	client->output = o_stream_create_fd(fd, IMAP_MAX_OUTBUF);
+	o_stream_set_no_error_handling(client->output, TRUE);
 	client->state = *state;
 	client->state.username = p_strdup(pool, state->username);
 	client->state.session_id = p_strdup(pool, state->session_id);
@@ -638,12 +629,14 @@ imap_client_create(int fd, const struct imap_client_state *state)
 		client->log_prefix = p_strdup(pool, str_c(str));
 	} T_END;
 
-	ident = imap_client_get_anvil_userip_ident(&client->state);
-	if (ident != NULL) {
-		master_service_anvil_send(master_service, t_strconcat(
-			"CONNECT\t", my_pid, "\timap/", ident, "\n", NULL));
+	struct master_service_anvil_session anvil_session = {
+		.username = client->state.username,
+		.service_name = master_service_get_name(master_service),
+		.ip = client->state.remote_ip,
+	};
+	if (master_service_anvil_connect(master_service, &anvil_session,
+					 TRUE, client->state.anvil_conn_guid))
 		client->state.anvil_sent = TRUE;
-	}
 
 	p_array_init(&client->notifys, pool, 2);
 	DLLIST_PREPEND(&imap_clients, client);
@@ -685,10 +678,13 @@ void imap_client_destroy(struct imap_client **_client, const char *reason)
 	}
 
 	if (client->state.anvil_sent) {
-		master_service_anvil_send(master_service, t_strconcat(
-			"DISCONNECT\t", my_pid, "\timap/",
-			imap_client_get_anvil_userip_ident(&client->state),
-			"\n", NULL));
+		struct master_service_anvil_session anvil_session = {
+			.username = client->state.username,
+			.service_name = master_service_get_name(master_service),
+			.ip = client->state.remote_ip,
+		};
+		master_service_anvil_disconnect(master_service, &anvil_session,
+						client->state.anvil_conn_guid);
 	}
 
 	if (client->master_conn != NULL)
@@ -781,6 +777,29 @@ static void imap_clients_unhibernate(void *context ATTR_UNUSED)
 	timeout_remove(&to_unhibernate);
 }
 
+static void imap_client_kick(struct imap_client *client)
+{
+	imap_client_io_activate_user(client);
+	o_stream_nsend_str(client->output,
+			   "* BYE "MASTER_SERVICE_SHUTTING_DOWN_MSG".\r\n");
+	imap_client_destroy(&client, MASTER_SERVICE_SHUTTING_DOWN_MSG);
+}
+
+unsigned int imap_clients_kick(const char *user, const guid_128_t conn_guid)
+{
+	struct imap_client *client, *next;
+	unsigned int count = 0;
+
+	for (client = imap_clients; client != NULL; client = next) {
+		next = client->next;
+		if (strcmp(client->state.username, user) == 0 &&
+		    (guid_128_is_empty(conn_guid) ||
+		     guid_128_cmp(client->state.anvil_conn_guid, conn_guid) == 0))
+			imap_client_kick(client);
+	}
+	return count;
+}
+
 void imap_clients_init(void)
 {
 	unhibernate_queue = priorityq_init(client_unhibernate_cmp, 64);
@@ -788,12 +807,9 @@ void imap_clients_init(void)
 
 void imap_clients_deinit(void)
 {
-	while (imap_clients != NULL) {
-		struct imap_client *client = imap_clients;
+	while (imap_clients != NULL)
+		imap_client_kick(imap_clients);
 
-		imap_client_io_activate_user(client);
-		imap_client_destroy(&client, "Shutting down");
-	}
 	timeout_remove(&to_unhibernate);
 	priorityq_deinit(&unhibernate_queue);
 }

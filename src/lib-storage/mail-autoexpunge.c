@@ -9,7 +9,6 @@
 #include "mail-autoexpunge.h"
 
 #define AUTOEXPUNGE_LOCK_FNAME "dovecot.autoexpunge.lock"
-#define AUTOEXPUNGE_BATCH_SIZE 1000
 
 static bool
 mailbox_autoexpunge_lock(struct mail_user *user, struct file_lock **lock)
@@ -79,7 +78,7 @@ mailbox_autoexpunge_batch(struct mailbox *box,
 
 	hdr = mail_index_get_header(box->view);
 
-	for (seq = 1; seq <= I_MIN(hdr->messages_count, AUTOEXPUNGE_BATCH_SIZE); seq++) {
+	for (seq = 1; seq <= I_MIN(hdr->messages_count, MAIL_EXPUNGE_BATCH_SIZE); seq++) {
 		mail_set_seq(mail, seq);
 		if (max_mails > 0 && hdr->messages_count - seq + 1 > max_mails) {
 			/* max_mails is still being reached -> expunge.
@@ -130,7 +129,7 @@ mailbox_autoexpunge(struct mailbox *box, unsigned int interval_time,
 	time_t expire_time;
 	int ret;
 
-	if ((unsigned int)ioloop_time < interval_time)
+	if (ioloop_time32 < interval_time)
 		expire_time = 0;
 	else
 		expire_time = ioloop_time - interval_time;
@@ -179,7 +178,6 @@ mailbox_autoexpunge_set(struct mail_namespace *ns, const char *vname,
 	   any ACLs the user might normally have against expunging in
 	   the mailbox. */
 	box = mailbox_alloc(ns->list, vname, MAILBOX_FLAG_IGNORE_ACLS);
-	mailbox_set_reason(box, "autoexpunge");
 	if (mailbox_autoexpunge(box, autoexpunge, autoexpunge_max_mails,
 				expunged_count) < 0) {
 		e_error(box->event, "Failed to autoexpunge: %s",
@@ -253,6 +251,8 @@ unsigned int mail_user_autoexpunge(struct mail_user *user)
 	struct file_lock *lock = NULL;
 	struct mail_namespace *ns;
 	unsigned int expunged_count = 0;
+	struct event_reason *reason =
+		event_reason_begin("storage:autoexpunge");
 
 	for (ns = user->namespaces; ns != NULL; ns = ns->next) {
 		if (ns->alias_for == NULL) {
@@ -260,6 +260,7 @@ unsigned int mail_user_autoexpunge(struct mail_user *user)
 				break;
 		}
 	}
+	event_reason_end(&reason);
 	file_lock_free(&lock);
 	return expunged_count;
 }

@@ -324,6 +324,8 @@ struct smtp_server_settings {
 	/* Enabled workarounds for client protocol deviations */
 	enum smtp_server_workarounds workarounds;
 
+	/* Module name for event reason codes. */
+	const char *reason_code_module;
 	/* Our hostname as presented to the client */
 	const char *hostname;
 	/* The message sent in the SMTP server greeting */
@@ -392,6 +394,9 @@ struct smtp_server_settings {
 	bool rcpt_domain_optional:1;
 	/* Don't include "(state=%s)" in the disconnection reason string. */
 	bool no_state_in_reason:1;
+	/* Don't send a greeting or login success message to the client upon
+	   connection start. */
+	bool no_greeting:1;
 };
 
 struct smtp_server_stats {
@@ -530,7 +535,7 @@ enum smtp_server_command_flags {
 };
 
 enum smtp_server_command_hook_type {
-	/* next: command is next to reply but has not submittted all replies
+	/* next: command is next to reply but has not submitted all replies
 	   yet. */
 	SMTP_SERVER_COMMAND_HOOK_NEXT,
 	/* replied_one: command has submitted one reply. */
@@ -587,13 +592,17 @@ void smtp_server_command_remove_hook(struct smtp_server_command *cmd,
 
 /* The core SMTP commands are pre-registered. Special connection callbacks are
    provided for the core SMTP commands. Only use this command registration API
-   when custom/extension SMTP commands are required.
+   when custom/extension SMTP commands are required. It is also possible to
+   completely override the default implementations.
  */
 void smtp_server_command_register(struct smtp_server *server, const char *name,
 				  smtp_server_cmd_start_func_t *func,
 				  enum smtp_server_command_flags);
 void smtp_server_command_unregister(struct smtp_server *server,
 				    const char *name);
+void smtp_server_command_override(struct smtp_server *server, const char *name,
+				  smtp_server_cmd_start_func_t *func,
+				  enum smtp_server_command_flags flags);
 
 void smtp_server_command_set_reply_count(struct smtp_server_command *cmd,
 					 unsigned int count);
@@ -619,13 +628,26 @@ void smtp_server_command_input_capture(
 	struct smtp_server_cmd_ctx *cmd,
 	smtp_server_cmd_input_callback_t *callback);
 
+void smtp_server_command_pipeline_block(struct smtp_server_cmd_ctx *cmd);
+void smtp_server_command_pipeline_unblock(struct smtp_server_cmd_ctx *cmd);
+
 /* EHLO */
+
+void smtp_server_cmd_ehlo(struct smtp_server_cmd_ctx *cmd, const char *params);
+void smtp_server_cmd_helo(struct smtp_server_cmd_ctx *cmd, const char *params);
 
 struct smtp_server_reply *
 smtp_server_cmd_ehlo_reply_create(struct smtp_server_cmd_ctx *cmd);
 void smtp_server_cmd_ehlo_reply_default(struct smtp_server_cmd_ctx *cmd);
 
+/* STARTTLS */
+
+void smtp_server_cmd_starttls(struct smtp_server_cmd_ctx *cmd,
+			      const char *params);
+
 /* AUTH */
+
+void smtp_server_cmd_auth(struct smtp_server_cmd_ctx *cmd, const char *params);
 
 void smtp_server_cmd_auth_send_challenge(struct smtp_server_cmd_ctx *cmd,
 					 const char *challenge);
@@ -635,28 +657,50 @@ void smtp_server_cmd_auth_success(struct smtp_server_cmd_ctx *cmd,
 
 /* MAIL */
 
+void smtp_server_cmd_mail(struct smtp_server_cmd_ctx *cmd, const char *params);
+
 void smtp_server_cmd_mail_reply_success(struct smtp_server_cmd_ctx *cmd);
 
 /* RCPT */
+
+void smtp_server_cmd_rcpt(struct smtp_server_cmd_ctx *cmd, const char *params);
 
 bool smtp_server_command_is_rcpt(struct smtp_server_cmd_ctx *cmd);
 void smtp_server_cmd_rcpt_reply_success(struct smtp_server_cmd_ctx *cmd);
 
 /* RSET */
 
+void smtp_server_cmd_rset(struct smtp_server_cmd_ctx *cmd, const char *params);
+
 void smtp_server_cmd_rset_reply_success(struct smtp_server_cmd_ctx *cmd);
 
 /* DATA */
+
+void smtp_server_cmd_data(struct smtp_server_cmd_ctx *cmd, const char *params);
+void smtp_server_cmd_bdat(struct smtp_server_cmd_ctx *cmd, const char *params);
 
 bool smtp_server_cmd_data_check_size(struct smtp_server_cmd_ctx *cmd);
 
 /* VRFY */
 
+void smtp_server_cmd_vrfy(struct smtp_server_cmd_ctx *cmd, const char *params);
+
 void smtp_server_cmd_vrfy_reply_default(struct smtp_server_cmd_ctx *cmd);
 
 /* NOOP */
 
+void smtp_server_cmd_noop(struct smtp_server_cmd_ctx *cmd, const char *params);
+
 void smtp_server_cmd_noop_reply_success(struct smtp_server_cmd_ctx *cmd);
+
+/* QUIT */
+
+void smtp_server_cmd_quit(struct smtp_server_cmd_ctx *cmd, const char *params);
+
+/* XCLIENT */
+
+void smtp_server_cmd_xclient(struct smtp_server_cmd_ctx *cmd,
+			     const char *params);
 
 /*
  * Reply

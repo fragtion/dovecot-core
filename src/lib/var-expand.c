@@ -201,7 +201,8 @@ var_expand_hash(struct var_expand_context *ctx,
 	enum {
 		FORMAT_HEX,
 		FORMAT_HEX_UC,
-		FORMAT_BASE64
+		FORMAT_BASE64,
+		FORMAT_BASE64_URL,
 	} format = FORMAT_HEX;
 
 	const char *p = strchr(key, ';');
@@ -218,16 +219,20 @@ var_expand_hash(struct var_expand_context *ctx,
 	const struct hash_method *method;
 	if (strcmp(algo, "pkcs5") == 0) {
 		method = hash_method_lookup("sha256");
-	} else if ((method = hash_method_lookup(algo)) == NULL) {
-		return 0;
+	} else {
+		method = hash_method_lookup(algo);
 	}
+
+	/* since this can get called only by registered algorithms
+	   it's not really possible for them to be suddenly missing */
+	i_assert(method != NULL);
 
 	string_t *field_value = t_str_new(64);
 	string_t *salt = t_str_new(64);
 	string_t *tmp = t_str_new(method->digest_size);
 
 	if ((ret = var_expand_long(ctx, field, strlen(field),
-				   &value, error_r)) < 1) {
+				   &value, error_r)) <= 0) {
 		return ret;
 	}
 
@@ -289,6 +294,8 @@ var_expand_hash(struct var_expand_context *ctx,
 				format = FORMAT_HEX_UC;
 			} else if (strcmp(value, "base64") == 0) {
 				format = FORMAT_BASE64;
+			} else if (strcmp(value, "base64url") == 0) {
+				format = FORMAT_BASE64_URL;
 			} else {
 				*error_r = t_strdup_printf(
 					"Cannot parse hash arguments:"
@@ -344,6 +351,13 @@ var_expand_hash(struct var_expand_context *ctx,
 			*result_r = str_c(dest);
 			return 1;
 		}
+		case FORMAT_BASE64_URL: {
+			string_t *dest = t_str_new(64);
+			base64url_encode(BASE64_ENCODE_FLAG_NO_PADDING, 0,
+					 tmp->data, tmp->used, dest);
+			*result_r = str_c(dest);
+			return 1;
+		}
 	}
 
 	i_unreached();
@@ -366,6 +380,8 @@ var_expand_func(const struct var_expand_func_table *func_table,
 		for (; func_table->key != NULL; func_table++) {
 			if (strcmp(func_table->key, key) == 0) {
 				ret = func_table->func(data, context, &value, error_r);
+				if (*error_r == NULL)
+					*error_r = t_strdup_printf("Unknown variables in function %%%s", key);
 				*var_r = value != NULL ? value : "";
 				return ret;
 			}
@@ -392,14 +408,14 @@ var_expand_try_extension(struct var_expand_context *ctx,
 	array_foreach(&var_expand_extensions, f) {
 		/* ensure we won't match abbreviations */
 		size_t len = sep-key;
-		if (strncasecmp(key, f->key, len) == 0 && f->key[len] == '\0')
-			return f->func(ctx, key, data, var_r, error_r);
+		if (strncasecmp(key, f->key, len) == 0 && f->key[len] == '\0') {
+			ret = f->func(ctx, key, data, var_r, error_r);
+			i_assert(ret == 1 || *error_r != NULL);
+			return ret;
+		}
 	}
-	if ((ret = var_expand_func(ctx->func_table, key, data,
-				   ctx->context, var_r, error_r)) == 0) {
-		*error_r = t_strdup_printf("Unknown variable '%%%s'", key);
-	}
-	return ret;
+	return var_expand_func(ctx->func_table, key, data,
+			       ctx->context, var_r, error_r);
 }
 
 

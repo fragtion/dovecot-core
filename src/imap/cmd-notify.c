@@ -151,9 +151,8 @@ cmd_notify_add_mailbox(struct imap_notify_context *ctx,
 {
 	struct imap_notify_namespace *notify_ns;
 	struct imap_notify_mailboxes *notify_boxes;
-	const char *const *names;
+	const char *suffix, *const *names;
 	unsigned int i, count;
-	size_t cur_len, name_len = strlen(name);
 	char ns_sep = mail_namespace_get_sep(ns);
 
 	if (mail_namespace_is_removable(ns)) {
@@ -162,8 +161,8 @@ cmd_notify_add_mailbox(struct imap_notify_context *ctx,
 	}
 
 	if ((ns->flags & NAMESPACE_FLAG_INBOX_USER) != 0 &&
-	    !str_begins(name, "INBOX") &&
-	    strncasecmp(name, "INBOX", 5) == 0 &&
+	    !str_begins_with(name, "INBOX") &&
+	    str_begins_icase_with(name, "INBOX") &&
 	    (name[5] == '\0' || name[5] == ns_sep)) {
 		/* we'll do only case-sensitive comparisons later,
 		   so sanitize INBOX to be uppercase */
@@ -183,14 +182,13 @@ cmd_notify_add_mailbox(struct imap_notify_context *ctx,
 			i++;
 		else {
 			/* see if one is a subtree of the other */
-			cur_len = strlen(names[i]);
-			if (str_begins(name, names[i]) &&
-			    names[i][cur_len] == ns_sep) {
+			if (str_begins(name, names[i], &suffix) &&
+			    suffix[0] == ns_sep) {
 				/* already matched in this subtree */
 				return;
 			}
-			if (strncmp(names[i], name, name_len) == 0 &&
-			    names[i][name_len] == ns_sep) {
+			if (str_begins(names[i], name, &suffix) &&
+			    suffix[0] == ns_sep) {
 				/* we're adding a parent, remove the child */
 				array_delete(&notify_boxes->names, i, 1);
 				names = array_get(&notify_boxes->names, &count);
@@ -441,7 +439,6 @@ imap_notify_box_send_status(struct client_command_context *cmd,
 		items.flags |= IMAP_STATUS_ITEM_HIGHESTMODSEQ;
 
 	box = mailbox_alloc(info->ns->list, info->vname, MAILBOX_FLAG_READONLY);
-	mailbox_set_reason(box, "NOTIFY send STATUS");
 	(void)mailbox_enable(box, client_enabled_mailbox_features(ctx->client));
 
 	if (imap_status_get(cmd, info->ns, info->vname, &items, &result) < 0) {

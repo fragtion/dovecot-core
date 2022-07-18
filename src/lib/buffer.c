@@ -14,7 +14,7 @@ struct real_buffer {
 			size_t used;
 			/* private: */
 			unsigned char *w_buffer;
-			size_t dirty, alloc, max_size;
+			size_t dirty, alloc, writable_size, max_size;
 
 			pool_t pool;
 
@@ -39,6 +39,7 @@ static void buffer_alloc(struct real_buffer *buf, size_t size)
 	else
 		buf->w_buffer = p_realloc(buf->pool, buf->w_buffer, buf->alloc, size);
 	buf->alloc = size;
+	buf->writable_size = size-1; /* -1 for str_c() NUL */
 
 	buf->r_buffer = buf->w_buffer;
 	buf->alloced = TRUE;
@@ -47,7 +48,6 @@ static void buffer_alloc(struct real_buffer *buf, size_t size)
 static inline void
 buffer_check_limits(struct real_buffer *buf, size_t pos, size_t data_size)
 {
-	unsigned int extra;
 	size_t new_size;
 
 	if (unlikely(buf->max_size - pos < data_size))
@@ -62,12 +62,11 @@ buffer_check_limits(struct real_buffer *buf, size_t pos, size_t data_size)
 		memset(buf->w_buffer + buf->used, 0, max - buf->used);
 	}
 
-	/* always keep +1 byte allocated available in case str_c() is called
-	   for this buffer. this is mainly for cases where the buffer is
-	   allocated from data stack, and str_c() is called in a separate stack
-	   frame. */
-	extra = buf->dynamic ? 1 : 0;
-	if (new_size + extra > buf->alloc) {
+	/* Use buf->writable_size instead of buf->alloc to always keep +1 byte
+	   available in case str_c() is called for this buffer. This is mainly
+	   for cases where the buffer is allocated from data stack, and str_c()
+	   is called in a separate stack frame. */
+	if (new_size > buf->writable_size) {
 		if (unlikely(!buf->dynamic)) {
 			i_panic("Buffer full (%zu > %zu, pool %s)",
 				pos + data_size, buf->alloc,
@@ -75,8 +74,15 @@ buffer_check_limits(struct real_buffer *buf, size_t pos, size_t data_size)
 				pool_get_name(buf->pool));
 		}
 
-		buffer_alloc(buf, pool_get_exp_grown_size(buf->pool, buf->alloc,
-							  new_size + extra));
+		size_t new_alloc_size =
+			pool_get_exp_grown_size(buf->pool, buf->alloc,
+						new_size + 1);
+		if (new_alloc_size > buf->max_size) {
+			/* limit to max_size, but do include +1 for
+			   str_c() NUL */
+			new_alloc_size = buf->max_size + 1;
+		}
+		buffer_alloc(buf, new_alloc_size);
 	}
 #if 0
 	else if (new_size > buf->used && buf->alloced &&
@@ -101,6 +107,18 @@ buffer_check_limits(struct real_buffer *buf, size_t pos, size_t data_size)
 	i_assert(buf->w_buffer != NULL);
 }
 
+static inline void
+buffer_check_append_limits(struct real_buffer *buf, size_t data_size)
+{
+	/* Fast path: See if data to be appended fits into allocated buffer.
+	   If it does, we don't even need to memset() the dirty buffer since
+	   it's going to be filled with the newly appended data. */
+	if (buf->writable_size - buf->used < data_size)
+		buffer_check_limits(buf, buf->used, data_size);
+	else
+		buf->used += data_size;
+}
+
 #undef buffer_create_from_data
 void buffer_create_from_data(buffer_t *buffer, void *data, size_t size)
 {
@@ -108,9 +126,9 @@ void buffer_create_from_data(buffer_t *buffer, void *data, size_t size)
 
 	i_assert(sizeof(*buffer) >= sizeof(struct real_buffer));
 
-	buf = (struct real_buffer *)buffer;
+	buf = container_of(buffer, struct real_buffer, buf);
 	i_zero(buf);
-	buf->alloc = buf->max_size = size;
+	buf->alloc = buf->writable_size = buf->max_size = size;
 	buf->r_buffer = buf->w_buffer = data;
 	/* clear the whole memory area. unnecessary usually, but if the
 	   buffer is used by e.g. str_c() it tries to access uninitialized
@@ -126,10 +144,10 @@ void buffer_create_from_const_data(buffer_t *buffer,
 
 	i_assert(sizeof(*buffer) >= sizeof(struct real_buffer));
 
-	buf = (struct real_buffer *)buffer;
+	buf = container_of(buffer, struct real_buffer, buf);
 	i_zero(buf);
 
-	buf->used = buf->alloc = buf->max_size = size;
+	buf->used = buf->alloc = buf->writable_size = buf->max_size = size;
 	buf->r_buffer = data;
 	i_assert(buf->w_buffer == NULL);
 }
@@ -161,15 +179,14 @@ buffer_t *buffer_create_dynamic_max(pool_t pool, size_t init_size,
 	   init_size so we can actually write that much to the buffer without
 	   realloc */
 	buffer_alloc(buf, init_size+1);
-	return (buffer_t *)buf;
+	return &buf->buf;
 }
 
 void buffer_free(buffer_t **_buf)
 {
-	struct real_buffer *buf = (struct real_buffer *)*_buf;
-
-	if (buf == NULL)
+	if (*_buf == NULL)
 		return;
+	struct real_buffer *buf = container_of(*_buf, struct real_buffer, buf);
 
 	*_buf = NULL;
 	if (buf->alloced)
@@ -180,7 +197,7 @@ void buffer_free(buffer_t **_buf)
 
 void *buffer_free_without_data(buffer_t **_buf)
 {
-	struct real_buffer *buf = (struct real_buffer *)*_buf;
+	struct real_buffer *buf = container_of(*_buf, struct real_buffer, buf);
 	void *data;
 
 	*_buf = NULL;
@@ -192,7 +209,8 @@ void *buffer_free_without_data(buffer_t **_buf)
 
 pool_t buffer_get_pool(const buffer_t *_buf)
 {
-	const struct real_buffer *buf = (const struct real_buffer *)_buf;
+	const struct real_buffer *buf =
+		container_of(_buf, const struct real_buffer, buf);
 
 	return buf->pool;
 }
@@ -200,27 +218,37 @@ pool_t buffer_get_pool(const buffer_t *_buf)
 void buffer_write(buffer_t *_buf, size_t pos,
 		  const void *data, size_t data_size)
 {
-	struct real_buffer *buf = (struct real_buffer *)_buf;
+	struct real_buffer *buf = container_of(_buf, struct real_buffer, buf);
 
 	buffer_check_limits(buf, pos, data_size);
 	if (data_size > 0)
 		memcpy(buf->w_buffer + pos, data, data_size);
 }
 
-void buffer_append(buffer_t *buf, const void *data, size_t data_size)
+void buffer_append(buffer_t *_buf, const void *data, size_t data_size)
 {
-	buffer_write(buf, buf->used, data, data_size);
+	struct real_buffer *buf = container_of(_buf, struct real_buffer, buf);
+
+	if (data_size > 0) {
+		size_t pos = buf->used;
+		buffer_check_append_limits(buf, data_size);
+		memcpy(buf->w_buffer + pos, data, data_size);
+	}
 }
 
-void buffer_append_c(buffer_t *buf, unsigned char chr)
+void buffer_append_c(buffer_t *_buf, unsigned char chr)
 {
-	buffer_append(buf, &chr, 1);
+	struct real_buffer *buf = container_of(_buf, struct real_buffer, buf);
+	size_t pos = buf->used;
+
+	buffer_check_append_limits(buf, 1);
+	buf->w_buffer[pos] = chr;
 }
 
 void buffer_insert(buffer_t *_buf, size_t pos,
 		   const void *data, size_t data_size)
 {
-	struct real_buffer *buf = (struct real_buffer *)_buf;
+	struct real_buffer *buf = container_of(_buf, struct real_buffer, buf);
 
 	if (pos >= buf->used)
 		buffer_write(_buf, pos, data, data_size);
@@ -232,7 +260,7 @@ void buffer_insert(buffer_t *_buf, size_t pos,
 
 void buffer_delete(buffer_t *_buf, size_t pos, size_t size)
 {
-	struct real_buffer *buf = (struct real_buffer *)_buf;
+	struct real_buffer *buf = container_of(_buf, struct real_buffer, buf);
 	size_t end_size;
 
 	if (pos >= buf->used)
@@ -255,7 +283,7 @@ void buffer_delete(buffer_t *_buf, size_t pos, size_t size)
 void buffer_replace(buffer_t *_buf, size_t pos, size_t size,
 		    const void *data, size_t data_size)
 {
-	struct real_buffer *buf = (struct real_buffer *)_buf;
+	struct real_buffer *buf = container_of(_buf, struct real_buffer, buf);
 	size_t end_size;
 
 	if (pos >= buf->used) {
@@ -288,20 +316,24 @@ void buffer_replace(buffer_t *_buf, size_t pos, size_t size,
 
 void buffer_write_zero(buffer_t *_buf, size_t pos, size_t data_size)
 {
-	struct real_buffer *buf = (struct real_buffer *)_buf;
+	struct real_buffer *buf = container_of(_buf, struct real_buffer, buf);
 
 	buffer_check_limits(buf, pos, data_size);
 	memset(buf->w_buffer + pos, 0, data_size);
 }
 
-void buffer_append_zero(buffer_t *buf, size_t data_size)
+void buffer_append_zero(buffer_t *_buf, size_t data_size)
 {
-	buffer_write_zero(buf, buf->used, data_size);
+	struct real_buffer *buf = container_of(_buf, struct real_buffer, buf);
+
+	/* NOTE: When appending it's enough to check that the limits are
+	   valid, because the data is already guaranteed to be zero-filled. */
+	buffer_check_limits(buf, buf->used, data_size);
 }
 
 void buffer_insert_zero(buffer_t *_buf, size_t pos, size_t data_size)
 {
-	struct real_buffer *buf = (struct real_buffer *)_buf;
+	struct real_buffer *buf = container_of(_buf, struct real_buffer, buf);
 
 	if (pos >= buf->used)
 		buffer_write_zero(_buf, pos, data_size);
@@ -314,8 +346,9 @@ void buffer_insert_zero(buffer_t *_buf, size_t pos, size_t data_size)
 void buffer_copy(buffer_t *_dest, size_t dest_pos,
 		 const buffer_t *_src, size_t src_pos, size_t copy_size)
 {
-	struct real_buffer *dest = (struct real_buffer *)_dest;
-	const struct real_buffer *src = (const struct real_buffer *)_src;
+	struct real_buffer *dest = container_of(_dest, struct real_buffer, buf);
+	const struct real_buffer *src =
+		container_of(_src, const struct real_buffer, buf);
 	size_t max_size;
 
 	i_assert(src_pos <= src->used);
@@ -344,7 +377,7 @@ void buffer_append_buf(buffer_t *dest, const buffer_t *src,
 
 void *buffer_get_space_unsafe(buffer_t *_buf, size_t pos, size_t size)
 {
-	struct real_buffer *buf = (struct real_buffer *)_buf;
+	struct real_buffer *buf = container_of(_buf, struct real_buffer, buf);
 
 	buffer_check_limits(buf, pos, size);
 	return buf->w_buffer + pos;
@@ -352,12 +385,15 @@ void *buffer_get_space_unsafe(buffer_t *_buf, size_t pos, size_t size)
 
 void *buffer_append_space_unsafe(buffer_t *buf, size_t size)
 {
+	/* NOTE: can't use buffer_check_append_limits() here because it doesn't
+	   guarantee that the buffer is zero-filled. */
 	return buffer_get_space_unsafe(buf, buf->used, size);
 }
 
 void *buffer_get_modifiable_data(const buffer_t *_buf, size_t *used_size_r)
 {
-	const struct real_buffer *buf = (const struct real_buffer *)_buf;
+	const struct real_buffer *buf =
+		container_of(_buf, const struct real_buffer, buf);
 
 	if (used_size_r != NULL)
 		*used_size_r = buf->used;
@@ -367,7 +403,7 @@ void *buffer_get_modifiable_data(const buffer_t *_buf, size_t *used_size_r)
 
 void buffer_set_used_size(buffer_t *_buf, size_t used_size)
 {
-	struct real_buffer *buf = (struct real_buffer *)_buf;
+	struct real_buffer *buf = container_of(_buf, struct real_buffer, buf);
 
 	i_assert(used_size <= buf->alloc);
 
@@ -379,28 +415,28 @@ void buffer_set_used_size(buffer_t *_buf, size_t used_size)
 
 size_t buffer_get_size(const buffer_t *_buf)
 {
-	const struct real_buffer *buf = (const struct real_buffer *)_buf;
+	const struct real_buffer *buf =
+		container_of(_buf, const struct real_buffer, buf);
 
 	return buf->alloc;
 }
 
 size_t buffer_get_writable_size(const buffer_t *_buf)
 {
-	const struct real_buffer *buf = (const struct real_buffer *)_buf;
+	const struct real_buffer *buf =
+		container_of(_buf, const struct real_buffer, buf);
 
-	if (!buf->dynamic || buf->alloc == 0)
-		return buf->alloc;
-
-	/* we reserve +1 for str_c() NUL in buffer_check_limits(), so don't
-	   include that in our return value. otherwise the caller might
+	/* Use buf->writable_size instead of buf->alloc to reserve +1 for
+	   str_c() NUL in buffer_check_limits(). Otherwise the caller might
 	   increase the buffer's alloc size unnecessarily when it just wants
 	   to access the entire buffer. */
-	return buf->alloc-1;
+	return buf->writable_size;
 }
 
 size_t buffer_get_avail_size(const buffer_t *_buf)
 {
-	const struct real_buffer *buf = (const struct real_buffer *)_buf;
+	const struct real_buffer *buf =
+		container_of(_buf, const struct real_buffer, buf);
 
 	i_assert(buf->alloc >= buf->used);
 	return ((buf->dynamic ? SIZE_MAX : buf->alloc) - buf->used);
@@ -418,7 +454,8 @@ bool buffer_cmp(const buffer_t *buf1, const buffer_t *buf2)
 
 void buffer_verify_pool(buffer_t *_buf)
 {
-	const struct real_buffer *buf = (const struct real_buffer *)_buf;
+	const struct real_buffer *buf =
+		container_of(_buf, struct real_buffer, buf);
 	void *ret;
 
 	if (buf->pool != NULL && buf->pool->datastack_pool && buf->alloc > 0) {
@@ -439,7 +476,7 @@ buffer_truncate_rshift_bits(buffer_t *buf, size_t bits)
 
 	if (bits > 0) {
 		/* truncate it to closest byte boundary */
-		size_t bytes = ((bits + 7) & -8U)/8;
+		size_t bytes = ((bits + 7) & ~(size_t)7) / 8;
 		/* remaining bits */
 		bits = bits % 8;
 		buffer_set_used_size(buf, I_MIN(bytes, buf->used));

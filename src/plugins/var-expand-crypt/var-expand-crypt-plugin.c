@@ -35,13 +35,12 @@ void var_expand_crypt_deinit(void);
 void auth_var_expand_crypt_init(struct module *module);
 void auth_var_expand_crypt_deinit(void);
 
-static bool has_been_init;
-
 static int
 var_expand_crypt_settings(struct var_expand_crypt_context *ctx,
 			  const char *const *args, const char **error_r)
 {
 	while(args != NULL && *args != NULL) {
+		int ret;
 		const char *k = t_strcut(*args, '=');
 		const char *value = strchr(*args, '=');
 		if (value == NULL) {
@@ -53,10 +52,10 @@ var_expand_crypt_settings(struct var_expand_crypt_context *ctx,
 
 		if (strcmp(k, "iv") == 0) {
 			str_truncate(ctx->iv, 0);
-			if (var_expand_with_funcs(ctx->iv, value, ctx->ctx->table,
-						  ctx->ctx->func_table,
-						  ctx->ctx->context, error_r) < 0) {
-				return -1;
+			if ((ret = var_expand_with_funcs(ctx->iv, value, ctx->ctx->table,
+							 ctx->ctx->func_table,
+							 ctx->ctx->context, error_r)) <= 0) {
+				return ret;
 			}
 			const char *hexiv = t_strdup(str_c(ctx->iv));
 			/* try to decode IV */
@@ -68,12 +67,12 @@ var_expand_crypt_settings(struct var_expand_crypt_context *ctx,
 			ctx->algo = value;
 		} else if (strcmp(k, "key") == 0) {
 			str_truncate(ctx->enckey, 0);
-			if (var_expand_with_funcs(ctx->enckey, value,
-						  ctx->ctx->table,
-						  ctx->ctx->func_table,
-						  ctx->ctx->context,
-						  error_r) < 0) {
-				return -1;
+			if ((ret = var_expand_with_funcs(ctx->enckey, value,
+							 ctx->ctx->table,
+							 ctx->ctx->func_table,
+							 ctx->ctx->context,
+							 error_r)) <= 0) {
+				return ret;
 			}
 			const char *hexkey = t_strdup(str_c(ctx->enckey));
 			str_truncate(ctx->enckey, 0);
@@ -95,10 +94,10 @@ var_expand_crypt_settings(struct var_expand_crypt_context *ctx,
 	}
 
 	if (ctx->algo == NULL) {
-		ctx->algo = "AES-256-CBC";
+		ctx->algo = VAR_EXPAND_CRYPT_DEFAULT_ALGO;
 	}
 
-	return 0;
+	return 1;
 }
 
 static int
@@ -141,7 +140,7 @@ var_expand_encrypt(struct var_expand_context *_ctx,
 		   const char *key, const char *field,
 		   const char **result_r, const char **error_r)
 {
-	if (!has_been_init && !var_expand_crypt_initialize(error_r))
+	if (!var_expand_crypt_initialize(error_r))
 		return -1;
 
 	const char *p = strchr(key, ';');
@@ -165,7 +164,7 @@ var_expand_encrypt(struct var_expand_context *_ctx,
 	string_t *tmp = t_str_new(128);
 
 	if ((ret = var_expand_long(_ctx, field, strlen(field),
-				   &value, error_r)) < 1) {
+				   &value, error_r)) <= 0) {
 		return ret;
 	}
 
@@ -174,8 +173,8 @@ var_expand_encrypt(struct var_expand_context *_ctx,
 		return ret;
 	}
 
-	if (var_expand_crypt_settings(&ctx, args, error_r) < 0)
-		return -1;
+	if ((ret = var_expand_crypt_settings(&ctx, args, error_r)) <= 0)
+		return ret;
 
 	str_append(field_value, value);
 
@@ -222,7 +221,7 @@ var_expand_decrypt(struct var_expand_context *_ctx,
 		   const char *key, const char *field,
 		   const char **result_r, const char **error_r)
 {
-	if (!has_been_init && !var_expand_crypt_initialize(error_r))
+	if (!var_expand_crypt_initialize(error_r))
 		return -1;
 
 	const char *p = strchr(key, ';');
@@ -245,7 +244,7 @@ var_expand_decrypt(struct var_expand_context *_ctx,
 	string_t *tmp = t_str_new(128);
 
 	if ((ret = var_expand_long(_ctx, field, strlen(field),
-				   &value, error_r)) < 1) {
+				   &value, error_r)) <= 0) {
 		return ret;
 	}
 
@@ -254,8 +253,8 @@ var_expand_decrypt(struct var_expand_context *_ctx,
 		return ret;
 	}
 
-	if (var_expand_crypt_settings(&ctx, args, error_r) < 0)
-		return -1;
+	if ((ret = var_expand_crypt_settings(&ctx, args, error_r)) <= 0)
+		return ret;
 
 	const char *encdata = value;
 	const char *enciv = "";
@@ -324,8 +323,6 @@ void var_expand_crypt_init(struct module *module ATTR_UNUSED)
 void var_expand_crypt_deinit(void)
 {
 	var_expand_unregister_func_array(funcs);
-	if (has_been_init)
-		dcrypt_deinitialize();
 }
 
 void auth_var_expand_crypt_init(struct module *module)

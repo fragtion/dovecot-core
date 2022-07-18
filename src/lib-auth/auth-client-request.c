@@ -126,10 +126,15 @@ static void auth_server_send_new_request(struct auth_client_connection *conn,
 		str_append_tabescaped(str, info->client_id);
 		event_add_str(request->event, "client_id", info->client_id);
 	}
-	if (info->forward_fields != NULL &&
-	    *info->forward_fields != '\0') {
+	if (info->forward_fields != NULL && info->forward_fields[0] != NULL) {
+		string_t *forward = t_str_new(64);
+		str_append_tabescaped(forward, info->forward_fields[0]);
+		for (unsigned int i = 1; info->forward_fields[i] != NULL; i++) {
+			str_append_c(forward, '\t');
+			str_append_tabescaped(forward, info->forward_fields[i]);
+		}
 		str_append(str, "\tforward_fields=");
-		str_append_tabescaped(str, info->forward_fields);
+		str_append_tabescaped(str, str_c(forward));
 	}
 	if (array_is_created(&info->extra_fields)) {
 		const char *const *fieldp;
@@ -284,12 +289,14 @@ time_t auth_client_request_get_create_time(struct auth_client_request *request)
 
 static void args_parse_user(struct auth_client_request *request, const char *arg)
 {
-	if (str_begins(arg, "user="))
-		event_add_str(request->event, "user", arg + 5);
-	else if (str_begins(arg, "original_user="))
-		event_add_str(request->event, "original_user", arg + 14);
-	else if (str_begins(arg, "auth_user="))
-		event_add_str(request->event, "auth_user", arg + 10);
+	const char *value;
+
+	if (str_begins(arg, "user=", &value))
+		event_add_str(request->event, "user", value);
+	else if (str_begins(arg, "original_user=", &value))
+		event_add_str(request->event, "original_user", value);
+	else if (str_begins(arg, "auth_user=", &value))
+		event_add_str(request->event, "auth_user", value);
 }
 
 void auth_client_request_server_input(struct auth_client_request *request,
@@ -316,9 +323,7 @@ void auth_client_request_server_input(struct auth_client_request *request,
 	}
 
 	for (tmp = args; *tmp != NULL; tmp++) {
-		if (str_begins(*tmp, "resp=")) {
-			base64_data = *tmp + 5;
-		}
+		(void)str_begins(*tmp, "resp=", &base64_data);
 		args_parse_user(request, *tmp);
 	}
 

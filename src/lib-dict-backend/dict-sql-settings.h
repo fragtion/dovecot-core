@@ -5,6 +5,7 @@ enum dict_sql_type {
 	DICT_SQL_TYPE_STRING = 0,
 	DICT_SQL_TYPE_INT,
 	DICT_SQL_TYPE_UINT,
+	DICT_SQL_TYPE_DOUBLE,
 	DICT_SQL_TYPE_HEXBLOB
 };
 
@@ -21,6 +22,7 @@ struct dict_sql_map {
 	const char *username_field;
 	const char *value_field;
 	const char *value_type;
+	const char *expire_field;
 	bool value_hexblob;
 
 	/* SQL field names, one for each $ variable in the pattern */

@@ -6,7 +6,7 @@ struct module;
 #include "net.h"
 #include "login-proxy.h"
 #include "sasl-server.h"
-#include "master-login.h" /* for LOGIN_MAX_SESSION_ID_LEN */
+#include "login-client.h"
 
 #define LOGIN_MAX_SESSION_ID_LEN 64
 #define LOGIN_MAX_MASTER_PREFIX_LEN 128
@@ -19,7 +19,7 @@ struct module;
    POP3: Max. length of a command line (spec says 512 would be enough)
 */
 #define LOGIN_MAX_INBUF_SIZE \
-	(MASTER_AUTH_MAX_DATA_SIZE - LOGIN_MAX_MASTER_PREFIX_LEN - \
+	(LOGIN_REQUEST_MAX_DATA_SIZE - LOGIN_MAX_MASTER_PREFIX_LEN - \
 	 LOGIN_MAX_SESSION_ID_LEN)
 /* max. size of output buffer. if it gets full, the client is disconnected.
    SASL authentication gives the largest output. */
@@ -94,25 +94,17 @@ enum client_list_type {
 };
 
 struct client_auth_reply {
-	const char *master_user, *reason;
+	const char *reason;
 	enum client_auth_fail_code fail_code;
+	ARRAY_TYPE(const_string) alt_usernames;
 
-	/* for proxying */
-	const char *host, *hostip, *source_ip;
-	const char *destuser, *password, *proxy_mech;
-	in_port_t port;
-	unsigned int proxy_timeout_msecs;
+	struct auth_proxy_settings proxy;
 	unsigned int proxy_refresh_secs;
 	unsigned int proxy_host_immediate_failure_after_secs;
-	enum login_proxy_ssl_flags ssl_flags;
 
 	/* all the key=value fields returned by passdb */
 	const char *const *all_fields;
 
-	bool proxy:1;
-	bool proxy_noauth:1;
-	bool proxy_nopipelining:1;
-	bool proxy_not_trusted:1;
 	bool nologin:1;
 };
 
@@ -174,12 +166,13 @@ struct client {
 	struct ssl_iostream *ssl_iostream;
 	const struct login_settings *set;
 	const struct master_service_ssl_settings *ssl_set;
+	const struct master_service_ssl_server_settings *ssl_server_set;
 	const char *session_id, *listener_name, *postlogin_socket_path;
 	const char *local_name;
 	const char *client_cert_common_name;
 
 	string_t *client_id;
-	string_t *forward_fields;
+	ARRAY_TYPE(const_string) forward_fields;
 
 	int fd;
 	struct istream *input;
@@ -199,7 +192,9 @@ struct client {
 	unsigned int proxy_ttl;
 
 	char *auth_mech_name;
+	enum sasl_server_auth_flags auth_flags;
 	struct auth_client_request *auth_request;
+	struct auth_client_request *reauth_request;
 	string_t *auth_response;
 	time_t auth_first_started, auth_finished;
 	const char *sasl_final_resp;
@@ -247,10 +242,12 @@ struct client {
 	bool auth_initializing:1;
 	bool auth_process_comm_fail:1;
 	bool auth_anonymous:1;
+	bool auth_nologin_referral:1;
 	bool proxy_auth_failed:1;
 	bool proxy_noauth:1;
 	bool proxy_nopipelining:1;
 	bool proxy_not_trusted:1;
+	bool proxy_redirect_reauth:1;
 	bool auth_waiting:1;
 	bool notified_auth_ready:1;
 	bool notified_disconnect:1;
@@ -279,7 +276,8 @@ struct client *
 client_alloc(int fd, pool_t pool,
 	     const struct master_service_connection *conn,
 	     const struct login_settings *set,
-	     const struct master_service_ssl_settings *ssl_set);
+	     const struct master_service_ssl_settings *ssl_set,
+	     const struct master_service_ssl_server_settings *ssl_server_set);
 void client_init(struct client *client, void **other_sets);
 void client_disconnect(struct client *client, const char *reason,
 		       bool add_disconnected_prefix);
@@ -303,6 +301,7 @@ struct client *clients_get_first_fd_proxy(void);
 
 void client_add_forward_field(struct client *client, const char *key,
 			      const char *value);
+bool client_forward_decode_base64(struct client *client, const char *value);
 void client_set_title(struct client *client);
 const char *client_get_extra_disconnect_reason(struct client *client);
 
@@ -344,6 +343,8 @@ int client_auth_begin(struct client *client, const char *mech_name,
 		      const char *init_resp);
 int client_auth_begin_private(struct client *client, const char *mech_name,
 			      const char *init_resp);
+int client_auth_begin_implicit(struct client *client, const char *mech_name,
+			       const char *init_resp);
 bool client_check_plaintext_auth(struct client *client, bool pass_sent);
 int client_auth_read_line(struct client *client);
 

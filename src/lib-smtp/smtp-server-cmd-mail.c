@@ -57,7 +57,7 @@ cmd_mail_recheck(struct smtp_server_cmd_ctx *cmd,
 {
 	struct smtp_server_connection *conn = cmd->conn;
 
-	/* All preceeding commands have finished and now the transaction state
+	/* All preceding commands have finished and now the transaction state
 	   is clear. This provides the opportunity to re-check the transaction
 	   state */
 	if (!cmd_mail_check_state(cmd))
@@ -93,15 +93,14 @@ void smtp_server_cmd_mail(struct smtp_server_cmd_ctx *cmd,
 		return;
 
 	/* Reverse-path */
-	if (params == NULL || strncasecmp(params, "FROM:", 5) != 0) {
+	if (params == NULL || !str_begins_icase(params, "FROM:", &params)) {
 		smtp_server_reply(cmd, 501, "5.5.4", "Invalid parameters");
 		return;
 	}
-	if (params[5] != ' ' && params[5] != '\t') {
-		params += 5;
+	if (params[0] != ' ' && params[0] != '\t') {
+		/* no whitespace */
 	} else if ((set->workarounds &
 		    SMTP_SERVER_WORKAROUND_WHITESPACE_BEFORE_PATH) != 0) {
-		params += 5;
 		while (*params == ' ' || *params == '\t')
 			params++;
 	} else {
@@ -189,7 +188,10 @@ void smtp_server_cmd_mail(struct smtp_server_cmd_ctx *cmd,
 	smtp_server_command_ref(command);
 	if (callbacks != NULL && callbacks->conn_cmd_mail != NULL) {
 		/* Specific implementation of MAIL command */
+		struct event_reason *reason =
+			smtp_server_connection_reason_begin(conn, "cmd_mail");
 		ret = callbacks->conn_cmd_mail(conn->context, cmd, mail_data);
+		event_reason_end(&reason);
 		if (ret <= 0) {
 			i_assert(ret == 0 ||
 				 smtp_server_command_is_replied(command));

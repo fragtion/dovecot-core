@@ -7,9 +7,7 @@
 #include "old-set-parser.h"
 #include "istream.h"
 #include "base64.h"
-
-static bool seen_ssl_parameters_dat;
-static const char *ssl_dh_parameters;
+#include <stdio.h>
 
 #define config_apply_line (void)config_apply_line
 
@@ -42,9 +40,6 @@ static const struct config_filter managesieve_filter = {
 	.service = "sieve"
 };
 
-static char *ssl_dh_value = NULL;
-static bool ssl_dh_loaded = FALSE;
-
 static void ATTR_FORMAT(2, 3)
 obsolete(struct config_parser_context *ctx, const char *str, ...)
 {
@@ -71,101 +66,6 @@ static void set_rename(struct config_parser_context *ctx,
 	config_parser_apply_line(ctx, CONFIG_LINE_TYPE_KEYVALUE, key, value);
 }
 
-static bool old_settings_ssl_dh_read(const char **value, const char **error_r)
-{
-
-	if (ssl_dh_parameters != NULL) *value = ssl_dh_parameters;
-
-	const char *fn = t_strconcat(PKG_STATEDIR, "/ssl-parameters.dat", NULL);
-	buffer_t *data = t_buffer_create(300);
-	string_t *b64_data = t_str_new(500);
-	size_t siz;
-	unsigned short keysize;
-	unsigned int off=0;
-
-	/* try read it */
-	struct istream *is = i_stream_create_file(fn, IO_BLOCK_SIZE);
-
-	if (is->stream_errno == ENOENT) {
-		/* this is given because the ssl-parameters.dat file is no more there
-		 and we don't want to to make go searching for the file
-		 this code is only ever reached if ssl_dh_parameters is empty anyways
-		 */
-		/* check moved to correct place from here */
-		*value = NULL;
-		i_stream_unref(&is);
-		return TRUE;
-	} else if (is->stream_errno != 0) {
-		*error_r = t_strdup(i_stream_get_error(is));
-		i_stream_unref(&is);
-		return FALSE;
-	}
-
-	/* then try to read the rest of the data */
-	while(i_stream_read(is) > 0) {
-		const unsigned char *buf = i_stream_get_data(is, &siz);
-		if (siz < 88) break;
-		memcpy(&keysize, buf, 2);
-		if (keysize == 512) {
-			memcpy(&off, buf+4, 4);
-			off += 16; // skip headers
-		} else {
-			off = 8; // skip header
-		}
-		if (off > siz) break;
-		buffer_append(data, buf+off, siz);
-		break;
-	}
-
-	const void *tmp = buffer_get_data(data, &siz);
-
-	if (siz > 4) {
-		str_append(b64_data, "-----BEGIN DH PARAMETERS-----\n");
-		base64_encode(tmp, siz-4, b64_data);
-		/* need to wrap the string nicely */
-		for(size_t i = 29+65; i < str_len(b64_data); i+=64) /* start at header + first 64 */
-		{
-			str_insert(b64_data, i++, "\n");
-		}
-		str_append_c(b64_data,'\n');
-		str_append(b64_data, "-----END DH PARAMETERS-----");
-		ssl_dh_parameters = i_strdup(str_c(b64_data));
-		*value = ssl_dh_parameters;
-
-		if (!seen_ssl_parameters_dat) {
-			i_warning("please set ssl_dh=<%s", SYSCONFDIR"/dh.pem");
-			i_warning("You can generate it with: dd if=%s bs=1 skip=%u | openssl dhparam -inform der > %s", fn, off, SYSCONFDIR"/dh.pem");
-			seen_ssl_parameters_dat = TRUE;
-		}
-	} else if (is->stream_errno == ENOENT) {
-		/* check for empty ssl_dh elsewhere */
-		*value = NULL;
-		i_stream_unref(&is);
-		return TRUE;
-	} else {
-		*error_r = "ssl enabled, but ssl_dh not set";
-		i_stream_unref(&is);
-		return FALSE;
-	}
-	i_stream_unref(&is);
-
-	return TRUE;
-}
-
-bool old_settings_ssl_dh_load(const char **value, const char **error_r)
-{
-	if (ssl_dh_loaded) {
-		*value = ssl_dh_value;
-		return TRUE;
-	}
-	if (!old_settings_ssl_dh_read(value, error_r))
-		return FALSE;
-	ssl_dh_value = i_strdup(*value);
-	ssl_dh_loaded = TRUE;
-	return TRUE;
-}
-
-/* FIXME: Remove ssl_protocols_to_min_protocol() in v2.4 */
 static int ssl_protocols_to_min_protocol(const char *ssl_protocols,
 					 const char **min_protocol_r,
 					 const char **error_r)
@@ -224,7 +124,7 @@ static bool
 old_settings_handle_root(struct config_parser_context *ctx,
 			 const char *key, const char *value)
 {
-	const char *p;
+	const char *p, *suffix;
 	size_t len;
 
 	if (strcmp(key, "base_dir") == 0) {
@@ -341,9 +241,13 @@ old_settings_handle_root(struct config_parser_context *ctx,
 		set_rename(ctx, key, "mdbox_rotate_size", value);
 		return TRUE;
 	}
-	if (str_begins(key, "mail_cache_compress_")) {
-		const char *new_key = t_strconcat("mail_cache_purge_", key+20, NULL);
+	if (str_begins(key, "mail_cache_compress_", &suffix)) {
+		const char *new_key = t_strconcat("mail_cache_purge_", suffix, NULL);
 		set_rename(ctx, key, new_key, value);
+		return TRUE;
+	}
+	if (strcmp(key, "auth_default_realm") == 0) {
+		set_rename(ctx, key, "auth_default_domain", value);
 		return TRUE;
 	}
 	if (strcmp(key, "imap_client_workarounds") == 0) {
@@ -366,6 +270,7 @@ old_settings_handle_root(struct config_parser_context *ctx,
 	}
 
 	if (strcmp(key, "login_dir") == 0 ||
+	    strcmp(key, "license_checksum") == 0 ||
 	    strcmp(key, "dbox_rotate_min_size") == 0 ||
 	    strcmp(key, "dbox_rotate_days") == 0 ||
 	    strcmp(key, "director_consistent_hashing") == 0 ||
@@ -374,8 +279,28 @@ old_settings_handle_root(struct config_parser_context *ctx,
 		obsolete(ctx, "%s has been removed", key);
 		return TRUE;
 	}
+	if (strcmp(key, "auth_worker_max_count") == 0) {
+		obsolete(ctx,
+			 "%s has been replaced with service auth-worker { process_limit }",
+			 key);
+		config_apply_line(ctx, key,
+				  t_strdup_printf("service/auth-worker/process_limit=%s", value),
+				  NULL);
+		return TRUE;
+	}
+	if (strcmp(key, "auth_debug") == 0) {
+		obsolete(ctx, "%s will be removed in a future version, consider using log_debug = \"category=auth\" instead", key);
+		return TRUE;
+	}
+	if (strcmp(key, "login_access_sockets") == 0) {
+		if (value != NULL && *value != '\0')
+			i_fatal("%s is no longer supported", key);
+		else
+			obsolete(ctx, "%s is no longer supported", key);
+		return TRUE;
+	}
 	if (ctx->old->auth_section == 1) {
-		if (!str_begins(key, "auth_"))
+		if (!str_begins_with(key, "auth_"))
 			key = t_strconcat("auth_", key, NULL);
 		config_parser_apply_line(ctx, CONFIG_LINE_TYPE_KEYVALUE,
 					 key, value);
@@ -442,17 +367,16 @@ config_apply_auth_set(struct config_parser_context *ctx,
 static bool listen_has_port(const char *str)
 {
 	const char *const *addrs;
+	const char *host ATTR_UNUSED;
+	in_port_t port ATTR_UNUSED;
 
 	if (strchr(str, ':') == NULL)
 		return FALSE;
 
 	addrs = t_strsplit_spaces(str, ", ");
 	for (; *addrs != NULL; addrs++) {
-		if (strcmp(*addrs, "*") != 0 &&
-		    strcmp(*addrs, "::") != 0 &&
-		    strcmp(*addrs, "[::]") != 0 &&
-		    !is_ipv4_address(*addrs) &&
-		    !is_ipv6_address(*addrs))
+		if (net_str2hostport(*addrs, 0, &host, &port) == 0 &&
+		    port > 0)
 			return TRUE;
 	}
 	return FALSE;
@@ -586,7 +510,7 @@ old_settings_handle_proto(struct config_parser_context *ctx,
 	}
 
 	if (ctx->old->auth_section == 1) {
-		if (!str_begins(key, "auth_"))
+		if (!str_begins_with(key, "auth_"))
 			key = t_strconcat("auth_", key, NULL);
 	}
 
@@ -688,7 +612,7 @@ static bool old_auth_section(struct config_parser_context *ctx,
 static void socket_apply(struct config_parser_context *ctx)
 {
 	const struct socket_set *set = &ctx->old->socket_set;
-	const char *path, *prefix;
+	const char *path, *prefix, *suffix;
 	size_t len;
 	bool master_suffix;
 
@@ -697,10 +621,9 @@ static void socket_apply(struct config_parser_context *ctx)
 		return;
 	}
 	path = set->path;
-	len = strlen(ctx->old->base_dir);
-	if (str_begins(path, ctx->old->base_dir) &&
-	    path[len] == '/')
-		path += len + 1;
+	if (str_begins(path, ctx->old->base_dir, &suffix) &&
+	    suffix[0] == '/')
+		path = suffix + 1;
 
 	len = strlen(path);
 	master_suffix = len >= 7 &&
@@ -737,11 +660,22 @@ static bool
 old_settings_handle_path(struct config_parser_context *ctx,
 			 const char *key, const char *value)
 {
-	if (strcmp(str_c(ctx->str), "plugin/0/") == 0) {
+	char end;
+	int index;
+	if (sscanf(str_c(ctx->str), "plugin/%d%c]", &index, &end) == 2 && end == '/') {
 		if (strcmp(key, "imap_zlib_compress_level") == 0) {
 			obsolete(ctx, "%s has been replaced by imap_compress_deflate_level", key);
-			config_apply_line(ctx, key,
-				t_strdup_printf("plugin/0/imap_compress_deflate_level=%s", value), NULL);
+			config_apply_line(ctx, key, t_strdup_printf(
+				"plugin/%d/imap_compress_deflate_level=%s",
+				index, value), NULL);
+			return TRUE;
+		}
+
+		if (strcmp(key, "push_notification_backend") == 0) {
+			obsolete(ctx, "%s has been replaced by push_notification_driver", key);
+			config_apply_line(ctx, key, t_strdup_printf(
+				"plugin/%d/push_notification_driver=%s",
+				index, value), NULL);
 			return TRUE;
 		}
 	}
@@ -758,9 +692,9 @@ bool old_settings_handle(struct config_parser_context *ctx,
 	case CONFIG_LINE_TYPE_ERROR:
 	case CONFIG_LINE_TYPE_INCLUDE:
 	case CONFIG_LINE_TYPE_INCLUDE_TRY:
-	case CONFIG_LINE_TYPE_KEYFILE:
 	case CONFIG_LINE_TYPE_KEYVARIABLE:
 		break;
+	case CONFIG_LINE_TYPE_KEYFILE:
 	case CONFIG_LINE_TYPE_KEYVALUE:
 		if (ctx->pathlen == 0) {
 			struct config_section_stack *old_section =
@@ -794,6 +728,10 @@ bool old_settings_handle(struct config_parser_context *ctx,
 			config_parser_apply_line(ctx, CONFIG_LINE_TYPE_SECTION_BEGIN,
 						 "service", "dns-client");
 			return TRUE;
+		} else if (ctx->pathlen == 0 && strcmp(key, "service") == 0 &&
+			   strcmp(value, "ipc") == 0) {
+			obsolete(ctx, "service ipc {} no longer exists");
+			/* continue anyway */
 		}
 		break;
 	case CONFIG_LINE_TYPE_SECTION_END:
@@ -820,5 +758,4 @@ void old_settings_init(struct config_parser_context *ctx)
 
 void old_settings_deinit_global(void)
 {
-	i_free(ssl_dh_value);
 }

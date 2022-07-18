@@ -18,6 +18,7 @@
 #include "http-client.h"
 
 #include <unistd.h>
+#include <sys/signal.h>
 
 #define CLIENT_PROGRESS_TIMEOUT     10
 #define SERVER_KILL_TIMEOUT_SECS    20
@@ -267,6 +268,7 @@ test_client_invalid_url_response(const struct http_response *resp,
 static bool
 test_client_invalid_url(const struct http_client_settings *client_set)
 {
+	static const unsigned char data[] = "FROP";
 	struct http_client_request *hreq;
 	struct _invalid_url *ctx;
 
@@ -278,11 +280,15 @@ test_client_invalid_url(const struct http_client_settings *client_set)
 	hreq = http_client_request_url_str(
 		http_client, "GET", "imap://example.com/INBOX",
 		test_client_invalid_url_response, ctx);
+	http_client_request_add_header(hreq, "X-Frop", "frop");
+	http_client_request_set_payload_data(hreq, data, sizeof(data) - 1);
 	http_client_request_submit(hreq);
 
 	hreq = http_client_request_url_str(
 		http_client, "GET", "http:/www.example.com",
 		test_client_invalid_url_response, ctx);
+	http_client_request_add_header(hreq, "X-Frop", "frop");
+	http_client_request_set_payload_data(hreq, data, sizeof(data) - 1);
 	http_client_request_submit(hreq);
 
 	return TRUE;
@@ -377,7 +383,7 @@ test_server_connection_refused(unsigned int index ATTR_UNUSED)
 {
 	i_close_fd(&fd_listen);
 
-	test_subprocess_notify_signal_send_parent();
+	test_subprocess_notify_signal_send_parent(SIGUSR1);
 }
 
 /* client */
@@ -418,7 +424,7 @@ test_client_connection_refused(const struct http_client_settings *client_set)
 	struct _connection_refused *ctx;
 
 	/* wait for the server side to close the socket */
-	test_subprocess_notify_signal_wait(10000);
+	test_subprocess_notify_signal_wait(SIGUSR1, 10000);
 
 	ctx = i_new(struct _connection_refused, 1);
 	ctx->count = 2;
@@ -456,6 +462,7 @@ static void test_connection_refused(void)
 	test_client_defaults(&http_client_set);
 
 	test_begin("connection refused");
+	test_subprocess_notify_signal_reset(SIGUSR1);
 	test_run_client_server(&http_client_set,
 			       test_client_connection_refused,
 			       test_server_connection_refused, 1, NULL);
@@ -464,6 +471,7 @@ static void test_connection_refused(void)
 	http_client_set.max_connect_attempts = 3;
 
 	test_begin("connection refused backoff");
+	test_subprocess_notify_signal_reset(SIGUSR1);
 	test_run_client_server(&http_client_set,
 			       test_client_connection_refused,
 			       test_server_connection_refused, 1, NULL);
@@ -1605,7 +1613,7 @@ test_client_early_success(const struct http_client_settings *client_set)
 				"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
 		}
 
-		chain_input = i_stream_create_chain(&chain);
+		chain_input = i_stream_create_chain(&chain, IO_BLOCK_SIZE);
 
 		input = i_stream_create_copy_from_data(str_data(payload),
 						       str_len(payload));
@@ -1636,7 +1644,7 @@ static void test_early_success(void)
 	test_client_defaults(&http_client_set);
 	http_client_set.socket_send_buffer_size = 4096;
 
-	test_begin("early succes");
+	test_begin("early success");
 	test_run_client_server(&http_client_set,
 			       test_client_early_success,
 			       test_server_early_success, 1, NULL);
@@ -2580,7 +2588,7 @@ test_dns_lookup_ttl_input(struct server_connection *conn)
 	}
 
 	while ((line = i_stream_read_next_line(conn->conn.input)) != NULL) {
-		if (str_begins(line, "VERSION"))
+		if (str_begins_with(line, "VERSION"))
 			continue;
 		if (debug)
 			i_debug("DNS REQUEST %u: %s", count, line);
@@ -2875,7 +2883,7 @@ static void test_dns_reconnect_failure_input(struct server_connection *conn)
 	}
 
 	while ((line = i_stream_read_next_line(conn->conn.input)) != NULL) {
-		if (str_begins(line, "VERSION"))
+		if (str_begins_with(line, "VERSION"))
 			continue;
 		if (debug)
 			i_debug("DNS REQUEST %u: %s", count, line);
@@ -3026,7 +3034,7 @@ static void test_multi_ip_attempts_input(struct server_connection *conn)
 	}
 
 	while ((line = i_stream_read_next_line(conn->conn.input)) != NULL) {
-		if (str_begins(line, "VERSION"))
+		if (str_begins_with(line, "VERSION"))
 			continue;
 		if (debug)
 			i_debug("DNS REQUEST %u: %s", count, line);
@@ -3382,7 +3390,7 @@ test_dns_idle_hosts_input(struct server_connection *conn)
 	}
 
 	while ((line = i_stream_read_next_line(conn->conn.input)) != NULL) {
-		if (str_begins(line, "VERSION"))
+		if (str_begins_with(line, "VERSION"))
 			continue;
 		if (debug)
 			i_debug("DNS REQUEST: %s", line);
@@ -3779,6 +3787,7 @@ static int test_run_server(struct test_server_data *data)
 	if (debug)
 		i_debug("PID=%s", my_pid);
 
+	test_subprocess_notify_signal_send_parent(SIGHUP);
 	ioloop = io_loop_create();
 	data->server_test(data->index);
 	io_loop_destroy(&ioloop);
@@ -3838,7 +3847,7 @@ test_run_client_server(const struct http_client_settings *client_set,
 {
 	unsigned int i;
 
-	test_subprocess_notify_signal_reset();
+	test_subprocess_notify_signal_reset(SIGHUP);
 	test_server_init = NULL;
 	test_server_deinit = NULL;
 	test_server_input = NULL;
@@ -3861,6 +3870,8 @@ test_run_client_server(const struct http_client_settings *client_set,
 			fd_listen = fds[i];
 			test_subprocess_fork(test_run_server, &data, FALSE);
 			i_close_fd(&fd_listen);
+			test_subprocess_notify_signal_wait(SIGHUP, 10000);
+			test_subprocess_notify_signal_reset(SIGHUP);
 		}
 	}
 

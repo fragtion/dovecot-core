@@ -87,6 +87,11 @@ static void queue_resume_callback(lua_State *L, int status)
 			/* traceback succeeded, remove original error */
 			lua_remove(L, -2);
 		}
+		/* After traceback has analyzed the stack, drop everything but
+		   the error. */
+		while (lua_gettop(L) > 1)
+			lua_remove(L, -2);
+		i_assert(lua_gettop(L) == 1);
 	}
 
 	/*
@@ -106,18 +111,19 @@ static void queue_resume_callback(lua_State *L, int status)
 static void dlua_pcall_yieldable_continue(lua_State *L)
 {
 	struct timeout *to;
-	int nargs;
+	int nargs, nresults;
 	int ret;
 
 	nargs = dlua_tls_get_int(L, RESUME_NARGS);
 	to = dlua_tls_get_ptr(L, RESUME_TIMEOUT);
 
+	i_assert(to != NULL);
 	timeout_remove(&to);
 
 	dlua_tls_clear(L, RESUME_TIMEOUT);
 	dlua_tls_clear(L, RESUME_NARGS);
 
-	ret = lua_resume(L, L, nargs);
+	ret = lua_resume(L, L, nargs, &nresults);
 	if (ret == LUA_YIELD) {
 		/*
 		 * thread yielded - nothing to do
@@ -138,6 +144,9 @@ void dlua_pcall_yieldable_resume(lua_State *L, int nargs)
 {
 	struct timeout *to;
 
+	to = dlua_tls_get_ptr(L, RESUME_TIMEOUT);
+	i_assert(to == NULL);
+
 	to = timeout_add_short(0, dlua_pcall_yieldable_continue, L);
 
 	dlua_tls_set_ptr(L, RESUME_TIMEOUT, to);
@@ -157,8 +166,10 @@ int dlua_pcall_yieldable(lua_State *L, const char *func_name, int nargs,
 {
 	struct dlua_pcall_resume_state *state;
 	int ret;
+	int nresults;
 
 	i_assert(lua_status(L) == LUA_OK);
+	i_assert(lua_gettop(L) == nargs);
 
 	lua_getglobal(L, func_name);
 
@@ -180,7 +191,7 @@ int dlua_pcall_yieldable(lua_State *L, const char *func_name, int nargs,
 	lua_insert(L, -(nargs + 1));
 
 	/* stack: func, args (top) */
-	ret = lua_resume(L, L, nargs);
+	ret = lua_resume(L, L, nargs, &nresults);
 	if (ret == LUA_YIELD) {
 		/*
 		 * thread yielded - nothing to do

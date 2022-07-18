@@ -30,6 +30,18 @@ void mailbox_name_get_sha128(const char *name, guid_128_t guid_128_r)
 	memcpy(guid_128_r, sha, I_MIN(GUID_128_SIZE, sizeof(sha)));
 }
 
+void mailbox_list_name_unescape(const char **name ATTR_UNUSED,
+				char escape_char ATTR_UNUSED)
+{
+}
+
+void mailbox_list_name_escape(const char *name,
+			      const char *escape_chars ATTR_UNUSED,
+			      string_t *dest)
+{
+	str_append(dest, name);
+}
+
 static struct dsync_mailbox_node *
 node_create(struct dsync_mailbox_tree *tree, unsigned int counter,
 	    const char *name, unsigned int last_renamed_or_created)
@@ -101,7 +113,7 @@ static struct dsync_mailbox_tree *create_random_tree(void)
 	struct dsync_mailbox_tree *tree;
 	unsigned int counter = 0;
 
-	tree = dsync_mailbox_tree_init('/', '_');
+	tree = dsync_mailbox_tree_init('/', '\0', '_');
 	create_random_nodes(tree, "", 0, &counter);
 	return tree;
 }
@@ -273,7 +285,7 @@ static void test_dsync_mailbox_tree_sync_creates(void)
 	unsigned int counter = 0;
 
 	test_begin("dsync mailbox tree sync creates");
-	tree1 = dsync_mailbox_tree_init('/', '_');
+	tree1 = dsync_mailbox_tree_init('/', '\0', '_');
 	nodes_create(tree1, &counter, common_nodes);
 	tree2 = dsync_mailbox_tree_dup(tree1);
 	nodes_create(tree1, &counter, create1_nodes);
@@ -292,7 +304,7 @@ static void test_dsync_mailbox_tree_sync_deletes(void)
 	unsigned int counter = 0;
 
 	test_begin("dsync mailbox tree sync deletes");
-	tree1 = dsync_mailbox_tree_init('/', '_');
+	tree1 = dsync_mailbox_tree_init('/', '\0', '_');
 	nodes_create(tree1, &counter, common_nodes);
 	tree2 = dsync_mailbox_tree_dup(tree1);
 	nodes_delete(tree1, &counter, delete1_nodes);
@@ -310,7 +322,7 @@ static void test_dsync_mailbox_tree_sync_renames1(void)
 	unsigned int counter = 0;
 
 	test_begin("dsync mailbox tree sync renames 1");
-	tree1 = dsync_mailbox_tree_init('/', '_');
+	tree1 = dsync_mailbox_tree_init('/', '\0', '_');
 	nodes_create(tree1, &counter, common_nodes);
 	tree2 = dsync_mailbox_tree_dup(tree1);
 
@@ -336,8 +348,8 @@ static void test_dsync_mailbox_tree_sync_renames2(void)
 	struct dsync_mailbox_tree *tree1, *tree2;
 
 	test_begin("dsync mailbox tree sync renames 2");
-	tree1 = dsync_mailbox_tree_init('/', '_');
-	tree2 = dsync_mailbox_tree_init('/', '_');
+	tree1 = dsync_mailbox_tree_init('/', '\0', '_');
+	tree2 = dsync_mailbox_tree_init('/', '\0', '_');
 
 	node_create(tree1, 1, "0/1", 1);
 	node_create(tree1, 2, "0/1/2", 3);
@@ -354,8 +366,8 @@ static void test_dsync_mailbox_tree_sync_renames3(void)
 	struct dsync_mailbox_tree *tree1, *tree2;
 
 	test_begin("dsync mailbox tree sync renames 3");
-	tree1 = dsync_mailbox_tree_init('/', '_');
-	tree2 = dsync_mailbox_tree_init('/', '_');
+	tree1 = dsync_mailbox_tree_init('/', '\0', '_');
+	tree2 = dsync_mailbox_tree_init('/', '\0', '_');
 
 	node_create(tree1, 1, "0/2", 1);
 	node_create(tree1, 2, "0/3", 1);
@@ -372,8 +384,8 @@ static void test_dsync_mailbox_tree_sync_renames4(void)
 	struct dsync_mailbox_tree *tree1, *tree2;
 
 	test_begin("dsync mailbox tree sync renames 4");
-	tree1 = dsync_mailbox_tree_init('/', '_');
-	tree2 = dsync_mailbox_tree_init('/', '_');
+	tree1 = dsync_mailbox_tree_init('/', '\0', '_');
+	tree2 = dsync_mailbox_tree_init('/', '\0', '_');
 
 	node_create(tree1, 1, "0/b", 0);
 	node_create(tree1, 2, "c", 2);
@@ -389,8 +401,8 @@ static void test_dsync_mailbox_tree_sync_renames5(void)
 	struct dsync_mailbox_tree *tree1, *tree2;
 
 	test_begin("dsync mailbox tree sync renames 5");
-	tree1 = dsync_mailbox_tree_init('/', '_');
-	tree2 = dsync_mailbox_tree_init('/', '_');
+	tree1 = dsync_mailbox_tree_init('/', '\0', '_');
+	tree2 = dsync_mailbox_tree_init('/', '\0', '_');
 
 	node_create(tree1, 1, "b", 0);
 	node_create(tree1, 2, "c", 2);
@@ -406,8 +418,8 @@ static void test_dsync_mailbox_tree_sync_renames6(void)
 	struct dsync_mailbox_tree *tree1, *tree2;
 
 	test_begin("dsync mailbox tree sync renames 6");
-	tree1 = dsync_mailbox_tree_init('/', '_');
-	tree2 = dsync_mailbox_tree_init('/', '_');
+	tree1 = dsync_mailbox_tree_init('/', '\0', '_');
+	tree2 = dsync_mailbox_tree_init('/', '\0', '_');
 
 	node_create(tree1, 1, "0/1", 0);
 	node_create(tree1, 2, "0/2", 1);
@@ -424,8 +436,8 @@ static void test_dsync_mailbox_tree_sync_renames7(void)
 	struct dsync_mailbox_tree *tree1, *tree2;
 
 	test_begin("dsync mailbox tree sync renames 7");
-	tree1 = dsync_mailbox_tree_init('/', '_');
-	tree2 = dsync_mailbox_tree_init('/', '_');
+	tree1 = dsync_mailbox_tree_init('/', '\0', '_');
+	tree2 = dsync_mailbox_tree_init('/', '\0', '_');
 
 	node_create(tree1, 1, "0/2", 0);
 	node_create(tree2, 1, "1/2", 0);
@@ -439,8 +451,8 @@ static void test_dsync_mailbox_tree_sync_renames8(void)
 	struct dsync_mailbox_tree *tree1, *tree2;
 
 	test_begin("dsync mailbox tree sync renames 8");
-	tree1 = dsync_mailbox_tree_init('/', '_');
-	tree2 = dsync_mailbox_tree_init('/', '_');
+	tree1 = dsync_mailbox_tree_init('/', '\0', '_');
+	tree2 = dsync_mailbox_tree_init('/', '\0', '_');
 
 	node_create(tree1, 1, "0/1", 0);
 	node_create(tree1, 2, "0/2", 1);
@@ -456,8 +468,8 @@ static void test_dsync_mailbox_tree_sync_renames9(void)
 	struct dsync_mailbox_tree *tree1, *tree2;
 
 	test_begin("dsync mailbox tree sync renames 9");
-	tree1 = dsync_mailbox_tree_init('/', '_');
-	tree2 = dsync_mailbox_tree_init('/', '_');
+	tree1 = dsync_mailbox_tree_init('/', '\0', '_');
+	tree2 = dsync_mailbox_tree_init('/', '\0', '_');
 
 	node_create(tree1, 1, "0/1/2", 0);
 	node_create(tree1, 2, "0/3", 1);
@@ -473,8 +485,8 @@ static void test_dsync_mailbox_tree_sync_renames10(void)
 	struct dsync_mailbox_tree *tree1, *tree2;
 
 	test_begin("dsync mailbox tree sync renames 10");
-	tree1 = dsync_mailbox_tree_init('/', '_');
-	tree2 = dsync_mailbox_tree_init('/', '_');
+	tree1 = dsync_mailbox_tree_init('/', '\0', '_');
+	tree2 = dsync_mailbox_tree_init('/', '\0', '_');
 
 	node_create(tree1, 1, "0/1", 0);
 	node_create(tree1, 3, "0/2/3", 0);
@@ -490,8 +502,8 @@ static void test_dsync_mailbox_tree_sync_renames11(void)
 	struct dsync_mailbox_tree *tree1, *tree2;
 
 	test_begin("dsync mailbox tree sync renames 11");
-	tree1 = dsync_mailbox_tree_init('/', '_');
-	tree2 = dsync_mailbox_tree_init('/', '_');
+	tree1 = dsync_mailbox_tree_init('/', '\0', '_');
+	tree2 = dsync_mailbox_tree_init('/', '\0', '_');
 
 	node_create(tree1, 1, "0/1", 2);
 	node_create(tree1, 0, "0/1/2", 0);
@@ -508,8 +520,8 @@ static void test_dsync_mailbox_tree_sync_renames12(void)
 	struct dsync_mailbox_tree *tree1, *tree2;
 
 	test_begin("dsync mailbox tree sync renames 12");
-	tree1 = dsync_mailbox_tree_init('/', '_');
-	tree2 = dsync_mailbox_tree_init('/', '_');
+	tree1 = dsync_mailbox_tree_init('/', '\0', '_');
+	tree2 = dsync_mailbox_tree_init('/', '\0', '_');
 
 	node_create(tree1, 1, "0/2", 0);
 	node_create(tree1, 2, "1", 0);
@@ -530,8 +542,8 @@ static void test_dsync_mailbox_tree_sync_renames13(void)
 	struct dsync_mailbox_tree *tree1, *tree2;
 
 	test_begin("dsync mailbox tree sync renames 13");
-	tree1 = dsync_mailbox_tree_init('/', '_');
-	tree2 = dsync_mailbox_tree_init('/', '_');
+	tree1 = dsync_mailbox_tree_init('/', '\0', '_');
+	tree2 = dsync_mailbox_tree_init('/', '\0', '_');
 
 	node_create(tree1, 4, "0.0/1.0/2.1", 0);
 	node_create(tree1, 5, "0.1", 2);
@@ -551,8 +563,8 @@ static void test_dsync_mailbox_tree_sync_renames14(void)
 	struct dsync_mailbox_tree *tree1, *tree2;
 
 	test_begin("dsync mailbox tree sync renames 14");
-	tree1 = dsync_mailbox_tree_init('/', '_');
-	tree2 = dsync_mailbox_tree_init('/', '_');
+	tree1 = dsync_mailbox_tree_init('/', '\0', '_');
+	tree2 = dsync_mailbox_tree_init('/', '\0', '_');
 
 	node_create(tree1, 1, "1", 0);
 	node_create(tree1, 2, "1/2", 0);
@@ -571,8 +583,8 @@ static void test_dsync_mailbox_tree_sync_renames15(void)
 	struct dsync_mailbox_tree *tree1, *tree2;
 
 	test_begin("dsync mailbox tree sync renames 15");
-	tree1 = dsync_mailbox_tree_init('/', '_');
-	tree2 = dsync_mailbox_tree_init('/', '_');
+	tree1 = dsync_mailbox_tree_init('/', '\0', '_');
+	tree2 = dsync_mailbox_tree_init('/', '\0', '_');
 
 	node_create(tree1, 1, "1", 0);
 	node_create(tree2, 2, "1", 1);
@@ -586,8 +598,8 @@ static void test_dsync_mailbox_tree_sync_renames16(void)
 	struct dsync_mailbox_tree *tree1, *tree2;
 
 	test_begin("dsync mailbox tree sync renames 16");
-	tree1 = dsync_mailbox_tree_init('/', '_');
-	tree2 = dsync_mailbox_tree_init('/', '_');
+	tree1 = dsync_mailbox_tree_init('/', '\0', '_');
+	tree2 = dsync_mailbox_tree_init('/', '\0', '_');
 
 	node_create(tree1, 1, "1/2", 4);
 	node_create(tree1, 2, "1", 2);
@@ -605,8 +617,8 @@ static void test_dsync_mailbox_tree_sync_renames17(void)
 	struct dsync_mailbox_tree *tree1, *tree2;
 
 	test_begin("dsync mailbox tree sync renames 17");
-	tree1 = dsync_mailbox_tree_init('/', '_');
-	tree2 = dsync_mailbox_tree_init('/', '_');
+	tree1 = dsync_mailbox_tree_init('/', '\0', '_');
+	tree2 = dsync_mailbox_tree_init('/', '\0', '_');
 
 	node_create(tree1, 1, "1", 1);
 
@@ -622,8 +634,8 @@ static void test_dsync_mailbox_tree_sync_renames18(void)
 	struct dsync_mailbox_tree *tree1, *tree2;
 
 	test_begin("dsync mailbox tree sync renames 18");
-	tree1 = dsync_mailbox_tree_init('/', '_');
-	tree2 = dsync_mailbox_tree_init('/', '_');
+	tree1 = dsync_mailbox_tree_init('/', '\0', '_');
+	tree2 = dsync_mailbox_tree_init('/', '\0', '_');
 
 	node_create(tree1, 2, "a", 5);
 	node_create(tree1, 4, "a/c", 2);
@@ -643,8 +655,8 @@ static void test_dsync_mailbox_tree_sync_renames19(void)
 	struct dsync_mailbox_tree *tree1, *tree2;
 
 	test_begin("dsync mailbox tree sync renames 19");
-	tree1 = dsync_mailbox_tree_init('/', '_');
-	tree2 = dsync_mailbox_tree_init('/', '_');
+	tree1 = dsync_mailbox_tree_init('/', '\0', '_');
+	tree2 = dsync_mailbox_tree_init('/', '\0', '_');
 
 	node_create(tree1, 1, "0/2/1", 1);
 	node_create(tree1, 2, "0/4", 3);
@@ -662,8 +674,8 @@ static void test_dsync_mailbox_tree_sync_renames20(void)
 	struct dsync_mailbox_tree *tree1, *tree2;
 
 	test_begin("dsync mailbox tree sync renames 20");
-	tree1 = dsync_mailbox_tree_init('/', '_');
-	tree2 = dsync_mailbox_tree_init('/', '_');
+	tree1 = dsync_mailbox_tree_init('/', '\0', '_');
+	tree2 = dsync_mailbox_tree_init('/', '\0', '_');
 
 	node_create(tree1, 1, "1", 0);
 	node_create(tree1, 2, "0", 0);
@@ -687,8 +699,8 @@ static void test_dsync_mailbox_tree_sync_renames21(void)
 	struct dsync_mailbox_tree *tree1, *tree2;
 
 	test_begin("dsync mailbox tree sync renames 21");
-	tree1 = dsync_mailbox_tree_init('/', '_');
-	tree2 = dsync_mailbox_tree_init('/', '_');
+	tree1 = dsync_mailbox_tree_init('/', '\0', '_');
+	tree2 = dsync_mailbox_tree_init('/', '\0', '_');
 
 	node_create(tree1, 1, "INBOX", 0);
 	node_create(tree1, 2, "foo", 0);
@@ -707,8 +719,8 @@ static void test_dsync_mailbox_tree_sync_renames22(void)
 	struct dsync_mailbox_tree *tree1, *tree2;
 
 	test_begin("dsync mailbox tree sync renames 22");
-	tree1 = dsync_mailbox_tree_init('/', '_');
-	tree2 = dsync_mailbox_tree_init('/', '_');
+	tree1 = dsync_mailbox_tree_init('/', '\0', '_');
+	tree2 = dsync_mailbox_tree_init('/', '\0', '_');
 
 	node_create(tree1, 3, "p/a", 0);
 	node_create(tree1, 0, "p/2", 0);

@@ -8,6 +8,8 @@
 #define DIRECTOR_VERSION_MAJOR 1
 #define DIRECTOR_VERSION_MINOR 9
 
+#define DIRECTOR_ALT_USER_FIELD_NAME "user_director_hash"
+
 /* weak users supported in protocol */
 #define DIRECTOR_VERSION_WEAK_USERS 1
 /* director ring remove supported */
@@ -90,8 +92,8 @@ struct director_kill_context {
 	/* Move timeout to make sure user's connections won't silently hang
 	   indefinitely if there is some trouble moving it. */
 	struct timeout *to_move;
-	/* IPC command to kick the user */
-	struct ipc_client_cmd *ipc_cmd;
+	/* anvil command to kick the user */
+	struct anvil_query *anvil_cmd;
 
 	/* these are set only for director_flush_socket handling: */
 	struct ip_addr host_ip;
@@ -146,7 +148,7 @@ struct director {
 	ARRAY(struct director_host *) dir_hosts;
 	struct timeout *to_remove_dirs;
 
-	struct ipc_client *ipc_proxy;
+	struct anvil_client *anvil;
 	unsigned int sync_seq;
 	unsigned int ring_change_counter;
 	unsigned int last_sync_sent_ring_change_counter;

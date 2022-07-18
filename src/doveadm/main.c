@@ -13,7 +13,6 @@
 #include "doveadm-dump.h"
 #include "doveadm-mail.h"
 #include "doveadm-print-private.h"
-#include "doveadm-server.h"
 #include "ostream.h"
 
 const struct doveadm_print_vfuncs *doveadm_print_vfuncs_all[] = {
@@ -99,8 +98,7 @@ int main(int argc, char *argv[])
 {
 	enum master_service_flags service_flags =
 		MASTER_SERVICE_FLAG_KEEP_CONFIG_OPEN |
-		MASTER_SERVICE_FLAG_HAVE_STARTTLS |
-		MASTER_SERVICE_FLAG_USE_SSL_SETTINGS;
+		MASTER_SERVICE_FLAG_HAVE_STARTTLS;
 	int c;
 
 	master_service = master_service_init("doveadm", service_flags,

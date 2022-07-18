@@ -40,6 +40,9 @@ static const char *dsync_state_names[] = {
 	"done"
 };
 
+struct dsync_mailbox_list_module dsync_mailbox_list_module =
+	MODULE_CONTEXT_INIT(&mailbox_list_module_register);
+
 static void dsync_brain_mailbox_states_dump(struct dsync_brain *brain);
 
 static const char *
@@ -160,10 +163,9 @@ dsync_brain_set_flags(struct dsync_brain *brain, enum dsync_brain_flags flags)
 		(flags & DSYNC_BRAIN_FLAG_NO_BACKUP_OVERWRITE) != 0;
 	brain->no_mail_prefetch =
 		(flags & DSYNC_BRAIN_FLAG_NO_MAIL_PREFETCH) != 0;
-	brain->no_mailbox_renames =
-		(flags & DSYNC_BRAIN_FLAG_NO_MAILBOX_RENAMES) != 0;
 	brain->no_notify = (flags & DSYNC_BRAIN_FLAG_NO_NOTIFY) != 0;
 	brain->empty_hdr_workaround = (flags & DSYNC_BRAIN_FLAG_EMPTY_HDR_WORKAROUND) != 0;
+	brain->no_header_hashes = (flags & DSYNC_BRAIN_FLAG_NO_HEADER_HASHES) != 0;
 }
 
 static void
@@ -402,7 +404,9 @@ dsync_brain_lock(struct dsync_brain *brain, const char *remote_hostname)
 {
 	const struct file_create_settings lock_set = {
 		.lock_timeout_secs = brain->lock_timeout,
-		.lock_method = FILE_LOCK_METHOD_FCNTL,
+		.lock_settings = {
+			.lock_method = FILE_LOCK_METHOD_FCNTL,
+		},
 	};
 	const char *home, *error, *local_hostname = my_hostdomain();
 	bool created;
@@ -852,7 +856,7 @@ static bool dsync_brain_want_shared_namespace(const struct mail_namespace *ns,
 	   shared namespace config. */
 	return (ns->type == MAIL_NAMESPACE_TYPE_SHARED) &&
 	       (sync_ns->type == MAIL_NAMESPACE_TYPE_SHARED) &&
-	       str_begins(ns->prefix, sync_ns->prefix);
+	       str_begins_with(ns->prefix, sync_ns->prefix);
 }
 
 bool dsync_brain_want_namespace(struct dsync_brain *brain,

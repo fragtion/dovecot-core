@@ -569,8 +569,8 @@ cmd_append_handle_args(struct client_command_context *cmd,
 
 	if (cat_list != NULL) {
 		ctx->cat_msg_size = 0;
-		ctx->input = i_stream_create_chain(&ctx->catchain);
-		i_stream_set_max_buffer_size(ctx->input, IO_BLOCK_SIZE);
+		ctx->input = i_stream_create_chain(&ctx->catchain,
+						   IO_BLOCK_SIZE);
 	} else {
 		if (ctx->literal_size == 0) {
 			/* no message data, abort */
@@ -931,7 +931,7 @@ bool cmd_append(struct client_command_context *cmd)
 	if (client_open_save_dest_box(cmd, mailbox, &ctx->box) < 0)
 		ctx->failed = TRUE;
 	else {
-		event_add_str(cmd->event, "mailbox",
+		event_add_str(cmd->global_event, "mailbox",
 			      mailbox_get_vname(ctx->box));
 		ctx->t = mailbox_transaction_begin(ctx->box,
 					MAILBOX_TRANSACTION_FLAG_EXTERNAL |

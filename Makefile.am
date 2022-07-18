@@ -13,38 +13,34 @@ EXTRA_DIST = \
 	COPYING.LGPL \
 	COPYING.MIT \
 	ChangeLog \
-	README \
 	README.md \
-	INSTALL \
 	INSTALL.md \
 	update-version.sh \
 	run-test-valgrind.supp \
 	dovecot.service.in \
 	dovecot.socket \
+	version \
 	$(conf_DATA)
 
 noinst_DATA = dovecot-config
 
 nodist_pkginclude_HEADERS = config.h
 
-README: README.md
-	$(PANDOC) -f markdown_github -t plain -o $@ $<
-
-INSTALL: INSTALL.md
-	$(PANDOC) -f markdown_github -t plain -o $@ $<
+version:
+	$(AM_V_GEN)$(top_srcdir)/build-aux/git-version-gen > $@
 
 ChangeLog:
-	git log --name-status --pretty="format:%ai %aN <%aE> (%h)%n%n%w(80,4,4)%s%n%n%b" 5d5c4f2bfb812c767084c0338dae692db476da10^.. > ChangeLog || rm -f ChangeLog
+	$(AM_V_GEN)git log --name-status --pretty="format:%ai %aN <%aE> (%h)%n%n%w(80,4,4)%s%n%n%b" 5d5c4f2bfb812c767084c0338dae692db476da10^.. > ChangeLog || rm -f ChangeLog
 
 aclocal_DATA = m4/dovecot.m4
 
 dovecot-version.h: noop
-	$(SHELL) $(top_srcdir)/update-version.sh $(top_srcdir) $(top_builddir)
+	$(AM_V_GEN)$(SHELL) $(top_srcdir)/update-version.sh $(top_srcdir) $(top_builddir)
 
 noop:
 
 dovecot-config: dovecot-config.in Makefile
-	old=`pwd` && cd $(top_builddir) && abs_builddir=`pwd` && cd $$old && \
+	$(AM_V_GEN)old=`pwd` && cd $(top_builddir) && abs_builddir=`pwd` && cd $$old && \
 	cd $(top_srcdir) && abs_srcdir=`pwd` && cd $$old && \
 	(echo "DOVECOT_INSTALLED=no"; cat dovecot-config.in | sed \
 	-e "s|\$$(top_builddir)|$$abs_builddir|g" \

@@ -6,6 +6,7 @@
 #include "istream.h"
 #include "ostream.h"
 #include "strescape.h"
+#include "hostpid.h"
 #include "process-title.h"
 #include "master-service.h"
 #include "master-service-settings.h"
@@ -86,12 +87,14 @@ index_mailbox_precache(struct master_connection *conn, struct mailbox *box)
 				 &metadata) < 0) {
 		e_error(index_event, "Precache-fields lookup failed: %s",
 			mailbox_get_last_internal_error(box, NULL));
+		event_unref(&index_event);
 		return -1;
 	}
 	if (mailbox_get_status(box, STATUS_MESSAGES | STATUS_LAST_CACHED_SEQ,
 			       &status) < 0) {
 		e_error(index_event, "Status lookup failed: %s",
 			mailbox_get_last_internal_error(box, NULL));
+		event_unref(&index_event);
 		return -1;
 	}
 	seq = status.last_cached_seq + 1;
@@ -138,9 +141,16 @@ index_mailbox_precache(struct master_connection *conn, struct mailbox *box)
 		}
 	}
 	if (mailbox_search_deinit(&ctx) < 0) {
-		e_error(index_event, "Mail search failed: %s%s",
-			mailbox_get_last_internal_error(box, NULL),
-			get_attempt_error(counter, first_uid, last_uid));
+		enum mail_error error;
+		const char *errstr = mailbox_get_last_internal_error(box, &error);
+
+		if (error == MAIL_ERROR_INTERRUPTED) {
+			e_info(index_event, "Mail search interrupted: %s%s", errstr,
+			       get_attempt_error(counter, first_uid, last_uid));
+		} else {
+			e_error(index_event, "Mail search failed: %s%s", errstr,
+				get_attempt_error(counter, first_uid, last_uid));
+		}
 		ret = -1;
 	}
 	const char *uids = first_uid == 0 ? "" :
@@ -187,7 +197,6 @@ index_mailbox(struct master_connection *conn, struct mail_user *user,
 
 	ns = mail_namespace_find(user->namespaces, mailbox);
 	box = mailbox_alloc(ns->list, mailbox, 0);
-	mailbox_set_reason(box, "indexing");
 	ret = mailbox_get_path_to(box, MAILBOX_LIST_PATH_TYPE_INDEX, &path);
 	if (ret < 0) {
 		errstr = mailbox_get_last_internal_error(box, &error);
@@ -242,14 +251,69 @@ index_mailbox(struct master_connection *conn, struct mail_user *user,
 }
 
 static int
+master_connection_cmd_index(struct master_connection *conn,
+			    const char *username, const char *mailbox,
+			    const char *session_id,
+			    unsigned int max_recent_msgs, const char *what)
+{
+	struct mail_storage_service_input input;
+	struct mail_storage_service_user *service_user;
+	struct mail_user *user;
+	const char *error;
+	int ret;
+
+	i_zero(&input);
+	input.module = "mail";
+	input.service = "indexer-worker";
+	input.username = username;
+	/* if session-id is given, use it as a prefix to a unique session ID.
+	   we can't use the session-id directly or stats process will complain
+	   about duplicates. (especially LMTP would use the same session-id for
+	   multiple users' indexing at the same time.) */
+	if (session_id[0] != '\0')
+		input.session_id_prefix = session_id;
+
+	if (mail_storage_service_lookup_next(conn->storage_service, &input,
+					     &service_user, &user, &error) <= 0) {
+		e_error(conn->conn.event, "User %s lookup failed: %s",
+			username, error);
+		return -1;
+	}
+
+	struct master_service_anvil_session anvil_session;
+	guid_128_t anvil_conn_guid;
+	bool anvil_sent = FALSE;
+	mail_user_get_anvil_session(user, &anvil_session);
+	if (master_service_anvil_connect(master_service, &anvil_session,
+					 TRUE, anvil_conn_guid))
+		anvil_sent = TRUE;
+
+	indexer_worker_refresh_proctitle(user->username, mailbox, 0, 0);
+	struct event_reason *reason =
+		event_reason_begin("indexer:index_mailbox");
+	ret = index_mailbox(conn, user, mailbox, max_recent_msgs, what);
+	event_reason_end(&reason);
+	/* refresh proctitle before a potentially long-running
+	   user unref */
+	indexer_worker_refresh_proctitle(user->username, "(deinit)", 0, 0);
+
+	if (anvil_sent) {
+		master_service_anvil_disconnect(master_service, &anvil_session,
+						anvil_conn_guid);
+	}
+
+	mail_user_deinit(&user);
+	mail_storage_service_user_unref(&service_user);
+	indexer_worker_refresh_proctitle(NULL, NULL, 0, 0);
+	return ret;
+}
+
+static int
 master_connection_input_args(struct connection *_conn, const char *const *args)
 {
 	struct master_connection *conn =
 		container_of(_conn, struct master_connection, conn);
-	struct mail_storage_service_input input;
-	struct mail_storage_service_user *service_user;
-	struct mail_user *user;
-	const char *str, *error;
+	const char *str;
 	unsigned int max_recent_msgs;
 	int ret;
 
@@ -260,33 +324,13 @@ master_connection_input_args(struct connection *_conn, const char *const *args)
 			t_strarray_join(args, "\t"));
 		return -1;
 	}
+	const char *username = args[0];
+	const char *mailbox = args[1];
+	const char *session_id = args[2];
+	const char *what = args[4];
 
-	i_zero(&input);
-	input.module = "mail";
-	input.service = "indexer-worker";
-	input.username = args[0];
-	/* if session-id is given, use it as a prefix to a unique session ID.
-	   we can't use the session-id directly or stats process will complain
-	   about duplicates. (especially LMTP would use the same session-id for
-	   multiple users' indexing at the same time.) */
-	if (args[2][0] != '\0')
-		input.session_id_prefix = args[2];
-
-	if (mail_storage_service_lookup_next(conn->storage_service, &input,
-					     &service_user, &user, &error) <= 0) {
-		e_error(conn->conn.event, "User %s lookup failed: %s", args[0], error);
-		ret = -1;
-	} else {
-		indexer_worker_refresh_proctitle(user->username, args[1], 0, 0);
-		ret = index_mailbox(conn, user, args[1],
-				    max_recent_msgs, args[4]);
-		/* refresh proctitle before a potentially long-running
-		   user unref */
-		indexer_worker_refresh_proctitle(user->username, "(deinit)", 0, 0);
-		mail_user_deinit(&user);
-		mail_storage_service_user_unref(&service_user);
-		indexer_worker_refresh_proctitle(NULL, NULL, 0, 0);
-	}
+	ret = master_connection_cmd_index(conn, username, mailbox, session_id,
+					  max_recent_msgs, what);
 
 	str = ret < 0 ? "-1\n" : "100\n";
 	o_stream_nsend_str(conn->conn.output, str);
@@ -306,8 +350,8 @@ static int master_connection_handshake_args(struct connection *connection,
 	int ret;
 	if ((ret = connection_handshake_args_default(connection, args)) < 1)
 		return ret;
-	const char *limit = t_strdup_printf("%u\n",
-		master_service_get_process_limit(master_service));
+	const char *limit = t_strdup_printf("%u\t%s\n",
+		master_service_get_process_limit(master_service), my_pid);
 	o_stream_nsend_str(connection->output, limit);
 	return 1;
 }

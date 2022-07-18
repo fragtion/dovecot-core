@@ -110,7 +110,7 @@ static bool user_has_special_use_mailboxes(struct mail_user *user)
 	return FALSE;
 }
 
-struct client *client_create(int fd_in, int fd_out,
+struct client *client_create(int fd_in, int fd_out, bool unhibernated,
 			     struct event *event, struct mail_user *user,
 			     struct mail_storage_service_user *service_user,
 			     const struct imap_settings *set,
@@ -118,7 +118,6 @@ struct client *client_create(int fd_in, int fd_out,
 {
 	const struct mail_storage_settings *mail_set;
 	struct client *client;
-	const char *ident;
 	pool_t pool;
 
 	/* always use nonblocking I/O */
@@ -131,6 +130,7 @@ struct client *client_create(int fd_in, int fd_out,
 	client->v = imap_client_vfuncs;
 	client->event = event;
 	event_ref(client->event);
+	client->unhibernated = unhibernated;
 	client->set = set;
 	client->smtp_set = smtp_set;
 	client->service_user = service_user;
@@ -203,12 +203,11 @@ struct client *client_create(int fd_in, int fd_out,
 		client_add_capability(client, "SPECIAL-USE");
 	}
 
-	ident = mail_user_get_anvil_userip_ident(client->user);
-	if (ident != NULL) {
-		master_service_anvil_send(master_service, t_strconcat(
-			"CONNECT\t", my_pid, "\timap/", ident, "\n", NULL));
+	struct master_service_anvil_session anvil_session;
+	mail_user_get_anvil_session(client->user, &anvil_session);
+	if (master_service_anvil_connect(master_service, &anvil_session,
+					 TRUE, client->anvil_conn_guid))
 		client->anvil_sent = TRUE;
-	}
 
 	imap_client_count++;
 	DLLIST_PREPEND(&imap_clients, client);
@@ -323,7 +322,7 @@ const char *client_stats(struct client *client)
 	str = t_str_new(128);
 	if (var_expand_with_funcs(str, client->set->imap_logout_format,
 				  tab, mail_user_var_expand_func_table,
-				  client->user, &error) < 0) {
+				  client->user, &error) <= 0) {
 		e_error(client->event,
 			"Failed to expand imap_logout_format=%s: %s",
 			client->set->imap_logout_format, error);
@@ -493,10 +492,10 @@ static void client_default_destroy(struct client *client, const char *reason)
 	if (client->mailbox != NULL)
 		imap_client_close_mailbox(client);
 	if (client->anvil_sent) {
-		master_service_anvil_send(master_service, t_strconcat(
-			"DISCONNECT\t", my_pid, "\timap/",
-			mail_user_get_anvil_userip_ident(client->user),
-			"\n", NULL));
+		struct master_service_anvil_session anvil_session;
+		mail_user_get_anvil_session(client->user, &anvil_session);
+		master_service_anvil_disconnect(master_service, &anvil_session,
+						client->anvil_conn_guid);
 	}
 
 	if (client->free_parser != NULL)
@@ -917,7 +916,8 @@ struct client_command_context *client_command_alloc(struct client *client)
 	cmd = p_new(client->command_pool, struct client_command_context, 1);
 	cmd->client = client;
 	cmd->pool = client->command_pool;
-	cmd->event = event_create(client->event);
+	cmd->global_event = event_create(client->event);
+	cmd->event = event_create(cmd->global_event);
 	cmd->stats.start_time = ioloop_timeval;
 	cmd->stats.last_run_timeval = ioloop_timeval;
 	cmd->stats.start_ioloop_wait_usecs =
@@ -1014,6 +1014,7 @@ void client_command_free(struct client_command_context **_cmd)
 	e_debug(cmd->event, "Command finished: %s %s", cmd->name,
 		cmd->human_args != NULL ? cmd->human_args : "");
 	event_unref(&cmd->event);
+	event_unref(&cmd->global_event);
 
 	if (cmd->parser != NULL) {
 		if (client->free_parser == NULL) {
@@ -1277,6 +1278,9 @@ static bool client_command_input(struct client_command_context *cmd)
 		cmd->func = command->func;
 		cmd->cmd_flags = command->flags;
 		/* valid command - overwrite the "unknown" string set earlier */
+		event_add_str(cmd->global_event, "cmd_name", command->name);
+		event_strlist_append(cmd->global_event, "reason_code",
+			event_reason_code_prefix("imap", "cmd_", command->name));
 		event_add_str(cmd->event, "cmd_name", command->name);
 		if (client_command_is_ambiguous(cmd)) {
 			/* do nothing until existing commands are finished */
@@ -1650,13 +1654,20 @@ void clients_init(void)
 				      imap_client_enable_qresync);
 }
 
+void client_kick(struct client *client)
+{
+	mail_storage_service_io_activate_user(client->service_user);
+	if (client->output_cmd_lock == NULL) {
+		client_send_line(client,
+				 "* BYE "MASTER_SERVICE_SHUTTING_DOWN_MSG".");
+	}
+	client_destroy(client, MASTER_SERVICE_SHUTTING_DOWN_MSG);
+}
+
 void clients_destroy_all(void)
 {
-	while (imap_clients != NULL) {
-		mail_storage_service_io_activate_user(imap_clients->service_user);
-		client_send_line(imap_clients, "* BYE Server shutting down.");
-		client_destroy(imap_clients, "Server shutting down.");
-	}
+	while (imap_clients != NULL)
+		client_kick(imap_clients);
 }
 
 struct imap_client_vfuncs imap_client_vfuncs = {

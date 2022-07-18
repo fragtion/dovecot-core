@@ -63,8 +63,10 @@ static ssize_t test_read(struct istream_private *stream)
 				    memarea_get_refcount(stream->memarea) > 1)) {
 			void *old_w_buffer = stream->w_buffer;
 			stream->w_buffer = i_malloc(cur_max);
-			memcpy(stream->w_buffer, old_w_buffer,
-			       I_MIN(stream->buffer_size, cur_max));
+			if (stream->buffer_size != 0) {
+				memcpy(stream->w_buffer, old_w_buffer,
+				       I_MIN(stream->buffer_size, cur_max));
+			}
 			stream->buffer = stream->w_buffer;
 			stream->buffer_size = cur_max;
 
@@ -132,6 +134,8 @@ struct istream *test_istream_create(const char *data)
 static struct test_istream *test_istream_find(struct istream *input)
 {
 	struct istream *in;
+
+	i_assert(input != NULL);
 
 	for (in = input; in != NULL; in = in->real_stream->parent) {
 		if (in->real_stream->read == test_read)

@@ -20,9 +20,16 @@ raw_storage_create_from_set(const struct setting_parser_info *set_info,
 	struct mail_namespace *ns;
 	struct mail_namespace_settings *ns_set;
 	struct mail_storage_settings *mail_set;
+	struct event *event;
 	const char *error;
 
-	user = mail_user_alloc(NULL, "raw mail user", set_info, set);
+	event = event_create(NULL);
+	/* Don't include raw user's events in statistics or anything else.
+	   They would just cause confusion. */
+	event_disable_callbacks(event);
+	user = mail_user_alloc(event, "raw mail user", set_info, set);
+	event_unref(&event);
+
 	user->autocreated = TRUE;
 	mail_user_set_home(user, "/");
 	if (mail_user_init(user, &error) < 0)
@@ -77,7 +84,7 @@ raw_mailbox_alloc_common(struct mail_user *user, struct istream *input,
 
 	i_assert(strcmp(box->storage->name, RAW_STORAGE_NAME) == 0);
 	raw_box = RAW_MAILBOX(box);
-	raw_box->envelope_sender = envelope_sender;
+	raw_box->envelope_sender = p_strdup(box->pool, envelope_sender);
 	raw_box->mtime = received_time;
 	return 0;
 }
@@ -254,6 +261,7 @@ struct mailbox raw_mailbox = {
 		index_storage_search_deinit,
 		index_storage_search_next_nonblock,
 		index_storage_search_next_update_seq,
+		index_storage_search_next_match_mail,
 		NULL,
 		NULL,
 		NULL,

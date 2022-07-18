@@ -25,7 +25,6 @@ static const struct setting_define login_setting_defines[] = {
 	DEF(STR_VARS, login_greeting),
 	DEF(STR, login_log_format_elements),
 	DEF(STR, login_log_format),
-	DEF(STR, login_access_sockets),
 	DEF(STR_VARS, login_proxy_notify_path),
 	DEF(STR, login_plugin_dir),
 	DEF(STR, login_plugins),
@@ -34,6 +33,7 @@ static const struct setting_define login_setting_defines[] = {
 	DEF(TIME, login_proxy_max_disconnect_delay),
 	DEF(STR, login_proxy_rawlog_dir),
 	DEF(STR, director_username_hash),
+	DEF(STR, login_auth_socket_path),
 
 	DEF(BOOL, auth_ssl_require_client_cert),
 	DEF(BOOL, auth_ssl_username_from_cert),
@@ -54,7 +54,6 @@ static const struct login_settings login_default_settings = {
 	.login_greeting = PACKAGE_NAME" ready.",
 	.login_log_format_elements = "user=<%u> method=%m rip=%r lip=%l mpid=%e %c session=<%{session}>",
 	.login_log_format = "%$: %s",
-	.login_access_sockets = "",
 	.login_proxy_notify_path = "proxy-notify",
 	.login_plugin_dir = MODULEDIR"/login",
 	.login_plugins = "",
@@ -62,7 +61,8 @@ static const struct login_settings login_default_settings = {
 	.login_proxy_max_reconnects = 3,
 	.login_proxy_max_disconnect_delay = 0,
 	.login_proxy_rawlog_dir = "",
-	.director_username_hash = "%u",
+	.director_username_hash = "%Lu",
+	.login_auth_socket_path = "",
 
 	.auth_ssl_require_client_cert = FALSE,
 	.auth_ssl_username_from_cert = FALSE,
@@ -160,6 +160,7 @@ login_settings_read(pool_t pool,
 		    const struct ip_addr *remote_ip,
 		    const char *local_name,
 		    const struct master_service_ssl_settings **ssl_set_r,
+		    const struct master_service_ssl_server_settings **ssl_server_set_r,
 		    void ***other_settings_r)
 {
 	struct master_service_settings_input input;
@@ -212,6 +213,9 @@ login_settings_read(pool_t pool,
 	*ssl_set_r =
 		login_setting_dup(pool, &master_service_ssl_setting_parser_info,
 				  settings_parser_get_list(parser)[1]);
+	*ssl_server_set_r =
+		login_setting_dup(pool, &master_service_ssl_server_setting_parser_info,
+				  settings_parser_get_list(parser)[2]);
 	*other_settings_r = sets + 1;
 	return sets[0];
 }

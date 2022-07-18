@@ -16,10 +16,12 @@ static bool submission_settings_verify(void *_set, pool_t pool,
 
 /* <settings checks> */
 static struct file_listener_settings submission_unix_listeners_array[] = {
-	{ "login/submission", 0666, "", "" }
+	{ "login/submission", 0666, "", "" },
+	{ "srv.submission/%{pid}", 0600, "", "" },
 };
 static struct file_listener_settings *submission_unix_listeners[] = {
-	&submission_unix_listeners_array[0]
+	&submission_unix_listeners_array[0],
+	&submission_unix_listeners_array[1],
 };
 static buffer_t submission_unix_listeners_buf = {
 	{ { submission_unix_listeners, sizeof(submission_unix_listeners) } }
@@ -71,6 +73,7 @@ static const struct setting_define submission_setting_defines[] = {
 	DEF(UINT, submission_max_recipients),
 	DEF(STR, submission_client_workarounds),
 	DEF(STR, submission_logout_format),
+	DEF(BOOL, submission_add_received_header),
 
 	DEF(STR, submission_backend_capabilities),
 
@@ -112,6 +115,7 @@ static const struct submission_settings submission_default_settings = {
 	.submission_max_recipients = 0,
 	.submission_client_workarounds = "",
 	.submission_logout_format = "in=%i out=%o",
+	.submission_add_received_header = TRUE,
 
 	.submission_backend_capabilities = NULL,
 
@@ -161,12 +165,18 @@ struct submission_client_workaround_list {
 	enum submission_client_workarounds num;
 };
 
+/* These definitions need to be kept in sync with equivalent definitions present
+   in src/submission-login/submission-login-settings.c. Workarounds that are not
+   relevant to the submission service are defined as 0 here to prevent "Unknown
+   workaround" errors below. */
 static const struct submission_client_workaround_list
 submission_client_workaround_list[] = {
 	{ "whitespace-before-path",
 	  SUBMISSION_WORKAROUND_WHITESPACE_BEFORE_PATH },
 	{ "mailbox-for-path",
 	  SUBMISSION_WORKAROUND_MAILBOX_FOR_PATH },
+	{ "implicit-auth-external", 0 },
+	{ "exotic-backend", 0 },
 	{ NULL, 0 }
 };
 

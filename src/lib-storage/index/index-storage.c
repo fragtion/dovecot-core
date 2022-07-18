@@ -9,6 +9,7 @@
 #include "str-sanitize.h"
 #include "mkdir-parents.h"
 #include "dict.h"
+#include "fs-api.h"
 #include "message-header-parser.h"
 #include "mail-index-alloc-cache.h"
 #include "mail-index-private.h"
@@ -48,7 +49,7 @@ static void set_cache_decisions(struct mail_cache *cache,
 		idx = mail_cache_register_lookup(cache, name);
 		if (idx != UINT_MAX) {
 			field = *mail_cache_register_get_field(cache, idx);
-		} else if (strncasecmp(name, "hdr.", 4) == 0) {
+		} else if (str_begins_icase_with(name, "hdr.")) {
 			/* Do some sanity checking for the header name. Mainly
 			   to make sure there aren't UTF-8 characters that look
 			   like their ASCII equivalents or are completely
@@ -127,7 +128,7 @@ void index_storage_lock_notify(struct mailbox *box,
 	}
 
 	ibox->next_lock_notify = now + LOCK_NOTIFY_INTERVAL;
-        ibox->last_notify_type = notify_type;
+	ibox->last_notify_type = notify_type;
 
 	switch (notify_type) {
 	case MAILBOX_LOCK_NOTIFY_NONE:
@@ -500,7 +501,7 @@ index_storage_mailbox_update_cache(struct mailbox *box,
 		}
 		if (j != old_count) {
 			field = old_fields[j];
-		} else if (str_begins(updates[i].name, "hdr.")) {
+		} else if (str_begins_with(updates[i].name, "hdr.")) {
 			/* new header */
 			i_zero(&field);
 			field.name = updates[i].name;
@@ -689,10 +690,12 @@ int index_storage_mailbox_create(struct mailbox *box, bool directory)
 				return -1;
 			if (existence != MAILBOX_EXISTENCE_SELECT)
 				return 1;
+		} else if (!box->storage->rebuilding_list_index) {
+			/* ignore existing location if we are recovering list index */
+			mail_storage_set_error(box->storage, MAIL_ERROR_EXISTS,
+					       "Mailbox already exists");
+			return -1;
 		}
-		mail_storage_set_error(box->storage, MAIL_ERROR_EXISTS,
-				       "Mailbox already exists");
-		return -1;
 	}
 
 	if (directory) {
@@ -737,7 +740,7 @@ mailbox_delete_all_attributes(struct mailbox_transaction_context *t,
 	iter = mailbox_attribute_iter_init(t->box, type, "");
 	while ((key = mailbox_attribute_iter_next(iter)) != NULL) {
 		if (inbox &&
-		    str_begins(key, MAILBOX_ATTRIBUTE_PREFIX_DOVECOT_PVT_SERVER))
+		    str_begins_with(key, MAILBOX_ATTRIBUTE_PREFIX_DOVECOT_PVT_SERVER))
 			continue;
 
 		if (mailbox_attribute_unset(t, type, key) < 0) {
@@ -754,37 +757,50 @@ mailbox_delete_all_attributes(struct mailbox_transaction_context *t,
 
 static int mailbox_expunge_all_data(struct mailbox *box)
 {
-	struct mail_search_context *ctx;
-        struct mailbox_transaction_context *t;
-	struct mail *mail;
+	struct mailbox_transaction_context *t;
 	struct mail_search_args *search_args;
+	struct mailbox_status status;
+	struct mail_search_seqset_iter *seqset_iter;
+	int ret;
 
 	(void)mailbox_sync(box, MAILBOX_SYNC_FLAG_FULL_READ);
 
-	t = mailbox_transaction_begin(box, 0, __func__);
+	mailbox_get_open_status(box, STATUS_MESSAGES, &status);
 
 	search_args = mail_search_build_init();
 	mail_search_build_add_all(search_args);
-	ctx = mailbox_search_init(t, search_args, NULL, 0, NULL);
+
+	seqset_iter = mail_search_seqset_iter_init(search_args, status.messages,
+						   MAIL_EXPUNGE_BATCH_SIZE);
+
+	do {
+		struct mail_search_context *ctx;
+		struct mail *mail;
+
+		t = mailbox_transaction_begin(box, 0, __func__);
+		ctx = mailbox_search_init(t, search_args, NULL, 0, NULL);
+		while (mailbox_search_next(ctx, &mail))
+			mail_expunge(mail);
+
+		ret = mailbox_search_deinit(&ctx);
+		if (mailbox_transaction_commit(&t) < 0)
+			ret = -1;
+	} while (ret >= 0 && mail_search_seqset_iter_next(seqset_iter));
+
+	mail_search_seqset_iter_deinit(&seqset_iter);
 	mail_search_args_unref(&search_args);
 
-	while (mailbox_search_next(ctx, &mail))
-		mail_expunge(mail);
-
-	if (mailbox_search_deinit(&ctx) < 0) {
-		mailbox_transaction_rollback(&t);
-		return -1;
-	}
-
+	t = mailbox_transaction_begin(box, 0, __func__);
 	if (mailbox_delete_all_attributes(t, MAIL_ATTRIBUTE_TYPE_PRIVATE) < 0 ||
-	    mailbox_delete_all_attributes(t, MAIL_ATTRIBUTE_TYPE_SHARED) < 0) {
-		mailbox_transaction_rollback(&t);
-		return -1;
-	}
+	    mailbox_delete_all_attributes(t, MAIL_ATTRIBUTE_TYPE_SHARED) < 0)
+		ret = -1;
 	if (mailbox_transaction_commit(&t) < 0)
-		return -1;
+		ret = -1;
+
 	/* sync to actually perform the expunges */
-	return mailbox_sync(box, 0);
+	if (mailbox_sync(box, 0) < 0)
+		ret = -1;
+	return ret;
 }
 
 int index_storage_mailbox_delete_pre(struct mailbox *box)
@@ -864,7 +880,7 @@ int index_storage_mailbox_delete_post(struct mailbox *box)
 	if (box->list->v.delete_mailbox(box->list, box->name) < 0) {
 		mail_storage_copy_list_error(box->storage, box->list);
 		return -1;
-	} 
+	}
 
 	if (ret_guid == 0) {
 		mailbox_list_add_change(box->list,
@@ -907,7 +923,7 @@ int index_storage_mailbox_rename(struct mailbox *src, struct mailbox *dest)
 		struct mail_index_transaction *t =
 			mail_index_transaction_begin(dest->view, 0);
 
-		uint32_t stamp = ioloop_time;
+		uint32_t stamp = ioloop_time32;
 
 		mail_index_update_header_ext(t, dest->box_last_rename_stamp_ext_id,
 					     0, &stamp, sizeof(stamp));
@@ -925,7 +941,7 @@ int index_storage_mailbox_rename(struct mailbox *src, struct mailbox *dest)
 
 int index_mailbox_update_last_temp_file_scan(struct mailbox *box)
 {
-	uint32_t last_temp_file_scan = ioloop_time;
+	uint32_t last_temp_file_scan = ioloop_time32;
 	struct mail_index_transaction *trans =
 		mail_index_transaction_begin(box->view,
 			MAIL_INDEX_TRANSACTION_FLAG_EXTERNAL);
@@ -952,6 +968,8 @@ bool index_storage_is_inconsistent(struct mailbox *box)
 
 void index_save_context_free(struct mail_save_context *ctx)
 {
+	i_assert(ctx->dest_mail != NULL);
+
 	index_mail_save_finish(ctx);
 	if (ctx->data.keywords != NULL)
 		mailbox_keywords_unref(&ctx->data.keywords);
@@ -993,7 +1011,7 @@ mail_copy_cache_field(struct mail_save_context *ctx, struct mail *src_mail,
 	buffer_set_used_size(buf, 0);
 	if (strcmp(name, "date.save") == 0) {
 		/* save date must update when mail is copied */
-		t = ioloop_time;
+		t = ioloop_time32;
 		buffer_append(buf, &t, sizeof(t));
 		add = TRUE;
 	} else if (mail_cache_lookup_field(src_mail->transaction->cache_view, buf,
@@ -1099,8 +1117,8 @@ int index_storage_set_subscribed(struct mailbox *box, bool set)
 		   subscription name */
 		subs_name = t_strconcat(list->ns->prefix, box->name, NULL);
 		/* drop the common prefix (typically there isn't one) */
-		i_assert(str_begins(subs_name, ns->prefix));
-		subs_name += strlen(ns->prefix);
+		if (!str_begins(subs_name, ns->prefix, &subs_name))
+			i_unreached();
 
 		list = ns->list;
 	}
@@ -1125,6 +1143,7 @@ void index_storage_destroy(struct mail_storage *storage)
 		dict_wait(storage->_shared_attr_dict);
 		dict_deinit(&storage->_shared_attr_dict);
 	}
+	fs_unref(&storage->mailboxes_fs);
 }
 
 static void index_storage_expunging_init(struct mailbox *box)

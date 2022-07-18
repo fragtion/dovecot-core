@@ -319,7 +319,9 @@ service_create(pool_t pool, const struct service_settings *set,
 
 	p_array_init(&service->listeners, pool,
 		     unix_count + fifo_count + inet_count);
-		     
+	if (unix_count > 0)
+		p_array_init(&service->unix_pid_listeners, pool, 1);
+
 	for (i = 0; i < unix_count; i++) {
 		if (unix_listeners[i]->mode == 0) {
 			/* disabled */
@@ -330,7 +332,11 @@ service_create(pool_t pool, const struct service_settings *set,
 						 unix_listeners[i], error_r);
 		if (l == NULL)
 			return NULL;
-		array_push_back(&service->listeners, &l);
+
+		if (strstr(unix_listeners[i]->path, "%{pid}") == NULL)
+			array_push_back(&service->listeners, &l);
+		else
+			array_push_back(&service->unix_pid_listeners, &l);
 	}
 	for (i = 0; i < fifo_count; i++) {
 		if (fifo_listeners[i]->mode == 0) {
@@ -430,8 +436,10 @@ services_create_real(const struct master_settings *set, pool_t pool,
 	for (i = 0; i < count; i++) {
 		if (!service_want(service_settings[i]))
 			continue;
-		service = service_create(pool, service_settings[i],
-					 service_list, &error);
+		T_BEGIN {
+			service = service_create(pool, service_settings[i],
+						 service_list, &error);
+		} T_END_PASS_STR_IF(service == NULL, &error);
 		if (service == NULL) {
 			*error_r = t_strdup_printf("service(%s) %s",
 				service_settings[i]->name, error);

@@ -79,7 +79,7 @@ imap_search_##_func(struct mail_search_build_context *ctx) \
 }
 static struct mail_search_arg *
 imap_search_all(struct mail_search_build_context *ctx)
-{ 
+{
 	return mail_search_build_new(ctx, SEARCH_ALL);
 }
 
@@ -221,13 +221,13 @@ arg_new_size(struct mail_search_build_context *ctx,
 
 static struct mail_search_arg *
 imap_search_larger(struct mail_search_build_context *ctx)
-{ 
+{
 	return arg_new_size(ctx, SEARCH_LARGER);
 }
 
 static struct mail_search_arg *
 imap_search_smaller(struct mail_search_build_context *ctx)
-{ 
+{
 	return arg_new_size(ctx, SEARCH_SMALLER);
 }
 
@@ -366,9 +366,8 @@ arg_modseq_set_ext(struct mail_search_build_context *ctx,
 	const char *value;
 
 	name = t_str_lcase(name);
-	if (!str_begins(name, "/flags/"))
+	if (!str_begins(name, "/flags/", &name))
 		return 0;
-	name += 7;
 
 	/* set name */
 	if (*name == '\\') {

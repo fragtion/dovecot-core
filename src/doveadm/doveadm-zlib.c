@@ -63,7 +63,7 @@ cmd_dump_imapzlib(const char *path, const char *const *args ATTR_UNUSED)
 			continue;
 		line++;
 
-		if (str_begins(line, "OK Begin compression") ||
+		if (str_begins_with(line, "OK Begin compression") ||
 		    strcasecmp(line, "COMPRESS DEFLATE") == 0)
 			break;
 	}
@@ -96,15 +96,17 @@ struct client {
 static bool
 client_input_get_compress_algorithm(struct client *client, const char *line)
 {
+	const char *algorithm;
+
 	/* skip tag */
 	while (*line != ' ' && *line != '\0')
 		line++;
-	if (strncasecmp(line, " COMPRESS ", 10) != 0)
+	if (!str_begins_icase(line, " COMPRESS ", &algorithm))
 		return FALSE;
 
-	if (compression_lookup_handler(t_str_lcase(line+10),
+	if (compression_lookup_handler(t_str_lcase(algorithm),
 				       &client->handler) <= 0)
-		i_fatal("Unsupported compression mechanism: %s", line+10);
+		i_fatal("Unsupported compression mechanism: %s", algorithm);
 	return TRUE;
 }
 
@@ -162,7 +164,7 @@ static bool server_input_is_compress_reply(const char *line)
 	/* skip tag */
 	while (*line != ' ' && *line != '\0')
 		line++;
-	return str_begins(line, " OK Begin compression");
+	return str_begins_with(line, " OK Begin compression");
 }
 
 static bool server_input_uncompressed(struct client *client)
@@ -292,6 +294,6 @@ struct doveadm_cmd_ver2 doveadm_cmd_zlibconnect = {
 	.usage = "<host> [<port>]",
 DOVEADM_CMD_PARAMS_START
 DOVEADM_CMD_PARAM('\0', "host", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
-DOVEADM_CMD_PARAM('\0', "port", CMD_PARAM_INT64, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAM('\0', "port", CMD_PARAM_INT64, CMD_PARAM_FLAG_POSITIONAL|CMD_PARAM_FLAG_UNSIGNED)
 DOVEADM_CMD_PARAMS_END
 };

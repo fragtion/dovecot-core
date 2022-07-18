@@ -1,8 +1,10 @@
 #ifndef DSYNC_BRAIN_H
 #define DSYNC_BRAIN_H
 
+#include "module-context.h"
 #include "guid.h"
 #include "mail-error.h"
+#include "mailbox-list-private.h"
 
 struct mail_namespace;
 struct mail_user;
@@ -28,13 +30,16 @@ enum dsync_brain_flags {
 	   only with pipe ibc. It's useful if most of the mails can be copied
 	   directly within filesystem without having to read them. */
 	DSYNC_BRAIN_FLAG_NO_MAIL_PREFETCH	= 0x100,
-	/* Disable mailbox renaming logic. This is just a kludge that should
-	   be removed once the renaming logic has no more bugs.. */
-	DSYNC_BRAIN_FLAG_NO_MAILBOX_RENAMES	= 0x200,
 	/* Add MAILBOX_TRANSACTION_FLAG_NO_NOTIFY to transactions. */
 	DSYNC_BRAIN_FLAG_NO_NOTIFY		= 0x400,
 	/* Workaround missing Date/Message-ID headers */
 	DSYNC_BRAIN_FLAG_EMPTY_HDR_WORKAROUND	= 0x800,
+	/* If mail GUIDs aren't supported, don't emulate them with header
+	   hashes either. This trusts that all the existing mails with
+	   identical UIDs have the same email content. This makes it slightly
+	   less safe, but can have huge performance improvement with imapc
+	   if the remote server doesn't have a fast header cache. */
+	DSYNC_BRAIN_FLAG_NO_HEADER_HASHES	= 0x1000,
 };
 
 enum dsync_brain_sync_type {
@@ -87,6 +92,15 @@ struct dsync_brain_settings {
 	/* Input state for DSYNC_BRAIN_SYNC_TYPE_STATE */
 	const char *state;
 };
+
+#define DSYNC_LIST_CONTEXT(obj) \
+	MODULE_CONTEXT(obj, dsync_mailbox_list_module)
+struct dsync_mailbox_list {
+	union mailbox_list_module_context module_ctx;
+	bool have_orig_escape_char;
+};
+extern MODULE_CONTEXT_DEFINE(dsync_mailbox_list_module,
+			     &mailbox_list_module_register);
 
 struct dsync_brain *
 dsync_brain_master_init(struct mail_user *user, struct dsync_ibc *ibc,

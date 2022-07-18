@@ -132,6 +132,7 @@ struct mailbox_list_index {
 	bool rebuild_on_missing_inbox:1;
 	bool force_resynced:1;
 	bool force_resync_failed:1;
+	bool last_refresh_success:1;
 };
 
 struct mailbox_list_index_iterate_context {
@@ -207,7 +208,8 @@ bool mailbox_list_index_status(struct mailbox_list *list,
 			       uint32_t seq, enum mailbox_status_items items,
 			       struct mailbox_status *status_r,
 			       uint8_t *mailbox_guid,
-			       struct mailbox_index_vsize *vsize_r);
+			       struct mailbox_index_vsize *vsize_r,
+			       const char **reason_r);
 void mailbox_list_index_status_set_info_flags(struct mailbox *box, uint32_t uid,
 					      enum mailbox_info_flags *flags);
 void mailbox_list_index_update_mailbox_index(struct mailbox *box,

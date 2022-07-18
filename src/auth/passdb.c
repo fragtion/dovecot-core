@@ -3,7 +3,7 @@
 #include "auth-common.h"
 #include "array.h"
 #include "password-scheme.h"
-#include "auth-worker-server.h"
+#include "auth-worker-connection.h"
 #include "passdb.h"
 
 static ARRAY(struct passdb_module_interface *) passdb_interfaces;
@@ -224,19 +224,8 @@ passdb_preinit(pool_t pool, const struct auth_passdb_settings *set)
 	passdb->id = ++auth_passdb_id;
 	passdb->iface = *iface;
 	passdb->args = p_strdup(pool, set->args);
-	if (*set->mechanisms == '\0') {
-		passdb->mechanisms = NULL;
-	} else if (strcasecmp(set->mechanisms, "none") == 0) {
-		passdb->mechanisms = (const char *const[]){NULL};
-	} else {
-		passdb->mechanisms = (const char* const*)p_strsplit_spaces(pool, set->mechanisms, " ,");
-	}
-
-	if (*set->username_filter == '\0') {
-		passdb->username_filter = NULL;
-	} else {
-		passdb->username_filter = (const char* const*)p_strsplit_spaces(pool, set->username_filter, " ,");
-	}
+	/* NOTE: if anything else than driver & args are added here,
+	   passdb_find() also needs to be updated. */
 	array_push_back(&passdb_modules, &passdb);
 	return passdb;
 }
@@ -315,10 +304,8 @@ extern struct passdb_module_interface passdb_dict;
 #ifdef HAVE_LUA
 extern struct passdb_module_interface passdb_lua;
 #endif
-extern struct passdb_module_interface passdb_shadow;
 extern struct passdb_module_interface passdb_passwd_file;
 extern struct passdb_module_interface passdb_pam;
-extern struct passdb_module_interface passdb_checkpassword;
 extern struct passdb_module_interface passdb_ldap;
 extern struct passdb_module_interface passdb_sql;
 extern struct passdb_module_interface passdb_static;
@@ -336,8 +323,6 @@ void passdbs_init(void)
 #endif
 	passdb_register_module(&passdb_passwd_file);
 	passdb_register_module(&passdb_pam);
-	passdb_register_module(&passdb_checkpassword);
-	passdb_register_module(&passdb_shadow);
 	passdb_register_module(&passdb_ldap);
 	passdb_register_module(&passdb_sql);
 	passdb_register_module(&passdb_static);

@@ -270,8 +270,7 @@ unsigned int auth_cache_clear(struct auth_cache *cache)
 static bool auth_cache_node_is_user(struct auth_cache_node *node,
 				    const char *username)
 {
-	const char *data = node->data;
-	size_t username_len;
+	const char *data = node->data, *suffix;
 
 	/* The cache nodes begin with "P"/"U", passdb/userdb ID, optional
 	   "+" master user, "\t" and then usually followed by the username.
@@ -294,9 +293,8 @@ static bool auth_cache_node_is_user(struct auth_cache_node *node,
 		return FALSE;
 	data++;
 
-	username_len = strlen(username);
-	return str_begins(data, username) &&
-		(data[username_len] == '\t' || data[username_len] == '\0');
+	return str_begins(data, username, &suffix) &&
+		(suffix[0] == '\t' || suffix[0] == '\0');
 }
 
 static bool auth_cache_node_is_one_of_users(struct auth_cache_node *node,
@@ -384,7 +382,7 @@ auth_cache_lookup(struct auth_cache *cache, const struct auth_request *request,
 	*expired_r = FALSE;
 	*neg_expired_r = FALSE;
 
-	key = auth_request_expand_cache_key(request, key, request->fields.user);
+	key = auth_request_expand_cache_key(request, key, request->fields.translated_username);
 	node = hash_table_lookup(cache->hash, key);
 	if (node == NULL) {
 		cache->miss_count++;
@@ -421,7 +419,6 @@ void auth_cache_insert(struct auth_cache *cache, struct auth_request *request,
 {
         struct auth_cache_node *node;
 	size_t data_size, alloc_size, key_len, value_len = strlen(value);
-	const char *cache_username;
 	char *hash_key;
 
 	if (*value == '\0' && cache->neg_ttl_secs == 0) {
@@ -429,15 +426,7 @@ void auth_cache_insert(struct auth_cache *cache, struct auth_request *request,
 		return;
 	}
 
-	/* store into cache using the translated username, except if we're doing
-	   a master user login */
-	cache_username = request->fields.user;
-	if (request->fields.translated_username != NULL &&
-	    request->fields.requested_login_user == NULL &&
-	    request->fields.master_user == NULL)
-		cache_username = request->fields.translated_username;
-
-	key = auth_request_expand_cache_key(request, key, cache_username);
+	key = auth_request_expand_cache_key(request, key, request->fields.translated_username);
 	key_len = strlen(key);
 
 	data_size = key_len + 1 + value_len + 1;

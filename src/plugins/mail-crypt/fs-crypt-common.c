@@ -3,7 +3,9 @@
 #include "lib.h"
 #include "randgen.h"
 #include "istream.h"
+#include "istream-try.h"
 #include "ostream.h"
+#include "dcrypt-iostream.h"
 #include "istream-decrypt.h"
 #include "ostream-encrypt.h"
 #include "iostream-temp.h"
@@ -18,6 +20,7 @@ struct crypt_fs {
 	struct fs fs;
 	struct mail_crypt_global_keys keys;
 	bool keys_loaded;
+	bool allow_missing_keys;
 
 	char *enc_algo;
 	char *set_prefix;
@@ -74,12 +77,14 @@ fs_crypt_init(struct fs *_fs, const char *args, const struct fs_settings *set,
 	enc_algo = "aes-256-gcm-sha256";
 	for (;;) {
 		p = strchr(args, ':');
-		if (p == NULL) {
-			*error_r = "Missing parameters";
-			return -1;
-		}
+		if (p == NULL)
+			break;
 		arg = t_strdup_until(args, p);
-		if ((value = strchr(arg, '=')) == NULL)
+		if (strcmp(arg, "maybe") == 0) {
+			fs->allow_missing_keys = TRUE;
+			args = p + 1;
+			continue;
+		} else if ((value = strchr(arg, '=')) == NULL)
 			break;
 		arg = t_strdup_until(arg, value++);
 		args = p+1;
@@ -274,8 +279,26 @@ fs_crypt_read_stream(struct fs_file *_file, size_t max_buffer_size)
 
 	input = fs_read_stream(file->super_read, max_buffer_size);
 
-	file->input = i_stream_create_decrypt_callback(input,
-				fs_crypt_istream_get_key, file);
+	if (file->fs->allow_missing_keys) {
+		struct istream *decrypted_input =
+			i_stream_create_decrypt_callback(input,
+					fs_crypt_istream_get_key, file);
+		struct istream *plaintext_input =
+			i_stream_create_noop(input);
+		/* If the file is not encrypted, fall back to reading
+		 * it as plaintext. */
+		struct istream *inputs[] = {
+			decrypted_input,
+			plaintext_input,
+			NULL
+		};
+		file->input = istream_try_create(inputs, max_buffer_size);
+		i_stream_unref(&decrypted_input);
+		i_stream_unref(&plaintext_input);
+	} else {
+		file->input = i_stream_create_decrypt_callback(input,
+					fs_crypt_istream_get_key, file);
+	}
 	i_stream_unref(&input);
 	i_stream_ref(file->input);
 	return file->input;
@@ -295,7 +318,11 @@ static void fs_crypt_write_stream(struct fs_file *_file)
 	}
 
 	if (file->fs->keys.public_key == NULL) {
-		if (_file->fs->set.debug)
+		if (!file->fs->allow_missing_keys) {
+			_file->output = o_stream_create_error_str(EINVAL,
+				"Encryption required, but no public key available");
+			return;
+		} else	if (_file->fs->set.debug)
 			i_debug("No public key provided, "
 				"NOT encrypting stream %s",
 				 fs_file_path(_file));

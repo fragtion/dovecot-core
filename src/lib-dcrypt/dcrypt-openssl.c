@@ -1021,7 +1021,6 @@ dcrypt_openssl_decrypt_point_password_v1(const char *data_hex,
 					 const char **error_r)
 {
 	buffer_t *salt, *data, *password, *key;
-	struct dcrypt_context_symmetric *dctx;
 
 	data = t_buffer_create(128);
 	salt = t_buffer_create(16);
@@ -1035,10 +1034,8 @@ dcrypt_openssl_decrypt_point_password_v1(const char *data_hex,
 	/* aes-256-ctr uses 32 byte key, and v1 uses all-zero IV */
 	if (!dcrypt_openssl_pbkdf2(password->data, password->used,
 				   salt->data, salt->used,
-				   "sha256", 16, key, 32, error_r)) {
-		dcrypt_ctx_sym_destroy(&dctx);
+				   "sha256", 16, key, 32, error_r))
 		return FALSE;
-	}
 
 	return dcrypt_openssl_decrypt_point_v1(data, key, point_r, error_r);
 }
@@ -2142,11 +2139,9 @@ dcrypt_openssl_load_public_key_dovecot(struct dcrypt_public_key **key_r,
 	case DCRYPT_KEY_VERSION_1:
 		return dcrypt_openssl_load_public_key_dovecot_v1(
 			key_r, len, input, error_r);
-		break;
 	case DCRYPT_KEY_VERSION_2:
 		return dcrypt_openssl_load_public_key_dovecot_v2(
 			key_r, len, input, error_r);
-		break;
 	case DCRYPT_KEY_VERSION_NA:
 		i_unreached();
 	}
@@ -2296,11 +2291,10 @@ dcrypt_openssl_store_private_key_dovecot(struct dcrypt_private_key *key,
 	}
 
 	/* see if we want ECDH based or password based encryption */
-	if (cipher != NULL && strncasecmp(cipher, "ecdh-", 5) == 0) {
+	if (cipher != NULL && str_begins_icase(cipher, "ecdh-", &cipher2)) {
 		i_assert(enc_key != NULL);
 		i_assert(password == NULL);
 		enctype = DCRYPT_DOVECOT_KEY_ENCRYPT_PK;
-		cipher2 = cipher+5;
 	} else if (cipher != NULL) {
 		i_assert(enc_key == NULL);
 		i_assert(password != NULL);
@@ -2686,21 +2680,18 @@ dcrypt_openssl_key_string_get_info(
 	i_assert(key_data != NULL);
 
 	/* is it PEM key */
-	if (str_begins(key_data, "-----BEGIN ")) {
+	if (str_begins(key_data, "-----BEGIN ", &key_data)) {
 		format = DCRYPT_FORMAT_PEM;
 		version = DCRYPT_KEY_VERSION_NA;
-		key_data += 11;
-		if (str_begins(key_data, "RSA ")) {
+		if (str_begins_with(key_data, "RSA ")) {
 			DCRYPT_SET_ERROR("RSA private key format not supported, convert it to PKEY format with openssl pkey");
 			return FALSE;
 		}
-		if (str_begins(key_data, "ENCRYPTED ")) {
+		if (str_begins(key_data, "ENCRYPTED ", &key_data))
 			encryption_type = DCRYPT_KEY_ENCRYPTION_TYPE_PASSWORD;
-			key_data += 10;
-		}
-		if (str_begins(key_data, "PRIVATE KEY-----"))
+		if (str_begins_with(key_data, "PRIVATE KEY-----"))
 			kind = DCRYPT_KEY_KIND_PRIVATE;
-		else if (str_begins(key_data, "PUBLIC KEY-----"))
+		else if (str_begins_with(key_data, "PUBLIC KEY-----"))
 			kind = DCRYPT_KEY_KIND_PUBLIC;
 		else {
 			DCRYPT_SET_ERROR("Unknown/invalid PEM key type");
@@ -2742,10 +2733,10 @@ dcrypt_openssl_key_string_get_info(
 		}
 		json_tree_deinit(&tree);
 	} else {
-		if (str_begins(key_data, "1:")) {
+		if (str_begins_with(key_data, "1:")) {
 			DCRYPT_SET_ERROR("Dovecot v1 key format uses tab to separate fields");
 			return FALSE;
-		} else if (str_begins(key_data, "2\t")) {
+		} else if (str_begins_with(key_data, "2\t")) {
 			DCRYPT_SET_ERROR("Dovecot v2 key format uses colon to separate fields");
 			return FALSE;
 		}

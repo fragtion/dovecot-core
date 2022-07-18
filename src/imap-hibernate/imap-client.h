@@ -22,6 +22,7 @@ struct imap_client_state {
 	const unsigned char *state;
 	size_t state_size;
 
+	guid_128_t anvil_conn_guid;
 	unsigned int imap_idle_notify_interval;
 	bool idle_cmd;
 	bool have_notify_fd;
@@ -33,6 +34,8 @@ imap_client_create(int fd, const struct imap_client_state *state);
 void imap_client_add_notify_fd(struct imap_client *client, int fd);
 void imap_client_create_finish(struct imap_client *client);
 void imap_client_destroy(struct imap_client **_client, const char *reason);
+
+unsigned int imap_clients_kick(const char *user, const guid_128_t conn_guid);
 
 void imap_clients_init(void);
 void imap_clients_deinit(void);

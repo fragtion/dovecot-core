@@ -16,7 +16,7 @@
 #include "doveadm-util.h"
 #include "doveadm-mail.h"
 #include "doveadm-print.h"
-#include "doveadm-server.h"
+#include "doveadm-protocol.h"
 #include "client-connection-private.h"
 
 #include <unistd.h>
@@ -26,6 +26,7 @@
 struct client_connection_tcp {
 	struct client_connection conn;
 
+	unsigned int minor_version;
 	int fd;
 	struct io *io;
 	struct istream *input;
@@ -38,7 +39,6 @@ struct client_connection_tcp {
 	bool preauthenticated:1;
 	bool authenticated:1;
 	bool io_setup:1;
-	bool use_multiplex:1;
 };
 
 static void
@@ -157,9 +157,17 @@ static void doveadm_server_restore_logs(void)
 }
 
 static void
-doveadm_cmd_server_post(struct client_connection_tcp *conn, const char *cmd_name)
+doveadm_cmd_server_post(struct client_connection_tcp *conn,
+			struct doveadm_cmd_context *cctx)
 {
 	const char *str = NULL;
+
+	if (cctx->referral != NULL) {
+		i_assert(cctx->referral[0] != '\0');
+		o_stream_nsend_str(conn->output, t_strdup_printf(
+			"\n-REFERRAL %s\n", cctx->referral));
+		return;
+	}
 
 	if (doveadm_exit_code == 0) {
 		o_stream_nsend(conn->output, "\n+\n", 3);
@@ -174,7 +182,7 @@ doveadm_cmd_server_post(struct client_connection_tcp *conn, const char *cmd_name
 	} else {
 		o_stream_nsend_str(conn->output, "\n-\n");
 		i_error("BUG: Command '%s' returned unknown error code %d",
-			cmd_name, doveadm_exit_code);
+			cctx->cmd->name, doveadm_exit_code);
 	}
 }
 
@@ -184,9 +192,9 @@ doveadm_cmd_server_run_ver2(struct client_connection_tcp *conn,
 			    struct doveadm_cmd_context *cctx)
 {
 	i_getopt_reset();
-	if (doveadm_cmd_run_ver2(argc, argv, cctx) < 0)
+	if (doveadm_cmdline_run(argc, argv, cctx) < 0)
 		doveadm_exit_code = EX_USAGE;
-	doveadm_cmd_server_post(conn, cctx->cmd->name);
+	doveadm_cmd_server_post(conn, cctx);
 }
 
 static int doveadm_cmd_handle(struct client_connection_tcp *conn,
@@ -197,7 +205,7 @@ static int doveadm_cmd_handle(struct client_connection_tcp *conn,
 	struct ioloop *prev_ioloop = current_ioloop;
 	const struct doveadm_cmd_ver2 *cmd_ver2;
 
-	if ((cmd_ver2 = doveadm_cmd_find_with_args_ver2(cmd_name, &argc, &argv)) == NULL) {
+	if ((cmd_ver2 = doveadm_cmdline_find_with_args(cmd_name, &argc, &argv)) == NULL) {
 		i_error("doveadm: Client sent unknown command: %s", cmd_name);
 		return -1;
 	}
@@ -227,10 +235,34 @@ static int doveadm_cmd_handle(struct client_connection_tcp *conn,
 	return 0;
 }
 
-static bool client_handle_command(struct client_connection_tcp *conn,
-				  const char *const *args)
+static void client_connection_log_passthrough(struct client_connection_tcp *conn)
 {
-	struct doveadm_cmd_context cctx;
+	conn->log_out = o_stream_multiplex_add_channel(conn->output,
+						       DOVEADM_LOG_CHANNEL_ID);
+	o_stream_set_no_error_handling(conn->log_out, TRUE);
+	o_stream_set_name(conn->log_out, t_strdup_printf("%s (log)",
+		o_stream_get_name(conn->output)));
+	doveadm_server_capture_logs();
+}
+
+static void
+client_handle_options(struct client_connection_tcp *conn,
+		      const char *const *options)
+{
+	for (unsigned int i = 0; options[i] != NULL; i++) {
+		if (strcmp(options[i], "log-passthrough") == 0) {
+			if (conn->log_out == NULL)
+				client_connection_log_passthrough(conn);
+		} else {
+			/* unknown option - ignore */
+		}
+	}
+}
+
+static bool client_handle_command_ctx(struct client_connection_tcp *conn,
+				      struct doveadm_cmd_context *cctx,
+				      const char *const *args)
+{
 	const char *flags, *cmd_name;
 	unsigned int argc = str_array_length(args);
 
@@ -238,36 +270,37 @@ static bool client_handle_command(struct client_connection_tcp *conn,
 		i_error("doveadm client: No command given");
 		return FALSE;
 	}
-	i_zero(&cctx);
-	cctx.conn_type = conn->conn.type;
-	cctx.input = conn->input;
-	cctx.output = conn->output;
-	cctx.local_ip = conn->conn.local_ip;
-	cctx.remote_ip = conn->conn.remote_ip;
-	cctx.local_port = conn->conn.local_port;
-	cctx.remote_port = conn->conn.remote_port;
 	doveadm_exit_code = 0;
 
-	flags = args[0];
-	cctx.username = args[1];
-	cmd_name = args[2];
+	flags = args[0]; args++; argc--;
 
 	doveadm_debug = FALSE;
 	doveadm_verbose = FALSE;
 
 	for (; *flags != '\0'; flags++) {
 		switch (*flags) {
-		case 'D':
+		case DOVEADM_PROTOCOL_CMD_FLAG_DEBUG:
 			doveadm_debug = TRUE;
 			doveadm_verbose = TRUE;
 			break;
-		case 'v':
+		case DOVEADM_PROTOCOL_CMD_FLAG_VERBOSE:
 			doveadm_verbose = TRUE;
+			break;
+		case DOVEADM_PROTOCOL_CMD_FLAG_EXTRA_FIELDS:
+			cctx->extra_fields = t_strsplit_tabescaped(args[0]);
+			args++; argc--;
 			break;
 		default:
 			i_error("doveadm client: Unknown flag: %c", *flags);
 			return FALSE;
 		}
+	}
+	cctx->username = args[0]; args++; argc--;
+	cmd_name = args[0];
+
+	if (strcmp(cmd_name, "OPTION") == 0) {
+		client_handle_options(conn, args+1);
+		return TRUE;
 	}
 
 	if (!doveadm_client_is_allowed_command(conn->conn.set, cmd_name)) {
@@ -281,7 +314,7 @@ static bool client_handle_command(struct client_connection_tcp *conn,
 	/* Disable IO while running a command. This is required for commands
 	   that do IO themselves (e.g. dsync-server). */
 	io_remove(&conn->io);
-	if (doveadm_cmd_handle(conn, cmd_name, argc-2, args+2, &cctx) < 0)
+	if (doveadm_cmd_handle(conn, cmd_name, argc, args, cctx) < 0)
 		o_stream_nsend(conn->output, "\n-\n", 3);
 	o_stream_uncork(conn->output);
 	conn->io = io_add_istream(conn->input, client_connection_tcp_input, conn);
@@ -292,11 +325,30 @@ static bool client_handle_command(struct client_connection_tcp *conn,
 	return TRUE;
 }
 
+static bool client_handle_command(struct client_connection_tcp *conn,
+				  const char *const *args)
+{
+	struct doveadm_cmd_context cctx;
+
+	i_zero(&cctx);
+	cctx.pool = pool_alloconly_create("doveadm cmd", 256);
+	cctx.conn_type = conn->conn.type;
+	cctx.input = conn->input;
+	cctx.output = conn->output;
+	cctx.local_ip = conn->conn.local_ip;
+	cctx.remote_ip = conn->conn.remote_ip;
+	cctx.local_port = conn->conn.local_port;
+	cctx.remote_port = conn->conn.remote_port;
+	bool ret = client_handle_command_ctx(conn, &cctx, args);
+	pool_unref(&cctx.pool);
+	return ret;
+}
+
 static int
 client_connection_tcp_authenticate(struct client_connection_tcp *conn)
 {
 	const struct doveadm_settings *set = conn->conn.set;
-	const char *line, *pass;
+	const char *line, *args, *pass;
 	buffer_t *plain;
 	const unsigned char *data;
 	size_t size;
@@ -323,13 +375,13 @@ client_connection_tcp_authenticate(struct client_connection_tcp *conn)
 
 	/* FIXME: some day we should probably let auth process do this and
 	   support all kinds of authentication */
-	if (!str_begins(line, "PLAIN\t")) {
+	if (!str_begins(line, "PLAIN\t", &args)) {
 		i_error("doveadm client attempted non-PLAIN authentication: %s", line);
 		return -1;
 	}
 
 	plain = t_buffer_create(128);
-	if (base64_decode(line + 6, strlen(line + 6), NULL, plain) < 0) {
+	if (base64_decode(args, strlen(args), plain) < 0) {
 		i_error("doveadm client sent invalid base64 auth PLAIN data");
 		return -1;
 	}
@@ -370,7 +422,6 @@ client_connection_tcp_input(struct client_connection_tcp *conn)
 	const char *line;
 	bool ok = TRUE;
 	int ret;
-	unsigned int minor;
 
 	if (!conn->handshaked) {
 		if ((line = i_stream_read_next_line(conn->input)) == NULL) {
@@ -381,17 +432,17 @@ client_connection_tcp_input(struct client_connection_tcp *conn)
 			return;
 		}
 		if (!version_string_verify_full(line, "doveadm-server",
-				DOVEADM_SERVER_PROTOCOL_VERSION_MAJOR, &minor)) {
+				DOVEADM_SERVER_PROTOCOL_VERSION_MAJOR,
+				&conn->minor_version)) {
 			i_error("doveadm client not compatible with this server "
 				"(mixed old and new binaries?)");
 			client_connection_tcp_destroy(&conn);
 			return;
 		}
-		if (minor > 0) {
+		if (conn->minor_version >= DOVEADM_PROTOCOL_MIN_VERSION_MULTIPLEX) {
 			/* send version reply */
 			o_stream_nsend_str(conn->output,
 					   DOVEADM_CLIENT_PROTOCOL_VERSION_LINE"\n");
-			conn->use_multiplex = TRUE;
 		}
 		client_connection_tcp_send_auth_handshake(conn);
 		conn->handshaked = TRUE;
@@ -410,19 +461,18 @@ client_connection_tcp_input(struct client_connection_tcp *conn)
 
 	if (!conn->io_setup) {
 		conn->io_setup = TRUE;
-                if (conn->use_multiplex) {
+		if (conn->minor_version >= DOVEADM_PROTOCOL_MIN_VERSION_MULTIPLEX) {
                         struct ostream *os = conn->output;
                         conn->output = o_stream_create_multiplex(os, SIZE_MAX);
                         o_stream_set_name(conn->output, o_stream_get_name(os));
                         o_stream_set_no_error_handling(conn->output, TRUE);
                         o_stream_unref(&os);
-                        conn->log_out =
-                                o_stream_multiplex_add_channel(conn->output,
-                                                               DOVEADM_LOG_CHANNEL_ID);
-                        o_stream_set_no_error_handling(conn->log_out, TRUE);
-                        o_stream_set_name(conn->log_out, t_strdup_printf("%s (log)",
-                                          o_stream_get_name(conn->output)));
-                        doveadm_server_capture_logs();
+		}
+		if (conn->minor_version >= DOVEADM_PROTOCOL_MIN_VERSION_MULTIPLEX &&
+		    conn->minor_version < DOVEADM_PROTOCOL_MIN_VERSION_LOG_PASSTHROUGH) {
+			/* Log passthrough supported by the client, but it's
+			   not explicitly requested. */
+			client_connection_log_passthrough(conn);
                 }
 		doveadm_print_ostream = conn->output;
 	}

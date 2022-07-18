@@ -100,12 +100,13 @@ struct mail_save_context *
 mdbox_save_alloc(struct mailbox_transaction_context *t)
 {
 	struct mdbox_mailbox *mbox = MDBOX_MAILBOX(t->box);
-	struct mdbox_save_context *ctx = MDBOX_SAVECTX(t->save_ctx);
+	struct mdbox_save_context *ctx;
 
 	i_assert((t->flags & MAILBOX_TRANSACTION_FLAG_EXTERNAL) != 0);
 
-	if (ctx != NULL) {
+	if (t->save_ctx != NULL) {
 		/* use the existing allocated structure */
+		ctx = MDBOX_SAVECTX(t->save_ctx);
 		ctx->cur_file = NULL;
 		ctx->ctx.failed = FALSE;
 		ctx->ctx.finished = FALSE;
@@ -269,9 +270,9 @@ mdbox_save_set_map_uids(struct mdbox_save_context *ctx,
 		}
 
 		if (mails[i].save_date > 0)
-			rec.save_date = mails[i].save_date;
+			rec.save_date = time_to_uint32_trunc(mails[i].save_date);
 		else
-			rec.save_date = ioloop_time;
+			rec.save_date = ioloop_time32;
 		rec.map_uid = next_map_uid++;
 		mail_index_update_ext(ctx->ctx.trans, mails[i].seq,
 				      mbox->ext_id, &rec, NULL);
@@ -310,6 +311,7 @@ int mdbox_transaction_save_commit_pre(struct mail_save_context *_ctx)
 		mdbox_transaction_save_rollback(_ctx);
 		return -1;
 	}
+	i_assert(ctx->sync_ctx != NULL);
 
 	/* assign map UIDs for newly saved messages after we've successfully
 	   acquired all the locks. the transaction is now very unlikely to
@@ -445,7 +447,7 @@ int mdbox_copy(struct mail_save_context *_ctx, struct mail *mail)
 	src_mbox = MDBOX_MAILBOX(mail->box);
 
 	i_zero(&rec);
-	rec.save_date = ioloop_time;
+	rec.save_date = ioloop_time32;
 	if (mdbox_mail_lookup(src_mbox, mail->transaction->view, mail->seq,
 			      &rec.map_uid) < 0) {
 		index_save_context_free(_ctx);

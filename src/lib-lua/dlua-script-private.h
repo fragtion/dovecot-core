@@ -15,10 +15,14 @@
 
 #define DLUA_TABLE_STRING(n, val) { .name = (n),\
 				    .type = DLUA_TABLE_VALUE_STRING, .v.s = (val) }
+#define DLUA_TABLE_STRING_SELF(n) { .name = #n,\
+				    .type = DLUA_TABLE_VALUE_STRING, .v.s = (n) }
 #define DLUA_TABLE_INTEGER(n, val) { .name = (n), \
 				    .type = DLUA_TABLE_VALUE_INTEGER, .v.i = (val) }
 #define DLUA_TABLE_ENUM(n) { .name = #n, \
 			     .type = DLUA_TABLE_VALUE_INTEGER, .v.i = (n) }
+#define DLUA_TABLE_ENUM_NOPREFIX(prefix, n) { .name = #n, \
+			     .type = DLUA_TABLE_VALUE_INTEGER, .v.i = (prefix ## n) }
 #define DLUA_TABLE_DOUBLE(n, val) { .name = (n), \
 				    .type = DLUA_TABLE_VALUE_DOUBLE, .v.d = (val) }
 #define DLUA_TABLE_BOOLEAN(n, val) { .name = (n), \
@@ -91,10 +95,13 @@ struct dlua_script *dlua_script_from_state(lua_State *L);
 void dlua_dovecot_register(struct dlua_script *script);
 
 /* push 'dovecot' global on top of stack */
-void dlua_getdovecot(lua_State *L);
+void dlua_get_dovecot(lua_State *L);
+
+/* register 'http' methods to 'dovecot' */
+void dlua_dovecot_http_register(struct dlua_script *script);
 
 /* assign values to table on idx */
-void dlua_setmembers(lua_State *L, const struct dlua_table_values *values, int idx);
+void dlua_set_members(lua_State *L, const struct dlua_table_values *values, int idx);
 
 /* push event to top of stack */
 void dlua_push_event(lua_State *L, struct event *event);
@@ -103,8 +110,8 @@ void dlua_push_event(lua_State *L, struct event *event);
 struct event *dlua_check_event(lua_State *L, int arg);
 
 /* improved lua_pushfstring, can handle full C format support */
-const char *dlua_pushvfstring(lua_State *L, const char *fmt, va_list argp) ATTR_FORMAT(2, 0);
-const char *dlua_pushfstring(lua_State *L, const char *fmt, ...) ATTR_FORMAT(2, 3);
+const char *dlua_push_vfstring(lua_State *L, const char *fmt, va_list argp) ATTR_FORMAT(2, 0);
+const char *dlua_push_fstring(lua_State *L, const char *fmt, ...) ATTR_FORMAT(2, 3);
 
 /* improved luaL_error, can handle full C format support */
 int dluaL_error(lua_State *L, const char *fmt, ...) ATTR_FORMAT(2, 3);
@@ -182,6 +189,26 @@ int dlua_table_get_data_by_thread(lua_State *L, int idx, const unsigned char **v
 int dlua_table_get_by_str(lua_State *L, int idx, int type, const char *field);
 int dlua_table_get_by_int(lua_State *L, int idx, int type, lua_Integer field);
 int dlua_table_get_by_thread(lua_State *L, int idx, int type);
+
+/* Return the table containing string keys and values convertible to strings as
+ * a NULL-terminated array of [key1, value2, key2, value2, ...] strings. The
+ * array and the strings are allocated from the given pool.
+ *
+ * Returns:
+ *   -1 = keys/values aren't types that can be converted to strings
+ *    0 = success */
+
+int dlua_strtable_to_kvarray(lua_State *L, int idx, pool_t pool,
+			     const char *const **arr_r, const char **error_r);
+/* Return the table containing values convertible to strings as a
+ * NULL-terminated array of [value1, value2, ...] strings. The array and the
+ * strings are allocated from the given pool.
+ *
+ * Returns:
+ *   -1 = values aren't types that can be converted to strings
+ *    0 = success */
+int dlua_table_to_array(lua_State *L, int idx, pool_t pool,
+			const char *const **arr_r, const char **error_r);
 
 /* call a function in a script.
 

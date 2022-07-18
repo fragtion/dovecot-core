@@ -105,6 +105,10 @@ enum mailbox_list_file_type {
 	MAILBOX_LIST_FILE_TYPE_OTHER
 };
 
+enum mailbox_list_get_storage_flags {
+	MAILBOX_LIST_GET_STORAGE_FLAG_SAVEONLY = BIT(0),
+};
+
 struct mailbox_list_settings {
 	const char *layout; /* FIXME: shouldn't be here */
 	const char *root_dir;
@@ -162,22 +166,22 @@ struct mailbox_list_settings {
 	   conversion. */
 	char vname_escape_char;
 	/* Use UTF-8 mailbox names on filesystem instead of mUTF-7 */
-	bool utf8;
+	bool utf8:1;
 	/* Don't check/create the alt-dir symlink. */
-	bool alt_dir_nocheck;
+	bool alt_dir_nocheck:1;
 	/* Use maildir_name also for index/control directories. This should
 	   have been the default since the beginning, but for backwards
 	   compatibility it had to be made an option. */
-	bool index_control_use_maildir_name;
+	bool index_control_use_maildir_name:1;
 	/* Perform mailbox iteration using the index directory instead of the
 	   mail root directory. This can be helpful if the indexes are on a
 	   faster storage. This could perhaps be made the default at some point,
 	   but for now since it's less tested it's optional. */
-	bool iter_from_index_dir;
-	/* Avoid creating or listing \NoSelect mailboxes. */
-	bool no_noselect;
+	bool iter_from_index_dir:1;
+	/* Control creation and listing of \NoSelect mailboxes. */
+	bool keep_noselect:1;
 	/* Do not validate names as fs names (allows weird names) */
-	bool no_fs_validation;
+	bool no_fs_validation:1;
 };
 
 struct mailbox_permissions {
@@ -222,7 +226,12 @@ struct mail_namespace *
 mailbox_list_get_namespace(const struct mailbox_list *list) ATTR_PURE;
 struct mail_user *
 mailbox_list_get_user(const struct mailbox_list *list) ATTR_PURE;
-int mailbox_list_get_storage(struct mailbox_list **list, const char *vname,
+/* Get a mail_storage for the given mailbox_list/vname combination. This might
+   result in mailbox_list and/or vname becoming changed. For example shared
+   folders will change the mailbox_list and saving to a virtual folder changes
+   both. */
+int mailbox_list_get_storage(struct mailbox_list **list, const char **vname,
+			     enum mailbox_list_get_storage_flags flags,
 			     struct mail_storage **storage_r);
 void mailbox_list_get_default_storage(struct mailbox_list *list,
 				      struct mail_storage **storage);

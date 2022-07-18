@@ -29,7 +29,6 @@ int dovecot_ssl_extdata_index;
 static RSA *ssl_gen_rsa_key(SSL *ssl ATTR_UNUSED,
 			    int is_export ATTR_UNUSED, int keylength)
 {
-#ifdef HAVE_RSA_GENERATE_KEY_EX
 	BIGNUM *bn = BN_new();
 	RSA *rsa = RSA_new();
 
@@ -44,15 +43,15 @@ static RSA *ssl_gen_rsa_key(SSL *ssl ATTR_UNUSED,
 	if (rsa != NULL)
 		RSA_free(rsa);
 	return NULL;
-#else
-	return RSA_generate_key(keylength, RSA_F4, NULL, NULL);
-#endif
 }
 
-static DH *ssl_tmp_dh_callback(SSL *ssl ATTR_UNUSED,
+static DH *ssl_tmp_dh_callback(SSL *ssl,
 			       int is_export ATTR_UNUSED, int keylength ATTR_UNUSED)
 {
-	i_error("Diffie-Hellman key exchange requested, "
+	struct ssl_iostream *ssl_io =
+		SSL_get_ex_data(ssl, dovecot_ssl_extdata_index);
+
+	e_error(ssl_io->event, "Diffie-Hellman key exchange requested, "
 		"but no DH parameters provided. Set ssl_dh=</path/to/dh.pem");
 	return NULL;
 }
@@ -215,13 +214,9 @@ static int ssl_ctx_use_certificate_chain(SSL_CTX *ctx, const char *cert)
 		X509 *ca;
 		int r;
 		unsigned long err;
-		
+
 		while ((ca = PEM_read_bio_X509(in,NULL,NULL,NULL)) != NULL) {
-#ifdef HAVE_SSL_CTX_ADD0_CHAIN_CERT
 			r = SSL_CTX_add0_chain_cert(ctx, ca);
-#else
-			r = SSL_CTX_add_extra_chain_cert(ctx, ca);
-#endif
 			if (r == 0) {
 				X509_free(ca);
 				ret = 0;
@@ -232,7 +227,7 @@ static int ssl_ctx_use_certificate_chain(SSL_CTX *ctx, const char *cert)
 		err = ERR_peek_last_error();
 		if (ERR_GET_LIB(err) == ERR_LIB_PEM && ERR_GET_REASON(err) == PEM_R_NO_START_LINE)
 			ERR_clear_error();
-		else 
+		else
 			ret = 0; /* some real error */
 		}
 
@@ -329,7 +324,6 @@ ssl_iostream_ctx_verify_remote_cert(struct ssl_iostream_context *ctx,
 	SSL_CTX_set_client_CA_list(ctx->ssl_ctx, ca_names);
 }
 
-#ifdef HAVE_SSL_GET_SERVERNAME
 static int ssl_servername_callback(SSL *ssl, int *al ATTR_UNUSED,
 				   void *context ATTR_UNUSED)
 {
@@ -341,8 +335,8 @@ static int ssl_servername_callback(SSL *ssl, int *al ATTR_UNUSED,
 	if (SSL_get_servername_type(ssl) != -1) {
 		i_free(ssl_io->sni_host);
 		ssl_io->sni_host = i_strdup(host);
-	} else if (ssl_io->verbose) {
-		i_debug("SSL_get_servername() failed");
+	} else {
+		e_debug(ssl_io->event, "SSL_get_servername() failed");
 	}
 
 	if (ssl_io->sni_callback != NULL) {
@@ -354,7 +348,6 @@ static int ssl_servername_callback(SSL *ssl, int *al ATTR_UNUSED,
 	}
 	return SSL_TLSEXT_ERR_OK;
 }
-#endif
 
 static int
 ssl_iostream_context_load_ca(struct ssl_iostream_context *ctx,
@@ -412,7 +405,6 @@ ssl_iostream_context_set(struct ssl_iostream_context *ctx,
 			set->cipher_list, openssl_iostream_error());
 		return -1;
 	}
-#ifdef HAVE_SSL_CTX_SET1_CURVES_LIST
 	if (set->curve_list != NULL && strlen(set->curve_list) > 0 &&
 		SSL_CTX_set1_curves_list(ctx->ssl_ctx, set->curve_list) == 0) {
 		*error_r = t_strdup_printf(
@@ -420,7 +412,6 @@ ssl_iostream_context_set(struct ssl_iostream_context *ctx,
 			set->curve_list);
 		return -1;
 	}
-#endif
 #ifdef HAVE_SSL_CTX_SET_CIPHERSUITES
 	if (set->ciphersuites != NULL &&
 	    SSL_CTX_set_ciphersuites(ctx->ssl_ctx, set->ciphersuites) == 0) {
@@ -494,7 +485,6 @@ ssl_iostream_context_set(struct ssl_iostream_context *ctx,
 			return -1;
 		}
 	}
-#ifdef HAVE_SSL_GET_SERVERNAME
 	if (!ctx->client_ctx) {
 		if (SSL_CTX_set_tlsext_servername_callback(ctx->ssl_ctx,
 					ssl_servername_callback) != 1) {
@@ -502,7 +492,6 @@ ssl_iostream_context_set(struct ssl_iostream_context *ctx,
 				i_debug("OpenSSL library doesn't support SNI");
 		}
 	}
-#endif
 	return 0;
 }
 
@@ -573,9 +562,7 @@ ssl_proxy_ctx_set_crypto_params(SSL_CTX *ssl_ctx,
 	   bool in OpenSSL 1.1 and is int in OpenSSL 1.0.2+ */
 	if ((long)(SSL_CTX_set_ecdh_auto(ssl_ctx, 1)) == 0) {
 		/* shouldn't happen */
-		*error_r = t_strdup_printf("SSL_CTX_set_ecdh_auto() failed: %s",
-					   openssl_iostream_error());
-		return -1;
+		i_unreached();
 	}
 #else
 	/* For OpenSSL < 1.0.2, ECDH temporary key parameter selection must be

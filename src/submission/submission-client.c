@@ -179,13 +179,13 @@ client_create(int fd_in, int fd_out, struct mail_user *user,
 	      struct mail_storage_service_user *service_user,
 	      const struct submission_settings *set, const char *helo,
 	      const struct smtp_proxy_data *proxy_data,
-	      const unsigned char *pdata, unsigned int pdata_len)
+	      const unsigned char *pdata, unsigned int pdata_len,
+	      bool no_greeting)
 {
 	enum submission_client_workarounds workarounds =
 		set->parsed_workarounds;
 	const struct mail_storage_settings *mail_set;
 	struct smtp_server_settings smtp_set;
-	const char *ident;
 	struct client *client;
 	pool_t pool;
 
@@ -212,6 +212,7 @@ client_create(int fd_in, int fd_out, struct mail_user *user,
 	smtp_set.max_client_idle_time_msecs = CLIENT_IDLE_TIMEOUT_MSECS;
 	smtp_set.max_message_size = set->submission_max_mail_size;
 	smtp_set.rawlog_dir = set->rawlog_dir;
+	smtp_set.no_greeting = no_greeting;
 	smtp_set.debug = user->mail_debug;
 
 	if ((workarounds & SUBMISSION_WORKAROUND_WHITESPACE_BEFORE_PATH) != 0) {
@@ -247,14 +248,11 @@ client_create(int fd_in, int fd_out, struct mail_user *user,
 	submission_client_count++;
 	DLLIST_PREPEND(&submission_clients, client);
 
-	ident = mail_user_get_anvil_userip_ident(client->user);
-	if (ident != NULL) {
-		master_service_anvil_send(
-			master_service, t_strconcat(
-				"CONNECT\t", my_pid, "\tsubmission/", ident,
-				"\n", NULL));
+	struct master_service_anvil_session anvil_session;
+	mail_user_get_anvil_session(client->user, &anvil_session);
+	if (master_service_anvil_connect(master_service, &anvil_session,
+					 TRUE, client->anvil_conn_guid))
 		client->anvil_sent = TRUE;
-	}
 
 	if (hook_client_created != NULL)
 		hook_client_created(&client);
@@ -314,11 +312,10 @@ client_default_destroy(struct client *client)
 	DLLIST_REMOVE(&submission_clients, client);
 
 	if (client->anvil_sent) {
-		master_service_anvil_send(
-			master_service, t_strconcat(
-				"DISCONNECT\t", my_pid, "\tsubmission/",
-				mail_user_get_anvil_userip_ident(client->user),
-				"\n", NULL));
+		struct master_service_anvil_session anvil_session;
+		mail_user_get_anvil_session(client->user, &anvil_session);
+		master_service_anvil_disconnect(master_service, &anvil_session,
+						client->anvil_conn_guid);
 	}
 
 	if (client->urlauth_ctx != NULL)
@@ -413,7 +410,7 @@ static const char *client_stats(struct client *client)
 	str = t_str_new(128);
 	if (var_expand_with_funcs(str, client->set->submission_logout_format,
 				  tab, mail_user_var_expand_func_table,
-				  client->user, &error) < 0) {
+				  client->user, &error) <= 0) {
 		i_error("Failed to expand submission_logout_format=%s: %s",
 			client->set->submission_logout_format, error);
 	}
@@ -496,14 +493,16 @@ void client_add_extra_capability(struct client *client, const char *capability,
 	array_push_back(&client->extra_capabilities, &cap);
 }
 
+void client_kick(struct client *client)
+{
+	mail_storage_service_io_activate_user(client->service_user);
+	client_destroy(&client, "4.3.2", MASTER_SERVICE_SHUTTING_DOWN_MSG);
+}
+
 void clients_destroy_all(void)
 {
-	while (submission_clients != NULL) {
-		struct client *client = submission_clients;
-
-		mail_storage_service_io_activate_user(client->service_user);
-		client_destroy(&client, "4.3.2", "Shutting down");
-	}
+	while (submission_clients != NULL)
+		client_kick(submission_clients);
 }
 
 static const struct smtp_server_callbacks smtp_callbacks = {

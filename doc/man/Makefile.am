@@ -8,8 +8,7 @@ dist_man1_MANS = \
 	doveadm-config.1 \
 	doveadm-copy.1 \
 	doveadm-reload.1 \
-	doveadm-stop.1 \
-	dsync.1
+	doveadm-stop.1
 
 dist_man7_MANS = \
 	doveadm-search-query.7
@@ -19,7 +18,6 @@ nodist_man1_MANS = \
 	doveadm-acl.1 \
 	doveadm-altmove.1 \
 	doveadm-auth.1 \
-	doveadm-batch.1 \
 	doveadm-deduplicate.1 \
 	doveadm-director.1 \
 	doveadm-dump.1 \
@@ -30,6 +28,7 @@ nodist_man1_MANS = \
 	doveadm-fs.1 \
 	doveadm-fts.1 \
 	doveadm-import.1 \
+	doveadm-indexer.1 \
 	doveadm-instance.1 \
 	doveadm-index.1 \
 	doveadm-force-resync.1 \
@@ -71,7 +70,6 @@ EXTRA_DIST = \
 	doveadm-acl.1.in \
 	doveadm-altmove.1.in \
 	doveadm-auth.1.in \
-	doveadm-batch.1.in \
 	doveadm-deduplicate.1.in \
 	doveadm-director.1.in \
 	doveadm-dump.1.in \
@@ -82,6 +80,7 @@ EXTRA_DIST = \
 	doveadm-fs.1.in \
 	doveadm-fts.1.in \
 	doveadm-import.1.in \
+	doveadm-indexer.1.in \
 	doveadm-instance.1.in \
 	doveadm-index.1.in \
 	doveadm-force-resync.1.in \
@@ -114,5 +113,5 @@ EXTRA_DIST = \
 CLEANFILES = $(nodist_man1_MANS)
 
 .1.in.1: $(man_includefiles) Makefile
-	$(SHELL) $(srcdir)/sed.sh $(srcdir) $(rundir) $(pkgsysconfdir) \
+	$(AM_V_GEN)$(SHELL) $(srcdir)/sed.sh $(srcdir) $(rundir) $(pkgsysconfdir) \
 		$(pkglibexecdir) < $< > $@

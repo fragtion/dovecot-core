@@ -15,8 +15,8 @@
 #include "master-service-settings.h"
 #include "auth-client.h"
 #include "auth-master.h"
-#include "master-auth.h"
-#include "master-login-auth.h"
+#include "login-interface.h"
+#include "login-server-auth.h"
 #include "mail-storage-service.h"
 #include "mail-user.h"
 #include "doveadm.h"
@@ -38,13 +38,25 @@ struct authtest_input {
 	bool success;
 
 	struct auth_client_request *request;
-	struct master_auth_request master_auth_req;
 
 	unsigned int auth_id;
 	unsigned int auth_pid;
 	const char *auth_cookie;
 
 };
+
+static bool auth_want_log_debug(void)
+{
+	struct event *event_auth = event_create(NULL);
+	event_add_category(event_auth, &event_category_auth);
+
+	bool ret = doveadm_debug || doveadm_settings->auth_debug ||
+		event_want_debug_log(event_auth);
+
+	event_unref(&event_auth);
+
+	return ret;
+}
 
 static void auth_cmd_help(struct doveadm_cmd_context *cctx);
 
@@ -53,7 +65,7 @@ doveadm_get_auth_master_conn(const char *auth_socket_path)
 {
 	enum auth_master_flags flags = 0;
 
-	if (doveadm_debug)
+	if (auth_want_log_debug())
 		flags |= AUTH_MASTER_FLAG_DEBUG;
 	return auth_master_init(auth_socket_path, flags);
 }
@@ -164,15 +176,12 @@ auth_callback(struct auth_client_request *request ATTR_UNUSED,
 static void auth_connected(struct auth_client *client,
 			   bool connected, void *context)
 {
-	struct event *event_auth;
 	struct authtest_input *input = context;
 	struct auth_request_info info;
 	string_t *init_resp, *base64_resp;
 
 	if (!connected)
 		i_fatal("Couldn't connect to auth socket");
-	event_auth = event_create(NULL);
-	event_add_category(event_auth, &event_category_auth);
 
 	init_resp = t_str_new(128);
 	str_append(init_resp, input->username);
@@ -203,13 +212,11 @@ static void auth_connected(struct auth_client *client,
 	info.extra_fields = input->info.extra_fields;
 	info.forward_fields = input->info.forward_fields;
 	info.initial_resp_base64 = str_c(base64_resp);
-	if (doveadm_settings->auth_debug ||
-	    event_want_debug_log(event_auth))
+	if (auth_want_log_debug())
 		info.flags |= AUTH_REQUEST_FLAG_DEBUG;
 
 	input->request = auth_client_request_new(client, &info,
 						 auth_callback, input);
-	event_unref(&event_auth);
 }
 
 static void
@@ -234,55 +241,43 @@ cmd_auth_input(const char *auth_socket_path, struct authtest_input *input)
 }
 
 static void
-auth_user_info_parse_arg(struct auth_user_info *info, const char *arg)
+auth_user_info_parse_arg(struct auth_user_info *info, const char *arg,
+			 ARRAY_TYPE(const_string) *forward_fields)
 {
-	if (str_begins(arg, "service="))
-		info->service = arg + 8;
-	else if (str_begins(arg, "session="))
-		info->session_id = arg + 8;
-	else if (str_begins(arg, "local_name="))
-		info->local_name = arg + 11;
-	else if (str_begins(arg, "lip=")) {
-		if (net_addr2ip(arg + 4, &info->local_ip) < 0)
-			i_fatal("lip: Invalid ip");
-	} else if (str_begins(arg, "rip=")) {
-		if (net_addr2ip(arg + 4, &info->remote_ip) < 0)
-			i_fatal("rip: Invalid ip");
-	} else if (str_begins(arg, "lport=")) {
-		if (net_str2port(arg + 6, &info->local_port) < 0)
-			i_fatal("lport: Invalid port number");
-	} else if (str_begins(arg, "rport=")) {
-		if (net_str2port(arg + 6, &info->remote_port) < 0)
-			i_fatal("rport: Invalid port number");
-	} else if (str_begins(arg, "real_lip=")) {
-		if (net_addr2ip(arg + 9, &info->real_local_ip) < 0)
-			i_fatal("real_lip: Invalid ip");
-	} else if (str_begins(arg, "real_rip=")) {
-		if (net_addr2ip(arg + 9, &info->real_remote_ip) < 0)
-			i_fatal("real_rip: Invalid ip");
-	} else if (str_begins(arg, "real_lport=")) {
-		if (net_str2port(arg + 11, &info->real_local_port) < 0)
-			i_fatal("real_lport: Invalid port number");
-	} else if (str_begins(arg, "real_rport=")) {
-		if (net_str2port(arg + 11, &info->real_remote_port) < 0)
-			i_fatal("real_rport: Invalid port number");
-	} else if (str_begins(arg, "forward_")) {
-		const char *key = arg+8;
-		const char *value = strchr(arg+8, '=');
+	const char *key, *value;
 
-		if (value == NULL)
-			value = "";
-		else
-			key = t_strdup_until(key, value++);
-		key = str_tabescape(key);
-		value = str_tabescape(value);
-		if (info->forward_fields == NULL) {
-			info->forward_fields =
-				t_strdup_printf("%s=%s", key, value);
-		} else {
-			info->forward_fields =
-				t_strdup_printf("%s\t%s=%s", info->forward_fields, key, value);
-		}
+	if (str_begins(arg, "service=", &value))
+		info->service = value;
+	else if (str_begins(arg, "session=", &value))
+		info->session_id = value;
+	else if (str_begins(arg, "local_name=", &value))
+		info->local_name = value;
+	else if (str_begins(arg, "lip=", &value)) {
+		if (net_addr2ip(value, &info->local_ip) < 0)
+			i_fatal("lip: Invalid ip");
+	} else if (str_begins(arg, "rip=", &value)) {
+		if (net_addr2ip(value, &info->remote_ip) < 0)
+			i_fatal("rip: Invalid ip");
+	} else if (str_begins(arg, "lport=", &value)) {
+		if (net_str2port(value, &info->local_port) < 0)
+			i_fatal("lport: Invalid port number");
+	} else if (str_begins(arg, "rport=", &value)) {
+		if (net_str2port(value, &info->remote_port) < 0)
+			i_fatal("rport: Invalid port number");
+	} else if (str_begins(arg, "real_lip=", &value)) {
+		if (net_addr2ip(value, &info->real_local_ip) < 0)
+			i_fatal("real_lip: Invalid ip");
+	} else if (str_begins(arg, "real_rip=", &value)) {
+		if (net_addr2ip(value, &info->real_remote_ip) < 0)
+			i_fatal("real_rip: Invalid ip");
+	} else if (str_begins(arg, "real_lport=", &value)) {
+		if (net_str2port(value, &info->real_local_port) < 0)
+			i_fatal("real_lport: Invalid port number");
+	} else if (str_begins(arg, "real_rport=", &value)) {
+		if (net_str2port(value, &info->real_remote_port) < 0)
+			i_fatal("real_rport: Invalid port number");
+	} else if (str_begins(arg, "forward_", &key)) {
+		array_push_back(forward_fields, &key);
 	} else {
 		if (!array_is_created(&info->extra_fields))
 			t_array_init(&info->extra_fields, 4);
@@ -293,8 +288,14 @@ auth_user_info_parse_arg(struct auth_user_info *info, const char *arg)
 static void
 auth_user_info_parse(struct auth_user_info *info, const char *const *args)
 {
+	ARRAY_TYPE(const_string) forward_fields;
+	t_array_init(&forward_fields, 8);
 	for (unsigned int i = 0; args[i] != NULL; i++)
-		auth_user_info_parse_arg(info, args[i]);
+		auth_user_info_parse_arg(info, args[i], &forward_fields);
+	if (array_count(&forward_fields) > 0) {
+		array_append_zero(&forward_fields);
+		info->forward_fields = array_front(&forward_fields);
+	}
 }
 
 static void
@@ -349,7 +350,7 @@ static void authtest_input_init(struct authtest_input *input)
 {
 	i_zero(input);
 	input->info.service = "doveadm";
-	input->info.debug = doveadm_settings->auth_debug;
+	input->info.debug = auth_want_log_debug();
 }
 
 static void cmd_auth_test(struct doveadm_cmd_context *cctx)
@@ -374,8 +375,8 @@ static void cmd_auth_test(struct doveadm_cmd_context *cctx)
 }
 
 static void
-master_auth_callback(const char *const *auth_args,
-		     const char *errormsg, void *context)
+login_server_auth_callback(const char *const *auth_args,
+			   const char *errormsg, void *context)
 {
 	struct authtest_input *input = context;
 	unsigned int i;
@@ -395,31 +396,31 @@ static void
 cmd_auth_master_input(const char *auth_master_socket_path,
 		      struct authtest_input *input)
 {
-	struct master_login_auth *master_auth;
-	struct master_auth_request master_auth_req;
+	struct login_server_auth *auth;
+	struct login_request login_req;
 	buffer_t buf;
 
-	i_zero(&master_auth_req);
-	master_auth_req.tag = 1;
-	master_auth_req.auth_pid = input->auth_pid;
-	master_auth_req.auth_id = input->auth_id;
-	master_auth_req.client_pid = getpid();
-	master_auth_req.local_ip = input->info.local_ip;
-	master_auth_req.remote_ip = input->info.remote_ip;
+	i_zero(&login_req);
+	login_req.tag = 1;
+	login_req.auth_pid = input->auth_pid;
+	login_req.auth_id = input->auth_id;
+	login_req.client_pid = getpid();
+	login_req.local_ip = input->info.local_ip;
+	login_req.remote_ip = input->info.remote_ip;
 
-	buffer_create_from_data(&buf, master_auth_req.cookie,
-				sizeof(master_auth_req.cookie));
-	if (strlen(input->auth_cookie) == MASTER_AUTH_COOKIE_SIZE*2)
+	buffer_create_from_data(&buf, login_req.cookie,
+				sizeof(login_req.cookie));
+	if (strlen(input->auth_cookie) == LOGIN_REQUEST_COOKIE_SIZE*2)
 		(void)hex_to_binary(input->auth_cookie, &buf);
 
 	input->success = FALSE;
-	master_auth = master_login_auth_init(auth_master_socket_path, FALSE);
+	auth = login_server_auth_init(auth_master_socket_path, FALSE);
 	io_loop_set_running(current_ioloop);
-	master_login_auth_request(master_auth, &master_auth_req,
-				  master_auth_callback, input);
+	login_server_auth_request(auth, &login_req,
+				  login_server_auth_callback, input);
 	if (io_loop_is_running(current_ioloop))
 		io_loop_run(current_ioloop);
-	master_login_auth_deinit(&master_auth);
+	login_server_auth_deinit(&auth);
 }
 
 static void cmd_auth_login(struct doveadm_cmd_context *cctx)

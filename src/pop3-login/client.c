@@ -12,6 +12,7 @@
 #include "str.h"
 #include "strescape.h"
 #include "master-service.h"
+#include "pop3-protocol.h"
 #include "client.h"
 #include "client-authenticate.h"
 #include "auth-client.h"
@@ -26,7 +27,7 @@
 
 static bool cmd_stls(struct pop3_client *client)
 {
-	client_cmd_starttls(&client->common);	
+	client_cmd_starttls(&client->common);
 	return TRUE;
 }
 
@@ -39,7 +40,7 @@ static bool cmd_quit(struct pop3_client *client)
 
 static bool cmd_xclient(struct pop3_client *client, const char *args)
 {
-	const char *const *tmp;
+	const char *const *tmp, *value;
 	in_port_t remote_port;
 	bool args_ok = TRUE;
 
@@ -49,31 +50,24 @@ static bool cmd_xclient(struct pop3_client *client, const char *args)
 		return TRUE;
 	}
 	for (tmp = t_strsplit(args, " "); *tmp != NULL; tmp++) {
-		if (strncasecmp(*tmp, "ADDR=", 5) == 0) {
-			if (net_addr2ip(*tmp + 5, &client->common.ip) < 0)
+		if (str_begins_icase(*tmp, "ADDR=", &value)) {
+			if (net_addr2ip(value, &client->common.ip) < 0)
 				args_ok = FALSE;
-		} else if (strncasecmp(*tmp, "PORT=", 5) == 0) {
-			if (net_str2port(*tmp + 5, &remote_port) < 0)
+		} else if (str_begins_icase(*tmp, "PORT=", &value)) {
+			if (net_str2port(value, &remote_port) < 0)
 				args_ok = FALSE;
 			else
 				client->common.remote_port = remote_port;
-		} else if (strncasecmp(*tmp, "SESSION=", 8) == 0) {
-			const char *value = *tmp + 8;
-
+		} else if (str_begins_icase(*tmp, "SESSION=", &value)) {
 			if (strlen(value) <= LOGIN_MAX_SESSION_ID_LEN) {
 				client->common.session_id =
 					p_strdup(client->common.pool, value);
 			}
-		} else if (strncasecmp(*tmp, "TTL=", 4) == 0) {
-			if (str_to_uint(*tmp + 4, &client->common.proxy_ttl) < 0)
+		} else if (str_begins_icase(*tmp, "TTL=", &value)) {
+			if (str_to_uint(value, &client->common.proxy_ttl) < 0)
 				args_ok = FALSE;
-		} else if (strncasecmp(*tmp, "FORWARD=", 8) == 0) {
-			size_t value_len = strlen((*tmp)+8);
-			client->common.forward_fields =
-				str_new(client->common.preproxy_pool,
-					MAX_BASE64_DECODED_SIZE(value_len));
-			if (base64_decode((*tmp)+8, value_len, NULL,
-					  client->common.forward_fields) < 0)
+		} else if (str_begins_icase(*tmp, "FORWARD=", &value)) {
+			if (!client_forward_decode_base64(&client->common, value))
 				args_ok = FALSE;
 		}
 	}
@@ -319,7 +313,7 @@ void client_send_reply(struct client *client, enum pop3_cmd_reply reply,
 	} T_END;
 }
 
-static void 
+static void
 pop3_client_notify_disconnect(struct client *client,
 			      enum client_disconnect_reason reason,
 			      const char *text)
@@ -373,8 +367,8 @@ static struct client_vfuncs pop3_client_vfuncs = {
 static struct login_binary pop3_login_binary = {
 	.protocol = "pop3",
 	.process_name = "pop3-login",
-	.default_port = 110,
-	.default_ssl_port = 995,
+	.default_port = POP3_DEFAULT_PORT,
+	.default_ssl_port = POP3S_DEFAULT_PORT,
 
 	.event_category = {
 		.name = "pop3",

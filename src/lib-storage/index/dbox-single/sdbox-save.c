@@ -57,12 +57,13 @@ struct mail_save_context *
 sdbox_save_alloc(struct mailbox_transaction_context *t)
 {
 	struct sdbox_mailbox *mbox = SDBOX_MAILBOX(t->box);
-	struct sdbox_save_context *ctx = SDBOX_SAVECTX(t->save_ctx);
+	struct sdbox_save_context *ctx;
 
 	i_assert((t->flags & MAILBOX_TRANSACTION_FLAG_EXTERNAL) != 0);
 
-	if (ctx != NULL) {
+	if (t->save_ctx != NULL) {
 		/* use the existing allocated structure */
+		ctx = SDBOX_SAVECTX(t->save_ctx);
 		ctx->cur_file = NULL;
 		ctx->ctx.failed = FALSE;
 		ctx->ctx.finished = FALSE;
@@ -182,7 +183,7 @@ static int dbox_save_finish_write(struct mail_save_context *_ctx)
 	if (_ctx->data.save_date != (time_t)-1) {
 		/* we can't change ctime, but we can add the date to cache */
 		struct index_mail *mail = (struct index_mail *)_ctx->dest_mail;
-		uint32_t t = _ctx->data.save_date;
+		uint32_t t = time_to_uint32_trunc(_ctx->data.save_date);
 
 		index_mail_cache_add(mail, MAIL_CACHE_SAVE_DATE, &t, sizeof(t));
 	}

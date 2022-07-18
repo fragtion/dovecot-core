@@ -2,6 +2,7 @@
 
 #include "auth-common.h"
 #include "array.h"
+#include "auth-settings.h"
 #include "ioloop.h"
 #include "net.h"
 #include "lib-signals.h"
@@ -25,9 +26,8 @@
 #include "auth-penalty.h"
 #include "auth-token.h"
 #include "auth-request-handler.h"
-#include "auth-request-stats.h"
 #include "auth-worker-server.h"
-#include "auth-worker-client.h"
+#include "auth-worker-connection.h"
 #include "auth-master-connection.h"
 #include "auth-client-connection.h"
 #include "auth-policy.h"
@@ -157,8 +157,8 @@ static void listeners_init(void)
 
 static bool auth_module_filter(const char *name, void *context ATTR_UNUSED)
 {
-	if (str_begins(name, "authdb_") ||
-	    str_begins(name, "mech_")) {
+	if (str_begins_with(name, "authdb_") ||
+	    str_begins_with(name, "mech_")) {
 		/* this is lazily loaded */
 		return FALSE;
 	}
@@ -194,7 +194,6 @@ static void main_preinit(void)
 
 	if (!worker)
 		auth_penalty = auth_penalty_init(AUTH_PENALTY_ANVIL_PATH);
-	auth_request_stats_init();
 	mech_init(global_auth_settings);
 	mech_reg = mech_register_init(global_auth_settings);
 	dict_drivers_register_builtin();
@@ -238,10 +237,13 @@ static void main_init(void)
 	auth_worker_refresh_proctitle("");
 
 	child_wait_init();
-	auth_worker_server_init();
+	auth_worker_connection_init();
 	auths_init();
 	auth_request_handler_init();
 	auth_policy_init();
+
+	if (global_auth_settings->allow_weak_schemes)
+		password_schemes_allow_weak(TRUE);
 
 	if (worker) {
 		/* workers have only a single connection from the master
@@ -254,6 +256,8 @@ static void main_init(void)
 	} else {
 		/* caching is handled only by the main auth process */
 		passdb_cache_init(global_auth_settings);
+		if (global_auth_settings->allow_weak_schemes)
+			i_warning("Weak password schemes are allowed");
 	}
 }
 
@@ -266,7 +270,7 @@ static void main_deinit(void)
 		auth_penalty_deinit(&auth_penalty);
 	}
 	/* deinit auth workers, which aborts pending requests */
-        auth_worker_server_deinit();
+        auth_worker_connection_deinit();
 	/* deinit passdbs and userdbs. it aborts any pending async requests. */
 	auths_deinit();
 	/* flush pending requests */
@@ -294,7 +298,6 @@ static void main_deinit(void)
 	passdbs_deinit();
 	passdb_cache_deinit();
         password_schemes_deinit();
-	auth_request_stats_deinit();
 
 	sql_drivers_deinit();
 	child_wait_deinit();
@@ -307,13 +310,13 @@ static void main_deinit(void)
 
 static void worker_connected(struct master_service_connection *conn)
 {
-	if (auth_worker_has_client()) {
+	if (auth_worker_has_connections()) {
 		i_error("Auth workers can handle only a single client");
 		return;
 	}
 
 	master_service_client_connection_accept(conn);
-	(void)auth_worker_client_create(auth_default_service(), conn);
+	(void)auth_worker_server_create(auth_default_service(), conn);
 }
 
 static void client_connected(struct master_service_connection *conn)
@@ -362,7 +365,7 @@ static void auth_die(void)
 		/* do nothing. auth clients should disconnect soon. */
 	} else {
 		/* ask auth master to disconnect us */
-		auth_worker_client_send_shutdown();
+		auth_worker_server_send_shutdown();
 	}
 }
 
@@ -370,7 +373,6 @@ int main(int argc, char *argv[])
 {
 	int c;
 	enum master_service_flags service_flags =
-		MASTER_SERVICE_FLAG_USE_SSL_SETTINGS |
 		MASTER_SERVICE_FLAG_NO_SSL_INIT;
 
 	master_service = master_service_init("auth", service_flags, &argc, &argv, "w");

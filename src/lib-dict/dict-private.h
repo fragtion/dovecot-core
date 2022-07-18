@@ -1,3 +1,4 @@
+
 #ifndef DICT_PRIVATE_H
 #define DICT_PRIVATE_H
 
@@ -6,15 +7,20 @@
 
 struct ioloop;
 
+enum dict_driver_flags {
+	DICT_DRIVER_FLAG_SUPPORT_EXPIRE_SECS	= BIT(0),
+};
+
 struct dict_vfuncs {
 	int (*init)(struct dict *dict_driver, const char *uri,
 		    const struct dict_settings *set,
 		    struct dict **dict_r, const char **error_r);
 	void (*deinit)(struct dict *dict);
 	void (*wait)(struct dict *dict);
+	int (*expire_scan)(struct dict *dict, const char **error_r);
 
 	int (*lookup)(struct dict *dict, const struct dict_op_settings *set,
-		      pool_t pool, const char *key, const char **value_r,
+		      pool_t pool, const char *key, const char *const **values_r,
 		      const char **error_r);
 
 	struct dict_iterate_context *
@@ -55,10 +61,13 @@ struct dict_commit_callback_ctx;
 struct dict_op_settings_private {
 	char *username;
 	char *home_dir;
+	unsigned int expire_secs;
+	bool no_slowness_warning;
 };
 
 struct dict {
 	const char *name;
+	enum dict_driver_flags flags;
 
 	struct dict_vfuncs v;
 	unsigned int iter_count;
@@ -68,6 +77,7 @@ struct dict {
 	struct event *event;
 	struct ioloop *ioloop, *prev_ioloop;
 	struct dict_commit_callback_ctx *commits;
+	struct dict_transaction_context *rollbacks;
 };
 
 struct dict_iterate_context {
@@ -92,8 +102,10 @@ struct dict_transaction_context {
 	struct event *event;
 	struct timespec timestamp;
 
+	struct timeout *to_rollback;
+	const char *error;
+
 	bool changed:1;
-	bool no_slowness_warning:1;
 };
 
 void dict_transaction_commit_async_noop_callback(
@@ -102,8 +114,6 @@ void dict_transaction_commit_async_noop_callback(
 extern struct dict dict_driver_client;
 extern struct dict dict_driver_file;
 extern struct dict dict_driver_fs;
-extern struct dict dict_driver_memcached;
-extern struct dict dict_driver_memcached_ascii;
 extern struct dict dict_driver_redis;
 extern struct dict dict_driver_cdb;
 extern struct dict dict_driver_fail;

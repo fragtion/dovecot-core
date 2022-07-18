@@ -20,12 +20,6 @@
 /* How often to touch the dotlock file when using KEEP_LOCKED flag */
 #define MBOX_LOCK_TOUCH_MSECS (10*1000)
 
-/* Assume that if atime < mtime, there are new mails. If it's good enough for
-   UW-IMAP, it's good enough for us. */
-#define STAT_GET_MARKED(st) \
-	((st).st_size == 0 ? MAILBOX_UNMARKED : \
-	 (st).st_atime < (st).st_mtime ? MAILBOX_MARKED : MAILBOX_UNMARKED)
-
 #define MBOX_LIST_CONTEXT(obj) \
 	MODULE_CONTEXT_REQUIRE(obj, mbox_mailbox_list_module)
 
@@ -197,7 +191,7 @@ mbox_storage_create(struct mail_storage *_storage, struct mail_namespace *ns,
 	if (stat(ns->list->set.root_dir, &st) == 0 && !S_ISDIR(st.st_mode)) {
 		*error_r = t_strdup_printf(
 			"mbox root directory can't be a file: %s "
-			"(http://wiki2.dovecot.org/MailLocation/Mbox)",
+			"(https://doc.dovecot.org/configuration_manual/mail_location/mbox/)",
 			ns->list->set.root_dir);
 		return -1;
 	}
@@ -466,7 +460,7 @@ static int mbox_mailbox_open_existing(struct mbox_mailbox *mbox)
 		   /var/mail and we want to allow privileged dotlocking */
 		rootdir = mailbox_list_get_root_forced(box->list,
 						       MAILBOX_LIST_PATH_TYPE_DIR);
-		if (!str_begins(box_path, rootdir))
+		if (!str_begins_with(box_path, rootdir))
 			mbox->mbox_privileged_locking = TRUE;
 	}
 	if ((box->flags & MAILBOX_FLAG_KEEP_LOCKED) != 0) {
@@ -896,6 +890,7 @@ struct mailbox mbox_mailbox = {
 		index_storage_search_deinit,
 		index_storage_search_next_nonblock,
 		index_storage_search_next_update_seq,
+		index_storage_search_next_match_mail,
 		mbox_save_alloc,
 		mbox_save_begin,
 		mbox_save_continue,

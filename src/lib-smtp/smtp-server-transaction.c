@@ -4,8 +4,6 @@
 #include "array.h"
 #include "str.h"
 #include "strfuncs.h"
-#include "guid.h"
-#include "base64.h"
 #include "message-date.h"
 #include "smtp-address.h"
 #include "smtp-params.h"
@@ -18,13 +16,14 @@ smtp_server_transaction_update_event(struct smtp_server_transaction *trans)
 	struct event *event = trans->event;
 
 	event_add_str(event, "transaction_id", trans->id);
+	event_add_str(event, "session", trans->id);
 	event_add_str(event, "mail_from",
 		      smtp_address_encode(trans->mail_from));
 	event_add_str(event, "mail_from_raw",
 		      smtp_address_encode_raw(trans->mail_from));
 	smtp_params_mail_add_to_event(&trans->params, event);
 	event_set_append_log_prefix(event,
-				    t_strdup_printf("trans %s: ", trans->id));
+				    t_strdup_printf("trans <%s>: ", trans->id));
 }
 
 struct smtp_server_transaction *
@@ -33,8 +32,6 @@ smtp_server_transaction_create(struct smtp_server_connection *conn,
 {
 	struct smtp_server_transaction *trans;
 	pool_t pool;
-	guid_128_t guid;
-	string_t *id;
 
 	/* create new transaction */
 	pool = pool_alloconly_create("smtp server transaction", 4096);
@@ -43,12 +40,12 @@ smtp_server_transaction_create(struct smtp_server_connection *conn,
 	trans->conn = conn;
 
 	/* generate transaction ID */
-	id = t_str_new(30);
-	guid_128_generate(guid);
-	base64_encode(guid, sizeof(guid), id);
-	i_assert(str_c(id)[str_len(id)-2] == '=');
-	str_truncate(id, str_len(id)-2); /* drop trailing "==" */
-	trans->id = p_strdup(pool, str_c(id));
+	if (conn->transaction_seq++ == 0)
+		trans->id = conn->session_id;
+	else {
+		trans->id = p_strdup_printf(pool, "%s:T%u", conn->session_id,
+					    conn->transaction_seq);
+	}
 
 	trans->flags = mail_data->flags;
 	trans->mail_from = smtp_address_clone(trans->pool, mail_data->path);

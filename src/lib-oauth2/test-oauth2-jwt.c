@@ -138,9 +138,10 @@ static buffer_t *create_jwt_token_kid(const char *algo, const char *kid)
 
 	/* body */
 	base64url_encode_str(
+		/* decimals injected to excercise the JSON number parser */
 		t_strdup_printf("{\"sub\":\"testuser\","\
 				"\"iat\":%"PRIdTIME_T","
-				"\"exp\":%"PRIdTIME_T"}",
+				"\"exp\":%"PRIdTIME_T".000E+0}",
 				time(NULL), time(NULL)+600),
 		tokenbuf);
 	return tokenbuf;
@@ -159,9 +160,10 @@ static buffer_t *create_jwt_token(const char *algo)
 
 	/* body */
 	base64url_encode_str(
+		/* decimals injected to excercise the JSON number parser */
 		t_strdup_printf("{\"sub\":\"testuser\","\
 				"\"iat\":%"PRIdTIME_T","
-				"\"exp\":%"PRIdTIME_T"}",
+				"\"exp\":%"PRIdTIME_T".000E+0}",
 				time(NULL), time(NULL)+600),
 		tokenbuf);
 	return tokenbuf;
@@ -475,6 +477,13 @@ static void test_jwt_bad_valid_token(void)
 			.key_values = { NULL },
 			.error = "Missing 'sub' field",
 		},
+		{ /* no expiration */
+			.key_values = {
+				"sub", "testuser",
+				NULL
+			},
+			.error = "Missing 'exp' field",
+		},
 		{ /* non-ISO date as iat */
 			.exp = now+500,
 			.iat = 0,
@@ -547,6 +556,76 @@ static void test_jwt_bad_valid_token(void)
 	test_end();
 }
 
+static void test_jwt_valid_token(void)
+{
+	test_begin("JWT valid token tests");
+	time_t now = time(NULL);
+
+	struct test_cases {
+		time_t exp;
+		time_t iat;
+		time_t nbf;
+		const char *key_values[20];
+	} test_cases[] = {
+	{	/* valid token */
+		.exp = now + 500,
+		.key_values = {
+			"sub", "testuser",
+			NULL
+		},
+	},
+	{
+		.exp = now + 500,
+		.nbf = now - 500,
+		.iat = now - 250,
+		.key_values = {
+			"sub", "testuser",
+			NULL
+		},
+	},
+	{	/* token issued in advance */
+		.exp = now + 500,
+		.nbf = now - 500,
+		.iat = now - 3600,
+		.key_values = {
+			"sub", "testuser",
+			NULL,
+		},
+	},
+	};
+
+	for (size_t i = 0; i < N_ELEMENTS(test_cases); i++) T_BEGIN {
+		const struct test_cases *test_case = &test_cases[i];
+		ARRAY_TYPE(oauth2_field) fields;
+
+		t_array_init(&fields, 8);
+		for (unsigned int i = 0; test_case->key_values[i] != NULL; i += 2) {
+			struct oauth2_field *field = array_append_space(&fields);
+			field->name = test_case->key_values[i];
+			field->value = test_case->key_values[i+1];
+		}
+
+		buffer_t *tokenbuf =
+			create_jwt_token_fields("HS256", test_case->exp,
+						test_case->iat, test_case->nbf,
+						&fields);
+		sign_jwt_token_hs256(tokenbuf, hs_sign_key);
+
+		struct oauth2_request req;
+		const char *error = NULL;
+		bool is_jwt;
+
+		test_assert_idx(parse_jwt_token(&req, str_c(tokenbuf),
+						&is_jwt, &error) == 0, i);
+		test_assert_idx(is_jwt == TRUE, i);
+		test_assert_idx(error == NULL, i);
+		if (error != NULL)
+			i_error("JWT validation error: %s", error);
+	} T_END;
+
+	test_end();
+}
+
 static void test_jwt_dates(void)
 {
 	test_begin("JWT Token dates");
@@ -585,8 +664,9 @@ static void test_jwt_dates(void)
 	base64url_encode_str("{\"alg\":\"HS256\",\"typ\":\"JWT\"}", tokenbuf);
 	str_append_c(tokenbuf, '.');
 	base64url_encode_str(t_strdup_printf("{\"sub\":\"testuser\","
+					     "\"nbf\":0,"
 					     "\"exp\":%"PRIdTIME_T","
-					     "\"nbf\":0,\"iat\":%"PRIdTIME_T"}",
+					     "\"iat\":%"PRIdTIME_T".000E+0}",
 					     exp, iat),
 			     tokenbuf);
 	sign_jwt_token_hs256(tokenbuf, hs_sign_key);
@@ -824,6 +904,7 @@ int main(void)
 		test_do_init,
 		test_jwt_hs_token,
 		test_jwt_token_escape,
+		test_jwt_valid_token,
 		test_jwt_bad_valid_token,
 		test_jwt_broken_token,
 		test_jwt_dates,

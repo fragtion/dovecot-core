@@ -385,9 +385,11 @@ static int maildirsize_recalculate(struct maildir_quota_root *root,
 				   const char **error_r)
 {
 	struct mail_namespace *const *namespaces;
+	struct event_reason *reason;
 	unsigned int i, count;
 	int ret = 0;
 
+	reason = event_reason_begin("quota:recalculate");
 	maildirsize_recalculate_init(root);
 
 	/* count mails from all namespaces */
@@ -417,7 +419,9 @@ static int maildirsize_recalculate(struct maildir_quota_root *root,
 		}
 	}
 
-	return maildirsize_recalculate_finish(root, ret, error_r);
+	ret = maildirsize_recalculate_finish(root, ret, error_r);
+	event_reason_end(&reason);
+	return ret;
 }
 
 static bool
@@ -658,7 +662,8 @@ static bool maildirquota_limits_init(struct maildir_quota_root *root)
 	}
 
 	list = root->maildirsize_ns->list;
-	if (mailbox_list_get_storage(&list, "", &storage) == 0 &&
+	const char *vname = "";
+	if (mailbox_list_get_storage(&list, &vname, 0, &storage) == 0 &&
 	    strcmp(storage->name, MAILDIR_STORAGE_NAME) != 0) {
 		/* non-maildir namespace, skip */
 		if ((storage->class_flags &
@@ -934,6 +939,7 @@ maildir_quota_update(struct quota_root *_root,
 
 struct quota_backend quota_backend_maildir = {
 	.name = "maildir",
+	.use_vsize = FALSE,
 
 	.v = {
 		.alloc = maildir_quota_alloc,

@@ -22,6 +22,13 @@ static const char salt_chars[] =
 
 static HASH_TABLE(const char*, const struct password_scheme *) password_schemes;
 
+static bool g_allow_weak = FALSE;
+
+void password_schemes_allow_weak(bool allow)
+{
+	g_allow_weak = allow;
+}
+
 static const struct password_scheme *
 password_scheme_lookup_name(const char *name)
 {
@@ -78,6 +85,12 @@ int password_verify(const char *plaintext,
 		return -1;
 	}
 
+	if (s->weak && !g_allow_weak) {
+		*error_r = t_strdup_printf("Weak password scheme '%s' used and refused",
+					   s->name);
+		return -1;
+	}
+
 	if (s->password_verify != NULL) {
 		ret = s->password_verify(plaintext, params, raw_password, size,
 					 error_r);
@@ -97,14 +110,14 @@ int password_verify(const char *plaintext,
 
 const char *password_get_scheme(const char **password)
 {
-	const char *p, *scheme;
+	const char *p, *suffix, *scheme;
 
 	if (*password == NULL)
 		return NULL;
 
-	if (str_begins(*password, "$1$")) {
+	if (str_begins(*password, "$1$", &suffix)) {
 		/* $1$<salt>$<password>[$<ignored>] */
-		p = strchr(*password + 3, '$');
+		p = strchr(suffix, '$');
 		if (p != NULL) {
 			/* stop at next '$' after password */
 			p = strchr(p+1, '$');
@@ -179,7 +192,7 @@ int password_decode(const char *password, const char *scheme,
 		/* fall through */
 	case PW_ENCODING_BASE64:
 		buf = t_buffer_create(MAX_BASE64_DECODED_SIZE(len));
-		if (base64_decode(password, len, NULL, buf) < 0) {
+		if (base64_decode(password, len, buf) < 0) {
 			*error_r = "Input isn't valid base64 encoded data";
 			return -1;
 		}
@@ -318,6 +331,16 @@ int crypt_verify(const char *plaintext, const struct password_generate_params *p
 		return 0;
 	}
 
+	if (size > 1 && !g_allow_weak) {
+		if (raw_password[0] != '$') {
+			*error_r = "Weak password scheme 'DES-CRYPT' used and refused";
+			return -1;
+		} else if (raw_password[1] == '1') {
+			*error_r = "Weak password scheme 'MD5-CRYPT' used and refused";
+			return -1;
+		}
+	}
+
 	password = t_strndup(raw_password, size);
 	crypted = mycrypt(plaintext, password);
 	if (crypted == NULL) {
@@ -338,7 +361,7 @@ md5_verify(const char *plaintext, const struct password_generate_params *params,
 	size_t md5_size;
 
 	password = t_strndup(raw_password, size);
-	if (str_begins(password, "$1$")) {
+	if (str_begins_with(password, "$1$")) {
 		/* MD5-CRYPT */
 		str = password_generate_md5_crypt(plaintext, password);
 		return str_equals_timing_almost_safe(str, password) ? 1 : 0;
@@ -737,41 +760,181 @@ otp_generate(const char *plaintext, const struct password_generate_params *param
 }
 
 static const struct password_scheme builtin_schemes[] = {
-	{ "MD5", PW_ENCODING_NONE, 0, md5_verify, md5_crypt_generate },
-	{ "MD5-CRYPT", PW_ENCODING_NONE, 0,
-	  md5_crypt_verify, md5_crypt_generate },
- 	{ "SHA", PW_ENCODING_BASE64, SHA1_RESULTLEN, NULL, sha1_generate },
- 	{ "SHA1", PW_ENCODING_BASE64, SHA1_RESULTLEN, NULL, sha1_generate },
- 	{ "SHA256", PW_ENCODING_BASE64, SHA256_RESULTLEN,
-	  NULL, sha256_generate },
- 	{ "SHA512", PW_ENCODING_BASE64, SHA512_RESULTLEN,
-	  NULL, sha512_generate },
-	{ "SMD5", PW_ENCODING_BASE64, 0, smd5_verify, smd5_generate },
-	{ "SSHA", PW_ENCODING_BASE64, 0, ssha_verify, ssha_generate },
-	{ "SSHA256", PW_ENCODING_BASE64, 0, ssha256_verify, ssha256_generate },
-	{ "SSHA512", PW_ENCODING_BASE64, 0, ssha512_verify, ssha512_generate },
-	{ "PLAIN", PW_ENCODING_NONE, 0, plain_verify, plain_generate },
-	{ "CLEAR", PW_ENCODING_NONE, 0, plain_verify, plain_generate },
-	{ "CLEARTEXT", PW_ENCODING_NONE, 0, plain_verify, plain_generate },
-	{ "PLAIN-TRUNC", PW_ENCODING_NONE, 0, plain_trunc_verify, plain_generate },
-	{ "CRAM-MD5", PW_ENCODING_HEX, CRAM_MD5_CONTEXTLEN,
-	  NULL, cram_md5_generate },
-	{ "SCRAM-SHA-1", PW_ENCODING_NONE, 0, scram_sha1_verify,
-	  scram_sha1_generate},
-	{ "SCRAM-SHA-256", PW_ENCODING_NONE, 0, scram_sha256_verify,
-	  scram_sha256_generate},
-	{ "HMAC-MD5", PW_ENCODING_HEX, CRAM_MD5_CONTEXTLEN,
-	  NULL, cram_md5_generate },
-	{ "DIGEST-MD5", PW_ENCODING_HEX, MD5_RESULTLEN,
-	  NULL, digest_md5_generate },
-	{ "PLAIN-MD4", PW_ENCODING_HEX, MD4_RESULTLEN,
-	  NULL, plain_md4_generate },
-	{ "PLAIN-MD5", PW_ENCODING_HEX, MD5_RESULTLEN,
-	  NULL, plain_md5_generate },
-	{ "LDAP-MD5", PW_ENCODING_BASE64, MD5_RESULTLEN,
-	  NULL, plain_md5_generate },
-	{ "OTP", PW_ENCODING_NONE, 0, otp_verify, otp_generate },
-        { "PBKDF2", PW_ENCODING_NONE, 0, pbkdf2_verify, pbkdf2_generate },
+	{
+		.name = "MD5",
+		.default_encoding = PW_ENCODING_NONE,
+		.raw_password_len = 0,
+		.weak = TRUE,
+		.password_verify = md5_verify,
+		.password_generate = md5_crypt_generate,
+	},
+	{
+		.name = "MD5-CRYPT",
+		.default_encoding = PW_ENCODING_NONE,
+		.weak = TRUE,
+		.raw_password_len = 0,
+		.password_verify = md5_crypt_verify,
+		.password_generate = md5_crypt_generate,
+	},
+	{
+		.name = "SHA",
+		.default_encoding = PW_ENCODING_BASE64,
+		.raw_password_len = SHA1_RESULTLEN,
+		.password_verify = NULL,
+		.password_generate = sha1_generate,
+	},
+	{
+		.name = "SHA1",
+		.default_encoding = PW_ENCODING_BASE64,
+		.raw_password_len = SHA1_RESULTLEN,
+		.password_verify = NULL,
+		.password_generate = sha1_generate,
+	},
+	{
+		.name = "SHA256",
+		.default_encoding = PW_ENCODING_BASE64,
+		.raw_password_len = SHA256_RESULTLEN,
+		.password_verify = NULL,
+		.password_generate = sha256_generate,
+	},
+	{
+		.name = "SHA512",
+		.default_encoding = PW_ENCODING_BASE64,
+		.raw_password_len = SHA512_RESULTLEN,
+		.password_verify = NULL,
+		.password_generate = sha512_generate,
+	},
+	{
+		.name = "SMD5",
+		.default_encoding = PW_ENCODING_BASE64,
+		.raw_password_len = 0,
+		.weak = TRUE,
+		.password_verify = smd5_verify,
+		.password_generate = smd5_generate,
+	},
+	{
+		.name = "SSHA",
+		.default_encoding = PW_ENCODING_BASE64,
+		.raw_password_len = 0,
+		.password_verify = ssha_verify,
+		.password_generate = ssha_generate,
+	},
+	{
+		.name = "SSHA256",
+		.default_encoding = PW_ENCODING_BASE64,
+		.raw_password_len = 0,
+		.password_verify = ssha256_verify,
+		.password_generate = ssha256_generate,
+	},
+	{
+		.name = "SSHA512",
+		.default_encoding = PW_ENCODING_BASE64,
+		.raw_password_len = 0,
+		.password_verify = ssha512_verify,
+		.password_generate = ssha512_generate,
+	},
+	{
+		.name = "PLAIN",
+		.default_encoding = PW_ENCODING_NONE,
+		.raw_password_len = 0,
+		.password_verify = plain_verify,
+		.password_generate = plain_generate,
+	},
+	{
+		.name = "CLEAR",
+		.default_encoding = PW_ENCODING_NONE,
+		.raw_password_len = 0,
+		.password_verify = plain_verify,
+		.password_generate = plain_generate,
+	},
+	{
+		.name = "CLEARTEXT",
+		.default_encoding = PW_ENCODING_NONE,
+		.raw_password_len = 0,
+		.password_verify = plain_verify,
+		.password_generate = plain_generate,
+	},
+	{
+		.name = "PLAIN-TRUNC",
+		.default_encoding = PW_ENCODING_NONE,
+		.raw_password_len = 0,
+		.password_verify = plain_trunc_verify,
+		.password_generate = plain_generate,
+	},
+	{
+		.name = "CRAM-MD5",
+		.default_encoding = PW_ENCODING_HEX,
+		.raw_password_len = CRAM_MD5_CONTEXTLEN,
+		.password_verify = NULL,
+		.password_generate = cram_md5_generate,
+	},
+	{
+		.name = "SCRAM-SHA-1",
+		.default_encoding = PW_ENCODING_NONE,
+		.raw_password_len = 0,
+		.password_verify = scram_sha1_verify,
+		.password_generate = scram_sha1_generate,
+	},
+	{
+		.name = "SCRAM-SHA-256",
+		.default_encoding = PW_ENCODING_NONE,
+		.raw_password_len = 0,
+		.password_verify = scram_sha256_verify,
+		.password_generate = scram_sha256_generate,
+	},
+	{
+		.name = "HMAC-MD5",
+		.default_encoding = PW_ENCODING_HEX,
+		.raw_password_len = CRAM_MD5_CONTEXTLEN,
+		.weak = TRUE,
+		.password_verify = NULL,
+		.password_generate = cram_md5_generate,
+	},
+	{
+		.name = "DIGEST-MD5",
+		.default_encoding = PW_ENCODING_HEX,
+		.raw_password_len = MD5_RESULTLEN,
+		.password_verify = NULL,
+		.password_generate = digest_md5_generate,
+	},
+	{
+		.name = "PLAIN-MD4",
+		.default_encoding = PW_ENCODING_HEX,
+		.raw_password_len = MD4_RESULTLEN,
+		.weak = TRUE,
+		.password_verify = NULL,
+		.password_generate = plain_md4_generate,
+	},
+	{
+		.name = "PLAIN-MD5",
+		.default_encoding = PW_ENCODING_HEX,
+		.raw_password_len = MD5_RESULTLEN,
+		.weak = TRUE,
+		.password_verify = NULL,
+		.password_generate = plain_md5_generate,
+	},
+	{
+		.name = "LDAP-MD5",
+		.default_encoding = PW_ENCODING_BASE64,
+		.raw_password_len = MD5_RESULTLEN,
+		.weak = TRUE,
+		.password_verify = NULL,
+		.password_generate = plain_md5_generate,
+	},
+	{
+		.name = "OTP",
+		.default_encoding = PW_ENCODING_NONE,
+		.raw_password_len = 0,
+		.password_verify = otp_verify,
+		.password_generate = otp_generate,
+	},
+	{
+		.name = "PBKDF2",
+		.default_encoding = PW_ENCODING_NONE,
+		.raw_password_len = 0,
+		.password_verify = pbkdf2_verify,
+		.password_generate = pbkdf2_generate,
+	},
 };
 
 void password_scheme_register(const struct password_scheme *scheme)

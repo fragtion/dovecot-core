@@ -682,7 +682,7 @@ static bool mail_namespace_is_usable_prefix(struct mail_namespace *ns,
 		return TRUE;
 	}
 
-	if (inbox && str_begins(ns->prefix, "INBOX") &&
+	if (inbox && str_begins_with(ns->prefix, "INBOX") &&
 	    strncmp(ns->prefix+5, mailbox+5, ns->prefix_len-5) == 0) {
 		/* we already checked that mailbox begins with case-insensitive
 		   INBOX. this namespace also begins with INBOX and the rest
@@ -707,10 +707,11 @@ mail_namespace_find_mask(struct mail_namespace *namespaces, const char *box,
         struct mail_namespace *ns = namespaces;
 	struct mail_namespace *best = NULL;
 	size_t best_len = 0;
+	const char *suffix;
 	bool inbox;
 
-	inbox = strncasecmp(box, "INBOX", 5) == 0;
-	if (inbox && box[5] == '\0') {
+	inbox = str_begins_icase(box, "INBOX", &suffix);
+	if (inbox && suffix[0] == '\0') {
 		/* find the INBOX namespace */
 		while (ns != NULL) {
 			if ((ns->flags & NAMESPACE_FLAG_INBOX_USER) != 0 &&
@@ -739,7 +740,7 @@ mail_namespace_find_shared(struct mail_namespace *ns, const char *mailbox)
 	struct mailbox_list *list = ns->list;
 	struct mail_storage *storage;
 
-	if (mailbox_list_get_storage(&list, mailbox, &storage) < 0)
+	if (mailbox_list_get_storage(&list, &mailbox, 0, &storage) < 0)
 		return ns;
 
 	return mailbox_list_get_namespace(list);

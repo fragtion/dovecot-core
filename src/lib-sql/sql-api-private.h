@@ -70,6 +70,7 @@ struct sql_db_vfuncs {
 			 const char **error);
 	void (*deinit)(struct sql_db *db);
 	void (*unref)(struct sql_db *db);
+	void (*wait) (struct sql_db *db);
 
 	enum sql_db_flags (*get_flags)(struct sql_db *db);
 
@@ -115,6 +116,8 @@ struct sql_db_vfuncs {
 				      size_t value_size);
 	void (*statement_bind_int64)(struct sql_statement *stmt,
 				     unsigned int column_idx, int64_t value);
+	void (*statement_bind_double)(struct sql_statement *stmt,
+				      unsigned int column_idx, double value);
 	void (*statement_query)(struct sql_statement *stmt,
 				sql_query_callback_t *callback, void *context);
 	struct sql_result *(*statement_query_s)(struct sql_statement *stmt);

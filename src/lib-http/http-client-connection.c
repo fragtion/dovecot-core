@@ -153,7 +153,6 @@ http_client_connection_server_close(struct http_client_connection **_conn)
 {
 	struct http_client_connection *conn = *_conn;
 	struct http_client_peer *peer = conn->peer;
-	struct http_client *client = peer->client;
 	struct http_client_request *req, **req_idx;
 
 	e_debug(conn->event, "Server explicitly closed connection");
@@ -169,8 +168,12 @@ http_client_connection_server_close(struct http_client_connection **_conn)
 	}
 	array_clear(&conn->request_wait_list);
 
-	if (client != NULL && client->waiting)
-		io_loop_stop(client->ioloop);
+	if (peer != NULL) {
+		struct http_client *client = peer->client;
+
+		if (client->waiting)
+			io_loop_stop(client->ioloop);
+	}
 
 	http_client_connection_close(_conn);
 }
@@ -347,20 +350,22 @@ int http_client_connection_check_ready(struct http_client_connection *conn)
 
 	if (conn->last_ioloop != NULL && conn->last_ioloop != current_ioloop) {
 		conn->last_ioloop = current_ioloop;
-		/* Active ioloop is different from what we saw earlier;
-		   we may have missed a disconnection event on this connection.
-		   Verify status by reading from connection. */
+		/* Active ioloop is different from what we saw earlier; we may
+		   have missed a disconnection event on this connection. Verify
+		   status by reading from connection. */
 		if (i_stream_read(conn->conn.input) == -1) {
 			int stream_errno = conn->conn.input->stream_errno;
 
 			i_assert(conn->conn.input->stream_errno != 0 ||
 				 conn->conn.input->eof);
-			http_client_connection_lost(&conn,
-				t_strdup_printf("read(%s) failed: %s",
-						i_stream_get_name(conn->conn.input),
-						stream_errno != 0 ?
-						i_stream_get_error(conn->conn.input) :
-						"EOF"));
+			http_client_connection_lost(
+				&conn,
+				t_strdup_printf(
+					"read(%s) failed: %s",
+					i_stream_get_name(conn->conn.input),
+					(stream_errno != 0 ?
+					 i_stream_get_error(conn->conn.input) :
+					 "EOF")));
 			return -1;
 		}
 
@@ -744,7 +749,7 @@ static void http_client_connection_destroy(struct connection *_conn)
 	case CONNECTION_DISCONNECT_CONN_CLOSED:
 		if (conn->connect_failed) {
 			i_assert(!array_is_created(&conn->request_wait_list) ||
-				array_count(&conn->request_wait_list) == 0);
+				 array_count(&conn->request_wait_list) == 0);
 			break;
 		}
 		http_client_connection_lost(
@@ -910,8 +915,9 @@ http_client_connection_return_response(struct http_client_connection *conn,
 	if (retrying) {
 		/* Retrying, don't destroy the request */
 		if (response->payload != NULL) {
-			i_stream_remove_destroy_callback(conn->incoming_payload,
-							 http_client_payload_destroyed);
+			i_stream_remove_destroy_callback(
+				conn->incoming_payload,
+				http_client_payload_destroyed);
 			i_stream_unref(&conn->incoming_payload);
 			connection_input_resume(&conn->conn);
 		}
@@ -958,7 +964,8 @@ http_client_request_add_event_headers(struct http_client_request *req,
 	string_t *str = t_str_new(128);
 	for (unsigned int i = 0; req->event_headers[i] != NULL; i++) {
 		const char *hdr_name = req->event_headers[i];
-		const char *value = http_response_header_get(response, hdr_name);
+		const char *value =
+			http_response_header_get(response, hdr_name);
 
 		if (value == NULL)
 			continue;
@@ -992,7 +999,7 @@ static void http_client_connection_input(struct connection *_conn)
 	_conn->last_input = ioloop_time;
 
 	if (conn->ssl_iostream != NULL &&
-		!ssl_iostream_is_handshaked(conn->ssl_iostream)) {
+	    !ssl_iostream_is_handshaked(conn->ssl_iostream)) {
 		/* Finish SSL negotiation by reading from input stream */
 		while ((ret = i_stream_read(conn->conn.input)) > 0 ||
 		       ret == -2) {
@@ -1089,7 +1096,8 @@ static void http_client_connection_input(struct connection *_conn)
 			http_response_parser_get_last_offset(conn->http_parser);
 		i_assert(req->response_offset != UOFF_T_MAX);
 		i_assert(req->response_offset < conn->conn.input->v_offset);
-		req->bytes_in = conn->conn.input->v_offset - req->response_offset;
+		req->bytes_in = conn->conn.input->v_offset -
+			req->response_offset;
 
 		/* Got some response; cancel response timeout */
 		timeout_remove(&conn->to_response);
@@ -1276,6 +1284,7 @@ static void http_client_connection_input(struct connection *_conn)
 	if (ret <= 0 &&
 	    (conn->conn.input->eof || conn->conn.input->stream_errno != 0)) {
 		int stream_errno = conn->conn.input->stream_errno;
+
 		http_client_connection_lost(
 			&conn,
 			t_strdup_printf("read(%s) failed: %s",
@@ -1456,7 +1465,7 @@ static void http_client_connection_ready(struct http_client_connection *conn)
 
 	/* Start protocol I/O */
 	conn->http_parser = http_response_parser_init(
-		conn->conn.input,  &set->response_hdr_limits, 0);
+		conn->conn.input, &set->response_hdr_limits, 0);
 	o_stream_set_finish_via_child(conn->conn.output, FALSE);
 	o_stream_set_flush_callback(conn->conn.output,
 				    http_client_connection_output, conn);
@@ -1499,15 +1508,14 @@ http_client_connection_ssl_init(struct http_client_connection *conn,
 	i_assert(ssl_ctx != NULL);
 
 	ssl_set = *set->ssl;
-	if (!set->ssl->allow_invalid_cert) {
+	if (!set->ssl->allow_invalid_cert)
 		ssl_set.verbose_invalid_cert = TRUE;
-	}
 
 	e_debug(conn->event, "Starting SSL handshake");
 
 	connection_input_halt(&conn->conn);
 	if (io_stream_create_ssl_client(ssl_ctx, pshared->addr.a.tcp.https_name,
-					&ssl_set,
+					&ssl_set, conn->event,
 					&conn->conn.input, &conn->conn.output,
 					&conn->ssl_iostream, &error) < 0) {
 		*error_r = t_strdup_printf(
@@ -1601,16 +1609,6 @@ struct connection_list *http_client_connection_list_init(void)
 				    &http_client_connection_vfuncs);
 }
 
-static void
-http_client_connection_delayed_connect_error(
-	struct http_client_connection *conn)
-{
-	timeout_remove(&conn->to_input);
-	errno = conn->connect_errno;
-	http_client_connection_connected(&conn->conn, FALSE);
-	http_client_connection_close(&conn);
-}
-
 static void http_client_connect_timeout(struct http_client_connection *conn)
 {
 	conn->conn.disconnect_reason = CONNECTION_DISCONNECT_CONNECT_TIMEOUT;
@@ -1624,12 +1622,8 @@ http_client_connection_connect(struct http_client_connection *conn,
 	struct http_client_context *cctx = conn->ppool->peer->cctx;
 
 	conn->connect_start_timestamp = ioloop_timeval;
-	if (connection_client_connect(&conn->conn) < 0) {
-		conn->connect_errno = errno;
+	if (connection_client_connect_async(&conn->conn) < 0) {
 		e_debug(conn->event, "Connect failed: %m");
-		conn->to_input = timeout_add_short_to(
-			conn->conn.ioloop, 0,
-			http_client_connection_delayed_connect_error, conn);
 		return;
 	}
 

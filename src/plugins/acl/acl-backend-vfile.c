@@ -34,17 +34,18 @@ acl_backend_vfile_init(struct acl_backend *_backend, const char *data)
 	struct acl_backend_vfile *backend =
 		(struct acl_backend_vfile *)_backend;
 	struct stat st;
-	const char *const *tmp;
+	const char *value, *const *tmp;
+	const char *global_path;
 
 	tmp = t_strsplit(data, ":");
-	backend->global_path = p_strdup_empty(_backend->pool, *tmp);
+	global_path = t_strdup_empty(*tmp);
 	backend->cache_secs = ACL_VFILE_DEFAULT_CACHE_SECS;
 
 	if (*tmp != NULL)
 		tmp++;
 	for (; *tmp != NULL; tmp++) {
-		if (str_begins(*tmp, "cache_secs=")) {
-			if (str_to_uint(*tmp + 11, &backend->cache_secs) < 0) {
+		if (str_begins(*tmp, "cache_secs=", &value)) {
+			if (str_to_uint(value, &backend->cache_secs) < 0) {
 				i_error("acl vfile: Invalid cache_secs value: %s",
 					*tmp + 11);
 				return -1;
@@ -54,28 +55,26 @@ acl_backend_vfile_init(struct acl_backend *_backend, const char *data)
 			return -1;
 		}
 	}
-	if (backend->global_path != NULL) {
-		if (stat(backend->global_path, &st) < 0) {
-			if (errno != ENOENT) {
-				i_error("acl vfile: stat(%s) failed: %m",
-					backend->global_path);
-				return -1;
-			}
-		} else if (!S_ISDIR(st.st_mode)) {
+	if (global_path != NULL) {
+		if (stat(global_path, &st) < 0) {
+			i_error("acl vfile: stat(%s) failed: %m",
+				global_path);
+			return -1;
+		} else if (S_ISDIR(st.st_mode)) {
+			i_error("acl vfile: Global ACL directories are no longer supported");
+			return -1;
+		} else {
 			_backend->global_file =
-				acl_global_file_init(backend->global_path, backend->cache_secs,
+				acl_global_file_init(global_path, backend->cache_secs,
 						     _backend->debug);
 		}
 	}
 	if (_backend->debug) {
-		if (backend->global_path == NULL)
+		if (_backend->global_file == NULL)
 			i_debug("acl vfile: Global ACLs disabled");
-		else if (_backend->global_file != NULL) {
+		else {
 			i_debug("acl vfile: Global ACL file: %s",
-				backend->global_path);
-		} else {
-			i_debug("acl vfile: Global ACL legacy directory: %s",
-				backend->global_path);
+				global_path);
 		}
 	}
 
@@ -118,13 +117,11 @@ acl_backend_vfile_get_local_dir(struct acl_backend *backend,
 	/* ACL files are very important. try to keep them among the main
 	   mail files. that's not possible though with a) if the mailbox is
 	   a file or b) if the mailbox path doesn't point to filesystem. */
-	if (mailbox_list_get_storage(&list, vname, &storage) < 0)
+	if (mailbox_list_get_storage(&list, &vname, 0, &storage) < 0)
 		return NULL;
 	i_assert(list == ns->list);
 
-	type = mail_storage_is_mailbox_file(storage) ||
-		(storage->class_flags & MAIL_STORAGE_CLASS_FLAG_NO_ROOT) != 0 ?
-		MAILBOX_LIST_PATH_TYPE_CONTROL : MAILBOX_LIST_PATH_TYPE_MAILBOX;
+	type = mail_storage_get_acl_list_path_type(storage);
 	if (name == NULL) {
 		if (!mailbox_list_get_root_path(list, type, &dir))
 			return NULL;
@@ -149,8 +146,6 @@ static struct acl_object *
 acl_backend_vfile_object_init(struct acl_backend *_backend,
 			      const char *name)
 {
-	struct acl_backend_vfile *backend =
-		(struct acl_backend_vfile *)_backend;
 	struct acl_object_vfile *aclobj;
 	const char *dir, *vname, *error;
 
@@ -167,11 +162,6 @@ acl_backend_vfile_object_init(struct acl_backend *_backend,
 			dir = acl_backend_vfile_get_local_dir(_backend, name, vname);
 			aclobj->local_path = dir == NULL ? NULL :
 				i_strconcat(dir, "/"ACL_FILENAME, NULL);
-			if (backend->global_path != NULL &&
-			    _backend->global_file == NULL) {
-				aclobj->global_path =
-					i_strconcat(backend->global_path, "/", vname, NULL);
-			}
 		} else {
 			/* Invalid mailbox name, just use the default
 			   global ACL files */
@@ -189,43 +179,11 @@ get_parent_mailbox(struct acl_backend *backend, const char *name)
 	return p == NULL ? NULL : t_strdup_until(name, p);
 }
 
-static int
-acl_backend_vfile_exists(struct acl_backend_vfile *backend, const char *path,
-			 struct acl_vfile_validity *validity)
-{
-	struct stat st;
-
-	if (validity->last_check + (time_t)backend->cache_secs > ioloop_time) {
-		/* use the cached value */
-		return validity->last_mtime != ACL_VFILE_VALIDITY_MTIME_NOTFOUND ? 1 : 0;
-	}
-
-	validity->last_check = ioloop_time;
-	if (stat(path, &st) < 0) {
-		if (errno == ENOENT || errno == ENOTDIR) {
-			validity->last_mtime = ACL_VFILE_VALIDITY_MTIME_NOTFOUND;
-			return 0;
-		}
-		if (errno == EACCES) {
-			validity->last_mtime = ACL_VFILE_VALIDITY_MTIME_NOACCESS;
-			return 1;
-		}
-		i_error("stat(%s) failed: %m", path);
-		return -1;
-	}
-	validity->last_mtime = st.st_mtime;
-	validity->last_size = st.st_size;
-	return 1;
-}
-
 static bool
 acl_backend_vfile_has_acl(struct acl_backend *_backend, const char *name)
 {
-	struct acl_backend_vfile *backend =
-		(struct acl_backend_vfile *)_backend;
 	struct acl_backend_vfile_validity *old_validity, new_validity;
-	const char *path, *local_path, *global_path, *dir, *vname = "";
-	const char *error;
+	const char *vname;
 	int ret;
 
 	old_validity = acl_cache_get_validity(_backend->cache, name);
@@ -234,42 +192,45 @@ acl_backend_vfile_has_acl(struct acl_backend *_backend, const char *name)
 	else
 		i_zero(&new_validity);
 
-	/* See if the mailbox exists. If we wanted recursive lookups we could
-	   skip this, but at least for now we assume that if an existing
-	   mailbox has no ACL it's equivalent to default ACLs. */
-	if (mailbox_list_get_path(_backend->list, name,
-				  MAILBOX_LIST_PATH_TYPE_MAILBOX, &path) <= 0)
-		ret = -1;
-	else {
-		ret = acl_backend_vfile_exists(backend, path,
-					       &new_validity.mailbox_validity);
+	/* The caller wants to stop whenever a parent mailbox exists, even if
+	   it has no ACL file. Also, if a mailbox doesn't exist then it can't
+	   have a local ACL file. First check if there's a matching global ACL.
+	   If not, check if the mailbox exists. */
+	vname = *name == '\0' ? "" :
+		mailbox_list_get_vname(_backend->list, name);
+	struct mailbox *box =
+		mailbox_alloc(_backend->list, vname,
+			      MAILBOX_FLAG_READONLY | MAILBOX_FLAG_IGNORE_ACLS);
+	if (_backend->global_file != NULL) {
+		/* check global ACL file */
+		ret = acl_global_file_refresh(_backend->global_file);
+		if (ret == 0 && acl_global_file_have_any(_backend->global_file, box->vname))
+			ret = 1;
+	} else {
+		/* global ACLs disabled */
+		ret = 0;
 	}
 
-	if (ret == 0 &&
-	    (*name == '\0' ||
-	     mailbox_list_is_valid_name(_backend->list, name, &error))) {
-		vname = *name == '\0' ? "" :
-			mailbox_list_get_vname(_backend->list, name);
-		dir = acl_backend_vfile_get_local_dir(_backend, name, vname);
-		if (dir != NULL) {
-			local_path = t_strconcat(dir, "/", name, NULL);
-			ret = acl_backend_vfile_exists(backend, local_path,
-						       &new_validity.local_validity);
+	if (ret != 0) {
+		/* error / global ACL found */
+	} else if (mailbox_open(box) == 0) {
+		/* mailbox exists */
+		ret = 1;
+	} else {
+		enum mail_error error;
+		const char *errstr =
+			mailbox_get_last_internal_error(box, &error);
+		if (error == MAIL_ERROR_NOTFOUND)
+			ret = 0;
+		else {
+			e_error(box->event, "acl: Failed to open mailbox: %s",
+				errstr);
+			ret = -1;
 		}
 	}
 
-	if (ret == 0 && backend->global_path != NULL) {
-		if (_backend->global_file != NULL) {
-			ret = acl_global_file_refresh(_backend->global_file);
-			if (ret == 0 && acl_global_file_have_any(_backend->global_file, vname))
-				ret = 1;
-		} else {
-			global_path = t_strconcat(backend->global_path, "/", name, NULL);
-			ret = acl_backend_vfile_exists(backend, global_path,
-						       &new_validity.global_validity);
-		}
-	}
 	acl_cache_set_validity(_backend->cache, name, &new_validity);
+	mailbox_free(&box);
 	return ret > 0;
 }
 
@@ -300,7 +261,6 @@ static void acl_backend_vfile_object_deinit(struct acl_object *_aclobj)
 	struct acl_object_vfile *aclobj = (struct acl_object_vfile *)_aclobj;
 
 	i_free(aclobj->local_path);
-	i_free(aclobj->global_path);
 
 	if (array_is_created(&aclobj->aclobj.rights))
 		array_free(&aclobj->aclobj.rights);
@@ -310,9 +270,8 @@ static void acl_backend_vfile_object_deinit(struct acl_object *_aclobj)
 }
 
 static int
-acl_backend_vfile_read(struct acl_object *aclobj, bool global, const char *path,
-		       struct acl_vfile_validity *validity, bool try_retry,
-		       bool *is_dir_r)
+acl_backend_vfile_read(struct acl_object *aclobj, const char *path,
+		       struct acl_vfile_validity *validity, bool try_retry)
 {
 	struct istream *input;
 	struct stat st;
@@ -320,8 +279,6 @@ acl_backend_vfile_read(struct acl_object *aclobj, bool global, const char *path,
 	const char *line, *error;
 	unsigned int linenum;
 	int fd, ret = 0;
-
-	*is_dir_r = FALSE;
 
 	fd = nfs_safe_open(path, O_RDONLY);
 	if (fd == -1) {
@@ -356,12 +313,6 @@ acl_backend_vfile_read(struct acl_object *aclobj, bool global, const char *path,
 		i_close_fd(&fd);
 		return -1;
 	}
-	if (S_ISDIR(st.st_mode)) {
-		/* we opened a directory. */
-		*is_dir_r = TRUE;
-		i_close_fd(&fd);
-		return 0;
-	}
 
 	if (aclobj->backend->debug)
 		i_debug("acl vfile: reading file %s", path);
@@ -376,7 +327,6 @@ acl_backend_vfile_read(struct acl_object *aclobj, bool global, const char *path,
 		T_BEGIN {
 			ret = acl_rights_parse_line(line, aclobj->rights_pool,
 						    &rights, &error);
-			rights.global = global;
 			if (ret < 0) {
 				i_error("ACL file %s line %u: %s",
 					path, linenum, error);
@@ -427,29 +377,22 @@ acl_backend_vfile_read(struct acl_object *aclobj, bool global, const char *path,
 
 static int
 acl_backend_vfile_read_with_retry(struct acl_object *aclobj,
-				  bool global, const char *path,
+				  const char *path,
 				  struct acl_vfile_validity *validity)
 {
 	unsigned int i;
 	int ret;
-	bool is_dir;
 
 	if (path == NULL)
 		return 0;
 
 	for (i = 0;; i++) {
-		ret = acl_backend_vfile_read(aclobj, global, path, validity,
-					     i < ACL_ESTALE_RETRY_COUNT,
-					     &is_dir);
+		ret = acl_backend_vfile_read(aclobj, path, validity,
+					     i < ACL_ESTALE_RETRY_COUNT);
 		if (ret != 0)
 			break;
 
-		if (is_dir) {
-			/* opened a directory. use dir/.DEFAULT instead */
-			path = t_strconcat(path, "/.DEFAULT", NULL);
-		} else {
-			/* ESTALE - try again */
-		}
+		/* ESTALE - try again */
 	}
 
 	return ret <= 0 ? -1 : 0;
@@ -494,17 +437,11 @@ acl_backend_vfile_refresh(struct acl_object *aclobj, const char *path,
 
 	validity->last_check = ioloop_time;
 	ret = stat(path, &st);
-	if (ret == 0 && S_ISDIR(st.st_mode)) {
-		/* it's a directory. use dir/.DEFAULT instead */
-		path = t_strconcat(path, "/.DEFAULT", NULL);
-		ret = stat(path, &st);
-	}
-
 	if (ret < 0) {
 		if (errno == ENOENT || errno == ENOTDIR) {
 			/* if the file used to exist, we have to re-read it */
 			return validity->last_mtime != ACL_VFILE_VALIDITY_MTIME_NOTFOUND ? 1 : 0;
-		} 
+		}
 		if (errno == EACCES)
 			return validity->last_mtime != ACL_VFILE_VALIDITY_MTIME_NOACCESS ? 1 : 0;
 		i_error("stat(%s) failed: %m", path);
@@ -556,16 +493,13 @@ static int acl_backend_vfile_object_refresh_cache(struct acl_object *_aclobj)
 	struct acl_backend_vfile_validity *old_validity;
 	struct acl_backend_vfile_validity validity;
 	time_t mtime;
-	int ret;
+	int ret = 0;
 
 	old_validity = acl_cache_get_validity(_aclobj->backend->cache,
 					      _aclobj->name);
-	ret = _aclobj->backend->global_file != NULL ?
-		acl_backend_global_file_refresh(_aclobj, old_validity == NULL ? NULL :
-						&old_validity->global_validity) :
-		acl_backend_vfile_refresh(_aclobj, aclobj->global_path,
-					  old_validity == NULL ? NULL :
-					  &old_validity->global_validity);
+	if (_aclobj->backend->global_file != NULL)
+		ret = acl_backend_global_file_refresh(_aclobj, old_validity == NULL ? NULL :
+						      &old_validity->global_validity);
 	if (ret == 0) {
 		ret = acl_backend_vfile_refresh(_aclobj, aclobj->local_path,
 						old_validity == NULL ? NULL :
@@ -593,12 +527,8 @@ static int acl_backend_vfile_object_refresh_cache(struct acl_object *_aclobj)
 		validity.global_validity.last_read_time = ioloop_time;
 		validity.global_validity.last_mtime = st.st_mtime;
 		validity.global_validity.last_size = st.st_size;
-	} else {
-		if (acl_backend_vfile_read_with_retry(_aclobj, TRUE, aclobj->global_path,
-						      &validity.global_validity) < 0)
-			return -1;
 	}
-	if (acl_backend_vfile_read_with_retry(_aclobj, FALSE, aclobj->local_path,
+	if (acl_backend_vfile_read_with_retry(_aclobj, aclobj->local_path,
 					      &validity.local_validity) < 0)
 		return -1;
 

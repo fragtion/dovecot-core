@@ -41,8 +41,7 @@ cmd_helo_next(struct smtp_server_cmd_ctx *cmd,
 {
 	struct smtp_server_connection *conn = cmd->conn;
 
-	if (conn->helo.domain == NULL ||
-	    strcmp(conn->helo.domain, data->helo.domain) != 0 ||
+	if (null_strcmp(conn->helo.domain, data->helo.domain) != 0 ||
 	    conn->helo.old_smtp != data->helo.old_smtp)
 		data->changed = TRUE; /* Definitive assessment */
 }
@@ -67,7 +66,7 @@ smtp_server_cmd_helo_run(struct smtp_server_cmd_ctx *cmd, const char *params,
 	}
 	ret = smtp_helo_domain_parse(params, !old_smtp, &domain);
 
-	smtp_server_command_input_lock(cmd);
+	smtp_server_command_pipeline_block(cmd);
 	if (conn->state.state == SMTP_SERVER_STATE_GREETING) {
 		smtp_server_connection_set_state(conn, SMTP_SERVER_STATE_HELO,
 						 NULL);
@@ -80,8 +79,7 @@ smtp_server_cmd_helo_run(struct smtp_server_cmd_ctx *cmd, const char *params,
 	helo_data->first = first;
 	command->data = helo_data;
 
-	if (conn->helo.domain == NULL ||
-	    (domain != NULL && strcmp(conn->helo.domain, domain) != 0) ||
+	if (null_strcmp(conn->helo.domain, domain) != 0 ||
 	    conn->helo.old_smtp != old_smtp)
 		helo_data->changed = TRUE; /* Preliminary assessment */
 

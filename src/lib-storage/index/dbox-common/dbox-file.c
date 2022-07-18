@@ -95,7 +95,6 @@ void dbox_file_unref(struct dbox_file **_file)
 static int dbox_file_parse_header(struct dbox_file *file, const char *line)
 {
 	const char *const *tmp, *value;
-	unsigned int pos;
 	enum dbox_header_key key;
 
 	file->file_version = *line - '0';
@@ -105,7 +104,6 @@ static int dbox_file_parse_header(struct dbox_file *file, const char *line)
 		return -1;
 	}
 	line += 2;
-	pos = 2;
 
 	file->msg_header_size = 0;
 
@@ -131,7 +129,6 @@ static int dbox_file_parse_header(struct dbox_file *file, const char *line)
 			file->create_time = (time_t)time;
 			break;
 		}
-		pos += strlen(value) + 2;
 	}
 
 	if (file->msg_header_size == 0) {
@@ -284,7 +281,7 @@ int dbox_file_header_write(struct dbox_file *file, struct ostream *output)
 	str_printfa(hdr, "%u %c%x %c%x\n", DBOX_VERSION,
 		    DBOX_HEADER_MSG_HEADER_SIZE,
 		    (unsigned int)sizeof(struct dbox_message_header),
-		    DBOX_HEADER_CREATE_STAMP, (unsigned int)ioloop_time);
+		    DBOX_HEADER_CREATE_STAMP, ioloop_time32);
 
 	file->file_version = DBOX_VERSION;
 	file->file_header_size = str_len(hdr);
@@ -310,16 +307,20 @@ void dbox_file_close(struct dbox_file *file)
 
 int dbox_file_try_lock(struct dbox_file *file)
 {
+	const char *error;
 	int ret;
 
 	i_assert(file->fd != -1);
 
 #ifdef DBOX_FILE_LOCK_METHOD_FLOCK
+	struct file_lock_settings lock_set = {
+		.lock_method = FILE_LOCK_METHOD_FLOCK,
+	};
 	ret = file_try_lock(file->fd, file->cur_path, F_WRLCK,
-			    FILE_LOCK_METHOD_FLOCK, &file->lock);
+			    &lock_set, &file->lock, &error);
 	if (ret < 0) {
 		mail_storage_set_critical(&file->storage->storage,
-			"file_try_lock(%s) failed: %m", file->cur_path);
+			"file_try_lock(%s) failed: %s", file->cur_path, error);
 	}
 #else
 	ret = file_dotlock_create(&dotlock_set, file->cur_path,

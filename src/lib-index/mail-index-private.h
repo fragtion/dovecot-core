@@ -41,6 +41,7 @@ struct mail_index_sync_map_ctx;
 	 (u)->modseq_inc_flag == 0)
 
 #define MAIL_INDEX_EXT_KEYWORDS "keywords"
+#define MAIL_INDEX_EXT_NAME_MAX_LENGTH 64
 
 typedef int mail_index_expunge_handler_t(struct mail_index_sync_map_ctx *ctx,
 					 const void *data, void **sync_context);
@@ -112,6 +113,14 @@ struct mail_index_registered_ext {
 	mail_index_expunge_handler_t *expunge_handler;
 };
 
+struct mail_index_modseq_header {
+	/* highest used modseq */
+	uint64_t highest_modseq;
+	/* last tracked log file position */
+	uint32_t log_seq;
+	uint32_t log_offset;
+};
+
 struct mail_index_record_map {
 	ARRAY(struct mail_index_map *) maps;
 
@@ -145,6 +154,8 @@ struct mail_index_map {
 	ARRAY(uint32_t) ext_id_map; /* index -> file */
 
 	ARRAY(unsigned int) keyword_idx_map; /* file -> index */
+
+	struct mail_index_modseq_header modseq_hdr_snapshot;
 
 	struct mail_index_record_map *rec_map;
 };
@@ -367,6 +378,7 @@ void mail_index_fchown(struct mail_index *index, int fd, const char *path);
 
 bool mail_index_map_lookup_ext(struct mail_index_map *map, const char *name,
 			       uint32_t *idx_r);
+bool mail_index_ext_name_is_valid(const char *name);
 uint32_t
 mail_index_map_register_ext(struct mail_index_map *map,
 			    const char *name, uint32_t ext_offset,
@@ -410,15 +422,16 @@ void mail_index_fsck_locked(struct mail_index *index);
 /* Log an error and set it as the index's current error that is available
    with mail_index_get_error_message(). */
 void mail_index_set_error(struct mail_index *index, const char *fmt, ...)
-	ATTR_FORMAT(2, 3);
+	ATTR_FORMAT(2, 3) ATTR_COLD;
 /* Same as mail_index_set_error(), but don't log the error. */
-void mail_index_set_error_nolog(struct mail_index *index, const char *str);
+void mail_index_set_error_nolog(struct mail_index *index, const char *str)
+	ATTR_COLD;
 /* "%s failed with index file %s: %m" */
 void mail_index_set_syscall_error(struct mail_index *index,
-				  const char *function);
+				  const char *function) ATTR_COLD;
 /* "%s failed with file %s: %m" */
 void mail_index_file_set_syscall_error(struct mail_index *index,
 				       const char *filepath,
-				       const char *function);
+				       const char *function) ATTR_COLD;
 
 #endif

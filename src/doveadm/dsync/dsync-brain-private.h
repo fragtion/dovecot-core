@@ -72,7 +72,7 @@ struct dsync_brain {
 	const char *lock_path;
 	struct file_lock *lock;
 
-	char hierarchy_sep;
+	char hierarchy_sep, escape_char;
 	struct dsync_mailbox_tree *local_mailbox_tree;
 	struct dsync_mailbox_tree *remote_mailbox_tree;
 	struct dsync_mailbox_tree_iter *local_tree_iter;
@@ -118,13 +118,13 @@ struct dsync_brain {
 	bool no_mail_sync:1;
 	bool no_backup_overwrite:1;
 	bool no_mail_prefetch:1;
-	bool no_mailbox_renames:1;
 	bool changes_during_remote_sync:1;
 	bool require_full_resync:1;
 	bool verbose_proctitle:1;
 	bool no_notify:1;
 	bool failed:1;
 	bool empty_hdr_workaround:1;
+	bool no_header_hashes:1;
 };
 
 extern const char *dsync_box_state_names[DSYNC_BOX_STATE_DONE+1];
@@ -149,7 +149,8 @@ bool dsync_brain_mailbox_update_pre(struct dsync_brain *brain,
 				    const char **reason_r);
 bool dsync_boxes_need_sync(struct dsync_brain *brain,
 			   const struct dsync_mailbox *box1,
-			   const struct dsync_mailbox *box2);
+			   const struct dsync_mailbox *box2,
+			   const char **reason_r);
 void dsync_brain_sync_init_box_states(struct dsync_brain *brain);
 void dsync_brain_set_changes_during_sync(struct dsync_brain *brain,
 					 const char *reason);

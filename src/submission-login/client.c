@@ -93,7 +93,7 @@ static void submission_client_create(struct client *client,
 				     void **other_sets)
 {
 	static const char *const xclient_extensions[] =
-		{ "SESSION", "FORWARD", NULL };
+		{ "FORWARD", NULL };
 	struct submission_client *subm_client =
 		container_of(client, struct submission_client, common);
 	struct smtp_server_settings smtp_set;
@@ -112,7 +112,9 @@ static void submission_client_create(struct client *client,
 	smtp_set.tls_required = !client->secured &&
 		(strcmp(client->ssl_set->ssl, "required") == 0);
 	smtp_set.xclient_extensions = xclient_extensions;
-	smtp_set.debug = client->set->auth_debug;
+	smtp_set.command_limits.max_parameters_size = LOGIN_MAX_INBUF_SIZE;
+	smtp_set.command_limits.max_auth_size = LOGIN_MAX_AUTH_BUF_SIZE;
+	smtp_set.debug = event_want_debug(client->event);
 
 	subm_client->conn = smtp_server_connection_create_from_streams(
 		smtp_server, client->input, client->output,
@@ -181,30 +183,20 @@ client_connection_cmd_xclient(void *context,
 		client->common.remote_port = data->source_port;
 	if (data->ttl_plus_1 > 0)
 		client->common.proxy_ttl = data->ttl_plus_1 - 1;
+	if (data->session != NULL) {
+		client->common.session_id =
+			p_strdup(client->common.pool, data->session);
+	}
 
 	for (i = 0; i < data->extra_fields_count; i++) {
 		const char *name = data->extra_fields[i].name;
 		const char *value = data->extra_fields[i].value;
 
 		if (strcasecmp(name, "FORWARD") == 0) {
-			size_t value_len = strlen(value);
-			if (client->common.forward_fields != NULL) {
-				str_truncate(client->common.forward_fields, 0);
-			} else {
-				client->common.forward_fields =	str_new(
-					client->common.preproxy_pool,
-					MAX_BASE64_DECODED_SIZE(value_len));
-				if (base64_decode(value, value_len, NULL,
-					  client->common.forward_fields) < 0) {
-					smtp_server_reply(cmd, 501, "5.5.4",
-						"Invalid FORWARD parameter");
-				}
+			if (!client_forward_decode_base64(&client->common, value)) {
+				smtp_server_reply(cmd, 501, "5.5.4",
+						  "Invalid FORWARD parameter");
 			}
-		} else if (strcasecmp(name, "SESSION") == 0) {
-			if (client->common.session_id != NULL)
-				continue;
-			client->common.session_id =
-				p_strdup(client->common.pool, value);
 		}
 	}
 }
@@ -258,10 +250,13 @@ static void submission_login_init(void)
 	smtp_server_set.protocol = SMTP_PROTOCOL_SMTP;
 	smtp_server_set.max_pipelined_commands = 5;
 	smtp_server_set.max_bad_commands = CLIENT_MAX_BAD_COMMANDS;
+	smtp_server_set.reason_code_module = "submission";
 	/* Pre-auth state is always logged either as GREETING or READY.
 	   It's not very useful. */
 	smtp_server_set.no_state_in_reason = TRUE;
 	smtp_server = smtp_server_init(&smtp_server_set);
+	smtp_server_command_override(smtp_server, "MAIL", cmd_mail,
+				     SMTP_SERVER_CMD_FLAG_PREAUTH);
 }
 
 static void submission_login_deinit(void)

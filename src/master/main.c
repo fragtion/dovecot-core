@@ -91,7 +91,7 @@ void process_exec(const char *cmd)
 	/* prefix with dovecot/ */
 	argv[0] = t_strdup_printf("%s/%s", services->set->instance_name,
 				  argv[0]);
-	if (!str_begins(argv[0], PACKAGE))
+	if (!str_begins_with(argv[0], PACKAGE))
 		argv[0] = t_strconcat(PACKAGE"-", argv[0], NULL);
 	execv_const(executable, argv);
 }
@@ -618,12 +618,16 @@ master_time_moved(const struct timeval *old_time,
 	long long diff = timeval_diff_usecs(old_time, new_time);
 	unsigned int msecs;
 
-	if (diff < 0)
+	if (diff < 0) {
+		diff = -diff;
+		i_warning("Time moved forward by %lld.%06lld seconds - adjusting timeouts.",
+			  diff / 1000000, diff % 1000000);
 		return;
+	}
 	msecs = (unsigned int)(diff/1000);
 
 	/* time moved backwards. disable launching new service processes
-	   until  */
+	   until the throttling timeout has reached. */
 	if (msecs > SERVICE_TIME_MOVED_BACKWARDS_MAX_THROTTLE_MSECS)
 		msecs = SERVICE_TIME_MOVED_BACKWARDS_MAX_THROTTLE_MSECS;
 	services_throttle_time_sensitives(services, msecs);
@@ -678,12 +682,7 @@ static void print_build_options(void)
 #ifdef IOLOOP_NOTIFY_KQUEUE
 		" notify=kqueue"
 #endif
-#ifdef HAVE_GNUTLS
-		" gnutls"
-#endif
-#ifdef HAVE_OPENSSL
 		" openssl"
-#endif
 	        " io_block_size=%u"
 #ifdef SQL_DRIVER_PLUGINS
 	"\nSQL driver plugins:"
@@ -706,9 +705,6 @@ static void print_build_options(void)
 #ifdef PASSDB_BSDAUTH
 		" bsdauth"
 #endif
-#ifdef PASSDB_CHECKPASSWORD
-		" checkpassword"
-#endif
 #ifdef PASSDB_LDAP
 		" ldap"
 #endif
@@ -721,16 +717,10 @@ static void print_build_options(void)
 #ifdef PASSDB_PASSWD_FILE
 		" passwd-file"
 #endif
-#ifdef PASSDB_SHADOW 
-		" shadow"
-#endif
 #ifdef PASSDB_SQL 
 		" sql"
 #endif
 	"\nUserdb:"
-#ifdef USERDB_CHECKPASSWORD
-		" checkpassword"
-#endif
 #ifdef USERDB_LDAP
 		" ldap"
 #ifndef BUILTIN_LDAP
@@ -774,7 +764,7 @@ int main(int argc, char *argv[])
 	/* drop -- prefix from all --args. ugly, but the only way that it
 	   works with standard getopt() in all OSes.. */
 	for (i = 1; i < argc; i++) {
-		if (str_begins(argv[i], "--")) {
+		if (str_begins_with(argv[i], "--")) {
 			if (argv[i][2] == '\0')
 				break;
 			argv[i] += 2;
@@ -787,7 +777,8 @@ int main(int argc, char *argv[])
 				MASTER_SERVICE_FLAG_STANDALONE |
 				MASTER_SERVICE_FLAG_DONT_SEND_STATS |
 				MASTER_SERVICE_FLAG_DONT_LOG_TO_STDERR |
-				MASTER_SERVICE_FLAG_NO_INIT_DATASTACK_FRAME,
+				MASTER_SERVICE_FLAG_NO_INIT_DATASTACK_FRAME |
+				MASTER_SERVICE_FLAG_DISABLE_SSL_SET,
 				&argc, &argv, "+Fanp");
 	i_unset_failure_prefix();
 

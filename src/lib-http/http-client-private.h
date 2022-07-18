@@ -175,7 +175,6 @@ struct http_client_connection {
 	struct http_client_peer_pool *ppool;
 	struct http_client_peer *peer;
 
-	int connect_errno;
 	struct timeval connect_start_timestamp;
 	struct timeval connected_timestamp;
 	struct http_client_request *connect_request;
@@ -285,7 +284,7 @@ struct http_client_peer {
 	struct timeout *to_req_handling;
 
 	bool connect_failed:1;    /* Last connection attempt failed */
-	bool connect_backoff:1;   /* Peer is waiting for backoff timout*/
+	bool connect_backoff:1;   /* Peer is waiting for backoff timeout */
 	bool disconnected:1;      /* Peer is already disconnected */
 	bool handling_requests:1; /* Currently running request handler */
 };

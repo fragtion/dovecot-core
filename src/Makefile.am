@@ -11,21 +11,23 @@ LIBDOVECOT_SUBDIRS = \
 	lib-settings \
 	lib-auth \
 	lib-dns \
-	lib-master \
-	lib-charset \
 	lib-ssl-iostream \
+	lib-master \
+	lib-login \
+	lib-charset \
 	lib-dcrypt \
 	lib-dict \
 	lib-sasl \
-	lib-old-stats \
 	lib-http \
 	lib-fs \
 	lib-mail \
 	lib-program-client \
 	lib-smtp \
+	lib-pop3 \
 	lib-imap \
 	lib-imap-storage \
-	lib-oauth2
+	lib-oauth2 \
+	lib-doveadm
 
 SUBDIRS = \
 	$(LIBDOVECOT_SUBDIRS) \
@@ -48,7 +50,6 @@ SUBDIRS = \
 	dict \
 	dns \
 	indexer \
-	ipc \
 	master \
 	login-common \
 	imap-hibernate \
@@ -68,5 +69,4 @@ SUBDIRS = \
 	util \
 	doveadm \
 	stats \
-	old-stats \
 	plugins

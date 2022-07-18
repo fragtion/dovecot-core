@@ -452,9 +452,9 @@ pop3c_client_prelogin_input_line(struct pop3c_client *client, const char *line)
 		break;
 	case POP3C_CLIENT_STATE_PASS:
 		if (client->login_callback != NULL) {
-			reply = strncasecmp(line, "+OK ", 4) == 0 ? line + 4 :
-				strncasecmp(line, "-ERR ", 5) == 0 ? line + 5 :
-				line;
+			if (!str_begins_icase(line, "+OK ", &reply) &&
+			    !str_begins_icase(line, "-ERR ", &reply))
+				reply = line;
 			client_login_callback(client, success ?
 					      POP3C_COMMAND_STATE_OK :
 					      POP3C_COMMAND_STATE_ERR, reply);
@@ -469,7 +469,7 @@ pop3c_client_prelogin_input_line(struct pop3c_client *client, const char *line)
 		client->state = POP3C_CLIENT_STATE_CAPA;
 		break;
 	case POP3C_CLIENT_STATE_CAPA:
-		if (strncasecmp(line, "-ERR", 4) == 0) {
+		if (str_begins_icase_with(line, "-ERR")) {
 			/* CAPA command not supported. some commands still
 			   support UIDL though. */
 			client->capabilities |= POP3C_CAPABILITY_UIDL;
@@ -576,8 +576,9 @@ static int pop3c_client_ssl_init(struct pop3c_client *client)
 	}
 
 	if (io_stream_create_ssl_client(client->ssl_ctx, client->set.host,
-					&client->set.ssl_set, &client->input,
-					&client->output, &client->ssl_iostream, &error) < 0) {
+					&client->set.ssl_set, client->event,
+					&client->input, &client->output,
+					&client->ssl_iostream, &error) < 0) {
 		i_error("pop3c(%s): Couldn't initialize SSL client: %s",
 			client->set.host, error);
 		return -1;
@@ -732,13 +733,11 @@ pop3c_client_input_next_reply(struct pop3c_client *client)
 	if (line == NULL)
 		return client->input->eof ? -1 : 0;
 
-	if (strncasecmp(line, "+OK", 3) == 0) {
-		line += 3;
+	if (str_begins_icase(line, "+OK", &line))
 		state = POP3C_COMMAND_STATE_OK;
-	} else if (strncasecmp(line, "-ERR", 4) == 0) {
-		line += 4;
+	else if (str_begins_icase(line, "-ERR", &line))
 		state = POP3C_COMMAND_STATE_ERR;
-	} else {
+	else {
 		i_error("pop3c(%s): Server sent unrecognized line: %s",
 			client->set.host, line);
 		state = POP3C_COMMAND_STATE_ERR;
@@ -889,7 +888,7 @@ pop3c_client_cmd_stream_async(struct pop3c_client *client, const char *cmdline,
 
 	cmd = pop3c_client_cmd_line_async(client, cmdline, callback, context);
 
-	input = i_stream_create_chain(&cmd->chain);
+	input = i_stream_create_chain(&cmd->chain, POP3C_MAX_INBUF_SIZE);
 	inputs[0] = i_stream_create_dot(input, TRUE);
 	inputs[1] = NULL;
 	cmd->input = i_stream_create_seekable(inputs, POP3C_MAX_INBUF_SIZE,

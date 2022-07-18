@@ -12,6 +12,7 @@
 #include "mail-user.h"
 #include "mail-storage-private.h"
 #include "fts-api.h"
+#include "fts-storage.h"
 #include "fts-indexer.h"
 
 #define INDEXER_NOTIFY_INTERVAL_SECS 10
@@ -94,7 +95,10 @@ int fts_indexer_more(struct fts_indexer_context *ctx)
 	int ret;
 
 	if ((ret = fts_indexer_more_int(ctx)) < 0) {
-		mail_storage_set_internal_error(ctx->box->storage);
+		/* If failed is already set, the code has had a chance to
+		 * set an internal error already, i.e. MAIL_ERROR_INUSE. */
+		if (!ctx->failed)
+			mail_storage_set_internal_error(ctx->box->storage);
 		ctx->failed = TRUE;
 		return -1;
 	}
@@ -197,8 +201,8 @@ static void fts_indexer_idle_timeout(struct connection *conn)
 
 static const struct connection_settings indexer_client_set =
 {
-	.service_name_in = "indexer",
-	.service_name_out = "indexer",
+	.service_name_in = "indexer-server",
+	.service_name_out = "indexer-client",
 	.major_version = 1,
 	.minor_version = 0,
 	.client_connect_timeout_msecs = 2000,
@@ -220,7 +224,6 @@ int fts_indexer_init(struct fts_backend *backend, struct mailbox *box,
 {
 	struct ioloop *prev_ioloop = current_ioloop;
 	struct fts_indexer_context *ctx;
-	struct mailbox_status status;
 	uint32_t last_uid, seq1, seq2;
 	const char *path, *value, *error;
 	unsigned int timeout_secs = 0;
@@ -228,18 +231,18 @@ int fts_indexer_init(struct fts_backend *backend, struct mailbox *box,
 
 	value = mail_user_plugin_getenv(box->storage->user, "fts_index_timeout");
 	if (value != NULL) {
-		if (settings_get_time(value, &timeout_secs, &error) < 0)
+		if (settings_get_time(value, &timeout_secs, &error) < 0) {
 			e_error(box->storage->user->event,
 				"Invalid fts_index_timeout setting: %s",
 				error);
-		return -1;
+			return -1;
+		}
 	}
 
-	if (fts_backend_get_last_uid(backend, box, &last_uid) < 0)
+	ret = fts_search_get_first_missing_uid(backend, box, &last_uid);
+	if (ret < 0)
 		return -1;
-
-	mailbox_get_open_status(box, STATUS_UIDNEXT, &status);
-	if (status.uidnext == last_uid+1) {
+	if (ret > 0) {
 		/* everything is already indexed */
 		return 0;
 	}
@@ -269,7 +272,7 @@ int fts_indexer_init(struct fts_backend *backend, struct mailbox *box,
 	return ctx->failed || ret < 0 ? -1 : 1;
 }
 
-#define INDEXER_HANDSHAKE "1\t0\tindexer\tindexer\n"
+#define INDEXER_HANDSHAKE "VERSION\tindexer-client\t1\t0\n"
 
 int fts_indexer_cmd(struct mail_user *user, const char *cmd,
 	            const char **path_r)

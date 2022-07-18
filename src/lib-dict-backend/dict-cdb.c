@@ -87,7 +87,7 @@ static int
 cdb_dict_lookup(struct dict *_dict,
 		const struct dict_op_settings *set ATTR_UNUSED,
 		pool_t pool,
-	        const char *key, const char **value_r,
+	        const char *key, const char *const **values_r,
 	        const char **error_r)
 {
 	struct cdb_dict *dict = (struct cdb_dict *)_dict;
@@ -110,7 +110,6 @@ cdb_dict_lookup(struct dict *_dict,
 	}
 
 	if (ret <= 0) {
-		*value_r = NULL;
 		/* something bad with db */
 		if (ret < 0) {
 			*error_r = t_strdup_printf("cdb_find(%s) failed: %m", dict->path);
@@ -126,7 +125,9 @@ cdb_dict_lookup(struct dict *_dict,
 		*error_r = t_strdup_printf("cdb_read(%s) failed: %m", dict->path);
 		return -1;
 	}
-	*value_r = data;
+	const char **values = p_new(pool, const char *, 2);
+	values[0] = data;
+	*values_r = values;
 	return 1;
 }
 
@@ -199,9 +200,9 @@ static bool cdb_dict_iterate(struct dict_iterate_context *_ctx,
 		if (((ctx->flags & DICT_ITERATE_FLAG_EXACT_KEY) != 0 &&
 		     strcmp(key, ctx->path) == 0) ||
 		    ((ctx->flags & DICT_ITERATE_FLAG_RECURSE) != 0 &&
-		     str_begins(key, ctx->path)) ||
+		     str_begins_with(key, ctx->path)) ||
 		    ((ctx->flags & DICT_ITERATE_FLAG_RECURSE) == 0 &&
-		     str_begins(key, ctx->path) &&
+		     str_begins_with(key, ctx->path) &&
 		     strchr(key + strlen(ctx->path), '/') == NULL)) {
 			match = TRUE;
 			break;
@@ -254,7 +255,7 @@ static int cdb_dict_iterate_deinit(struct dict_iterate_context *_ctx,
 
 struct dict dict_driver_cdb = {
 	.name = "cdb",
-	{
+	.v = {
 		.init = cdb_dict_init,
 		.deinit = cdb_dict_deinit,
 		.lookup = cdb_dict_lookup,

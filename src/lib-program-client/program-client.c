@@ -37,6 +37,8 @@ program_client_callback(struct program_client *pclient, int result,
 	pclient->callback = NULL;
 	if (pclient->destroying || callback == NULL)
 		return;
+	if (pclient->wait_ioloop != NULL)
+		io_loop_stop(pclient->wait_ioloop);
 	callback(result, context);
 }
 
@@ -667,21 +669,23 @@ int program_client_create(const char *uri, const char *const *args,
 			  bool noreply, struct program_client **pc_r,
 			  const char **error_r)
 {
-	if (str_begins(uri, "exec:")) {
-		*pc_r = program_client_local_create(uri+5, args, set);
+	const char *suffix;
+
+	if (str_begins(uri, "exec:", &suffix)) {
+		*pc_r = program_client_local_create(suffix, args, set);
 		return 0;
-	} else if (str_begins(uri, "unix:")) {
-		*pc_r = program_client_unix_create(uri+5, args, set, noreply);
+	} else if (str_begins(uri, "unix:", &suffix)) {
+		*pc_r = program_client_unix_create(suffix, args, set, noreply);
 		return 0;
-	} else if (str_begins(uri, "tcp:")) {
+	} else if (str_begins(uri, "tcp:", &suffix)) {
 		const char *host;
 		in_port_t port;
 
-		if (net_str2hostport(uri+4, 0, &host, &port) < 0 ||
+		if (net_str2hostport(suffix, 0, &host, &port) < 0 ||
 		    port == 0) {
 			*error_r = t_strdup_printf(
 				"Invalid tcp syntax, "
-				"must be host:port in '%s'", uri+4);
+				"must be host:port in '%s'", suffix);
 			return -1;
 		}
 		*pc_r = program_client_net_create(host, port, args, set,
@@ -742,4 +746,24 @@ void program_client_run_async(struct program_client *pclient,
 	pclient->context = context;
 	if (program_client_connect(pclient) < 0)
 		program_client_fail(pclient, PROGRAM_CLIENT_ERROR_IO);
+}
+
+void program_client_wait(struct program_client *pclient)
+{
+	if (pclient->disconnected)
+		return;
+
+	struct ioloop *prev_ioloop = current_ioloop;
+	struct ioloop *ioloop = io_loop_create();
+
+	program_client_switch_ioloop(pclient);
+
+	pclient->wait_ioloop = ioloop;
+	io_loop_run(ioloop);
+	pclient->wait_ioloop = NULL;
+
+	io_loop_set_current(prev_ioloop);
+	program_client_switch_ioloop(pclient);
+	io_loop_set_current(ioloop);
+	io_loop_destroy(&ioloop);
 }

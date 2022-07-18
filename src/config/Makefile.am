@@ -12,6 +12,7 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-mail \
 	-I$(top_srcdir)/src/lib-settings \
 	-I$(top_srcdir)/src/lib-master \
+	-I$(top_srcdir)/src/lib-pop3 \
 	-DPKG_RUNDIR=\""$(rundir)"\" \
 	-DPKG_STATEDIR=\""$(statedir)"\" \
 	-DPKG_LIBEXECDIR=\""$(pkglibexecdir)"\" \
@@ -72,7 +73,7 @@ pkginclude_HEADERS = \
 	config-request.h
 
 all-settings.c: $(SETTING_FILES) $(top_srcdir)/src/config/settings-get.pl
-	$(top_srcdir)/src/config/settings-get.pl $(SETTING_FILES) > all-settings.c || rm -f all-settings.c
+	$(AM_V_GEN)$(top_srcdir)/src/config/settings-get.pl $(SETTING_FILES) > all-settings.c || rm -f all-settings.c
 
 EXTRA_DIST = \
 	config-settings.c \

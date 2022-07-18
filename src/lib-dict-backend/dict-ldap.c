@@ -1,4 +1,4 @@
-/* Copyright (c) 2016-2018 Dovecot authors, see the included COPYING memcached */
+/* Copyright (c) 2016-2018 Dovecot authors */
 
 #include "lib.h"
 
@@ -200,12 +200,11 @@ ldap_dict_build_query(const struct dict_op_settings *set,
 	struct var_expand_table entry;
 
 	t_array_init(&exp, 8);
-	entry.key = '\0';
-	entry.value = ldap_escape(set->username);
-	entry.long_key = "username";
-	array_push_back(&exp, &entry);
-
 	if (priv) {
+		entry.key = '\0';
+		entry.value = ldap_escape(set->username);
+		entry.long_key = "username";
+		array_push_back(&exp, &entry);
 		template = t_strdup_printf("(&(%s=%s)%s)", map->username_attribute, "%{username}", map->filter);
 	} else {
 		template = map->filter;
@@ -300,7 +299,10 @@ void ldap_dict_lookup_done(const struct dict_lookup_result *result, void *ctx)
 {
 	struct dict_lookup_result *res = ctx;
 	res->ret = result->ret;
-	res->value = t_strdup(result->value);
+	if (result->ret > 0) {
+		res->values = p_strarray_dup(pool_datastack_create(),
+					     result->values);
+	}
 	res->error = t_strdup(result->error);
 }
 
@@ -355,7 +357,7 @@ ldap_dict_lookup_callback(struct ldap_result *result, struct dict_ldap_op *op)
 static int
 ldap_dict_lookup(struct dict *dict, const struct dict_op_settings *set,
 		 pool_t pool, const char *key,
-		 const char **value_r, const char **error_r)
+		 const char *const **values_r, const char **error_r)
 {
 	struct dict_lookup_result res;
 
@@ -367,7 +369,7 @@ ldap_dict_lookup(struct dict *dict, const struct dict_op_settings *set,
 		return -1;
 	}
 	if (res.ret > 0)
-		*value_r = p_strdup(pool, res.value);
+		*values_r = p_strarray_dup(pool, res.values);
 	return res.ret;
 }
 
@@ -468,7 +470,7 @@ void ldap_dict_lookup_async(struct dict *dict,
 
 struct dict dict_driver_ldap = {
 	.name = "ldap",
-	{
+	.v = {
 		.init = ldap_dict_init,
 		.deinit = ldap_dict_deinit,
 		.wait = ldap_dict_wait,

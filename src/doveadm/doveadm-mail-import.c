@@ -63,7 +63,6 @@ dest_mailbox_open_or_create(struct import_cmd_context *ctx,
 	}
 
 	box = mailbox_alloc(ns->list, name, MAILBOX_FLAG_SAVEONLY);
-	mailbox_set_reason(box, ctx->ctx.cmd->name);
 	if (mailbox_create(box, NULL, FALSE) < 0) {
 		errstr = mailbox_get_last_internal_error(box, &error);
 		if (error != MAIL_ERROR_EXISTS) {
@@ -134,12 +133,14 @@ cmd_import_box(struct import_cmd_context *ctx, struct mail_user *dest_user,
 	struct doveadm_mail_iter *iter;
 	struct mailbox *box;
 	struct mail *mail;
-	int ret = 0;
 
-	if (doveadm_mail_iter_init(&ctx->ctx, info, search_args, 0, NULL, TRUE,
-				   &iter) < 0)
-		return -1;
+	int ret = doveadm_mail_iter_init(&ctx->ctx, info, search_args, 0, NULL,
+					 DOVEADM_MAIL_ITER_FLAG_READONLY,
+					 &iter);
+	if (ret <= 0)
+		return ret;
 
+	ret = 0;
 	if (doveadm_mail_iter_next(iter, &mail)) {
 		/* at least one mail matches in this mailbox */
 		if (dest_mailbox_open_or_create(ctx, dest_user, info, &box) < 0)
@@ -171,6 +172,7 @@ static void cmd_import_init_source_user(struct import_cmd_context *ctx, struct m
 			 ctx->src_username :
 			 dest_user->username;
 
+	mail_storage_service_io_deactivate_user(ctx->ctx.cur_service_user);
 	input.flags_override_add = MAIL_STORAGE_SERVICE_FLAG_NO_NAMESPACES |
 		MAIL_STORAGE_SERVICE_FLAG_NO_RESTRICT_ACCESS;
 	if (mail_storage_service_lookup_next(ctx->ctx.storage_service, &input,
@@ -180,13 +182,16 @@ static void cmd_import_init_source_user(struct import_cmd_context *ctx, struct m
 		i_fatal("Import namespace initialization failed: %s", error);
 
 	ctx->src_user = user;
+	mail_storage_service_io_deactivate_user(service_user);
 	mail_storage_service_user_unref(&service_user);
+	mail_storage_service_io_activate_user(ctx->ctx.cur_service_user);
 }
 
 static int
 cmd_import_run(struct doveadm_mail_cmd_context *_ctx, struct mail_user *user)
 {
-	struct import_cmd_context *ctx = (struct import_cmd_context *)_ctx;
+	struct import_cmd_context *ctx =
+		container_of(_ctx, struct import_cmd_context, ctx);
 	const enum mailbox_list_iter_flags iter_flags =
 		MAILBOX_LIST_ITER_NO_AUTO_BOXES |
 		MAILBOX_LIST_ITER_RETURN_NO_FLAGS;
@@ -208,41 +213,32 @@ cmd_import_run(struct doveadm_mail_cmd_context *_ctx, struct mail_user *user)
 	return ret;
 }
 
-static void cmd_import_init(struct doveadm_mail_cmd_context *_ctx,
-			    const char *const args[])
+static void cmd_import_init(struct doveadm_mail_cmd_context *_ctx)
 {
-	struct import_cmd_context *ctx = (struct import_cmd_context *)_ctx;
+	struct import_cmd_context *ctx =
+		container_of(_ctx, struct import_cmd_context, ctx);
 
-	if (str_array_length(args) < 3)
+	struct doveadm_cmd_context *cctx = _ctx->cctx;
+
+	(void)doveadm_cmd_param_str(cctx, "source-user", &ctx->src_username);
+	ctx->subscribe = doveadm_cmd_param_flag(cctx, "subscribe");
+
+	const char *const *query;
+	if (!doveadm_cmd_param_str(cctx, "source-location", &ctx->src_location) ||
+	    !doveadm_cmd_param_str(cctx, "dest-parent-mailbox", &ctx->dest_parent) ||
+	    !doveadm_cmd_param_array(cctx, "query", &query))
 		doveadm_mail_help_name("import");
-	ctx->src_location = p_strdup(_ctx->pool, args[0]);
-	ctx->dest_parent = p_strdup(_ctx->pool, args[1]);
-	ctx->ctx.search_args = doveadm_mail_build_search_args(args+2);
+
+	_ctx->search_args = doveadm_mail_build_search_args(query);
 }
 
 static void cmd_import_deinit(struct doveadm_mail_cmd_context *_ctx)
 {
-	struct import_cmd_context *ctx = (struct import_cmd_context *)_ctx;
+	struct import_cmd_context *ctx =
+		container_of(_ctx, struct import_cmd_context, ctx);
 
 	if (ctx->src_user != NULL)
 		mail_user_deinit(&ctx->src_user);
-}
-
-static bool cmd_import_parse_arg(struct doveadm_mail_cmd_context *_ctx, int c)
-{
-	struct import_cmd_context *ctx = (struct import_cmd_context *)_ctx;
-
-	switch (c) {
-	case 'U':
-		ctx->src_username = p_strdup(_ctx->pool, optarg);
-		break;
-	case 's':
-		ctx->subscribe = TRUE;
-		break;
-	default:
-		return FALSE;
-	}
-	return TRUE;
 }
 
 static struct doveadm_mail_cmd_context *cmd_import_alloc(void)
@@ -250,8 +246,6 @@ static struct doveadm_mail_cmd_context *cmd_import_alloc(void)
 	struct import_cmd_context *ctx;
 
 	ctx = doveadm_mail_cmd_alloc(struct import_cmd_context);
-	ctx->ctx.getopt_args = "s";
-	ctx->ctx.v.parse_arg = cmd_import_parse_arg;
 	ctx->ctx.v.init = cmd_import_init;
 	ctx->ctx.v.deinit = cmd_import_deinit;
 	ctx->ctx.v.run = cmd_import_run;

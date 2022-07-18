@@ -16,6 +16,29 @@ static void test_p_strdup(void)
 	test_end();
 }
 
+static void test_p_strndup(void)
+{
+	struct {
+		const char *input;
+		const char *output;
+		size_t len;
+	} tests[] = {
+		{ "foo", "fo", 2 },
+		{ "foo", "foo", 3 },
+		{ "foo", "foo", 4 },
+		{ "foo\0more", "foo", 8 },
+	};
+	test_begin("p_strndup()");
+
+	for (unsigned int i = 0; i < N_ELEMENTS(tests); i++) {
+		char *str = p_strndup(default_pool, tests[i].input,
+				      tests[i].len);
+		test_assert_strcmp_idx(str, tests[i].output, i);
+		p_free(default_pool, str);
+	}
+	test_end();
+}
+
 static void test_p_strdup_empty(void)
 {
 	test_begin("p_strdup_empty()");
@@ -312,13 +335,12 @@ static struct {
 
 static void test_t_strarray_join(void)
 {
-	const char *null = NULL;
 	unsigned int i;
 
 	test_begin("t_strarray_join()");
 
 	/* empty array -> empty string */
-	test_assert(strcmp(t_strarray_join(&null, " "), "") == 0);
+	test_assert(strcmp(t_strarray_join(empty_str_array, " "), "") == 0);
 
 	for (i = 0; i < N_ELEMENTS(test_strarray_outputs); i++) {
 		test_assert_idx(strcmp(t_strarray_join(test_strarray_input,
@@ -439,6 +461,13 @@ test_str_match(void)
 	static const struct {
 		const char*s1, *s2; size_t match;
 	} tests[] = {
+		{ "", "a", 0 },
+		{ "a", "a", 1 },
+		{ "a", "A", 0 },
+		{ "ab", "a", 1 },
+		{ "ab", "A", 0 },
+		{ "B", "AB", 0 },
+		{ "ab", "AB", 0 },
 #define MATCH_TEST(common, left, right) { common left, common right, sizeof(common)-1 }
 		MATCH_TEST("", "", ""),
 		MATCH_TEST("", "x", ""),
@@ -452,7 +481,7 @@ test_str_match(void)
 		MATCH_TEST("blahblahblah", "foo", "bar"),
 #undef MATCH_TEST
 	};
-
+	const char *suffix;
 	unsigned int i;
 
 	test_begin("str_match");
@@ -464,17 +493,195 @@ test_str_match(void)
 	for (i = 0; i < N_ELEMENTS(tests); i++) {
 		/* This is just 2 ways of wording the same test, but that also
 		   sanity tests the match values above. */
-		test_assert_idx(str_begins(tests[i].s1, tests[i].s2) ==
-				(str_begins(tests[i].s1, tests[i].s2)), i);
-		test_assert_idx(str_begins(tests[i].s1, tests[i].s2) ==
+		bool equals = strncmp(tests[i].s1, tests[i].s2, strlen(tests[i].s2)) == 0;
+		test_assert_idx(str_begins_with(tests[i].s1, tests[i].s2) == equals, i);
+		test_assert_idx(str_begins(tests[i].s1, tests[i].s2, &suffix) == equals &&
+				(!equals || suffix == tests[i].s1 + strlen(tests[i].s2)), i);
+		test_assert_idx(str_begins(tests[i].s1, tests[i].s2, &suffix) ==
 				(strlen(tests[i].s2) == tests[i].match), i);
 	}
+	/* test literal-optimized versions of these */
+	test_assert(str_begins("", "", &suffix) && suffix[0] == '\0');
+	test_assert(str_begins("123", "", &suffix) && strcmp(suffix, "123") == 0);
+	test_assert(str_begins("123", "1", &suffix) && strcmp(suffix, "23") == 0);
+	test_assert(str_begins("123", "123", &suffix) && suffix[0] == '\0');
+	suffix = NULL;
+	test_assert(!str_begins("123", "1234", &suffix) && suffix == NULL);
+	test_assert(!str_begins("", "123", &suffix) && suffix == NULL);
+	test_assert(!str_begins("12", "123", &suffix) && suffix == NULL);
+
+	test_assert(str_begins_with("", ""));
+	test_assert(str_begins_with("123", ""));
+	test_assert(str_begins_with("123", "1"));
+	test_assert(str_begins_with("123", "123"));
+	test_assert(!str_begins_with("123", "1234"));
+	test_assert(!str_begins_with("", "123"));
+	test_assert(!str_begins_with("12", "123"));
+	test_end();
+}
+
+static void
+test_str_match_icase(void)
+{
+	const struct {
+		const char *s1, *s2;
+		size_t match;
+	} tests[] = {
+		{ "", "a", 0 },
+		{ "a", "a", 1 },
+		{ "a", "A", 1 },
+		{ "ab", "a", 1 },
+		{ "ab", "A", 1 },
+		{ "B", "AB", 0 },
+		{ "ab", "AB", 2 },
+	};
+	const char *suffix;
+	unsigned int i;
+
+	test_begin("str_match_icase");
+	for (i = 0; i < N_ELEMENTS(tests); i++)
+		test_assert_idx(str_match_icase(tests[i].s1, tests[i].s2) == tests[i].match, i);
+	test_end();
+
+	test_begin("str_begins_icase");
+	for (i = 0; i < N_ELEMENTS(tests); i++) {
+		/* This is just 2 ways of wording the same test, but that also
+		   sanity tests the match values above. */
+		bool equals = strncasecmp(tests[i].s1, tests[i].s2, strlen(tests[i].s2)) == 0;
+		test_assert_idx(str_begins_icase_with(tests[i].s1, tests[i].s2) == equals, i);
+		test_assert_idx(str_begins_icase(tests[i].s1, tests[i].s2, &suffix) == equals &&
+				(!equals || suffix == tests[i].s1 + strlen(tests[i].s2)), i);
+		test_assert_idx(str_begins_icase(tests[i].s1, tests[i].s2, &suffix) ==
+				(strlen(tests[i].s2) == tests[i].match), i);
+	}
+	/* test literal-optimized versions of these */
+	test_assert(str_begins_icase("", "", &suffix) && suffix[0] == '\0');
+	test_assert(str_begins_icase("aBc", "", &suffix) && strcmp(suffix, "aBc") == 0);
+	test_assert(str_begins_icase("aBc", "a", &suffix) && strcmp(suffix, "Bc") == 0);
+	test_assert(str_begins_icase("aBc", "A", &suffix) && strcmp(suffix, "Bc") == 0);
+	test_assert(str_begins_icase("aBc", "AbC", &suffix) && suffix[0] == '\0');
+	suffix = NULL;
+	test_assert(!str_begins_icase("aBc", "AbCd", &suffix) && suffix == NULL);
+	test_assert(!str_begins_icase("", "aBc", &suffix) && suffix == NULL);
+	test_assert(!str_begins_icase("aB", "AbC", &suffix) && suffix == NULL);
+
+	test_assert(str_begins_icase_with("", ""));
+	test_assert(str_begins_icase_with("aBc", ""));
+	test_assert(str_begins_icase_with("aBc", "A"));
+	test_assert(str_begins_icase_with("aBc", "AbC"));
+	test_assert(!str_begins_icase_with("aBc", "aBcD"));
+	test_assert(!str_begins_icase_with("", "aBc"));
+	test_assert(!str_begins_icase_with("aB", "AbC"));
+	test_end();
+}
+
+static void test_memspn(void)
+{
+#undef TEST_CASE
+/* we substract 1 to ensure we don't include the final \0 byte */
+#define TEST_CASE(a, b, r) { \
+	.input = (const unsigned char*)((a)), .input_len = sizeof((a))-1, \
+	.accept = (const unsigned char*)((b)), .accept_len = sizeof((b))-1, \
+	.result = r, \
+}
+
+	static struct {
+		const unsigned char *input;
+		size_t input_len;
+		const unsigned char *accept;
+		size_t accept_len;
+		size_t result;
+	} tests[] = {
+		TEST_CASE("", "", 0),
+		TEST_CASE("", "123456789", 0),
+		TEST_CASE("123456789", "", 0),
+		TEST_CASE("hello, world", "helo", 5),
+		TEST_CASE("hello, uuuuu", "helo", 5),
+		TEST_CASE("\0\0\0\0\0hello", "\0", 5),
+		TEST_CASE("\r\r\r\r", "\r", 4),
+		TEST_CASE("aaa", "a", 3),
+		TEST_CASE("bbb", "a", 0),
+		/* null safety test */
+		{
+			.input = NULL, .accept = NULL,
+			.input_len = 0, .accept_len = 0,
+			.result = 0,
+		}
+	};
+
+	test_begin("i_memspn");
+
+	for (unsigned int i = 0; i < N_ELEMENTS(tests); i++) {
+		size_t a = i_memspn(tests[i].input, tests[i].input_len,
+				    tests[i].accept, tests[i].accept_len);
+		test_assert_ucmp_idx(a, ==, tests[i].result, i);
+		if (tests[i].input == NULL)
+			continue;
+		a = i_memspn(tests[i].input, strlen((const char*)tests[i].input),
+			     tests[i].accept, strlen((const char*)tests[i].accept));
+		size_t b = strspn((const char*)tests[i].input,
+				  (const char*)tests[i].accept);
+		test_assert_ucmp_idx(a, ==, b, i);
+	}
+
+	test_end();
+}
+
+static void test_memcspn(void)
+{
+#undef TEST_CASE
+/* we substract 1 to ensure we don't include the final \0 byte */
+#define TEST_CASE(a, b, r) { \
+	.input = (const unsigned char*)((a)), .input_len = sizeof((a))-1, \
+	.reject = (const unsigned char*)((b)), .reject_len = sizeof((b))-1, \
+	.result = r, \
+}
+
+	static struct {
+		const unsigned char *input;
+		size_t input_len;
+		const unsigned char *reject;
+		size_t reject_len;
+		size_t result;
+	} tests[] = {
+		TEST_CASE("", "", 0),
+		TEST_CASE("hello", "", 5),
+		TEST_CASE("uuuuu, hello", "helo", 7),
+		TEST_CASE("\0\0\0\0\0\0hello", "u", 11),
+		TEST_CASE("this\0is\0test", "\0", 4),
+		TEST_CASE("hello, world\r", "\r", 12),
+		TEST_CASE("aaa", "a", 0),
+		TEST_CASE("bbb", "a", 3),
+		/* null safety test */
+		{
+			.input = NULL, .reject = NULL,
+			.input_len = 0, .reject_len = 0,
+			.result = 0,
+		}
+	};
+
+	test_begin("i_memcspn");
+
+	for (unsigned int i = 0; i < N_ELEMENTS(tests); i++) {
+		size_t a = i_memcspn(tests[i].input, tests[i].input_len,
+				     tests[i].reject, tests[i].reject_len);
+		test_assert_ucmp_idx(a, ==, tests[i].result, i);
+		if (tests[i].input == NULL)
+			continue;
+		a = i_memcspn(tests[i].input, strlen((const char*)tests[i].input),
+			      tests[i].reject, strlen((const char*)tests[i].reject));
+		size_t b = strcspn((const char*)tests[i].input,
+				   (const char*)tests[i].reject);
+		test_assert_ucmp_idx(a, ==, b, i);
+	}
+
 	test_end();
 }
 
 void test_strfuncs(void)
 {
 	test_p_strdup();
+	test_p_strndup();
 	test_p_strdup_empty();
 	test_p_strdup_until();
 	test_p_strarray_dup();
@@ -491,4 +698,24 @@ void test_strfuncs(void)
 	test_str_equals_timing_almost_safe();
 	test_dec2str_buf();
 	test_str_match();
+	test_str_match_icase();
+	test_memspn();
+	test_memcspn();
+}
+
+enum fatal_test_state fatal_strfuncs(unsigned int stage)
+{
+	switch (stage) {
+	case 0:
+		test_begin("fatal p_strndup()");
+		test_expect_fatal_string("(str != NULL)");
+		(void)p_strndup(default_pool, NULL, 100);
+		return FATAL_TEST_FAILURE;
+	case 1:
+		test_expect_fatal_string("(max_chars != SIZE_MAX)");
+		(void)p_strndup(default_pool, "foo", SIZE_MAX);
+		return FATAL_TEST_FAILURE;
+	}
+	test_end();
+	return FATAL_TEST_FINISHED;
 }

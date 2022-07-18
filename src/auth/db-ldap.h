@@ -2,8 +2,9 @@
 #define DB_LDAP_H
 
 /* Functions like ldap_bind() have been deprecated in OpenLDAP 2.3
-   This define enables them until the code here can be refactored */
-#define LDAP_DEPRECATED 1
+   This define enables them until the code here can be refactored
+   It is now set in m4/want_ldap.m4 if ldap is enabled. */
+/* #define LDAP_DEPRECATED 1 */
 
 /* Maximum number of pending requests before delaying new requests. */
 #define DB_LDAP_MAX_PENDING_REQUESTS 8
@@ -103,6 +104,11 @@ struct ldap_request {
 	int msgid;
 	/* timestamp when request was created */
 	time_t create_time;
+
+	/* Number of times this request has been sent to LDAP server. This
+	   increases when LDAP gets disconnected and reconnect send the request
+	   again. */
+	unsigned int send_count;
 
 	bool failed:1;
 	/* This is to prevent double logging the result */

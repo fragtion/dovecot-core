@@ -79,7 +79,6 @@
 #define DIRECTOR_RECONNECT_AFTER_WRONG_CONNECT_MSECS 1000
 #define DIRECTOR_WAIT_DISCONNECT_SECS 10
 #define DIRECTOR_HANDSHAKE_WARN_SECS 29
-#define DIRECTOR_HANDSHAKE_BYTES_LOG_MIN_SECS (60*30)
 #define DIRECTOR_MAX_SYNC_SEQ_DUPLICATES 4
 /* If we receive SYNCs with a timestamp this many seconds higher than the last
    valid received SYNC timestamp, assume that we lost the director's restart
@@ -188,9 +187,6 @@ director_cmd_error(struct director_connection *conn, const char *fmt, ...)
 static void
 director_connection_append_stats(struct director_connection *conn, string_t *str)
 {
-	int input_msecs = timeval_diff_msecs(&ioloop_timeval, &conn->last_input);
-	int output_msecs = timeval_diff_msecs(&ioloop_timeval, &conn->last_output);
-	int connected_msecs = timeval_diff_msecs(&ioloop_timeval, &conn->connected_time);
 	struct rusage usage;
 
 	str_printfa(str, "bytes in=%"PRIuUOFF_T", bytes out=%"PRIuUOFF_T,
@@ -202,14 +198,20 @@ director_connection_append_stats(struct director_connection *conn, string_t *str
 			    conn->handshake_users_sent);
 	}
 	if (conn->last_input.tv_sec > 0) {
+		int input_msecs = timeval_diff_msecs(&ioloop_timeval,
+						     &conn->last_input);
 		str_printfa(str, ", last input %u.%03u s ago",
 			    input_msecs/1000, input_msecs%1000);
 	}
 	if (conn->last_output.tv_sec > 0) {
+		int output_msecs = timeval_diff_msecs(&ioloop_timeval,
+						      &conn->last_output);
 		str_printfa(str, ", last output %u.%03u s ago",
 			    output_msecs/1000, output_msecs%1000);
 	}
 	if (conn->connected) {
+		int connected_msecs = timeval_diff_msecs(&ioloop_timeval,
+							 &conn->connected_time);
 		str_printfa(str, ", connected %u.%03u s ago",
 			    connected_msecs/1000, connected_msecs%1000);
 	}
@@ -312,7 +314,7 @@ static void director_connection_assigned(struct director_connection *conn)
 		dir->sync_seq++;
 		director_set_ring_unsynced(dir);
 		director_sync_send(dir, dir->self_host, dir->sync_seq,
-				   DIRECTOR_VERSION_MINOR, ioloop_time,
+				   DIRECTOR_VERSION_MINOR, ioloop_time32,
 				   mail_hosts_hash(dir->mail_hosts));
 	}
 	director_connection_set_ping_timeout(conn);
@@ -750,7 +752,7 @@ director_user_refresh(struct director_connection *conn,
 		e_debug(conn->event, "user refresh: %u refreshed timestamp from %u to %"PRIdTIME_T,
 			username_hash, user->timestamp, timestamp);
 		user_directory_refresh(users, user);
-		user->timestamp = timestamp;
+		user->timestamp = time_to_uint32(timestamp);
 		ret = TRUE;
 	} else {
 		e_debug(conn->event, "user refresh: %u ignored timestamp %"PRIdTIME_T" (we have %u)",
@@ -794,11 +796,11 @@ director_handshake_cmd_user(struct director_connection *conn,
 		return FALSE;
 	}
 
-	if ((time_t)timestamp > ioloop_time) {
+	if (timestamp > ioloop_time32) {
 		/* The other director's clock seems to be into the future
 		   compared to us. Don't set any of our users' timestamps into
 		   future though. It's most likely only 1 second difference. */
-		timestamp = ioloop_time;
+		timestamp = ioloop_time32;
 	}
 	conn->dir->num_incoming_requests++;
 	if (director_user_refresh(conn, username_hash, host,
@@ -893,7 +895,7 @@ static bool director_cmd_director(struct director_connection *conn,
 
 		/* already have this. just reset its last_network_failure
 		   timestamp, since it might be up now, but only if this
-		   isn't part of the handshake. (if it was, reseting the
+		   isn't part of the handshake. (if it was, resetting the
 		   timestamp could cause us to rapidly keep trying to connect
 		   to it) */
 		if (conn->handshake_received)
@@ -1114,7 +1116,7 @@ director_cmd_host_int(struct director_connection *conn, const char *const *args,
 	struct ip_addr ip;
 	const char *tag = "", *host_tag, *hostname = NULL;
 	unsigned int arg_count, vhost_count;
-	bool update, down = FALSE;
+	bool update, down = FALSE, tag_changed = FALSE;
 	time_t last_updown_change = 0;
 
 	arg_count = str_array_length(args);
@@ -1153,18 +1155,11 @@ director_cmd_host_int(struct director_connection *conn, const char *const *args,
 					      hostname, &ip, tag);
 		update = TRUE;
 	} else {
-		update = host->vhost_count != vhost_count ||
-			host->down != down;
-
 		host_tag = mail_host_get_tag(host);
-		if (strcmp(tag, host_tag) != 0) {
-			e_error(conn->event,
-				"Host %s changed tag from '%s' to '%s'",
-				host->ip_str,
-				host_tag, tag);
-			mail_host_set_tag(host, tag);
-			update = TRUE;
-		}
+		tag_changed = strcmp(tag, host_tag) != 0;
+		update = host->vhost_count != vhost_count ||
+			host->down != down || tag_changed;
+
 		if (update && host->desynced) {
 			string_t *str = t_str_new(128);
 
@@ -1210,6 +1205,13 @@ director_cmd_host_int(struct director_connection *conn, const char *const *args,
 	if (update) {
 		const char *log_prefix = t_strdup_printf("director(%s): ",
 							 conn->name);
+		if (tag_changed) {
+			e_error(conn->event,
+				"Host %s changed tag from '%s' to '%s'",
+				host->ip_str,
+				mail_host_get_tag(host), tag);
+			mail_host_set_tag(host, tag);
+		}
 		mail_host_set_down(host, down, last_updown_change, log_prefix);
 		mail_host_set_vhost_count(host, vhost_count, log_prefix);
 		director_update_host(conn->dir, src_host, dir_host, host);
@@ -1704,7 +1706,7 @@ static bool director_connection_sync(struct director_connection *conn,
 	struct director_host *host;
 	struct ip_addr ip;
 	in_port_t port;
-	unsigned int arg_count, seq, minor_version = 0, timestamp = ioloop_time;
+	unsigned int arg_count, seq, minor_version = 0, timestamp = ioloop_time32;
 	unsigned int hosts_hash = 0;
 
 	arg_count = str_array_length(args);
@@ -1745,7 +1747,7 @@ static bool director_connection_sync(struct director_connection *conn,
 	   causes unnecessary error logging and hosts-resending. */
 	if ((host == NULL || !host->self) &&
 	    dir->last_sync_sent_ring_change_counter != dir->ring_change_counter &&
-	    (time_t)dir->self_host->last_sync_timestamp != ioloop_time)
+	    dir->self_host->last_sync_timestamp != ioloop_time32)
 		(void)director_resend_sync(dir);
 	return TRUE;
 }

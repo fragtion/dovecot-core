@@ -3,6 +3,7 @@
 #include "test-auth.h"
 #include "auth.h"
 #include "str.h"
+#include "ioloop.h"
 #include "auth-common.h"
 #include "auth-request.h"
 #include "auth-request-handler-private.h"
@@ -108,9 +109,6 @@ static void test_mechs_init(void)
 	array_push_back(&set.passdbs, &mock_set);
 	t_array_init(&set.userdbs, 1);
 
-	/* Disable stats */
-	set.stats = FALSE;
-
 	/* For tests of digest-md5. */
 	set.realms_arr = t_strsplit_spaces("example.com ", " ");
 	/* For tests of mech-anonymous. */
@@ -122,6 +120,7 @@ static void test_mechs_init(void)
 	userdbs_init();
 	passdb_mock_mod_init();
 	password_schemes_init();
+	password_schemes_allow_weak(TRUE);
 
 	auths_preinit(&set, pool_datastack_create(), mech_reg, services);
 	auths_init();
@@ -408,5 +407,9 @@ int main(void)
 		NULL
 	};
 
-	return test_run(test_functions);
+	struct ioloop *ioloop = io_loop_create();
+	io_loop_set_current(ioloop);
+	int ret = test_run(test_functions);
+	io_loop_destroy(&ioloop);
+	return ret;
 }

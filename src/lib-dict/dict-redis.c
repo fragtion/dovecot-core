@@ -351,7 +351,7 @@ redis_dict_init(struct dict *driver, const char *uri,
 	struct ip_addr ip;
 	unsigned int secs;
 	in_port_t port = REDIS_DEFAULT_PORT;
-	const char *const *args, *unix_path = NULL;
+	const char *const *args, *value, *unix_path = NULL;
 	int ret = 0;
 
 	if (redis_connections == NULL) {
@@ -369,32 +369,30 @@ redis_dict_init(struct dict *driver, const char *uri,
 
 	args = t_strsplit(uri, ":");
 	for (; *args != NULL; args++) {
-		if (str_begins(*args, "path=")) {
-			unix_path = *args + 5;
-		} else if (str_begins(*args, "host=")) {
-			if (net_addr2ip(*args+5, &ip) < 0) {
+		if (str_begins(*args, "path=", &value)) {
+			unix_path = value;
+		} else if (str_begins(*args, "host=", &value)) {
+			if (net_addr2ip(value, &ip) < 0) {
 				*error_r = t_strdup_printf("Invalid IP: %s",
-							   *args+5);
+							   value);
 				ret = -1;
 			}
-		} else if (str_begins(*args, "port=")) {
-			if (net_str2port(*args+5, &port) < 0) {
+		} else if (str_begins(*args, "port=", &value)) {
+			if (net_str2port(value, &port) < 0) {
 				*error_r = t_strdup_printf("Invalid port: %s",
-							   *args+5);
+							   value);
 				ret = -1;
 			}
-		} else if (str_begins(*args, "prefix=")) {
+		} else if (str_begins(*args, "prefix=", &value)) {
 			i_free(dict->key_prefix);
-			dict->key_prefix = i_strdup(*args + 7);
-		} else if (str_begins(*args, "db=")) {
-			if (str_to_uint(*args+3, &dict->db_id) < 0) {
+			dict->key_prefix = i_strdup(value);
+		} else if (str_begins(*args, "db=", &value)) {
+			if (str_to_uint(value, &dict->db_id) < 0) {
 				*error_r = t_strdup_printf(
-					"Invalid db number: %s", *args+3);
+					"Invalid db number: %s", value);
 				ret = -1;
 			}
-		} else if (str_begins(*args, "expire_secs=")) {
-			const char *value = *args + 12;
-
+		} else if (str_begins(*args, "expire_secs=", &value)) {
 			if (str_to_uint(value, &secs) < 0 || secs == 0) {
 				*error_r = t_strdup_printf(
 					"Invalid expire_secs: %s", value);
@@ -402,15 +400,15 @@ redis_dict_init(struct dict *driver, const char *uri,
 			}
 			i_free(dict->expire_value);
 			dict->expire_value = i_strdup(value);
-		} else if (str_begins(*args, "timeout_msecs=")) {
-			if (str_to_uint(*args+14, &dict->timeout_msecs) < 0) {
+		} else if (str_begins(*args, "timeout_msecs=", &value)) {
+			if (str_to_uint(value, &dict->timeout_msecs) < 0) {
 				*error_r = t_strdup_printf(
-					"Invalid timeout_msecs: %s", *args+14);
+					"Invalid timeout_msecs: %s", value);
 				ret = -1;
 			}
-		} else if (str_begins(*args, "password=")) {
+		} else if (str_begins(*args, "password=", &value)) {
 			i_free(dict->password);
-			dict->password = i_strdup(*args + 9);
+			dict->password = i_strdup(value);
 		} else {
 			*error_r = t_strdup_printf("Unknown parameter: %s",
 						   *args);
@@ -488,14 +486,13 @@ redis_dict_get_full_key(struct redis_dict *dict, const char *username,
 {
 	const char *username_sp = strchr(username, DICT_USERNAME_SEPARATOR);
 
-	if (str_begins(key, DICT_PATH_SHARED))
-		key += strlen(DICT_PATH_SHARED);
-	else if (str_begins(key, DICT_PATH_PRIVATE)) {
+	if (str_begins(key, DICT_PATH_SHARED, &key))
+		;
+	else if (str_begins(key, DICT_PATH_PRIVATE, &key)) {
 		key = t_strdup_printf("%s%c%s",
 				      username_sp == NULL ? username :
 						redis_escape_username(username),
-				      DICT_USERNAME_SEPARATOR,
-				      key + strlen(DICT_PATH_PRIVATE));
+				      DICT_USERNAME_SEPARATOR, key);
 	} else {
 		i_unreached();
 	}
@@ -511,8 +508,8 @@ static void redis_dict_auth(struct redis_dict *dict)
 	if (*dict->password == '\0')
 		return;
 
-	cmd = t_strdup_printf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n",
-	                      (int)strlen(dict->password), dict->password);
+	cmd = t_strdup_printf("*2\r\n$4\r\nAUTH\r\n$%zu\r\n%s\r\n",
+	                      strlen(dict->password), dict->password);
 	o_stream_nsend_str(dict->conn.conn.output, cmd);
 	redis_input_state_add(dict, REDIS_INPUT_STATE_AUTH);
 }
@@ -529,8 +526,8 @@ static void redis_dict_select_db(struct redis_dict *dict)
 		return;
 	}
 	db_str = dec2str(dict->db_id);
-	cmd = t_strdup_printf("*2\r\n$6\r\nSELECT\r\n$%d\r\n%s\r\n",
-			      (int)strlen(db_str), db_str);
+	cmd = t_strdup_printf("*2\r\n$6\r\nSELECT\r\n$%zu\r\n%s\r\n",
+			      strlen(db_str), db_str);
 	o_stream_nsend_str(dict->conn.conn.output, cmd);
 	redis_input_state_add(dict, REDIS_INPUT_STATE_SELECT);
 }
@@ -538,7 +535,7 @@ static void redis_dict_select_db(struct redis_dict *dict)
 static int redis_dict_lookup(struct dict *_dict,
 			     const struct dict_op_settings *set,
 			     pool_t pool, const char *key,
-			     const char **value_r, const char **error_r)
+			     const char *const **values_r, const char **error_r)
 {
 	struct redis_dict *dict = (struct redis_dict *)_dict;
 	struct timeout *to;
@@ -570,8 +567,8 @@ static int redis_dict_lookup(struct dict *_dict,
 
 		if (dict->connected) {
 			redis_dict_select_db(dict);
-			cmd = t_strdup_printf("*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n",
-					      (int)strlen(key), key);
+			cmd = t_strdup_printf("*2\r\n$3\r\nGET\r\n$%zu\r\n%s\r\n",
+					      strlen(key), key);
 			o_stream_nsend_str(dict->conn.conn.output, cmd);
 
 			str_truncate(dict->conn.last_reply, 0);
@@ -600,7 +597,9 @@ static int redis_dict_lookup(struct dict *_dict,
 	if (dict->conn.value_not_found)
 		return 0;
 
-	*value_r = p_strdup(pool, str_c(dict->conn.last_reply));
+	const char **values = p_new(pool, const char *, 2);
+	values[0] = p_strdup(pool, str_c(dict->conn.last_reply));
+	*values_r = values;
 	return 1;
 }
 
@@ -725,14 +724,15 @@ redis_append_expire(struct redis_dict_transaction_context *ctx,
 		    string_t *cmd, const char *key)
 {
 	struct redis_dict *dict = (struct redis_dict *)ctx->ctx.dict;
+	const char *expire_value = dict->expire_value;
 
-	if (dict->expire_value == NULL)
+	if (ctx->ctx.set.expire_secs > 0)
+		expire_value = dec2str(ctx->ctx.set.expire_secs);
+	if (expire_value == NULL)
 		return;
 
-	str_printfa(cmd, "*3\r\n$6\r\nEXPIRE\r\n$%u\r\n%s\r\n$%u\r\n%s\r\n",
-		    (unsigned int)strlen(key), key,
-		    (unsigned int)strlen(dict->expire_value),
-		    dict->expire_value);
+	str_printfa(cmd, "*3\r\n$6\r\nEXPIRE\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
+		    strlen(key), key, strlen(expire_value), expire_value);
 	redis_input_state_add(dict, REDIS_INPUT_STATE_MULTI);
 	ctx->cmd_count++;
 }
@@ -751,9 +751,8 @@ static void redis_set(struct dict_transaction_context *_ctx,
 
 	key = redis_dict_get_full_key(dict, set->username, key);
 	cmd = t_str_new(128);
-	str_printfa(cmd, "*3\r\n$3\r\nSET\r\n$%u\r\n%s\r\n$%u\r\n%s\r\n",
-		    (unsigned int)strlen(key), key,
-		    (unsigned int)strlen(value), value);
+	str_printfa(cmd, "*3\r\n$3\r\nSET\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
+		    strlen(key), key, strlen(value), value);
 	redis_input_state_add(dict, REDIS_INPUT_STATE_MULTI);
 	ctx->cmd_count++;
 	redis_append_expire(ctx, cmd, key);
@@ -776,8 +775,8 @@ static void redis_unset(struct dict_transaction_context *_ctx,
 		return;
 
 	key = redis_dict_get_full_key(dict, set->username, key);
-	cmd = t_strdup_printf("*2\r\n$3\r\nDEL\r\n$%u\r\n%s\r\n",
-			      (unsigned int)strlen(key), key);
+	cmd = t_strdup_printf("*2\r\n$3\r\nDEL\r\n$%zu\r\n%s\r\n",
+			      strlen(key), key);
 	if (o_stream_send_str(dict->conn.conn.output, cmd) < 0) {
 		ctx->error = i_strdup_printf("write() failed: %s",
 			o_stream_get_error(dict->conn.conn.output));
@@ -802,9 +801,8 @@ static void redis_atomic_inc(struct dict_transaction_context *_ctx,
 	key = redis_dict_get_full_key(dict, set->username, key);
 	diffstr = t_strdup_printf("%lld", diff);
 	cmd = t_str_new(128);
-	str_printfa(cmd, "*3\r\n$6\r\nINCRBY\r\n$%u\r\n%s\r\n$%u\r\n%s\r\n",
-		    (unsigned int)strlen(key), key,
-		    (unsigned int)strlen(diffstr), diffstr);
+	str_printfa(cmd, "*3\r\n$6\r\nINCRBY\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
+		    strlen(key), key, strlen(diffstr), diffstr);
 	redis_input_state_add(dict, REDIS_INPUT_STATE_MULTI);
 	ctx->cmd_count++;
 	redis_append_expire(ctx, cmd, key);
@@ -816,7 +814,8 @@ static void redis_atomic_inc(struct dict_transaction_context *_ctx,
 
 struct dict dict_driver_redis = {
 	.name = "redis",
-	{
+	.flags = DICT_DRIVER_FLAG_SUPPORT_EXPIRE_SECS,
+	.v = {
 		.init = redis_dict_init,
 		.deinit = redis_dict_deinit,
 		.wait = redis_dict_wait,

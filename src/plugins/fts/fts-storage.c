@@ -1,12 +1,10 @@
 /* Copyright (c) 2006-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
-#include "array.h"
 #include "net.h"
 #include "str.h"
 #include "strescape.h"
 #include "write-full.h"
-#include "wildcard-match.h"
 #include "mail-search-build.h"
 #include "mail-storage-private.h"
 #include "mailbox-list-private.h"
@@ -16,7 +14,9 @@
 #include "fts-build-mail.h"
 #include "fts-search-serialize.h"
 #include "fts-plugin.h"
+#include "fts-user.h"
 #include "fts-storage.h"
+#include "hash.h"
 
 
 #define FTS_CONTEXT(obj) \
@@ -31,7 +31,7 @@
 	MODULE_CONTEXT_REQUIRE(obj, fts_mailbox_list_module)
 
 #define INDEXER_SOCKET_NAME "indexer"
-#define INDEXER_HANDSHAKE "VERSION\tindexer\t1\t0\n"
+#define INDEXER_HANDSHAKE "VERSION\tindexer-client\t1\t0\n"
 
 struct fts_mailbox_list {
 	union mailbox_list_module_context module_ctx;
@@ -81,15 +81,22 @@ static int fts_mailbox_get_last_cached_seq(struct mailbox *box, uint32_t *seq_r)
 {
 	struct fts_mailbox_list *flist = FTS_LIST_CONTEXT_REQUIRE(box->list);
 	uint32_t seq1, seq2, last_uid;
+	int ret;
 
-	if (fts_backend_get_last_uid(flist->backend, box, &last_uid) < 0) {
+	ret = fts_search_get_first_missing_uid(flist->backend, box, &last_uid);
+	if (ret < 0) {
 		mail_storage_set_internal_error(box->storage);
 		return -1;
 	}
 
-	if (last_uid == 0)
+	if (ret == 0 && last_uid == 0) {
+		/* nothing is indexed. */
 		*seq_r = 0;
-	else {
+	} else {
+		if (ret > 0) {
+			/* everything is indexed */
+			last_uid = (uint32_t)-1;
+		}
 		mailbox_get_seq_range(box, 1, last_uid, &seq1, &seq2);
 		*seq_r = seq2;
 	}
@@ -232,6 +239,10 @@ fts_mailbox_search_init(struct mailbox_transaction_context *t,
 	fctx->result_pool = pool_alloconly_create("fts results", 1024*64);
 	fctx->orig_matches = buffer_create_dynamic(default_pool, 64);
 	fctx->virtual_mailbox = t->box->virtual_vfuncs != NULL;
+	if (fctx->virtual_mailbox) {
+		hash_table_create(&fctx->last_indexed_virtual_uids,
+				  default_pool, 0, str_hash, strcmp);
+	}
 	fctx->enforced = fts_enforced_parse(
 		mail_user_plugin_getenv(t->box->storage->user, "fts_enforced"));
 	i_array_init(&fctx->levels, 8);
@@ -379,14 +390,16 @@ static int fts_mailbox_search_deinit(struct mail_search_context *ctx)
 	int ret = 0;
 
 	if (fctx != NULL) {
+		if (fctx->virtual_mailbox)
+			hash_table_destroy(&fctx->last_indexed_virtual_uids);
 		if (fctx->indexer_ctx != NULL) {
 			if (fts_indexer_deinit(&fctx->indexer_ctx) < 0)
 				ft->failure_reason = "FTS indexing failed";
 		}
 		if (fctx->indexing_timed_out)
 			ret = -1;
-		if (!fctx->fts_lookup_success &&
-		    fctx->enforced != FTS_ENFORCED_NO) {
+		else if (!fctx->fts_lookup_success &&
+			 fctx->enforced != FTS_ENFORCED_NO) {
 			/* FTS lookup failed and we didn't want to fallback to
 			   opening all the mails and searching manually */
 			mail_storage_set_internal_error(ctx->transaction->box->storage);
@@ -428,7 +441,7 @@ static int fts_mail_get_special(struct mail *_mail, enum mail_fetch_field field,
 		i_assert(scores->uid == _mail->uid);
 		(void)i_snprintf(fmail->score, sizeof(fmail->score),
 				 "%f", scores->score);
-			
+
 		*value_r = fmail->score;
 		return 0;
 	}
@@ -558,10 +571,13 @@ static int fts_mail_precache(struct mail *_mail)
 			ft->highest_virtual_uid = _mail->uid;
 	} else if (!ft->indexing) T_BEGIN {
 		/* avoid recursing here from fts_mail_precache_range() */
+		struct event_reason *reason =
+			event_reason_begin("fts:index");
 		ft->indexing = TRUE;
 		ret = fts_mail_index(_mail);
 		i_assert(ft->indexing);
 		ft->indexing = FALSE;
+		event_reason_end(&reason);
 	} T_END;
 	return ret;
 }
@@ -613,6 +629,7 @@ static int fts_transaction_end(struct mailbox_transaction_context *t, const char
 		ret = -1;
 	}
 
+	struct event_reason *reason = event_reason_begin("fts:index");
 	if (ft->precached) {
 		i_assert(flist->update_ctx_refcount > 0);
 		if (--flist->update_ctx_refcount == 0) {
@@ -638,6 +655,7 @@ static int fts_transaction_end(struct mailbox_transaction_context *t, const char
 			       ft->precache_extra_count, t->box->vname);
 		}
 	}
+	event_reason_end(&reason);
 	i_free(ft);
 	return ret;
 }
@@ -792,59 +810,67 @@ static int fts_copy(struct mail_save_context *ctx, struct mail *mail)
 	return 0;
 }
 
-static const char *const *fts_exclude_get_patterns(struct mail_user *user)
+static void fts_mailbox_virtual_match_mail(struct mail_search_context *ctx,
+					   struct mail *mail)
 {
-	ARRAY_TYPE(const_string) patterns;
-	const char *str;
-	char set_name[21 + MAX_INT_STRLEN];
-	unsigned int i;
+	struct fts_search_context *fctx = FTS_CONTEXT(ctx);
+	unsigned int idx, be_last_uid;
 
-	str = mail_user_plugin_getenv(user, "fts_autoindex_exclude");
-	if (str == NULL)
-		return NULL;
+	if (fctx == NULL || !fctx->fts_lookup_success || !fctx->virtual_mailbox ||
+	    ctx->seq < fctx->first_unindexed_seq)
+		return;
+	/* Table of last indexed UID per backend mailbox */
+	HASH_TABLE_TYPE(virtual_last_indexed) hash_tbl =
+		fctx->last_indexed_virtual_uids;
 
-	t_array_init(&patterns, 16);
-	for (i = 2; str != NULL; i++) {
-		array_push_back(&patterns, &str);
-
-		if (i_snprintf(set_name, sizeof(set_name),
-			       "fts_autoindex_exclude%u", i) < 0)
-			i_unreached();
-		str = mail_user_plugin_getenv(user, set_name);
+	struct mail *backend_mail;
+	if (mail->box->mail_vfuncs->get_backend_mail(mail, &backend_mail) < 0)
+		return;
+	const char *box_name = backend_mail->box->vname;
+	/* Get the last indexed UID in the backend mailbox */
+	void *uid_value =
+		hash_table_lookup(fctx->last_indexed_virtual_uids, box_name);
+	if (uid_value == NULL) {
+		/* This backend's last indexed uid is not yet inserted to the table */
+		struct fts_mailbox_list *flist =
+			FTS_LIST_CONTEXT(backend_mail->box->list);
+		if (flist == NULL || flist->failed ||
+		    mailbox_open(backend_mail->box) < 0 ||
+		    fts_backend_get_last_uid(flist->backend, backend_mail->box,
+					     &be_last_uid) < 0) {
+			be_last_uid = 0;
+		} else {
+			const char *vname_copy =
+				p_strdup(fctx->result_pool, backend_mail->box->vname);
+			hash_table_insert(hash_tbl, vname_copy,
+					  POINTER_CAST(be_last_uid + 1));
+		}
+	} else {
+		be_last_uid = POINTER_CAST_TO(uid_value, uint32_t) - 1;
 	}
-	array_append_zero(&patterns);
-	return array_front(&patterns);
+	if (backend_mail->uid <= be_last_uid) {
+		/* Mail was already indexed in the backend mailbox.
+		   Apply [non]matches based on the FTS lookup results */
+		struct fts_transaction_context *ft = FTS_CONTEXT_REQUIRE(ctx->transaction);
+
+		if (fctx->next_unindexed_seq == mail->seq) {
+			fctx->next_unindexed_seq++;
+			ft->highest_virtual_uid = mail->uid;
+		}
+		idx = 0;
+		fts_search_apply_results_level(ctx, ctx->args->args, &idx);
+	} else {
+		fctx->virtual_seen_unindexed_gaps = TRUE;
+	}
 }
 
-static bool fts_autoindex_exclude_match(struct mailbox *box)
+static int fts_mailbox_search_next_match_mail(struct mail_search_context *ctx,
+					      struct mail *mail)
 {
-	const char *const *exclude_list;
-	unsigned int i;
-	const struct mailbox_settings *set;
-	const char *const *special_use;
-	struct mail_user *user = box->storage->user;
+	struct fts_mailbox *fbox = FTS_CONTEXT_REQUIRE(ctx->transaction->box);
 
-	exclude_list = fts_exclude_get_patterns(user);
-	if (exclude_list == NULL)
-		return FALSE;
-
-	set = mailbox_settings_find(mailbox_get_namespace(box),
-				    mailbox_get_vname(box));
-	special_use = set == NULL ? NULL :
-		t_strsplit_spaces(set->special_use, " ");
-	for (i = 0; exclude_list[i] != NULL; i++) {
-		if (exclude_list[i][0] == '\\') {
-			/* \Special-use flag */
-			if (special_use != NULL &&
-			    str_array_icase_find(special_use, exclude_list[i]))
-				return TRUE;
-		} else {
-			/* mailbox name with wildcards */
-			if (wildcard_match(box->name, exclude_list[i]))
-				return TRUE;
-		}
-	}
-	return FALSE;
+	fts_mailbox_virtual_match_mail(ctx, mail);
+	return fbox->module_ctx.super.search_next_match_mail(ctx, mail);
 }
 
 void fts_mailbox_allocated(struct mailbox *box)
@@ -859,7 +885,7 @@ void fts_mailbox_allocated(struct mailbox *box)
 	fbox = p_new(box->pool, struct fts_mailbox, 1);
 	fbox->module_ctx.super = *v;
 	box->vlast = &fbox->module_ctx.super;
-	fbox->fts_mailbox_excluded = fts_autoindex_exclude_match(box);
+	fbox->fts_mailbox_excluded = fts_user_autoindex_exclude(box);
 
 	v->get_status = fts_mailbox_get_status;
 	v->search_init = fts_mailbox_search_init;
@@ -873,6 +899,7 @@ void fts_mailbox_allocated(struct mailbox *box)
 	v->sync_deinit = fts_sync_deinit;
 	v->save_finish = fts_save_finish;
 	v->copy = fts_copy;
+	v->search_next_match_mail = fts_mailbox_search_next_match_mail;
 
 	MODULE_CONTEXT_SET(box, fts_storage_module, fbox);
 }

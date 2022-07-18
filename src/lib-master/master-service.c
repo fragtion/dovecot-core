@@ -7,7 +7,9 @@
 #include "ioloop.h"
 #include "hostpid.h"
 #include "path-util.h"
+#include "net.h"
 #include "array.h"
+#include "str.h"
 #include "strescape.h"
 #include "env-util.h"
 #include "home-expand.h"
@@ -17,10 +19,10 @@
 #include "settings-parser.h"
 #include "syslog-util.h"
 #include "stats-client.h"
+#include "master-admin-client.h"
 #include "master-instance.h"
-#include "master-login.h"
-#include "master-service-ssl.h"
 #include "master-service-private.h"
+#include "master-service-ssl.h"
 #include "master-service-settings.h"
 #include "iostream-ssl.h"
 
@@ -63,17 +65,41 @@ const char *master_service_getopt_string(void)
 	return "c:i:ko:OL";
 }
 
-static void sig_die(const siginfo_t *si, void *context)
+static int block_sigterm(sigset_t *oldmask_r)
+{
+	sigset_t sigmask;
+
+	if (sigemptyset(&sigmask) < 0)
+		i_error("sigemptyset() failed: %m");
+	else if (sigaddset(&sigmask, SIGTERM) < 0)
+		i_error("sigaddset(SIGTERM) failed: %m");
+	else if (sigprocmask(SIG_BLOCK, &sigmask, oldmask_r) < 0)
+		i_error("sigprocmask(SIG_BLOCK, SIGTERM) failed: %m");
+	else
+		return 0;
+	return -1;
+}
+
+static void
+log_killed_signal(struct master_service *service, const siginfo_t *si)
+{
+	if (service->killed_signal_logged)
+		return;
+
+	i_warning("Killed with signal %d (by pid=%s uid=%s code=%s)",
+		  si->si_signo, dec2str(si->si_pid), dec2str(si->si_uid),
+		  lib_signal_code_to_str(si->si_signo, si->si_code));
+	service->killed_signal_logged = TRUE;
+}
+
+static void sig_delayed_die(const siginfo_t *si, void *context)
 {
 	struct master_service *service = context;
 
 	/* SIGINT comes either from master process or from keyboard. we don't
 	   want to log it in either case.*/
 	if (si->si_signo != SIGINT) {
-		i_warning("Killed with signal %d (by pid=%s uid=%s code=%s)",
-			  si->si_signo, dec2str(si->si_pid),
-			  dec2str(si->si_uid),
-			  lib_signal_code_to_str(si->si_signo, si->si_code));
+		log_killed_signal(service, si);
 	} else if ((service->flags & MASTER_SERVICE_FLAG_NO_IDLE_DIE) != 0) {
 		/* never die when idling */
 		return;
@@ -93,8 +119,181 @@ static void sig_die(const siginfo_t *si, void *context)
 		}
 	}
 
-	service->killed = TRUE;
+	service->killed_signal = si->si_signo;
 	io_loop_stop(service->ioloop);
+}
+
+static bool sig_term_buf_get_kick_user(char *buf, const char **user_r)
+{
+	/* WARNING: We are in a (non-delayed) signal handler context.
+	   Be VERY careful what functions you call. */
+	if (strncmp(buf, "VERSION\tmaster-admin-client\t1\t", 30) != 0)
+		return FALSE;
+	buf += 30;
+	/* skip over minor version */
+	while (*buf >= '0' && *buf <= '0') buf++;
+	if (*buf != '\n')
+		return FALSE;
+	buf++;
+
+	if (strncmp(buf, "KICK-USER-SIGNAL\t", 17) != 0)
+		return FALSE;
+	buf += 17;
+
+	/* <user> [<conn-guid>] - Handling the conn-guid is too much effort,
+	   it should normally be enough to just check the user. */
+	char *p = strpbrk(buf, "\t\n");
+	if (p == NULL)
+		return FALSE;
+	*p = '\0';
+
+	*user_r = buf;
+	return TRUE;
+}
+
+static bool
+sig_service_kick_user_match(struct master_service *service, const char *user)
+{
+	/* WARNING: We are in a (non-delayed) signal handler context.
+	   Be VERY careful what functions you call. */
+	if (service->current_user != NULL)
+		return strcmp(user, service->current_user) == 0 ? 1 : 0;
+	else {
+		/* There is no currently accessed user. Most likely it
+		   means that the process already stopped handling the
+		   requested user. */
+		return 0;
+	}
+}
+
+static int sig_term_try_kick_user(struct master_service *service, int fd_listen)
+{
+	/* WARNING: We are in a (non-delayed) signal handler context.
+	   Be VERY careful what functions you call. */
+	int fd, ret = -1;
+	char buf[256];
+	ssize_t bytes;
+
+	if (service->last_kick_signal_user != NULL &&
+	    service->last_kick_signal_user_accessed == 0) {
+		/* The signal came a bit late. The KICK-USER-SIGNAL command
+		   was already handled. */
+		service->last_kick_signal_user_accessed = 1;
+		return sig_service_kick_user_match(service,
+			service->last_kick_signal_user) ? 1 : 0;
+	}
+
+	fd = accept(fd_listen, NULL, NULL);
+	if (fd < 0) {
+		if (errno == EAGAIN || errno == ECONNABORTED)
+			return -1;
+		lib_signals_syscall_error("SIGTERM: accept() failed: ");
+		return -1;
+	}
+	alarm(1);
+	bytes = read(fd, buf, sizeof(buf)-1);
+	alarm(0);
+	if (bytes >= 0) {
+		const char *user;
+		buf[bytes] = '\0';
+		if (!sig_term_buf_get_kick_user(buf, &user)) {
+			/* This wasn't a KICK-USER-SIGNAL command at all. The
+			   process will be soon killed with a delayed SIGTERM,
+			   so we can simply close the connection and ignore the
+			   command. */
+		} else {
+			ret = sig_service_kick_user_match(service, user) ? 1 : 0;
+		}
+	} else if (errno != EINTR) {
+		lib_signals_syscall_error("SIGTERM: read() failed: ");
+	}
+	if (close(fd) < 0)
+		lib_signals_syscall_error("SIGTERM: close() failed: ");
+	return ret;
+}
+
+static bool sig_term_try_kick(struct master_service *service)
+{
+	/* WARNING: We are in a (non-delayed) signal handler context.
+	   Be VERY careful what functions you call. */
+	int ret;
+
+	/* see if there's a admin-socket connection waiting */
+	for (unsigned int i = 0; i < service->socket_count; i++) {
+		struct master_service_listener *l = &service->listeners[i];
+
+		if (master_admin_client_can_accept(l->name)) {
+			ret = sig_term_try_kick_user(service, l->fd);
+			if (ret > 0) {
+				/* USER-KICK matched */
+				return TRUE;
+			}
+			if (ret == 0) {
+				/* USER-KICK mismatch - ignore */
+				return FALSE;
+			}
+			/* no connection or not a USER-KICK command */
+		}
+	}
+	/* no. just handle the signal normally as a delayed signal. */
+	return TRUE;
+}
+
+static void sig_die_delayed(struct master_service *service, const siginfo_t *si)
+{
+	/* WARNING: We are in a (non-delayed) signal handler context.
+	   Be VERY careful what functions you call. */
+	if (service->killed_time.tv_sec == 0) {
+		struct timespec ts;
+		if (clock_gettime(CLOCK_REALTIME, &ts) < 0) {
+			lib_signals_syscall_error("clock_gettime() failed: ");
+			service->killed_time.tv_sec = time(NULL);
+			service->killed_time.tv_usec = 0;
+		} else {
+			service->killed_time.tv_sec = ts.tv_sec;
+			service->killed_time.tv_usec = ts.tv_nsec/1000;
+		}
+	}
+	service->killed_signal_info = *si;
+	/* set killed_signal after killed_time */
+	service->killed_signal = si->si_signo;
+	lib_signal_delayed(si);
+}
+
+static void sig_standalone_die(const siginfo_t *si, void *context)
+{
+	/* WARNING: We are in a (non-delayed) signal handler context.
+	   Be VERY careful what functions you call. */
+	struct master_service *service = context;
+
+	sig_die_delayed(service, si);
+}
+
+static void sig_term(const siginfo_t *si, void *context)
+{
+	/* WARNING: We are in a (non-delayed) signal handler context.
+	   Be VERY careful what functions you call. */
+	struct master_service *service = context;
+	sigset_t sigmask, oldmask;
+	int saved_errno = errno;
+	bool call_delayed = TRUE;
+
+	/* Block SIGTERM so that we don't get back here recursively. */
+	if (sigemptyset(&sigmask) < 0)
+		lib_signals_syscall_error("SIGTERM: sigemptyset() failed: ");
+	else if (sigaddset(&sigmask, SIGTERM) < 0)
+		lib_signals_syscall_error("SIGTERM: sigaddset() failed: ");
+	else if (sigprocmask(SIG_BLOCK, &sigmask, &oldmask) < 0)
+		lib_signals_syscall_error("SIGTERM: sigprocmask(SIG_BLOCK) failed: ");
+	else {
+		call_delayed = sig_term_try_kick(service);
+		if (sigprocmask(SIG_SETMASK, &oldmask, NULL) < 0)
+			lib_signals_syscall_error("SIGTERM: sigprocmask(SIG_SETMASK) failed: ");
+	}
+
+	if (call_delayed)
+		sig_die_delayed(service, si);
+	errno = saved_errno;
 }
 
 static void sig_close_listeners(const siginfo_t *si ATTR_UNUSED, void *context)
@@ -122,7 +321,7 @@ static void sig_close_listeners(const siginfo_t *si ATTR_UNUSED, void *context)
 }
 
 static void
-sig_state_changed(const siginfo_t *si ATTR_UNUSED, void *context)
+sig_delayed_state_changed(const siginfo_t *si ATTR_UNUSED, void *context)
 {
 	struct master_service *service = context;
 
@@ -132,7 +331,7 @@ sig_state_changed(const siginfo_t *si ATTR_UNUSED, void *context)
 static bool
 master_service_event_callback(struct event *event,
 			      enum event_callback_type type,
-			      struct failure_context *ctx ATTR_UNUSED,
+			      struct failure_context *ctx,
 			      const char *fmt ATTR_UNUSED,
 			      va_list args ATTR_UNUSED)
 {
@@ -142,6 +341,12 @@ master_service_event_callback(struct event *event,
 		   inherit the category from them. */
 		event_add_category(event, &master_service_category);
 	}
+	/* This callback may be called while still in master_service_init().
+	   In that case master_service is NULL. */
+	if (type == EVENT_CALLBACK_TYPE_SEND && master_service != NULL &&
+	    event_filter_match(master_service->process_shutdown_filter,
+			       event, ctx))
+		master_service_stop_new_connections(master_service);
 	return TRUE;
 }
 
@@ -181,6 +386,8 @@ static void master_service_init_socket_listeners(struct master_service *service)
 
 			if (*settings != NULL) {
 				l->name = i_strdup_empty(*settings);
+				if (master_admin_client_can_accept(l->name))
+					service->have_admin_sockets = TRUE;
 				settings++;
 			}
 			while (*settings != NULL) {
@@ -255,8 +462,8 @@ master_service_init(const char *name, enum master_service_flags flags,
 
 	/* ignore these signals as early as possible */
 	lib_signals_init();
-        lib_signals_ignore(SIGPIPE, TRUE);
-        lib_signals_ignore(SIGALRM, FALSE);
+	lib_signals_ignore(SIGPIPE, TRUE);
+	lib_signals_ignore(SIGALRM, FALSE);
 
 	if (getenv(MASTER_UID_ENV) == NULL)
 		flags |= MASTER_SERVICE_FLAG_STANDALONE;
@@ -304,18 +511,14 @@ master_service_init(const char *name, enum master_service_flags flags,
 	T_BEGIN {
 		master_service_init_socket_listeners(service);
 	} T_END;
-	service->want_ssl_settings = service->want_ssl_server ||
-		(service->flags & MASTER_SERVICE_FLAG_USE_SSL_SETTINGS) != 0;
 
-#ifdef HAVE_SSL
-	/* load SSL module if necessary */
-	if (service->want_ssl_settings) {
+	/* Load the SSL module if we already know it is necessary. It can also
+	   get loaded later on-demand. */
+	if (service->want_ssl_server) {
 		const char *error;
 		if (ssl_module_load(&error) < 0)
 			i_fatal("Cannot load SSL module: %s", error);
-		service->ssl_module_loaded = TRUE;
 	}
-#endif
 
 	/* set up some kind of logging until we know exactly how and where
 	   we want to log */
@@ -363,7 +566,7 @@ master_service_init(const char *name, enum master_service_flags flags,
 			i_fatal(MASTER_CLIENT_LIMIT_ENV" missing");
 		master_service_set_client_limit(service, count);
 
-		/* seve the process limit */
+		/* save the process limit */
 		value = getenv(MASTER_PROCESS_LIMIT_ENV);
 		if (value != NULL && str_to_uint(value, &count) == 0 &&
 		    count > 0)
@@ -480,7 +683,7 @@ master_service_try_init_log(struct master_service *service,
 					  &facility))
 			facility = LOG_MAIL;
 		i_set_failure_syslog(service->set->instance_name, LOG_NDELAY,
-		                     facility);
+				     facility);
 		i_set_failure_prefix("%s", prefix);
 
 		if (strcmp(service->set->log_path, "syslog") != 0) {
@@ -624,6 +827,10 @@ bool master_service_parse_option(struct master_service *service,
 
 static void master_service_error(struct master_service *service)
 {
+	/* Close all master-admin connections from anvil. This way they won't
+	   block stopping the process quickly. */
+	master_admin_clients_deinit();
+
 	master_service_stop_new_connections(service);
 	if (service->master_status.available_count ==
 	    service->total_available_count || service->die_with_master) {
@@ -653,9 +860,19 @@ static void master_status_error(struct master_service *service)
 	master_service_error(service);
 }
 
+static void master_status_update_wait(struct master_service *service)
+{
+	struct ioloop *ioloop = io_loop_create();
+	service->io_status_waiting = TRUE;
+	service->io_status_write = io_loop_move_io(&service->io_status_write);
+	while (service->io_status_write != NULL)
+		io_loop_run(ioloop);
+	service->io_status_waiting = FALSE;
+	io_loop_destroy(&ioloop);
+}
+
 void master_service_init_finish(struct master_service *service)
 {
-	enum libsig_flags sigint_flags = LIBSIG_FLAG_DELAYED;
 	struct stat st;
 
 	i_assert(!service->init_finished);
@@ -665,13 +882,27 @@ void master_service_init_finish(struct master_service *service)
 	lib_set_clean_exit(FALSE);
 
 	/* set default signal handlers */
-	if ((service->flags & MASTER_SERVICE_FLAG_STANDALONE) == 0)
-		sigint_flags |= LIBSIG_FLAG_RESTART;
-        lib_signals_set_handler(SIGINT, sigint_flags, sig_die, service);
-	lib_signals_set_handler(SIGTERM, LIBSIG_FLAG_DELAYED, sig_die, service);
+	if ((service->flags & MASTER_SERVICE_FLAG_STANDALONE) != 0) {
+		/* Standalone programs stop immediately on signals */
+		lib_signals_set_handler2(SIGINT, 0, sig_standalone_die,
+					 sig_delayed_die, service);
+		lib_signals_set_handler2(SIGTERM, 0, sig_standalone_die,
+					 sig_delayed_die, service);
+	} else {
+		/* SIGINT is used by master for killing idle processes */
+		lib_signals_set_handler(SIGINT, LIBSIG_FLAGS_SAFE,
+					sig_delayed_die, service);
+		if (!service->have_admin_sockets) {
+			lib_signals_set_handler(SIGTERM, LIBSIG_FLAG_DELAYED,
+						sig_delayed_die, service);
+		} else {
+			lib_signals_set_handler2(SIGTERM, 0, sig_term,
+						 sig_delayed_die, service);
+		}
+	}
 	if ((service->flags & MASTER_SERVICE_FLAG_TRACK_LOGIN_STATE) != 0) {
 		lib_signals_set_handler(SIGUSR1, LIBSIG_FLAGS_SAFE,
-					sig_state_changed, service);
+					sig_delayed_state_changed, service);
 	}
 
 	if ((service->flags & MASTER_SERVICE_FLAG_STANDALONE) == 0) {
@@ -693,6 +924,8 @@ void master_service_init_finish(struct master_service *service)
 		service->master_status.available_count--;
 	}
 	master_status_update(service);
+	if (service->io_status_write != NULL)
+		master_status_update_wait(service);
 
 	/* close data stack frame opened by master_service_init() */
 	if ((service->flags & MASTER_SERVICE_FLAG_NO_INIT_DATASTACK_FRAME) == 0) {
@@ -868,7 +1101,7 @@ void master_service_run(struct master_service *service,
 
 void master_service_stop(struct master_service *service)
 {
-        io_loop_stop(service->ioloop);
+	io_loop_stop(service->ioloop);
 }
 
 void master_service_stop_new_connections(struct master_service *service)
@@ -896,13 +1129,56 @@ void master_service_stop_new_connections(struct master_service *service)
 		service->master_status.available_count = 0;
 		master_status_update(service);
 	}
-	if (service->login != NULL)
-		master_login_stop(service->login);
+	if (service->stop_new_connections_callback != NULL) {
+		service->stop_new_connections_callback(
+			service->stop_new_connections_context);
+	}
+}
+
+void master_service_add_stop_new_connections_callback(
+	struct master_service *service,
+	void (*callback)(void *context), void *context)
+{
+	/* for now we need to support just one */
+	i_assert(service->stop_new_connections_callback == NULL);
+	service->stop_new_connections_callback = callback;
+	service->stop_new_connections_context = context;
+}
+
+void master_service_remove_stop_new_connections_callback(
+	struct master_service *service,
+	void (*callback)(void *context), void *context)
+{
+	i_assert(service->stop_new_connections_callback == callback);
+	i_assert(service->stop_new_connections_context == context);
+
+	service->stop_new_connections_callback = NULL;
+	service->stop_new_connections_context = NULL;
 }
 
 bool master_service_is_killed(struct master_service *service)
 {
-	return service->killed;
+	return service->killed_signal != 0;
+}
+
+int master_service_get_kill_signal(struct master_service *service)
+{
+	return service->killed_signal;
+}
+
+void master_service_get_kill_time(struct master_service *service,
+				  struct timeval *tv_r)
+{
+	/* block the signal to avoid races accessing killed_time */
+	sigset_t oldmask;
+	bool sigterm_blocked = block_sigterm(&oldmask) == 0;
+
+	*tv_r = service->killed_time;
+
+	if (sigterm_blocked) {
+		if (sigprocmask(SIG_SETMASK, &oldmask, NULL) < 0)
+			i_error("sigprocmask(SIG_SETMASK) failed: %m");
+	}
 }
 
 bool master_service_is_master_stopped(struct master_service *service)
@@ -911,26 +1187,94 @@ bool master_service_is_master_stopped(struct master_service *service)
 		(service->flags & MASTER_SERVICE_FLAG_STANDALONE) == 0;
 }
 
-void master_service_anvil_send(struct master_service *service, const char *cmd)
+static bool
+master_service_anvil_send(struct master_service *service, const char *cmd)
 {
 	ssize_t ret;
 
 	if ((service->flags & MASTER_SERVICE_FLAG_STANDALONE) != 0)
-		return;
+		return FALSE;
 
 	ret = write(MASTER_ANVIL_FD, cmd, strlen(cmd));
 	if (ret < 0) {
 		if (errno == EPIPE) {
 			/* anvil process was probably recreated, don't bother
 			   logging an error about losing connection to it */
-			return;
+			return FALSE;
 		}
 		i_error("write(anvil) failed: %m");
-	} else if (ret == 0)
+		return FALSE;
+	} else if (ret == 0) {
 		i_error("write(anvil) failed: EOF");
-	else {
+		return FALSE;
+	} else {
 		i_assert((size_t)ret == strlen(cmd));
+		return TRUE;
 	}
+}
+
+static void
+master_service_anvil_session_to_cmd(string_t *cmd,
+	const struct master_service_anvil_session *session)
+{
+	str_printfa(cmd, "%s\t", my_pid);
+	str_append_tabescaped(cmd, session->username);
+	str_append_c(cmd, '\t');
+	str_append_tabescaped(cmd, session->service_name);
+	str_append_c(cmd, '\t');
+	if (session->ip.family != 0)
+		str_append(cmd, net_ip2addr(&session->ip));
+}
+
+bool master_service_anvil_connect(struct master_service *service,
+	const struct master_service_anvil_session *session,
+	bool kick_supported, guid_128_t conn_guid_r)
+{
+	guid_128_generate(conn_guid_r);
+
+	string_t *cmd = t_str_new(128);
+	str_append(cmd, "CONNECT\t");
+	str_append(cmd, guid_128_to_string(conn_guid_r));
+	str_append_c(cmd, '\t');
+	master_service_anvil_session_to_cmd(cmd, session);
+	str_append_c(cmd, '\t');
+	if (!kick_supported)
+		str_append_c(cmd, 'N');
+	else if (master_service_get_client_limit(service) > 1)
+		str_append_c(cmd, 'A');
+	else if (service->have_admin_sockets)
+		str_append_c(cmd, 'W');
+	else
+		str_append_c(cmd, 'S');
+	str_append_c(cmd, '\t');
+	if (session->dest_ip.family != 0)
+		str_append(cmd, net_ip2addr(&session->dest_ip));
+	if (session->alt_usernames != NULL) {
+		string_t *alt_usernames = t_str_new(64);
+		for (unsigned int i = 0; session->alt_usernames[i] != NULL; i++) {
+			if (i > 0)
+				str_append_c(alt_usernames, '\t');
+			str_append_tabescaped(alt_usernames,
+					      session->alt_usernames[i]);
+		}
+		str_append_c(cmd, '\t');
+		str_append_tabescaped(cmd, str_c(alt_usernames));
+	}
+	str_append_c(cmd, '\n');
+	return master_service_anvil_send(service, str_c(cmd));
+}
+
+void master_service_anvil_disconnect(struct master_service *service,
+	const struct master_service_anvil_session *session,
+	const guid_128_t conn_guid)
+{
+	string_t *cmd = t_str_new(128);
+	str_append(cmd, "DISCONNECT\t");
+	str_append(cmd, guid_128_to_string(conn_guid));
+	str_append_c(cmd, '\t');
+	master_service_anvil_session_to_cmd(cmd, session);
+	str_append_c(cmd, '\n');
+	(void)master_service_anvil_send(service, str_c(cmd));
 }
 
 void master_service_client_connection_created(struct master_service *service)
@@ -1017,7 +1361,7 @@ void master_service_client_connection_destroyed(struct master_service *service)
 
 	if (service->service_count_left == service->total_available_count) {
 		service->total_available_count--;
-                service->service_count_left--;
+		service->service_count_left--;
 	} else {
 		if (service->service_count_left != UINT_MAX)
 			service->service_count_left--;
@@ -1106,14 +1450,21 @@ static void master_service_deinit_real(struct master_service **_service)
 
 	*_service = NULL;
 
+	if (master_service_is_killed(service) &&
+	    (service->killed_signal != SIGINT ||
+	     (service->flags & MASTER_SERVICE_FLAG_STANDALONE) != 0))
+		log_killed_signal(service, &service->killed_signal_info);
+
 	if (!service->init_finished &&
 	    (service->flags & MASTER_SERVICE_FLAG_NO_INIT_DATASTACK_FRAME) == 0) {
 		if (!t_pop(&service->datastack_frame_id))
 			i_panic("Leaked t_pop() call");
 	}
+	master_admin_clients_deinit();
 	master_service_haproxy_abort(service);
 
-	master_service_io_listeners_remove(service);
+	for (unsigned int i = 0; i < service->socket_count; i++)
+		io_remove(&service->listeners[i].io);
 	master_service_ssl_ctx_deinit(service);
 
 	if (service->stats_client != NULL)
@@ -1135,6 +1486,7 @@ static void master_service_deinit_real(struct master_service **_service)
 	i_free(master_service_category_name);
 	master_service_category.name = NULL;
 	event_unregister_callback(master_service_event_callback);
+	master_service_unset_process_shutdown_filter(service);
 }
 
 static void master_service_free(struct master_service *service)
@@ -1148,6 +1500,8 @@ static void master_service_free(struct master_service *service)
 	i_free(service->configured_name);
 	i_free(service->name);
 	i_free(service->config_path);
+	i_free(service->current_user);
+	i_free(service->last_kick_signal_user);
 	i_free(service);
 }
 
@@ -1271,21 +1625,12 @@ static bool master_service_full(struct master_service *service)
 	return TRUE;
 }
 
-static void master_service_listen(struct master_service_listener *l)
+static void
+master_service_accept(struct master_service_listener *l, const char *conn_name,
+		      bool master_admin_conn)
 {
 	struct master_service *service = l->service;
 	struct master_service_connection conn;
-
-	if (service->master_status.available_count == 0) {
-		if (master_service_full(service)) {
-			/* Stop the listener until a client has disconnected or
-			   overflow callback has killed one. */
-			master_service_io_listeners_remove(service);
-			return;
-		}
-		/* we can accept another client */
-		i_assert(service->master_status.available_count > 0);
-	}
 
 	i_zero(&conn);
 	conn.listen_fd = l->fd;
@@ -1320,7 +1665,7 @@ static void master_service_listen(struct master_service_listener *l)
 		l->fd = -1;
 	}
 	conn.ssl = l->ssl;
-	conn.name = master_service_get_socket_name(service, conn.listen_fd);
+	conn.name = conn_name;
 
 	(void)net_getsockname(conn.fd, &conn.local_ip, &conn.local_port);
 	conn.real_remote_ip = conn.remote_ip;
@@ -1330,11 +1675,51 @@ static void master_service_listen(struct master_service_listener *l)
 
 	net_set_nonblock(conn.fd, TRUE);
 
+	if (master_admin_conn) {
+		master_admin_client_create(&conn);
+		return;
+	}
 	master_service_client_connection_created(service);
 	if (l->haproxy)
 		master_service_haproxy_new(service, &conn);
 	else
 		master_service_client_connection_callback(service, &conn);
+}
+
+static void master_service_listen(struct master_service_listener *l)
+{
+	struct master_service *service = l->service;
+	const char *conn_name;
+	bool master_admin_conn;
+
+	conn_name = master_service_get_socket_name(service, l->fd);
+	master_admin_conn = master_admin_client_can_accept(conn_name);
+
+	if (service->master_status.available_count == 0 && !master_admin_conn) {
+		if (master_service_full(service)) {
+			/* Stop the listener until a client has disconnected or
+			   overflow callback has killed one. */
+			master_service_io_listeners_remove(service);
+			return;
+		}
+		/* we can accept another client */
+		i_assert(service->master_status.available_count > 0);
+	}
+
+	sigset_t oldmask;
+	bool sigterm_blocked = FALSE;
+	if (master_admin_conn) {
+		/* Keep SIGTERM blocked while handling a master-admin
+		   connection. This prevents race conditions with the SIGTERM
+		   being received while handling the KICK-USER-SIGNAL
+		   command. */
+		sigterm_blocked = block_sigterm(&oldmask) == 0;
+	}
+	master_service_accept(l, conn_name, master_admin_conn);
+	if (sigterm_blocked) {
+		if (sigprocmask(SIG_SETMASK, &oldmask, NULL) < 0)
+			i_error("sigprocmask(SIG_SETMASK) failed: %m");
+	}
 }
 
 void master_service_io_listeners_add(struct master_service *service)
@@ -1363,7 +1748,8 @@ void master_service_io_listeners_remove(struct master_service *service)
 	unsigned int i;
 
 	for (i = 0; i < service->socket_count; i++) {
-		io_remove(&service->listeners[i].io);
+		if (!master_admin_client_can_accept(service->listeners[i].name))
+			io_remove(&service->listeners[i].io);
 	}
 }
 
@@ -1385,7 +1771,8 @@ static void master_service_io_listeners_close(struct master_service *service)
 	/* close via listeners. some fds might be pipes that are
 	   currently handled as clients. we don't want to close them. */
 	for (i = 0; i < service->socket_count; i++) {
-		if (service->listeners[i].fd != -1) {
+		if (service->listeners[i].fd != -1 &&
+		    !master_admin_client_can_accept(service->listeners[i].name)) {
 			if (close(service->listeners[i].fd) < 0) {
 				i_error("close(listener %d) failed: %m",
 					service->listeners[i].fd);
@@ -1434,11 +1821,13 @@ master_status_send(struct master_service *service, bool important_update)
 		/* shouldn't happen? */
 		i_error("write(master_status_fd) returned %d", (int)ret);
 		service->master_status.pid = 0;
+		io_remove(&service->io_status_write);
 	} else if (errno != EAGAIN) {
 		/* failure */
 		if (errno != EPIPE)
 			i_error("write(master_status_fd) failed: %m");
 		service->master_status.pid = 0;
+		io_remove(&service->io_status_write);
 	} else if (important_update) {
 		/* reader is busy, but it's important to get this notification
 		   through. send it when possible. */
@@ -1447,6 +1836,13 @@ master_status_send(struct master_service *service, bool important_update)
 				io_add(MASTER_STATUS_FD, IO_WRITE,
 				       master_status_update, service);
 		}
+	}
+	if (service->io_status_waiting &&
+	    service->io_status_write == NULL) {
+		/* Waiting in an inner ioloop in master_status_update_wait()
+		   for the status write to finish (succeed or permanently
+		   fail) */
+		io_loop_stop(current_ioloop);
 	}
 }
 
@@ -1505,9 +1901,8 @@ bool version_string_verify_full(const char *line, const char *service_name,
 	size_t service_name_len = strlen(service_name);
 	bool ret;
 
-	if (!str_begins(line, "VERSION\t"))
+	if (!str_begins(line, "VERSION\t", &line))
 		return FALSE;
-	line += 8;
 
 	if (strncmp(line, service_name, service_name_len) != 0 ||
 	    line[service_name_len] != '\t')
@@ -1529,8 +1924,49 @@ bool version_string_verify_full(const char *line, const char *service_name,
 	return ret;
 }
 
-bool master_service_is_ssl_module_loaded(struct master_service *service)
+void master_service_set_process_shutdown_filter(struct master_service *service,
+						struct event_filter *filter)
 {
-	/* if this is TRUE, then ssl module is loaded by init */
-	return service->ssl_module_loaded;
+	master_service_unset_process_shutdown_filter(service);
+	service->process_shutdown_filter = filter;
+	event_filter_ref(service->process_shutdown_filter);
+}
+
+void master_service_unset_process_shutdown_filter(struct master_service *service)
+{
+	event_filter_unref(&service->process_shutdown_filter);
+}
+
+void master_service_set_current_user(struct master_service *service,
+				     const char *user)
+{
+	/* block the signal to avoid races accessing current_user */
+	sigset_t oldmask;
+	bool sigterm_blocked = block_sigterm(&oldmask) == 0;
+
+	char *old_user = service->current_user;
+	service->current_user = i_strdup(user);
+	i_free(old_user);
+
+	if (sigterm_blocked) {
+		if (sigprocmask(SIG_SETMASK, &oldmask, NULL) < 0)
+			i_error("sigprocmask(SIG_SETMASK) failed: %m");
+	}
+}
+
+void master_service_set_last_kick_signal_user(struct master_service *service,
+					      const char *user)
+{
+	/* block the signal to avoid races accessing last_kick_signal_user */
+	sigset_t oldmask;
+	bool sigterm_blocked = block_sigterm(&oldmask) == 0;
+
+	i_free(service->last_kick_signal_user);
+	service->last_kick_signal_user = i_strdup(user);
+	service->last_kick_signal_user_accessed = 0;
+
+	if (sigterm_blocked) {
+		if (sigprocmask(SIG_SETMASK, &oldmask, NULL) < 0)
+			i_error("sigprocmask(SIG_SETMASK) failed: %m");
+	}
 }

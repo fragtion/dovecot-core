@@ -38,7 +38,8 @@ struct mailbox_list_vfuncs {
 	int (*init)(struct mailbox_list *list, const char **error_r);
 	void (*deinit)(struct mailbox_list *list);
 
-	int (*get_storage)(struct mailbox_list **list, const char *vname,
+	int (*get_storage)(struct mailbox_list **list, const char **vname,
+			   enum mailbox_list_get_storage_flags flags,
 			   struct mail_storage **storage_r);
 
 	char (*get_hierarchy_sep)(struct mailbox_list *list);
@@ -144,6 +145,7 @@ struct mailbox_list {
 	bool index_root_dir_created:1;
 	bool list_index_root_dir_created:1;
 	bool guid_cache_updated:1;
+	bool disable_rebuild_on_corruption:1;
 	bool guid_cache_invalidated:1;
 	bool last_error_is_internal:1;
 };
@@ -169,7 +171,7 @@ struct mailbox_list_iterate_context {
 struct mailbox_list_iter_update_context {
 	struct mailbox_list_iterate_context *iter_ctx;
 	struct mailbox_tree_context *tree_ctx;
-			      
+
 	struct imap_match_glob *glob;
 	enum mailbox_info_flags leaf_flags, parent_flags;
 
@@ -196,6 +198,10 @@ const char *
 mailbox_list_unescape_name_params(const char *src, const char *ns_prefix,
 				  char ns_sep, char list_sep, char escape_char);
 
+int mailbox_list_default_get_storage(struct mailbox_list **list,
+				     const char **vname,
+				     enum mailbox_list_get_storage_flags flags,
+				     struct mail_storage **storage_r);
 const char *mailbox_list_default_get_storage_name(struct mailbox_list *list,
 						  const char *vname);
 const char *mailbox_list_default_get_vname(struct mailbox_list *list,

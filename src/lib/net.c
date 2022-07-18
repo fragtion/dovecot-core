@@ -49,6 +49,38 @@ union sockaddr_union_unix {
    conflict. */
 #define MAX_CONNECT_RETRIES 20
 
+static int net_handle_gai_error(const char *function,
+				int gai_errno, bool log)
+{
+	if (gai_errno == 0)
+		return 0;
+	switch (gai_errno) {
+	/* errors that are not logged */
+#ifdef EAI_ADDRFAMILY
+	case EAI_ADDRFAMILY:
+#endif
+	case EAI_FAMILY:
+#ifdef EAI_NODATA
+	case EAI_NODATA:
+#endif
+	case EAI_NONAME:
+		break;
+	case EAI_MEMORY:
+		i_fatal_status(FATAL_OUTOFMEM, "%s() failed: %s",
+			       function, gai_strerror(gai_errno));
+	case EAI_SYSTEM:
+		if (log)
+			i_error("%s() failed: %m", function);
+		break;
+	default:
+		if (log)
+			i_error("%s() failed: %s", function,
+				gai_strerror(gai_errno));
+		break;
+	}
+	return gai_errno;
+}
+
 bool net_ip_compare(const struct ip_addr *ip1, const struct ip_addr *ip2)
 {
 	return net_ip_cmp(ip1, ip2) == 0;
@@ -105,6 +137,7 @@ sin_set_ip(union sockaddr_union *so, const struct ip_addr *ip)
 	}
 
 	so->sin.sin_family = ip->family;
+	so->sin6.sin6_scope_id = ip->scope_id;
 	if (ip->family == AF_INET6)
 		memcpy(&so->sin6.sin6_addr, &ip->u.ip6, sizeof(ip->u.ip6));
 	else
@@ -120,10 +153,10 @@ sin_get_ip(const union sockaddr_union *so, struct ip_addr *ip)
 
 	ip->family = so->sin.sin_family;
 
-	if (ip->family == AF_INET6)
+	if (ip->family == AF_INET6) {
 		memcpy(&ip->u.ip6, &so->sin6.sin6_addr, sizeof(ip->u.ip6));
-	else
-	if (ip->family == AF_INET)
+		ip->scope_id = so->sin6.sin6_scope_id;
+	} else if (ip->family == AF_INET)
 		memcpy(&ip->u.ip4, &so->sin.sin_addr, sizeof(ip->u.ip4));
 	else
 		i_zero(&ip->u);
@@ -133,11 +166,13 @@ static inline void sin_set_port(union sockaddr_union *so, in_port_t port)
 {
 	if (so->sin.sin_family == AF_INET6)
                 so->sin6.sin6_port = htons(port);
-	else
+	else if (so->sin.sin_family == AF_INET)
 		so->sin.sin_port = htons(port);
+	else
+		i_unreached();
 }
 
-static inline in_port_t sin_get_port(union sockaddr_union *so)
+static inline in_port_t sin_get_port(const union sockaddr_union *so)
 {
 	if (so->sin.sin_family == AF_INET6)
 		return ntohs(so->sin6.sin6_port);
@@ -435,8 +470,8 @@ int net_listen_full(const struct ip_addr *my_ip, in_port_t *port,
 	socklen_t len;
 
 	i_zero(&so);
-	sin_set_port(&so, *port);
 	sin_set_ip(&so, my_ip);
+	sin_set_port(&so, *port);
 
 	/* create the socket */
 	fd = socket(so.sin.sin_family, SOCK_STREAM, 0);
@@ -641,7 +676,7 @@ int net_gethostbyname(const char *addr, struct ip_addr **ips,
 		      unsigned int *ips_count)
 {
 	/* @UNSAFE */
-	union sockaddr_union *so;
+	const union sockaddr_union *so;
 	struct addrinfo hints, *ai, *origai;
 	struct ip_addr ip;
 	int host_error;
@@ -663,13 +698,14 @@ int net_gethostbyname(const char *addr, struct ip_addr **ips,
 
 	/* save error to host_error for later use */
 	host_error = getaddrinfo(addr, NULL, &hints, &ai);
-	if (host_error != 0)
+	if (net_handle_gai_error("getaddrinfo", host_error, FALSE) != 0)
 		return host_error;
 
         /* get number of IPs */
         origai = ai;
 	for (count = 0; ai != NULL; ai = ai->ai_next)
-                count++;
+		count++;
+	i_assert(count > 0);
 
         *ips_count = count;
         *ips = t_new(struct ip_addr, count);
@@ -696,7 +732,7 @@ int net_gethostbyaddr(const struct ip_addr *ip, const char **name_r)
 	sin_set_ip(&so, ip);
 	ret = getnameinfo(&so.sa, addrlen, hbuf, sizeof(hbuf), NULL, 0,
 			  NI_NAMEREQD);
-	if (ret != 0)
+	if (net_handle_gai_error("getnameinfo", ret, FALSE) != 0)
 		return ret;
 
 	*name_r = t_strdup(hbuf);
@@ -890,11 +926,28 @@ int net_getunixcred(int fd, struct net_unix_cred *cred_r)
 
 const char *net_ip2addr(const struct ip_addr *ip)
 {
-	char *addr = t_malloc_no0(MAX_IP_LEN+1);
+	union sockaddr_union u;
+	socklen_t so_len;
 
-	if (inet_ntop(ip->family, &ip->u.ip6, addr, MAX_IP_LEN) == NULL)
+	if (ip->family == AF_INET) {
+		u.sin.sin_addr = ip->u.ip4;
+		u.sin.sin_family = ip->family;
+		so_len = sizeof(u.sin);
+	} else if (ip->family == AF_INET6) {
+		u.sin6.sin6_addr = ip->u.ip6;
+		u.sin6.sin6_family = ip->family;
+		u.sin6.sin6_scope_id = ip->scope_id;
+		so_len = sizeof(u.sin6);
+	} else /* not an IP */
 		return "";
 
+	char *addr = t_malloc_no0(MAX_IP_LEN+1);
+	int ret;
+	if ((ret = getnameinfo(&u.sa, so_len, addr, MAX_IP_LEN+1, NULL, 0,
+			       NI_NUMERICHOST)) < 0) {
+		(void)net_handle_gai_error("getnameinfo", ret, TRUE);
+		return "";
+	}
 	return addr;
 }
 
@@ -905,12 +958,6 @@ static bool net_addr2ip_inet4_fast(const char *addr, struct ip_addr *ip)
 
 	if (str_parse_uint(addr, &num, &addr) < 0)
 		return FALSE;
-	if (*addr == '\0' && num <= 0xffffffff) {
-		/* single-number IPv4 address */
-		ip->u.ip4.s_addr = htonl(num);
-		ip->family = AF_INET;
-		return TRUE;
-	}
 
 	/* try to parse as a.b.c.d */
 	i = 0;
@@ -933,34 +980,38 @@ static bool net_addr2ip_inet4_fast(const char *addr, struct ip_addr *ip)
 	return TRUE;
 }
 
-int net_addr2ip(const char *addr, struct ip_addr *ip)
+int net_addr2ip(const char *addr, struct ip_addr *ip_r)
 {
 	int ret;
 
-	if (net_addr2ip_inet4_fast(addr, ip))
+	if (net_addr2ip_inet4_fast(addr, ip_r))
 		return 0;
 
-	if (strchr(addr, ':') != NULL) {
-		/* IPv6 */
-		T_BEGIN {
+	T_BEGIN {
+		if (strchr(addr, ':') != NULL) {
 			if (addr[0] == '[') {
 				/* allow [ipv6 addr] */
 				size_t len = strlen(addr);
 				if (addr[len-1] == ']')
 					addr = t_strndup(addr+1, len-2);
 			}
-			ret = inet_pton(AF_INET6, addr, &ip->u.ip6);
-		} T_END;
-		if (ret == 0)
-			return -1;
-		ip->family = AF_INET6;
- 	} else {
-		/* IPv4 */
-		if (inet_aton(addr, &ip->u.ip4) == 0)
-			return -1;
-		ip->family = AF_INET;
-	}
-	return 0;
+		}
+
+		struct addrinfo *res = NULL;
+		const struct addrinfo hints = {
+			.ai_flags = AI_NUMERICHOST,
+		};
+		if ((ret = getaddrinfo(addr, NULL, &hints, &res)) == 0) {
+			i_assert(res != NULL);
+			const union sockaddr_union *so =
+				(union sockaddr_union *)res->ai_addr;
+			sin_get_ip(so, ip_r);
+		}
+		if (res != NULL)
+			freeaddrinfo(res);
+		ret = net_handle_gai_error("getaddrinfo", ret, TRUE);
+	} T_END;
+	return ret < 0 ? -1 : 0;
 }
 
 int net_str2port(const char *str, in_port_t *port_r)
@@ -1025,22 +1076,19 @@ int net_str2hostport(const char *str, in_port_t default_port,
 	return 0;
 }
 
-int net_ipport2str(const struct ip_addr *ip, in_port_t port, const char **str_r)
+const char *net_ipport2str(const struct ip_addr *ip, in_port_t port)
 {
-	if (!IPADDR_IS_V4(ip) && !IPADDR_IS_V6(ip)) return -1;
+	i_assert(IPADDR_IS_V4(ip) || IPADDR_IS_V6(ip));
 
-	*str_r = t_strdup_printf("%s%s%s:%u",
-				 IPADDR_IS_V6(ip) ? "[" : "",
-				 net_ip2addr(ip),
-				 IPADDR_IS_V6(ip) ? "]" : "",
-				 port);
-	return 0;
+	return t_strdup_printf("%s%s%s:%u",
+			       (IPADDR_IS_V6(ip) ? "[" : ""), net_ip2addr(ip),
+			       (IPADDR_IS_V6(ip) ? "]" : ""), port);
 }
 
 int net_ipv6_mapped_ipv4_convert(const struct ip_addr *src,
 				 struct ip_addr *dest)
 {
-	static uint8_t v4_prefix[] =
+	static const uint8_t v4_prefix[] =
 		{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
 
 	if (!IPADDR_IS_V6(src))
@@ -1109,7 +1157,7 @@ enum net_hosterror_type net_get_hosterror_type(int error)
 
 int net_hosterror_notfound(int error)
 {
-#ifdef EAI_NODATA /* NODATA is depricated */
+#ifdef EAI_NODATA /* NODATA is deprecated */
 	return (error != 1 && (error == EAI_NONAME || error == EAI_NODATA)) ? 1 : 0;
 #else
 	return (error != 1 && (error == EAI_NONAME)) ? 1 : 0;
@@ -1118,41 +1166,10 @@ int net_hosterror_notfound(int error)
 
 const char *net_getservbyport(in_port_t port)
 {
-	struct servent *entry;
+	const struct servent *entry;
 
 	entry = getservbyport(htons(port), "tcp");
 	return entry == NULL ? NULL : entry->s_name;
-}
-
-bool is_ipv4_address(const char *addr)
-{
-	while (*addr != '\0') {
-		if (*addr != '.' && !i_isdigit(*addr))
-			return FALSE;
-                addr++;
-	}
-
-	return TRUE;
-}
-
-bool is_ipv6_address(const char *addr)
-{
-	bool have_prefix = FALSE;
-
-	if (*addr == '[') {
-		have_prefix = TRUE;
-		addr++;
-	}
-	while (*addr != '\0') {
-		if (*addr != ':' && !i_isxdigit(*addr)) {
-			if (have_prefix && *addr == ']' && addr[1] == '\0')
-				break;
-			return FALSE;
-		}
-                addr++;
-	}
-
-	return TRUE;
 }
 
 int net_parse_range(const char *network, struct ip_addr *ip_r,

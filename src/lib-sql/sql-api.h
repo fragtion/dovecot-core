@@ -13,7 +13,7 @@ enum sql_db_flags {
 	SQL_DB_FLAG_POOLED		= 0x02,
 	/* Prepared statements are supported by the database. If they aren't,
 	   the functions can still be used, but they're just internally
-	   convered into regular statements. */
+	   converted into regular statements. */
 	SQL_DB_FLAG_PREP_STATEMENTS	= 0x04,
 	/* Database supports INSERT .. ON DUPLICATE KEY syntax. */
 	SQL_DB_FLAG_ON_DUPLICATE_KEY	= 0x08,
@@ -150,6 +150,8 @@ void sql_statement_bind_binary(struct sql_statement *stmt,
 			       size_t value_size);
 void sql_statement_bind_int64(struct sql_statement *stmt,
 			      unsigned int column_idx, int64_t value);
+void sql_statement_bind_double(struct sql_statement *stmt,
+			       unsigned int column_idx, double value);
 void sql_statement_query(struct sql_statement **stmt,
 			 sql_query_callback_t *callback, void *context);
 #define sql_statement_query(stmt, callback, context) \
@@ -168,7 +170,7 @@ int sql_result_next_row(struct sql_result *result);
 
 /* If sql_result_next_row() returned SQL_RESULT_NEXT_MORE, this can be called
    to continue returning more results. The result is freed with this call, so
-   it must not be accesed anymore until the callback is finished. */
+   it must not be accessed anymore until the callback is finished. */
 void sql_result_more(struct sql_result **result,
 		     sql_query_callback_t *callback, void *context);
 #define sql_result_more(result, callback, context) \
@@ -242,5 +244,8 @@ void sql_update_get_rows(struct sql_transaction_context *ctx, const char *query,
 void sql_update_stmt_get_rows(struct sql_transaction_context *ctx,
 			      struct sql_statement **stmt,
 			      unsigned int *affected_rows);
+
+/* Wait for SQL query results. */
+void sql_wait(struct sql_db *db);
 
 #endif

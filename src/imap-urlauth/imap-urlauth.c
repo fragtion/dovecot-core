@@ -23,14 +23,14 @@ The imap-urlauth service thus consists of three separate stages:
 
 - imap-urlauth:
   Once the client is authenticated, the connection gets passed to the
-  imap-urlauth service (as implemented here). The goal of this stage is 
+  imap-urlauth service (as implemented here). The goal of this stage is
   to prevent the need for re-authenticating to the imap-urlauth service when
   the clients wants to switch to a different target user. It normally runs as
   $default_internal_user and starts workers to perform the actual work. To start
   a worker, the imap-urlauth service establishes a control connection to the
   imap-urlauth-worker service. In the handshake phase of the control protocol,
   the connection of the client is passed to the worker. Once the worker
-  finishes, a new worker is started and the client connection is transfered to
+  finishes, a new worker is started and the client connection is transferred to
   it, unless the client is disconnected.
 
 - imap-urlauth-worker:
@@ -57,7 +57,7 @@ The imap-urlauth service thus consists of three separate stages:
 #include "auth-master.h"
 #include "master-service.h"
 #include "master-service-settings.h"
-#include "master-login.h"
+#include "login-server.h"
 #include "master-interface.h"
 #include "var-expand.h"
 
@@ -68,7 +68,7 @@ The imap-urlauth service thus consists of three separate stages:
         (getenv(MASTER_IS_PARENT_ENV) == NULL)
 
 bool verbose_proctitle = FALSE;
-static struct master_login *master_login = NULL;
+static struct login_server *login_server = NULL;
 
 static const struct imap_urlauth_settings *imap_urlauth_settings;
 
@@ -129,7 +129,7 @@ static void main_stdio_run(const char *username)
 }
 
 static void
-login_client_connected(const struct master_login_client *client,
+login_request_finished(const struct login_server_request *request,
 		       const char *username, const char *const *extra_fields)
 {
 	const char *msg = "NO\n";
@@ -142,47 +142,46 @@ login_client_connected(const struct master_login_client *client,
 	auth_user_fields_parse(extra_fields, pool_datastack_create(), &reply);
 
 	/* check peer credentials if possible */
-	if (reply.uid != (uid_t)-1 && net_getunixcred(client->fd, &cred) == 0 &&
+	if (reply.uid != (uid_t)-1 && net_getunixcred(request->fd, &cred) == 0 &&
 		reply.uid != cred.uid) {
 		i_error("Peer's credentials (uid=%ld) do not match "
 			"the user that logged in (uid=%ld).",
 			(long)cred.uid, (long)reply.uid);
-		if (write(client->fd, msg, strlen(msg)) < 0) {
+		if (write(request->fd, msg, strlen(msg)) < 0) {
 			/* ignored */
 		}
-		net_disconnect(client->fd);
+		net_disconnect(request->fd);
 		return;
 	}
 
 	fields = array_get(&reply.extra_fields, &count);
 	for (i = 0; i < count; i++) {
-		if (str_begins(fields[i], "client_service=")) {
-			service = fields[i] + 15;
+		if (str_begins(fields[i], "client_service=", &service))
 			break;
-		}
 	}
 
 	if (service == NULL) {
 		i_error("Auth did not yield required client_service field (BUG).");
-		if (write(client->fd, msg, strlen(msg)) < 0) {
+		if (write(request->fd, msg, strlen(msg)) < 0) {
 			/* ignored */
 		}
-		net_disconnect(client->fd);
+		net_disconnect(request->fd);
 		return;
 	}
 
 	if (reply.anonymous)
 		username = NULL;
 
-	if (client_create_from_input(service, username, client->fd, client->fd) < 0)
-		net_disconnect(client->fd);
+	if (client_create_from_input(service, username, request->fd,
+				     request->fd) < 0)
+		net_disconnect(request->fd);
 }
 
-static void login_client_failed(const struct master_login_client *client,
-				const char *errormsg ATTR_UNUSED)
+static void login_request_failed(const struct login_server_request *request,
+				 const char *errormsg ATTR_UNUSED)
 {
 	const char *msg = "NO\n";
-	if (write(client->fd, msg, strlen(msg)) < 0) {
+	if (write(request->fd, msg, strlen(msg)) < 0) {
 		/* ignored */
 	}
 }
@@ -190,10 +189,10 @@ static void login_client_failed(const struct master_login_client *client,
 static void client_connected(struct master_service_connection *conn)
 {
 	/* when running standalone, we shouldn't even get here */
-	i_assert(master_login != NULL);
+	i_assert(login_server != NULL);
 
 	master_service_client_connection_accept(conn);
-	master_login_add(master_login, conn->fd);
+	login_server_add(login_server, conn->fd);
 }
 
 int main(int argc, char *argv[])
@@ -202,7 +201,7 @@ int main(int argc, char *argv[])
 		&imap_urlauth_setting_parser_info,
 		NULL
 	};
-	struct master_login_settings login_set;
+	struct login_server_settings login_set;
 	struct master_service_settings_input input;
 	struct master_service_settings_output output;
 	void **sets;
@@ -212,7 +211,8 @@ int main(int argc, char *argv[])
 	int c;
 
 	i_zero(&login_set);
-	login_set.postlogin_timeout_secs = MASTER_POSTLOGIN_TIMEOUT_DEFAULT;
+	login_set.postlogin_timeout_secs =
+		LOGIN_SERVER_POSTLOGIN_TIMEOUT_DEFAULT;
 
 	if (IS_STANDALONE() && getuid() == 0 &&
 	    net_getpeername(1, NULL, NULL) == 0) {
@@ -250,7 +250,7 @@ int main(int argc, char *argv[])
 		i_fatal("Error reading configuration: %s", error);
 
 	sets = master_service_settings_get_others(master_service);
-	imap_urlauth_settings = sets[0];	
+	imap_urlauth_settings = sets[0];
 
 	if (imap_urlauth_settings->verbose_proctitle)
 		verbose_proctitle = TRUE;
@@ -258,8 +258,8 @@ int main(int argc, char *argv[])
 	if (t_abspath(auth_socket_path, &login_set.auth_socket_path, &error) < 0) {
 		i_fatal("t_abspath(%s) failed: %s", auth_socket_path, error);
 	}
-	login_set.callback = login_client_connected;
-	login_set.failure_callback = login_client_failed;
+	login_set.callback = login_request_finished;
+	login_set.failure_callback = login_request_failed;
 
 	master_service_init_finish(master_service);
 	master_service_set_die_callback(master_service, imap_urlauth_die);
@@ -273,7 +273,7 @@ int main(int argc, char *argv[])
 			main_stdio_run(username);
 		} T_END;
 	} else {
-		master_login = master_login_init(master_service, &login_set);
+		login_server = login_server_init(master_service, &login_set);
 		io_loop_set_running(current_ioloop);
 	}
 
@@ -281,8 +281,8 @@ int main(int argc, char *argv[])
 		master_service_run(master_service, client_connected);
 	clients_destroy_all();
 
-	if (master_login != NULL)
-		master_login_deinit(&master_login);
+	if (login_server != NULL)
+		login_server_deinit(&login_server);
 	master_service_deinit(&master_service);
 	return 0;
 }

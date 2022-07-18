@@ -159,7 +159,7 @@ static ssize_t program_client_istream_read(struct istream_private *stream)
 
 				reserved = (stream->buffer[pos - 1] == '\n' &&
 					    pos > 1 ? 2 : 1);
-				reserve_mod = reserved - old_reserved;
+				reserve_mod = (ssize_t)reserved - (ssize_t)old_reserved;
 				pos -= reserved;
 			}
 			if (ret == 0) {
@@ -168,7 +168,7 @@ static ssize_t program_client_istream_read(struct istream_private *stream)
 				   not visible to application. */
 				break;
 			}
-			if (ret >= reserve_mod) {
+			if (ret > 0 && ret >= reserve_mod) {
 				/* Subtract additional reserved bytes */
 				ret -= reserve_mod;
 			}
@@ -362,8 +362,7 @@ static int program_client_unix_connect(struct program_client *pclient)
 	pclient->fd_in = (prclient->noreply && pclient->output == NULL ?
 			  -1 : fd);
 	pclient->fd_out = fd;
-	pclient->io = io_add(fd, IO_WRITE,
-			     program_client_remote_connected, prclient);
+	program_client_remote_connected(prclient);
 	return 0;
 }
 
@@ -421,8 +420,7 @@ program_client_net_connect_real(struct program_client_remote *prclient)
 
 	i_assert(prclient->ips_count > 0);
 
-	if (net_ipport2str(prclient->ips, prclient->port, &address) < 0)
-		i_unreached();
+	address = net_ipport2str(prclient->ips, prclient->port);
 	label = t_strconcat("tcp:", address, NULL);
 	program_client_set_label(pclient, label);
 
@@ -535,9 +533,9 @@ static int program_client_net_connect_init(struct program_client *pclient)
 			prclient->dns_set.timeout_msecs =
 				pclient->set.client_connect_timeout_msecs;
 			prclient->dns_set.event_parent = pclient->event;
-			dns_lookup(prclient->address, &prclient->dns_set,
-				   program_client_net_connect_resolved,
-				   prclient, &prclient->lookup);
+			(void)dns_lookup(prclient->address, &prclient->dns_set,
+					 program_client_net_connect_resolved,
+					 prclient, &prclient->lookup);
 			return 0;
 		} else {
 			struct ip_addr *ips;
@@ -680,9 +678,7 @@ program_client_net_create_ips(const struct ip_addr *ips, size_t ips_count,
 
 	i_assert(ips != NULL && ips_count > 0);
 
-	if (net_ipport2str(ips, port, &label) < 0)
-		i_unreached();
-	label = t_strconcat("tcp:", label, NULL);
+	label = t_strconcat("tcp:", net_ipport2str(ips, port), NULL);
 
 	pool = pool_alloconly_create("program client net", 1024);
 	prclient = p_new(pool, struct program_client_remote, 1);

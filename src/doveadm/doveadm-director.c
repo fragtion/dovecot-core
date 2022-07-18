@@ -225,7 +225,7 @@ static void cmd_director_status(struct doveadm_cmd_context *cctx)
 			arg_count = str_array_length(args);
 			if (arg_count >= 6) {
 				/* ip vhosts users tag updown updown-ts */
-				doveadm_print(args[0]); 
+				doveadm_print(args[0]);
 				doveadm_print(args[3]);
 				doveadm_print(args[1]);
 				doveadm_print(args[4][0] == 'D' ? "down" : "up");
@@ -1022,7 +1022,7 @@ DOVEADM_CMD_PARAMS_END
 DOVEADM_CMD_PARAMS_START
 DOVEADM_CMD_PARAM('a', "socket-path", CMD_PARAM_STR, 0)
 DOVEADM_CMD_PARAM('F', "force-flush", CMD_PARAM_BOOL, 0)
-DOVEADM_CMD_PARAM('\0', "max-parallel", CMD_PARAM_INT64, 0)
+DOVEADM_CMD_PARAM('\0', "max-parallel", CMD_PARAM_INT64, CMD_PARAM_FLAG_UNSIGNED)
 DOVEADM_CMD_PARAM('\0', "host", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
 DOVEADM_CMD_PARAMS_END
 },

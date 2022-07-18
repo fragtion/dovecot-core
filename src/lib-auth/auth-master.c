@@ -11,14 +11,12 @@
 #include "str.h"
 #include "strescape.h"
 #include "connection.h"
+#include "auth-client-interface.h"
 #include "master-interface.h"
 #include "auth-client-private.h"
 #include "auth-master.h"
 
 #include <unistd.h>
-
-#define AUTH_PROTOCOL_MAJOR 1
-#define AUTH_PROTOCOL_MINOR 0
 
 #define AUTH_MASTER_IDLE_SECS 60
 
@@ -86,8 +84,8 @@ static const struct connection_settings auth_master_set = {
 	.dont_send_version = TRUE,
 	.service_name_in = "auth-master",
 	.service_name_out = "auth-master",
-	.major_version = AUTH_PROTOCOL_MAJOR,
-	.minor_version = AUTH_PROTOCOL_MINOR,
+	.major_version = AUTH_CLIENT_PROTOCOL_MAJOR_VERSION,
+	.minor_version = AUTH_CLIENT_PROTOCOL_MINOR_VERSION,
 	.unix_client_connect_msecs = 1000,
 	.input_max_size = MAX_INBUF_SIZE,
 	.output_max_size = MAX_OUTBUF_SIZE,
@@ -279,6 +277,7 @@ static bool auth_lookup_reply_callback(const char *cmd, const char *const *args,
 				       void *context)
 {
 	struct auth_master_lookup_ctx *ctx = context;
+	const char *value;
 	unsigned int i, len;
 
 	io_loop_stop(ctx->conn->ioloop);
@@ -295,9 +294,8 @@ static bool auth_lookup_reply_callback(const char *cmd, const char *const *args,
 		/* put the reason string into first field */
 		ctx->fields = p_new(ctx->pool, const char *, 2);
 		for (i = 0; i < len; i++) {
-			if (str_begins(args[i], "reason=")) {
-				ctx->fields[0] =
-					p_strdup(ctx->pool, args[i] + 7);
+			if (str_begins(args[i], "reason=", &value)) {
+				ctx->fields[0] = p_strdup(ctx->pool, value);
 				break;
 			}
 		}
@@ -326,6 +324,8 @@ auth_master_input_args(struct connection *_conn, const char *const *args)
 
 	wanted_id = dec2str(conn->request_counter);
 	if (strcmp(id, wanted_id) == 0) {
+		e_debug(conn->conn.event, "auth input: %s",
+			t_strarray_join(args, "\t"));
 		return (conn->reply_callback(cmd, args, conn->reply_context) ?
 			0 : 1);
 	}
@@ -559,10 +559,15 @@ void auth_user_info_export(string_t *str, const struct auth_user_info *info)
 		str_printfa(str, "\treal_rport=%d", info->real_remote_port);
 	if (info->debug)
 		str_append(str, "\tdebug");
-	if (info->forward_fields != NULL &&
-	    *info->forward_fields != '\0') {
+	if (info->forward_fields != NULL && info->forward_fields[0] != NULL) {
+		string_t *forward = t_str_new(64);
+		str_append_tabescaped(forward, info->forward_fields[0]);
+		for (unsigned int i = 1; info->forward_fields[i] != NULL; i++) {
+			str_append_c(forward, '\t');
+			str_append_tabescaped(forward, info->forward_fields[i]);
+		}
 		str_append(str, "\tforward_fields=");
-		str_append_tabescaped(str, info->forward_fields);
+		str_append_tabescaped(str, str_c(forward));
 	}
 	if (array_is_created(&info->extra_fields)) {
 		array_foreach(&info->extra_fields, fieldp) {
@@ -717,22 +722,24 @@ int auth_master_user_lookup(struct auth_master_connection *conn,
 void auth_user_fields_parse(const char *const *fields, pool_t pool,
 			    struct auth_user_reply *reply_r)
 {
+	const char *value;
+
 	i_zero(reply_r);
 	reply_r->uid = (uid_t)-1;
 	reply_r->gid = (gid_t)-1;
 	p_array_init(&reply_r->extra_fields, pool, 64);
 
 	for (; *fields != NULL; fields++) {
-		if (str_begins(*fields, "uid=")) {
-			if (str_to_uid(*fields + 4, &reply_r->uid) < 0)
+		if (str_begins(*fields, "uid=", &value)) {
+			if (str_to_uid(value, &reply_r->uid) < 0)
 				i_error("Invalid uid in reply");
-		} else if (str_begins(*fields, "gid=")) {
-			if (str_to_gid(*fields + 4, &reply_r->gid) < 0)
+		} else if (str_begins(*fields, "gid=", &value)) {
+			if (str_to_gid(value, &reply_r->gid) < 0)
 				i_error("Invalid gid in reply");
-		} else if (str_begins(*fields, "home="))
-			reply_r->home = p_strdup(pool, *fields + 5);
-		else if (str_begins(*fields, "chroot="))
-			reply_r->chroot = p_strdup(pool, *fields + 7);
+		} else if (str_begins(*fields, "home=", &value))
+			reply_r->home = p_strdup(pool, value);
+		else if (str_begins(*fields, "chroot=", &value))
+			reply_r->chroot = p_strdup(pool, value);
 		else if (strcmp(*fields, "anonymous") == 0)
 			reply_r->anonymous = TRUE;
 		else {
@@ -855,25 +862,14 @@ int auth_master_cache_flush(struct auth_master_connection *conn,
 
 	auth_master_event_create(conn, "auth cache flush: ");
 
-	struct event_passthrough *e =
-		event_create_passthrough(conn->event)->
-		set_name("auth_client_cache_flush_started");
-	e_debug(e->event(), "Started cache flush");
+	e_debug(conn->event, "Started cache flush");
 
 	(void)auth_master_run_cmd(conn, str_c(str));
 
-	if (ctx.failed) {
-		struct event_passthrough *e =
-			event_create_passthrough(conn->event)->
-			set_name("auth_client_cache_flush_finished");
-		e->add_str("error", "Cache flush failed");
-		e_debug(e->event(), "Cache flush failed");
-	} else {
-		struct event_passthrough *e =
-			event_create_passthrough(conn->event)->
-			set_name("auth_client_cache_flush_finished");
-		e_debug(e->event(), "Finished cache flush");
-	}
+	if (ctx.failed)
+		e_debug(conn->event, "Cache flush failed");
+	else
+		e_debug(conn->event, "Finished cache flush");
 	auth_master_event_finish(conn);
 
 	conn->reply_context = NULL;

@@ -2,6 +2,7 @@
 
 #include "lib.h"
 #include "buffer.h"
+#include "memarea.h"
 #include "istream-private.h"
 #include "istream-concat.h"
 
@@ -95,8 +96,12 @@ static void i_stream_concat_read_next(struct concat_istream *cstream)
 
 	/* we already verified that the data size is less than the
 	   maximum buffer size */
+	cstream->istream.skip = 0;
 	cstream->istream.pos = 0;
 	if (data_size > 0) {
+		if (cstream->istream.memarea != NULL &&
+		    memarea_get_refcount(cstream->istream.memarea) > 1)
+			i_stream_memarea_detach(&cstream->istream);
 		if (!i_stream_try_alloc(&cstream->istream, data_size, &size))
 			i_unreached();
 		i_assert(size >= data_size);
@@ -164,7 +169,10 @@ static ssize_t i_stream_concat_read(struct istream_private *stream)
 	else {
 		/* need to read more - NOTE: Can't use i_stream_read_memarea()
 		   here, because our stream->buffer may point to the parent
-		   istream. */
+		   istream. Implementing explicit snapshot function to avoid
+		   this isn't easy for seekable concat-istreams, because due to
+		   seeking it's not necessarily the cur_input that needs to be
+		   snapshotted. */
 		i_assert(cur_data_pos == data_size);
 		ret = i_stream_read(cstream->cur_input);
 		if (ret == -2 || ret == 0)
@@ -335,7 +343,7 @@ struct istream *i_stream_create_concat(struct istream *input[])
 {
 	struct concat_istream *cstream;
 	unsigned int count;
-	size_t max_buffer_size = I_STREAM_MIN_SIZE;
+	size_t max_buffer_size = 0;
 	bool blocking = TRUE, seekable = TRUE;
 
 	/* if any of the streams isn't blocking or seekable, set ourself also
@@ -343,7 +351,8 @@ struct istream *i_stream_create_concat(struct istream *input[])
 	for (count = 0; input[count] != NULL; count++) {
 		size_t cur_max = i_stream_get_max_buffer_size(input[count]);
 
-		if (cur_max > max_buffer_size)
+		i_assert(cur_max != 0);
+		if (cur_max != SIZE_MAX && cur_max > max_buffer_size)
 			max_buffer_size = cur_max;
 		if (!input[count]->blocking)
 			blocking = FALSE;
@@ -352,6 +361,10 @@ struct istream *i_stream_create_concat(struct istream *input[])
 		i_stream_ref(input[count]);
 	}
 	i_assert(count != 0);
+	if (max_buffer_size == 0)
+		max_buffer_size = SIZE_MAX;
+	if (max_buffer_size < I_STREAM_MIN_SIZE)
+		max_buffer_size = I_STREAM_MIN_SIZE;
 
 	cstream = i_new(struct concat_istream, 1);
 	cstream->input_count = count;
@@ -374,6 +387,5 @@ struct istream *i_stream_create_concat(struct istream *input[])
 	cstream->istream.istream.readable_fd = FALSE;
 	cstream->istream.istream.blocking = blocking;
 	cstream->istream.istream.seekable = seekable;
-	return i_stream_create(&cstream->istream, NULL, -1,
-			       ISTREAM_CREATE_FLAG_NOOP_SNAPSHOT);
+	return i_stream_create(&cstream->istream, NULL, -1, 0);
 }

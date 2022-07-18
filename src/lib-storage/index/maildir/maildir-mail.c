@@ -68,6 +68,9 @@ maildir_open_mail(struct maildir_mailbox *mbox, struct mail *mail,
 
 	*deleted_r = FALSE;
 
+	if (!mail_stream_access_start(mail))
+		return NULL;
+
 	ctx.fd = -1;
 	ctx.path = NULL;
 
@@ -107,11 +110,8 @@ static int maildir_mail_stat(struct mail *mail, struct stat *st_r)
 	const char *path;
 	int fd, ret;
 
-	if (mail->lookup_abort >= MAIL_LOOKUP_ABORT_NOT_IN_CACHE) {
-		mail_set_aborted(mail);
+	if (!mail_metadata_access_start(mail))
 		return -1;
-	}
-	mail->mail_metadata_accessed = TRUE;
 
 	if (imail->data.access_part != 0 &&
 	    imail->data.stream == NULL) {
@@ -591,7 +591,7 @@ maildir_mail_get_special(struct mail *_mail, enum mail_fetch_field field,
 		return index_mail_get_special(_mail, field, value_r);
 	}
 }
-							
+
 static int
 maildir_mail_get_stream(struct mail *_mail, bool get_body ATTR_UNUSED,
 			struct message_size *hdr_size,

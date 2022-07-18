@@ -16,6 +16,8 @@
 #include "stats-settings.h"
 #include "client-writer.h"
 
+#define STATS_UPDATE_CLIENTS_DELAY_MSECS 1000
+
 struct stats_event {
 	struct stats_event *prev, *next;
 
@@ -30,6 +32,7 @@ struct writer_client {
 	HASH_TABLE(struct stats_event *, struct stats_event *) events_hash;
 };
 
+static struct timeout *to_update_clients;
 static struct connection_list *writer_clients = NULL;
 
 static void client_writer_send_handshake(struct writer_client *client)
@@ -137,14 +140,35 @@ static bool
 writer_client_input_event(struct writer_client *client,
 			  const char *const *args, const char **error_r)
 {
-	struct event *event;
-	uint64_t parent_event_id;
+	struct event *event, *global_event = NULL;
+	uint64_t parent_event_id, global_event_id;
+	bool ret;
 
-	if (args[0] == NULL || str_to_uint64(args[0], &parent_event_id) < 0) {
+	if (args[1] == NULL || str_to_uint64(args[0], &global_event_id) < 0) {
+		*error_r = "Invalid global event ID";
+		return FALSE;
+	}
+	if (args[1] == NULL || str_to_uint64(args[1], &parent_event_id) < 0) {
 		*error_r = "Invalid parent ID";
 		return FALSE;
 	}
-	if (!writer_client_run_event(client, parent_event_id, args+1, &event, error_r))
+
+	if (global_event_id != 0) {
+		struct stats_event *stats_global_event =
+			writer_client_find_event(client, global_event_id);
+		if (stats_global_event == NULL) {
+			*error_r = "Unknown global event ID";
+			return FALSE;
+		}
+		global_event = stats_global_event->event;
+		event_push_global(global_event);
+	}
+
+	ret = writer_client_run_event(client, parent_event_id, args+2,
+				      &event, error_r);
+	if (global_event != NULL)
+		event_pop_global(global_event);
+	if (!ret)
 		return FALSE;
 	event_unref(&event);
 	return TRUE;
@@ -303,7 +327,7 @@ writer_client_input_args(struct connection *conn, const char *const *args)
 static struct connection_settings client_set = {
 	.service_name_in = "stats-client",
 	.service_name_out = "stats-server",
-	.major_version = 3,
+	.major_version = 4,
 	.minor_version = 0,
 
 	.input_max_size = 1024*128, /* "big enough" */
@@ -316,6 +340,27 @@ static const struct connection_vfuncs client_vfuncs = {
 	.input_args = writer_client_input_args,
 };
 
+static void
+client_writer_update_connections_internal(void *context ATTR_UNUSED)
+{
+	struct connection *conn;
+	for (conn = writer_clients->connections; conn != NULL; conn = conn->next) {
+		struct writer_client *client =
+			container_of(conn, struct writer_client, conn);
+		client_writer_send_handshake(client);
+	}
+	timeout_remove(&to_update_clients);
+}
+
+void client_writer_update_connections(void)
+{
+	if (to_update_clients != NULL)
+		return;
+	to_update_clients = timeout_add(STATS_UPDATE_CLIENTS_DELAY_MSECS,
+					client_writer_update_connections_internal,
+					NULL);
+}
+
 void client_writers_init(void)
 {
 	writer_clients = connection_list_init(&client_set, &client_vfuncs);
@@ -323,5 +368,6 @@ void client_writers_init(void)
 
 void client_writers_deinit(void)
 {
+	timeout_remove(&to_update_clients);
 	connection_list_deinit(&writer_clients);
 }

@@ -94,6 +94,30 @@ struct imapc_fetch_request {
 	ARRAY(struct imapc_mail *) mails;
 };
 
+struct imapc_untagged_fetch_ctx {
+	pool_t pool;
+
+	/* keywords, flags, guid, modseq and fetch_uid may or may not be
+	   received with an untagged fetch response */
+	ARRAY_TYPE(const_string) keywords;
+	/* Is set if have_flags is TRUE */
+	enum mail_flags flags;
+	const char *guid;
+	uint64_t modseq;
+	uint32_t fetch_uid;
+
+	/* uid is generated locally based on the remote MSN or fetch_uid */
+	uint32_t uid;
+
+	bool have_gmail_labels:1;
+	bool have_flags:1;
+};
+
+struct imapc_copy_request {
+	struct imapc_save_context *sctx;
+	struct seqset_builder *uidset_builder;
+};
+
 struct imapc_mailbox {
 	struct mailbox box;
 	struct imapc_storage *storage;
@@ -107,11 +131,17 @@ struct imapc_mailbox {
 	struct timeout *to_idle_check, *to_idle_delay;
 
 	ARRAY(struct imapc_fetch_request *) fetch_requests;
+	ARRAY(struct imapc_untagged_fetch_ctx *) untagged_fetch_contexts;
 	/* if non-empty, contains the latest FETCH command we're going to be
 	   sending soon (but still waiting to see if we can increase its
 	   UID range) */
 	string_t *pending_fetch_cmd;
+	/* if non-empty, contains the latest COPY command we're going to be
+	   sending soon. */
+	string_t *pending_copy_cmd;
+	char *copy_dest_box;
 	struct imapc_fetch_request *pending_fetch_request;
+	struct imapc_copy_request *pending_copy_request;
 	struct timeout *to_pending_fetch_send;
 
 	ARRAY(struct imapc_mailbox_event_callback) untagged_callbacks;
@@ -122,6 +152,7 @@ struct imapc_mailbox {
 
 	ARRAY(uint64_t) rseq_modseqs;
 	ARRAY_TYPE(seq_range) delayed_expunged_uids;
+	ARRAY_TYPE(seq_range) copy_rollback_expunge_uids;
 	uint32_t sync_uid_validity;
 	uint32_t sync_uid_next;
 	uint64_t sync_highestmodseq;
@@ -149,6 +180,8 @@ struct imapc_mailbox {
 	bool exists_received:1;
 	bool state_fetching_uid1:1;
 	bool state_fetched_success:1;
+	bool rollback_pending:1;
+	bool delayed_untagged_exists:1;
 };
 
 struct imapc_simple_context {
@@ -175,6 +208,7 @@ int imapc_save_finish(struct mail_save_context *ctx);
 void imapc_save_cancel(struct mail_save_context *ctx);
 int imapc_copy(struct mail_save_context *ctx, struct mail *mail);
 
+int imapc_transaction_save_commit(struct mailbox_transaction_context *t);
 int imapc_transaction_save_commit_pre(struct mail_save_context *ctx);
 void imapc_transaction_save_commit_post(struct mail_save_context *ctx,
 					struct mail_index_transaction_commit_result *result);
@@ -220,5 +254,15 @@ void imapc_mailbox_register_resp_text(struct imapc_mailbox *mbox,
 				      imapc_mailbox_callback_t *callback);
 
 void imapc_mailbox_register_callbacks(struct imapc_mailbox *mbox);
+
+struct mail_index_view *
+imapc_mailbox_get_sync_view(struct imapc_mailbox *mbox);
+
+void imapc_untagged_fetch_ctx_free(struct imapc_untagged_fetch_ctx **_ctx);
+void imapc_untagged_fetch_update_flags(struct imapc_mailbox *mbox,
+				       struct imapc_untagged_fetch_ctx *ctx,
+				       struct mail_index_view *view,
+				       uint32_t lseq);
+bool imapc_mailbox_fetch_state(struct imapc_mailbox *mbox, uint32_t first_uid);
 
 #endif

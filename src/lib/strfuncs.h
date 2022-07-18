@@ -7,6 +7,7 @@
 
 extern const unsigned char uchar_nul; /* (const unsigned char *)"" */
 extern const unsigned char *uchar_empty_ptr; /* non-NULL pointer that shouldn't be dereferenced. */
+extern const char *const empty_str_array[];
 
 /* Returns -1 if dest wasn't large enough, 0 if not. */
 int i_snprintf(char *dest, size_t max_chars, const char *format, ...)
@@ -87,15 +88,62 @@ bool mem_equals_timing_safe(const void *p1, const void *p2, size_t size);
 bool str_equals_timing_almost_safe(const char *s1, const char *s2);
 
 size_t str_match(const char *p1, const char *p2) ATTR_PURE;
-static inline ATTR_PURE bool str_begins(const char *haystack, const char *needle)
+size_t str_match_icase(const char *p1, const char *p2) ATTR_PURE;
+bool str_begins(const char *haystack, const char *needle,
+		const char **suffix_r);
+bool str_begins_icase(const char *haystack, const char *needle,
+		      const char **suffix_r);
+static inline ATTR_PURE bool
+str_begins_with(const char *haystack, const char *needle)
 {
 	return needle[str_match(haystack, needle)] == '\0';
 }
-#if defined(__GNUC__) && (__GNUC__ >= 2)
+static inline ATTR_PURE bool
+str_begins_icase_with(const char *haystack, const char *needle)
+{
+	return needle[str_match_icase(haystack, needle)] == '\0';
+}
+#if defined(__GNUC__) && (__GNUC__ >= 2) && !defined(STATIC_CHECKER)
 /* GCC (and Clang) are known to have a compile-time strlen("literal") shortcut, and
    an optimised strncmp(), so use that by default. Macro is multi-evaluation safe. */
-# define str_begins(h, n) (__builtin_constant_p(n) ? strncmp((h), (n), strlen(n))==0 : (str_begins)((h), (n)))
+static inline bool
+str_begins_builtin_success(const char *haystack, size_t needle_len,
+			   const char **suffix_r)
+{
+	*suffix_r = haystack + needle_len;
+	return TRUE;
+}
+# define str_begins_with(h, n) \
+	(__builtin_constant_p(n) ? strncmp((h), (n), strlen(n))==0 : \
+	 (str_begins_with)((h), (n)))
+# define str_begins(h, n, suffix_r) \
+	(!__builtin_constant_p(n) ? (str_begins)((h), (n), (suffix_r)) : \
+	 (strncmp((h), (n), strlen(n)) != 0 ? FALSE : \
+	  str_begins_builtin_success((h), strlen(n), suffix_r)))
+
+# define str_begins_icase_with(h, n) \
+	(__builtin_constant_p(n) ? strncasecmp((h), (n), strlen(n))==0 : \
+	 (str_begins_icase_with)((h), (n)))
+# define str_begins_icase(h, n, suffix_r) \
+	(!__builtin_constant_p(n) ? (str_begins_icase)((h), (n), (suffix_r)) : \
+	 (strncasecmp((h), (n), strlen(n)) != 0 ? FALSE : \
+	  str_begins_builtin_success((h), strlen(n), suffix_r)))
 #endif
+
+/* Get length of a prefix segment.
+
+  Calculates the length (in bytes) of the initial segment of s which consists
+  entirely of bytes in accept.
+*/
+size_t i_memspn(const void *data, size_t data_len,
+		const void *accept, size_t accept_len);
+/* Get length of a prefix segment.
+
+  Calculates the length of the initial segment of s which consists entirely of
+  bytes not in reject.
+*/
+size_t i_memcspn(const void *data, size_t data_len,
+		 const void *reject, size_t reject_len);
 
 static inline char *i_strchr_to_next(const char *str, char chr)
 {

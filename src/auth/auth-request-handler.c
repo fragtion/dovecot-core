@@ -204,7 +204,8 @@ auth_str_append_extra_fields(struct auth_request *request, string_t *dest)
 					      request->mech_password);
 		}
 		if (fields->master_user != NULL &&
-		    !auth_fields_exists(fields->extra_fields, "master")) {
+		    !auth_fields_exists(fields->extra_fields, "master") &&
+		    *fields->master_user != '\0') {
 			/* the master username needs to be forwarded */
 			auth_str_add_keyvalue(dest, "master",
 					      fields->master_user);
@@ -307,7 +308,7 @@ auth_request_handler_reply_failure_finish(struct auth_request *request)
 	if (request->fields.user != NULL)
 		auth_str_add_keyvalue(str, "user", request->fields.user);
 	else if (request->fields.original_username != NULL) {
-		auth_str_add_keyvalue(str, "user", 
+		auth_str_add_keyvalue(str, "user",
 				      request->fields.original_username);
 	}
 
@@ -639,7 +640,7 @@ bool auth_request_handler_auth_begin(struct auth_request_handler *handler,
 		 return TRUE;
 	 }
 
-	/* Handle initial respose */
+	/* Handle initial response */
 	if (initial_resp == NULL) {
 		/* No initial response */
 		request->initial_response = NULL;
@@ -666,7 +667,7 @@ bool auth_request_handler_auth_begin(struct auth_request_handler *handler,
 
 		/* Initial response encoded in Bas64 */
 		buf = t_buffer_create(MAX_BASE64_DECODED_SIZE(len));
-		if (base64_decode(initial_resp, len, NULL, buf) < 0) {
+		if (base64_decode(initial_resp, len, buf) < 0) {
 			auth_request_handler_auth_fail_code(handler, request,
 				AUTH_CLIENT_FAIL_CODE_INVALID_BASE64,
 				"Invalid base64 data in initial response");
@@ -724,7 +725,7 @@ bool auth_request_handler_auth_continue(struct auth_request_handler *handler,
 
 	data_len = strlen(data);
 	buf = t_buffer_create(MAX_BASE64_DECODED_SIZE(data_len));
-	if (base64_decode(data, data_len, NULL, buf) < 0) {
+	if (base64_decode(data, data_len, buf) < 0) {
 		auth_request_handler_auth_fail_code(handler, request,
 			AUTH_CLIENT_FAIL_CODE_INVALID_BASE64,
 			"Invalid base64 data in continued response");

@@ -19,7 +19,7 @@ struct fs_dict_iterate_context {
 	enum dict_iterate_flags flags;
 	pool_t value_pool;
 	struct fs_iter *fs_iter;
-	const char *values[2];
+	const char *const *values;
 	char *error;
 };
 
@@ -94,19 +94,17 @@ static const char *fs_dict_escape_key(const char *key)
 static const char *fs_dict_get_full_key(const char *username, const char *key)
 {
 	key = fs_dict_escape_key(key);
-	if (str_begins(key, DICT_PATH_SHARED))
-		return key + strlen(DICT_PATH_SHARED);
-	else if (str_begins(key, DICT_PATH_PRIVATE)) {
-		return t_strdup_printf("%s/%s", username,
-				       key + strlen(DICT_PATH_PRIVATE));
-	} else {
+	if (str_begins(key, DICT_PATH_SHARED, &key))
+		return key;
+	else if (str_begins(key, DICT_PATH_PRIVATE, &key))
+		return t_strdup_printf("%s/%s", username, key);
+	else
 		i_unreached();
-	}
 }
 
 static int fs_dict_lookup(struct dict *_dict, const struct dict_op_settings *set,
 			  pool_t pool, const char *key,
-			  const char **value_r, const char **error_r)
+			  const char *const **values_r, const char **error_r)
 {
 	struct fs_dict *dict = (struct fs_dict *)_dict;
 	struct fs_file *file;
@@ -130,10 +128,11 @@ static int fs_dict_lookup(struct dict *_dict, const struct dict_op_settings *set
 	i_assert(ret == -1);
 
 	if (input->stream_errno == 0) {
-		*value_r = str_c(str);
+		const char **values = p_new(pool, const char *, 2);
+		values[0] = str_c(str);
+		*values_r = values;
 		ret = 1;
 	} else {
-		*value_r = NULL;
 		if (input->stream_errno == ENOENT)
 			ret = 0;
 		else {
@@ -196,7 +195,6 @@ static bool fs_dict_iterate(struct dict_iterate_context *ctx,
 	}
 	path = t_strconcat(iter->path, *key_r, NULL);
 	if ((iter->flags & DICT_ITERATE_FLAG_NO_VALUE) != 0) {
-		iter->values[0] = NULL;
 		*key_r = path;
 		return TRUE;
 	}
@@ -205,7 +203,7 @@ static bool fs_dict_iterate(struct dict_iterate_context *ctx,
 		.username = ctx->set.username,
 	};
 	ret = fs_dict_lookup(ctx->dict, &set, iter->value_pool, path,
-			     &iter->values[0], &error);
+			     &iter->values, &error);
 	if (ret < 0) {
 		/* I/O error */
 		iter->error = i_strdup(error);
@@ -314,7 +312,7 @@ fs_dict_transaction_commit(struct dict_transaction_context *_ctx,
 
 struct dict dict_driver_fs = {
 	.name = "fs",
-	{
+	.v = {
 		.init = fs_dict_init,
 		.deinit = fs_dict_deinit,
 		.lookup = fs_dict_lookup,

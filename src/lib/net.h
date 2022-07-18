@@ -1,12 +1,10 @@
 #ifndef NET_H
 #define NET_H
 
-#ifndef WIN32
-#  include <sys/socket.h>
-#  include <netinet/in.h>
-#  include <netdb.h>
-#  include <arpa/inet.h>
-#endif
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <arpa/inet.h>
 
 #ifdef HAVE_SOCKS_H
 #include <socks.h>
@@ -26,6 +24,7 @@ struct ip_addr {
 		struct in6_addr ip6;
 		struct in_addr ip4;
 	} u;
+	uint32_t scope_id;
 };
 ARRAY_DEFINE_TYPE(ip_addr, struct ip_addr);
 
@@ -127,7 +126,8 @@ int net_accept(int fd, struct ip_addr *addr_r, in_port_t *port_r)
 ssize_t net_receive(int fd, void *buf, size_t len);
 
 /* Get IP addresses for host. ips contains ips_count of IPs, they don't need
-   to be free'd. Returns 0 = ok, others = error code for net_gethosterror() */
+   to be free'd. Returns 0 = ok, others = error code for net_gethosterror().
+   When returning 0, ips_count is guaranteed to be >0. */
 int net_gethostbyname(const char *addr, struct ip_addr **ips,
 		      unsigned int *ips_count);
 /* Return host for the IP address. Returns 0 = ok, others = error code for
@@ -156,7 +156,7 @@ int net_getunixcred(int fd, struct net_unix_cred *cred_r);
 /* Returns ip_addr as string, or "" if ip isn't valid IPv4 or IPv6 address. */
 const char *net_ip2addr(const struct ip_addr *ip);
 /* char* -> struct ip_addr translation. */
-int net_addr2ip(const char *addr, struct ip_addr *ip);
+int net_addr2ip(const char *addr, struct ip_addr *ip_r);
 /* char* -> in_port_t translation */
 int net_str2port(const char *str, in_port_t *port_r);
 /* char* -> in_port_t translation (allows port zero) */
@@ -168,9 +168,9 @@ int net_str2port_zero(const char *str, in_port_t *port_r);
    through. */
 int net_str2hostport(const char *str, in_port_t default_port,
 		     const char **host_r, in_port_t *port_r);
-/* Converts ip and port to ipv4:port or [ipv6]:port. Returns -1 if
-   ip is not valid IPv4 or IPv6 address. */
-int net_ipport2str(const struct ip_addr *ip, in_port_t port, const char **str_r);
+/* Converts ip and port to ipv4:port or [ipv6]:port. Triggers an assert crash
+   when IP is not valid. */
+const char *net_ipport2str(const struct ip_addr *ip, in_port_t port);
 
 /* Convert IPv6 mapped IPv4 address to an actual IPv4 address. Returns 0 if
    successful, -1 if the source address isn't IPv6 mapped IPv4 address. */
@@ -182,9 +182,6 @@ int net_geterror(int fd);
 
 /* Get name of TCP service */
 const char *net_getservbyport(in_port_t port) ATTR_CONST;
-
-bool is_ipv4_address(const char *addr) ATTR_PURE;
-bool is_ipv6_address(const char *addr) ATTR_PURE;
 
 /* Parse network as ip/bits. Returns 0 if successful, -1 if invalid input. */
 int net_parse_range(const char *network, struct ip_addr *ip_r,

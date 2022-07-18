@@ -54,8 +54,8 @@ master_client_process_output(string_t *str,
 			     const struct service_process *process)
 {
 	str_append_tabescaped(str, process->service->set->name);
-	str_printfa(str, "\t%ld\t%u\t%u\t%ld\t%ld\t%ld\n",
-		    (long)process->pid, process->available_count,
+	str_printfa(str, "\t%lu\t%u\t%u\t%ld\t%ld\t%ld\n",
+		    (unsigned long)process->pid, process->available_count,
 		    process->total_count, (long)process->idle_start,
 		    (long)process->last_status_update,
 		    (long)process->last_kill_sent);
@@ -161,6 +161,7 @@ void master_client_connected(struct service_list *service_list)
 			i_error("net_accept() failed: %m");
 		return;
 	}
+	fd_close_on_exec(fd, TRUE);
 	client = i_new(struct master_client, 1);
 	connection_init_server(master_connections, &client->conn,
 			       "master-client", fd, fd);

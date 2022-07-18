@@ -18,27 +18,27 @@ compile_commands.json
 
 /configure
 /config.cache
-/config.guess
+/build-aux/config.guess
 /config.h
 /config.h.in
 /config.log
 /config.status
-/config.sub
-/config.rpath
-/compile
-/depcomp
+/build-aux/config.sub
+/build-aux/config.rpath
+/build-aux/compile
+/build-aux/depcomp
 /dummy-config.h
 /dummy-config.h.in
 /fts-config.h
-/install-sh
+/build-aux/install-sh
 /libtool
-/ltmain.sh
-/missing
-/run-test.sh
+/build-aux/ltmain.sh
+/build-aux/missing
+/build-aux/run-test.sh
 /stamp.h
 /stamp-h1
 /stamp-h2
-/ylwrap
+/build-aux/ylwrap
 /autom4te.cache
 /ChangeLog
 /cc-wrapper.sh
@@ -48,6 +48,7 @@ compile_commands.json
 /dovecot.service
 /README
 /INSTALL
+/version
 
 /aclocal.m4
 /m4/libtool.m4
@@ -61,10 +62,13 @@ src/**/test-*
 !src/**/test-*.h
 !src/**/test-*.inc
 
+doc/venv
+doc/documentation*
+doc/html
+
 doc/man/doveadm-acl.1
 doc/man/doveadm-altmove.1
 doc/man/doveadm-auth.1
-doc/man/doveadm-batch.1
 doc/man/doveadm-deduplicate.1
 doc/man/doveadm-director.1
 doc/man/doveadm-dump.1
@@ -77,6 +81,7 @@ doc/man/doveadm-fts.1
 doc/man/doveadm-import.1
 doc/man/doveadm-instance.1
 doc/man/doveadm-index.1
+doc/man/doveadm-indexer.1
 doc/man/doveadm-force-resync.1
 doc/man/doveadm-help.1
 doc/man/doveadm-kick.1
@@ -108,13 +113,13 @@ doc/example-config/README
 doc/wiki/*.txt
 doc/wiki/Makefile.am
 src/anvil/anvil
-src/auth/checkpassword-reply
 src/auth/auth
 src/config/all-settings.c
 src/config/config
 src/config/doveconf
 src/lda/dovecot-lda
 src/dict/dict
+src/dict/dict-expire
 src/director/director
 src/director/director-test
 src/dns/dns-client
@@ -146,8 +151,6 @@ src/lmtp/lmtp
 src/master/dovecot
 src/ssl-params/ssl-params
 src/stats/stats
-src/old-stats/old-stats
-src/plugins/fts-squat/squat-test
 src/pop3-login/pop3-login
 src/pop3/pop3
 src/replication/replicator/replicator
@@ -160,7 +163,6 @@ src/util/maildirlock
 src/util/rawlog
 src/util/script
 src/util/script-login
-src/util/tcpwrap
 src/plugins/fts/xml2text
 src/plugins/quota/rquota_xdr.c
 src/plugins/quota/rquota.h

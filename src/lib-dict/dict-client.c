@@ -108,6 +108,7 @@ struct client_dict_iterate_context {
 
 	bool cmd_sent;
 	bool seen_results;
+	bool iterating;
 	bool finished;
 	bool deinit;
 };
@@ -194,12 +195,10 @@ static void
 dict_cmd_callback_error(struct client_dict_cmd *cmd, const char *error,
 			bool disconnected)
 {
-	const char *null_arg = NULL;
-
 	cmd->unfinished = FALSE;
 	if (cmd->callback != NULL) {
 		cmd->callback(cmd, DICT_PROTOCOL_REPLY_ERROR,
-			      "", &null_arg, error, disconnected);
+			      "", empty_str_array, error, disconnected);
 	}
 	i_assert(!cmd->unfinished);
 }
@@ -355,9 +354,10 @@ client_dict_transaction_send_begin(struct client_dict_transaction_context *ctx,
 	ctx->sent_begin = TRUE;
 
 	/* transactions commands don't have replies. only COMMIT has. */
-	query = t_strdup_printf("%c%u\t%s", DICT_PROTOCOL_CMD_BEGIN,
+	query = t_strdup_printf("%c%u\t%s\t%u", DICT_PROTOCOL_CMD_BEGIN,
 				ctx->id,
-				set->username == NULL ? "" : str_tabescape(set->username));
+				set->username == NULL ? "" : str_tabescape(set->username),
+				set->expire_secs);
 	cmd = client_dict_cmd_init(dict, query);
 	cmd->no_replies = TRUE;
 	cmd->retry_errors = TRUE;
@@ -707,30 +707,30 @@ client_dict_init(struct dict *driver, const char *uri,
 {
 	struct ioloop *old_ioloop = current_ioloop;
 	struct client_dict *dict;
-	const char *p, *dest_uri, *path;
+	const char *p, *dest_uri, *value, *path;
 	unsigned int idle_msecs = DICT_CLIENT_DEFAULT_TIMEOUT_MSECS;
 	unsigned int warn_slow_msecs = DICT_CLIENT_DEFAULT_WARN_SLOW_MSECS;
 
 	/* uri = [idle_msecs=<n>:] [warn_slow_msecs=<n>:] [<path>] ":" <uri> */
 	for (;;) {
-		if (str_begins(uri, "idle_msecs=")) {
-			p = strchr(uri+11, ':');
+		if (str_begins(uri, "idle_msecs=", &value)) {
+			p = strchr(value, ':');
 			if (p == NULL) {
 				*error_r = t_strdup_printf("Invalid URI: %s", uri);
 				return -1;
 			}
-			if (str_to_uint(t_strdup_until(uri+11, p), &idle_msecs) < 0) {
+			if (str_to_uint(t_strdup_until(value, p), &idle_msecs) < 0) {
 				*error_r = "Invalid idle_msecs";
 				return -1;
 			}
 			uri = p+1;
-		} else if (str_begins(uri, "warn_slow_msecs=")) {
-			p = strchr(uri+11, ':');
+		} else if (str_begins(uri, "warn_slow_msecs=", &value)) {
+			p = strchr(value, ':');
 			if (p == NULL) {
 				*error_r = t_strdup_printf("Invalid URI: %s", uri);
 				return -1;
 			}
-			if (str_to_uint(t_strdup_until(uri+16, p), &warn_slow_msecs) < 0) {
+			if (str_to_uint(t_strdup_until(value, p), &warn_slow_msecs) < 0) {
 				*error_r = "Invalid warn_slow_msecs";
 				return -1;
 			}
@@ -988,7 +988,7 @@ client_dict_lookup_async(struct dict *_dict, const struct dict_op_settings *set,
 
 struct client_dict_sync_lookup {
 	char *error;
-	char *value;
+	const char **values;
 	int ret;
 };
 
@@ -998,14 +998,19 @@ static void client_dict_lookup_callback(const struct dict_lookup_result *result,
 	lookup->ret = result->ret;
 	if (result->ret == -1)
 		lookup->error = i_strdup(result->error);
-	else if (result->ret == 1)
-		lookup->value = i_strdup(result->value);
+	else if (result->ret == 1) {
+		/* The caller's pool could point to data stack. We can't
+		   allocate from there, since we're in a different data stack
+		   frame. */
+		lookup->values = p_strarray_dup(default_pool, result->values);
+	}
 }
 
 static int client_dict_lookup(struct dict *_dict,
 			      const struct dict_op_settings *set,
 			      pool_t pool, const char *key,
-			      const char **value_r, const char **error_r)
+			      const char *const **values_r,
+			      const char **error_r)
 {
 	struct client_dict_sync_lookup lookup;
 
@@ -1022,12 +1027,11 @@ static int client_dict_lookup(struct dict *_dict,
 		i_free(lookup.error);
 		return -1;
 	case 0:
-		i_assert(lookup.value == NULL);
-		*value_r = NULL;
+		i_assert(lookup.values == NULL);
 		return 0;
 	case 1:
-		*value_r = p_strdup(pool, lookup.value);
-		i_free(lookup.value);
+		*values_r = p_strarray_dup(pool, lookup.values);
+		i_free(lookup.values);
 		return 1;
 	}
 	i_unreached();
@@ -1070,13 +1074,17 @@ client_dict_iter_api_callback(struct client_dict_iterate_context *ctx,
 				  cmd->query);
 		}
 	}
-	if (ctx->ctx.async_callback != NULL) {
+	if (ctx->ctx.async_callback == NULL) {
+		/* synchronous lookup */
+		io_loop_stop(dict->dict.ioloop);
+	} else if (ctx->iterating) {
+		/* We're already in client_dict_iterate(). Don't call the
+		   async callback, because it would just recurse and possibly
+		   break. */
+	} else {
 		dict_pre_api_callback(&dict->dict);
 		ctx->ctx.async_callback(ctx->ctx.async_context);
 		dict_post_api_callback(&dict->dict);
-	} else {
-		/* synchronous lookup */
-		io_loop_stop(dict->dict.ioloop);
 	}
 }
 
@@ -1217,7 +1225,9 @@ static bool client_dict_iterate(struct dict_iterate_context *_ctx,
 	}
 	if (!ctx->cmd_sent) {
 		ctx->cmd_sent = TRUE;
+		ctx->iterating = TRUE;
 		client_dict_iterate_cmd_send(ctx);
+		ctx->iterating = FALSE;
 		return client_dict_iterate(_ctx, key_r, values_r);
 	}
 	ctx->ctx.has_more = !ctx->finished;
@@ -1331,7 +1341,7 @@ client_dict_transaction_commit_callback(struct client_dict_cmd *cmd,
 		/* include timing info always in error messages */
 		result.error = t_strdup_printf("%s (reply took %s)",
 			result.error, dict_warnings_sec(cmd, diff, extra_args));
-	} else if (!cmd->background && !cmd->trans->ctx.no_slowness_warning &&
+	} else if (!cmd->background && !cmd->trans->ctx.set.no_slowness_warning &&
 		   diff >= (int)dict->warn_slow_msecs) {
 		e_warning(dict->conn.conn.event, "dict commit took %s: "
 			  "%s (%u commands, first: %s)",
@@ -1470,8 +1480,8 @@ static void client_dict_set_timestamp(struct dict_transaction_context *_ctx,
 
 struct dict dict_driver_client = {
 	.name = "proxy",
-
-	{
+	.flags = DICT_DRIVER_FLAG_SUPPORT_EXPIRE_SECS,
+	.v = {
 		.init = client_dict_init,
 		.deinit = client_dict_deinit,
 		.wait = client_dict_wait,

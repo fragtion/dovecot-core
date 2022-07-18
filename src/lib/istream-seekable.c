@@ -13,8 +13,6 @@
 
 #include <unistd.h>
 
-#define BUF_INITIAL_SIZE (1024*32)
-
 struct seekable_istream {
 	struct istream_private istream;
 
@@ -125,7 +123,7 @@ static int copy_to_temp_file(struct seekable_istream *sstream)
 				i_stream_get_name(&stream->istream),
 				i_stream_get_error(sstream->fd_input));
 			i_stream_destroy(&sstream->fd_input);
-			i_close_fd(&sstream->fd);
+			sstream->fd = -1; /* autoclosed by fd_input */
 			return -1;
 		}
 	}
@@ -197,6 +195,10 @@ static bool read_from_buffer(struct seekable_istream *sstream, ssize_t *ret_r)
 		stream->skip = stream->istream.v_offset;
 		stream->pos = sstream->buffer_peak;
 		size = stream->pos - stream->skip;
+		if (stream->istream.v_offset == sstream->buffer_peak) {
+			/* this could happen after write to temp file failed */
+			return read_from_buffer(sstream, ret_r);
+		}
 	} else {
 		/* need to read more */
 		i_assert(stream->pos == sstream->buffer_peak);
@@ -239,19 +241,26 @@ static int i_stream_seekable_write_failed(struct seekable_istream *sstream)
 {
 	struct istream_private *stream = &sstream->istream;
 	void *data;
+	size_t old_pos = stream->pos;
 
 	i_assert(sstream->fd != -1);
+	i_assert(stream->skip == 0);
 
 	stream->max_buffer_size = SIZE_MAX;
+	stream->pos = 0;
 	data = i_stream_alloc(stream, sstream->write_peak);
+	stream->pos = old_pos;
 
 	if (pread_full(sstream->fd, data, sstream->write_peak, 0) < 0) {
-		i_error("istream-seekable: read(%s) failed: %m", sstream->temp_path);
-		memarea_unref(&stream->memarea);
+		sstream->istream.istream.stream_errno = errno;
+		sstream->istream.istream.eof = TRUE;
+		io_stream_set_error(&sstream->istream.iostream,
+				    "istream-seekable: read(%s) failed: %m",
+				    sstream->temp_path);
 		return -1;
 	}
 	i_stream_destroy(&sstream->fd_input);
-	i_close_fd(&sstream->fd);
+	sstream->fd = -1; /* autoclosed by fd_input */
 
 	i_free_and_null(sstream->temp_path);
 	return 0;

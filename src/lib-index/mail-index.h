@@ -384,7 +384,7 @@ void mail_index_set_lock_method(struct mail_index *index,
    use the default. */
 void mail_index_set_optimization_settings(struct mail_index *index,
 	const struct mail_index_optimization_settings *set);
-/* When creating a new index file or reseting an existing one, add the given
+/* When creating a new index file or resetting an existing one, add the given
    extension header data immediately to it. */
 void mail_index_set_ext_init_data(struct mail_index *index, uint32_t ext_id,
 				  const void *data, size_t size);
@@ -450,11 +450,6 @@ void mail_index_transaction_reset(struct mail_index_transaction *t);
 void mail_index_transaction_set_max_modseq(struct mail_index_transaction *t,
 					   uint64_t max_modseq,
 					   ARRAY_TYPE(seq_range) *seqs);
-/* Returns the resulting highest-modseq after this commit. This can be called
-   only if transaction log is locked, which normally means only during mail
-   index syncing. If there are any appends, they all must have been assigned
-   UIDs before calling this. */
-uint64_t mail_index_transaction_get_highest_modseq(struct mail_index_transaction *t);
 
 /* Returns the view transaction was created for. */
 struct mail_index_view *
@@ -561,10 +556,10 @@ bool mail_index_is_locked(struct mail_index *index);
 /* Mark index file corrupted in memory and delete it from disk.
    Invalidates all views. This should be called only for index files that can
    safely be recreated without any data loss. */
-void mail_index_mark_corrupted(struct mail_index *index);
+void mail_index_mark_corrupted(struct mail_index *index) ATTR_COLD;
 /* Check and fix any found problems. Returns -1 if we couldn't lock for sync,
    0 if everything went ok. */
-int mail_index_fsck(struct mail_index *index);
+int mail_index_fsck(struct mail_index *index) ATTR_COLD;
 /* Returns TRUE if mail_index_fsck() has been called since the last
    mail_index_reset_fscked() call. */
 bool mail_index_reset_fscked(struct mail_index *index);
@@ -591,7 +586,7 @@ const struct mail_index_record *
 mail_index_lookup(struct mail_index_view *view, uint32_t seq);
 const struct mail_index_record *
 mail_index_lookup_full(struct mail_index_view *view, uint32_t seq,
-		       struct mail_index_map **map_r);
+		       struct mail_index_map **map_r, bool *expunged_r);
 /* Returns TRUE if the given message has already been expunged from index. */
 bool mail_index_is_expunged(struct mail_index_view *view, uint32_t seq);
 /* Note that returned keyword indexes aren't sorted. */

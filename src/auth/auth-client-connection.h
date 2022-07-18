@@ -1,7 +1,7 @@
 #ifndef AUTH_CLIENT_CONNECTION_H
 #define AUTH_CLIENT_CONNECTION_H
 
-#include "master-auth.h"
+#include "login-interface.h"
 
 struct auth_client_connection {
 	struct auth_client_connection *prev, *next;
@@ -17,7 +17,7 @@ struct auth_client_connection {
 	unsigned int version_minor;
 	unsigned int pid;
 	unsigned int connect_uid;
-	uint8_t cookie[MASTER_AUTH_COOKIE_SIZE];
+	uint8_t cookie[LOGIN_REQUEST_COOKIE_SIZE];
 	struct auth_request_handler *request_handler;
 
 	bool login_requests:1;

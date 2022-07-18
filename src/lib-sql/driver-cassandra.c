@@ -177,13 +177,22 @@ struct cassandra_transaction_context {
 	bool failed:1;
 };
 
+enum cassandra_sql_arg_type {
+	CASSANDRA_SQL_ARG_TYPE_STR,
+	CASSANDRA_SQL_ARG_TYPE_BINARY,
+	CASSANDRA_SQL_ARG_TYPE_INT64,
+	CASSANDRA_SQL_ARG_TYPE_DOUBLE,
+};
+
 struct cassandra_sql_arg {
 	unsigned int column_idx;
 
+	enum cassandra_sql_arg_type type;
 	char *value_str;
 	const unsigned char *value_binary;
 	size_t value_binary_size;
 	int64_t value_int64;
+	double value_double;
 };
 
 struct cassandra_sql_statement {
@@ -616,7 +625,7 @@ static int driver_cassandra_parse_connect_string(struct cassandra_db *db,
 		}
 		key = t_strdup_until(*args, value++);
 
-		if (str_begins(key, "ssl_"))
+		if (str_begins_with(key, "ssl_"))
 			db->init_ssl = TRUE;
 
 		if (strcmp(key, "host") == 0) {
@@ -1690,6 +1699,18 @@ driver_cassandra_get_value(struct cassandra_result *result,
 		type = "int32";
 		break;
 	}
+	case CASS_VALUE_TYPE_DOUBLE: {
+		cass_double_t num;
+
+		rc = cass_value_get_double(value, &num);
+		if (rc == CASS_OK) {
+			const char *str = t_strdup_printf("%f", num);
+			output_size = strlen(str);
+			output = (const void *)str;
+		}
+		type = "double";
+		break;
+	}
 	case CASS_VALUE_TYPE_TIMESTAMP:
 	case CASS_VALUE_TYPE_BIGINT: {
 		cass_int64_t num;
@@ -1985,7 +2006,7 @@ driver_cassandra_transaction_commit(struct sql_transaction_context *_ctx,
 	/* just a single query, send it */
 	const char *query = ctx->query != NULL ?
 		ctx->query : sql_statement_get_query(&ctx->stmt->stmt);
-	if (strncasecmp(query, "DELETE ", 7) == 0)
+	if (str_begins_icase_with(query, "DELETE "))
 		query_type = CASSANDRA_QUERY_TYPE_DELETE;
 	else
 		query_type = CASSANDRA_QUERY_TYPE_WRITE;
@@ -2026,7 +2047,7 @@ driver_cassandra_try_commit_s(struct cassandra_transaction_context *ctx)
 	enum cassandra_query_type query_type;
 
 	/* just a single query, send it */
-	if (strncasecmp(ctx->query, "DELETE ", 7) == 0)
+	if (str_begins_icase_with(ctx->query, "DELETE "))
 		query_type = CASSANDRA_QUERY_TYPE_DELETE;
 	else
 		query_type = CASSANDRA_QUERY_TYPE_WRITE;
@@ -2142,16 +2163,27 @@ static void prepare_finish_arg(struct cassandra_sql_statement *stmt,
 {
 	CassError rc;
 
-	if (arg->value_str != NULL) {
+	switch (arg->type) {
+	case CASSANDRA_SQL_ARG_TYPE_STR:
 		rc = cass_statement_bind_string(stmt->cass_stmt, arg->column_idx,
 						arg->value_str);
-	} else if (arg->value_binary != NULL) {
+		break;
+	case CASSANDRA_SQL_ARG_TYPE_BINARY:
 		rc = cass_statement_bind_bytes(stmt->cass_stmt, arg->column_idx,
 					       arg->value_binary,
 					       arg->value_binary_size);
-	} else {
+		break;
+	case CASSANDRA_SQL_ARG_TYPE_INT64:
 		rc = driver_cassandra_bind_int(stmt, arg->column_idx,
 					       arg->value_int64);
+		break;
+	case CASSANDRA_SQL_ARG_TYPE_DOUBLE:
+		rc = cass_statement_bind_double(stmt->cass_stmt,
+						arg->column_idx,
+						arg->value_double);
+		break;
+	default:
+		i_unreached();
 	}
 	if (rc != CASS_OK) {
 		e_error(stmt->stmt.db->event,
@@ -2172,6 +2204,7 @@ static void prepare_finish_statement(struct cassandra_sql_statement *stmt)
 			stmt->result->error = i_strdup(stmt->prep->error);
 			result_finish(stmt->result);
 		}
+		pool_unref(&stmt->stmt.pool);
 		return;
 	}
 	stmt->cass_stmt = cass_prepared_bind(stmt->prep->prepared);
@@ -2352,13 +2385,15 @@ driver_cassandra_statement_set_timestamp(struct sql_statement *_stmt,
 
 static struct cassandra_sql_arg *
 driver_cassandra_add_pending_arg(struct cassandra_sql_statement *stmt,
-				 unsigned int column_idx)
+				 unsigned int column_idx,
+				 enum cassandra_sql_arg_type value_type)
 {
 	struct cassandra_sql_arg *arg;
 
 	if (!array_is_created(&stmt->pending_args))
 		p_array_init(&stmt->pending_args, stmt->stmt.pool, 8);
 	arg = array_append_space(&stmt->pending_args);
+	arg->type = value_type;
 	arg->column_idx = column_idx;
 	return arg;
 }
@@ -2374,7 +2409,8 @@ driver_cassandra_statement_bind_str(struct sql_statement *_stmt,
 		cass_statement_bind_string(stmt->cass_stmt, column_idx, value);
 	else if (stmt->prep != NULL) {
 		struct cassandra_sql_arg *arg =
-			driver_cassandra_add_pending_arg(stmt, column_idx);
+			driver_cassandra_add_pending_arg(stmt, column_idx,
+				CASSANDRA_SQL_ARG_TYPE_STR);
 		arg->value_str = p_strdup(_stmt->pool, value);
 	}
 }
@@ -2392,7 +2428,8 @@ driver_cassandra_statement_bind_binary(struct sql_statement *_stmt,
 					  value, value_size);
 	} else if (stmt->prep != NULL) {
 		struct cassandra_sql_arg *arg =
-			driver_cassandra_add_pending_arg(stmt, column_idx);
+			driver_cassandra_add_pending_arg(stmt, column_idx,
+				CASSANDRA_SQL_ARG_TYPE_BINARY);
 		arg->value_binary = value_size == 0 ? &uchar_nul :
 			p_memdup(_stmt->pool, value, value_size);
 		arg->value_binary_size = value_size;
@@ -2410,8 +2447,26 @@ driver_cassandra_statement_bind_int64(struct sql_statement *_stmt,
 		driver_cassandra_bind_int(stmt, column_idx, value);
 	else if (stmt->prep != NULL) {
 		struct cassandra_sql_arg *arg =
-			driver_cassandra_add_pending_arg(stmt, column_idx);
+			driver_cassandra_add_pending_arg(stmt, column_idx,
+				CASSANDRA_SQL_ARG_TYPE_INT64);
 		arg->value_int64 = value;
+	}
+}
+
+static void
+driver_cassandra_statement_bind_double(struct sql_statement *_stmt,
+				       unsigned int column_idx, double value)
+{
+	struct cassandra_sql_statement *stmt =
+		(struct cassandra_sql_statement *)_stmt;
+
+	if (stmt->cass_stmt != NULL)
+		cass_statement_bind_double(stmt->cass_stmt, column_idx, value);
+	else if (stmt->prep != NULL) {
+		struct cassandra_sql_arg *arg =
+			driver_cassandra_add_pending_arg(stmt, column_idx,
+				CASSANDRA_SQL_ARG_TYPE_DOUBLE);
+		arg->value_double = value;
 	}
 }
 
@@ -2479,6 +2534,32 @@ driver_cassandra_update_stmt(struct sql_transaction_context *_ctx,
 	}
 }
 
+static bool driver_cassandra_have_work(struct cassandra_db *db)
+{
+	return array_not_empty(&db->pending_prepares) ||
+		array_not_empty(&db->callbacks) ||
+		array_not_empty(&db->results);
+}
+
+static void driver_cassandra_wait(struct sql_db *_db)
+{
+	struct cassandra_db *db = (struct cassandra_db *)_db;
+
+	if (!driver_cassandra_have_work(db))
+		return;
+
+	struct ioloop *prev_ioloop = current_ioloop;
+	db->ioloop = io_loop_create();
+	db->io_pipe = io_loop_move_io(&db->io_pipe);
+	while (driver_cassandra_have_work(db))
+		io_loop_run(db->ioloop);
+
+	io_loop_set_current(prev_ioloop);
+	db->io_pipe = io_loop_move_io(&db->io_pipe);
+	io_loop_set_current(db->ioloop);
+	io_loop_destroy(&db->ioloop);
+}
+
 const struct sql_db driver_cassandra_db = {
 	.name = "cassandra",
 	.flags = SQL_DB_FLAG_PREP_STATEMENTS,
@@ -2492,6 +2573,7 @@ const struct sql_db driver_cassandra_db = {
 		.exec = driver_cassandra_exec,
 		.query = driver_cassandra_query,
 		.query_s = driver_cassandra_query_s,
+		.wait = driver_cassandra_wait,
 
 		.transaction_begin = driver_cassandra_transaction_begin,
 		.transaction_commit = driver_cassandra_transaction_commit,
@@ -2511,6 +2593,7 @@ const struct sql_db driver_cassandra_db = {
 		.statement_bind_str = driver_cassandra_statement_bind_str,
 		.statement_bind_binary = driver_cassandra_statement_bind_binary,
 		.statement_bind_int64 = driver_cassandra_statement_bind_int64,
+		.statement_bind_double = driver_cassandra_statement_bind_double,
 		.statement_query = driver_cassandra_statement_query,
 		.statement_query_s = driver_cassandra_statement_query_s,
 		.update_stmt = driver_cassandra_update_stmt,

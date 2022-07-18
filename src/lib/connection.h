@@ -152,6 +152,7 @@ struct connection {
 	/* handlers */
 	struct connection_vfuncs v;
 
+	int connect_failed_errno;
 	enum connection_disconnect_reason disconnect_reason;
 
 	bool version_received:1;
@@ -200,7 +201,16 @@ void connection_init_from_streams(struct connection_list *list,
 				  struct istream *input,
 				  struct ostream *output) ATTR_NULL(3);
 
+/* connect() to the server. If the connect() fails immediately, return -1. */
 int connection_client_connect(struct connection *conn);
+/* connect() to the server. If the connect() fails immediately, call the
+   client_connected() and destroy() asynchronously from a timeout. This
+   simulates what happens on a delayed connect() failure. */
+int connection_client_connect_async(struct connection *conn);
+/* Connect to UNIX socket. If it fails, try it up to msecs is reached.
+   Overrides connection_settings.unix_client_connect_msecs. */
+int connection_client_connect_with_retries(struct connection *conn,
+					   unsigned int msecs);
 
 /* Disconnects a connection */
 void connection_disconnect(struct connection *conn);
@@ -216,12 +226,20 @@ void connection_input_resume(struct connection *conn);
 /* Update event fields and log prefix based on connection properties. */
 void connection_update_event(struct connection *conn);
 
+/* Update connection properties and labels */
+void connection_update_properties(struct connection *conn);
+
 /* This needs to be called if the input/output streams are changed */
 void connection_streams_changed(struct connection *conn);
 
 /* Returns -1 = disconnected, 0 = nothing new, 1 = something new.
    If input_full_behavior is ALLOW, may return also -2 = buffer full. */
 int connection_input_read(struct connection *conn);
+/* Same as connection_input_read(), but read from a different input stream.
+   On failures, copy the error to the main istream. This is mainly intended
+   to be used with multiplex istream. */
+int connection_input_read_stream(struct connection *conn,
+				 struct istream *input);
 /* Verify that VERSION input matches what we expect. */
 int connection_verify_version(struct connection *conn,
 			      const char *service_name,

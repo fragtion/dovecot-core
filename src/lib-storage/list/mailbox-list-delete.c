@@ -278,7 +278,7 @@ void mailbox_list_delete_until_root(struct mailbox_list *list, const char *path,
 	const char *root_dir, *p;
 	size_t len;
 
-	if (list->set.iter_from_index_dir && !list->set.no_noselect &&
+	if (list->set.iter_from_index_dir && list->set.keep_noselect &&
 	    mailbox_list_path_is_index(list, type)) {
 		/* Don't auto-rmdir parent index directories with ITERINDEX.
 		   Otherwise it'll get us into inconsistent state with a
@@ -288,7 +288,7 @@ void mailbox_list_delete_until_root(struct mailbox_list *list, const char *path,
 	}
 
 	root_dir = mailbox_list_get_root_forced(list, type);
-	if (!str_begins(path, root_dir)) {
+	if (!str_begins_with(path, root_dir)) {
 		/* mbox workaround: name=child/box, root_dir=mail/.imap/,
 		   path=mail/child/.imap/box. we'll want to try to delete
 		   the .imap/ part, but no further. */

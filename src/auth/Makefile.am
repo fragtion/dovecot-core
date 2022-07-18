@@ -33,7 +33,7 @@ auth_module_LTLIBRARIES = \
 
 pkglibexecdir = $(libexecdir)/dovecot
 
-pkglibexec_PROGRAMS = auth checkpassword-reply
+pkglibexec_PROGRAMS = auth
 
 AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib \
@@ -44,9 +44,9 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-http \
 	-I$(top_srcdir)/src/lib-sql \
 	-I$(top_srcdir)/src/lib-settings \
-	-I$(top_srcdir)/src/lib-old-stats \
 	-I$(top_srcdir)/src/lib-otp \
 	-I$(top_srcdir)/src/lib-master \
+	-I$(top_srcdir)/src/lib-login \
 	-I$(top_srcdir)/src/lib-oauth2 \
 	-I$(top_srcdir)/src/lib-ssl-iostream \
 	-I$(top_srcdir)/src/lib-lua \
@@ -74,7 +74,6 @@ libpassword_la_CFLAGS = $(AM_CPPFLAGS) $(LIBSODIUM_CFLAGS)
 
 auth_libs = \
 	libauth.la \
-	libstats_auth.la \
 	libpassword.la \
 	../lib-otp/libotp.la \
 	$(AUTH_LUA_LIBS) \
@@ -101,14 +100,12 @@ libauth_la_SOURCES = \
 	auth-request.c \
 	auth-request-fields.c \
 	auth-request-handler.c \
-	auth-request-stats.c \
 	auth-request-var-expand.c \
 	auth-settings.c \
 	auth-fields.c \
 	auth-token.c \
-	auth-worker-client.c \
+	auth-worker-connection.c \
 	auth-worker-server.c \
-	db-checkpassword.c \
 	db-dict.c \
 	db-dict-cache-key.c \
 	db-oauth2.c \
@@ -132,19 +129,16 @@ libauth_la_SOURCES = \
 	passdb-blocking.c \
 	passdb-bsdauth.c \
 	passdb-cache.c \
-	passdb-checkpassword.c \
 	passdb-dict.c \
 	passdb-oauth2.c \
 	passdb-passwd.c \
 	passdb-passwd-file.c \
 	passdb-pam.c \
-	passdb-shadow.c \
 	passdb-sql.c \
 	passdb-static.c \
 	passdb-template.c \
 	userdb.c \
 	userdb-blocking.c \
-	userdb-checkpassword.c \
 	userdb-dict.c \
 	userdb-passwd.c \
 	userdb-passwd-file.c \
@@ -170,19 +164,16 @@ headers = \
 	auth-request.h \
 	auth-request-handler.h \
 	auth-request-handler-private.h \
-	auth-request-stats.h \
 	auth-request-var-expand.h \
 	auth-settings.h \
-	auth-stats.h \
 	auth-fields.h \
 	auth-token.h \
-	auth-worker-client.h \
+	auth-worker-connection.h \
 	auth-worker-server.h \
 	db-dict.h \
 	db-ldap.h \
 	db-sql.h \
 	db-passwd-file.h \
-	db-checkpassword.h \
 	db-oauth2.h \
 	mech.h \
 	mycrypt.h \
@@ -228,21 +219,6 @@ libauthdb_imap_la_SOURCES = passdb-imap.c
 
 pkginc_libdir=$(pkgincludedir)
 pkginc_lib_HEADERS = $(headers)
-
-checkpassword_reply_CPPFLAGS = $(AM_CPPFLAGS) $(BINARY_CFLAGS)
-checkpassword_reply_LDADD = $(LIBDOVECOT) $(BINARY_LDFLAGS)
-checkpassword_reply_DEPENDENCIES = $(LIBDOVECOT_DEPS)
-
-checkpassword_reply_sources = \
-	checkpassword-reply.c
-
-stats_moduledir = $(moduledir)/old-stats
-stats_module_LTLIBRARIES = libstats_auth.la
-
-libstats_auth_la_LDFLAGS = -module -avoid-version
-libstats_auth_la_LIBADD = $(LIBDOVECOT)
-libstats_auth_la_DEPENDENCIES = $(LIBDOVECOT_DEPS)
-libstats_auth_la_SOURCES = auth-stats.c
 
 test_programs = \
 	test-libpassword \

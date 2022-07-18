@@ -25,9 +25,10 @@ cmd_flags_run_box(struct flags_cmd_context *ctx,
 	struct mail *mail;
 	struct mail_keywords *kw = NULL;
 
-	if (doveadm_mail_iter_init(&ctx->ctx, info, ctx->ctx.search_args,
-				   0, NULL, FALSE, &iter) < 0)
-		return -1;
+	int ret = doveadm_mail_iter_init(&ctx->ctx, info, ctx->ctx.search_args,
+					 0, NULL, 0, &iter);
+	if (ret <= 0)
+		return ret;
 	box = doveadm_mail_iter_get_mailbox(iter);
 
 	if (ctx->keywords != NULL) {
@@ -53,7 +54,8 @@ cmd_flags_run_box(struct flags_cmd_context *ctx,
 static int
 cmd_flags_run(struct doveadm_mail_cmd_context *_ctx, struct mail_user *user)
 {
-	struct flags_cmd_context *ctx = (struct flags_cmd_context *)_ctx;
+	struct flags_cmd_context *ctx =
+		container_of(_ctx, struct flags_cmd_context, ctx);
 	const enum mailbox_list_iter_flags iter_flags =
 		MAILBOX_LIST_ITER_NO_AUTO_BOXES |
 		MAILBOX_LIST_ITER_RETURN_NO_FLAGS;
@@ -72,15 +74,24 @@ cmd_flags_run(struct doveadm_mail_cmd_context *_ctx, struct mail_user *user)
 	return ret;
 }
 
-static void cmd_flags_init(struct doveadm_mail_cmd_context *_ctx,
-			   const char *const args[])
+static void cmd_flags_init(struct doveadm_mail_cmd_context *_ctx)
 {
-	struct flags_cmd_context *ctx = (struct flags_cmd_context *)_ctx;
-	const char *const *tmp;
+	struct doveadm_cmd_context *cctx = _ctx->cctx;
+	struct flags_cmd_context *ctx =
+		container_of(_ctx, struct flags_cmd_context, ctx);
+
 	enum mail_flags flag;
 	ARRAY_TYPE(const_string) keywords;
 
-	if (args[0] == NULL || args[1] == NULL) {
+	const char *const *flags = NULL;
+	if (!doveadm_cmd_param_array(cctx, "flag", &flags)) {
+		const char *flagstr;
+		if (doveadm_cmd_param_str(cctx, "flagstr", &flagstr))
+			flags = t_strsplit_spaces(flagstr, " ");
+	}
+
+	const char *const *query;
+	if (flags == NULL || !doveadm_cmd_param_array(cctx, "query", &query)) {
 		switch (ctx->modify_type) {
 		case MODIFY_ADD:
 			doveadm_mail_help_name("flags add");
@@ -93,8 +104,8 @@ static void cmd_flags_init(struct doveadm_mail_cmd_context *_ctx,
 	}
 
 	p_array_init(&keywords, _ctx->pool, 8);
-	for (tmp = t_strsplit(args[0], " "); *tmp != NULL; tmp++) {
-		const char *str = *tmp;
+	for (; *flags != NULL; flags++) {
+		const char *str = *flags;
 
 		if (str[0] == '\\') {
 			flag = imap_parse_system_flag(str);
@@ -110,8 +121,7 @@ static void cmd_flags_init(struct doveadm_mail_cmd_context *_ctx,
 		array_append_zero(&keywords);
 		ctx->keywords = array_front(&keywords);
 	}
-
-	_ctx->search_args = doveadm_mail_build_search_args(args+1);
+	_ctx->search_args = doveadm_mail_build_search_args(query);
 }
 
 static struct doveadm_mail_cmd_context *

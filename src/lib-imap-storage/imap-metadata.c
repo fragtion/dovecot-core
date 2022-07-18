@@ -86,14 +86,12 @@ imap_metadata_entry2key(struct imap_metadata_transaction *imtrans,
 	/* names are case-insensitive so we'll always lowercase them */
 	entry = t_str_lcase(entry);
 
-	if (str_begins(entry, IMAP_METADATA_PRIVATE_PREFIX)) {
-		*key_r = entry + strlen(IMAP_METADATA_PRIVATE_PREFIX);
+	if (str_begins(entry, IMAP_METADATA_PRIVATE_PREFIX, key_r))
 		*type_r = MAIL_ATTRIBUTE_TYPE_PRIVATE;
-	} else {
-		i_assert(str_begins(entry, IMAP_METADATA_SHARED_PREFIX));
-		*key_r = entry + strlen(IMAP_METADATA_SHARED_PREFIX);
+	else if (str_begins(entry, IMAP_METADATA_SHARED_PREFIX, key_r))
 		*type_r = MAIL_ATTRIBUTE_TYPE_SHARED;
-	}
+	else
+		i_unreached();
 	if ((*key_r)[0] == '\0') {
 		/* /private or /shared prefix has no value itself */
 	} else {
@@ -104,7 +102,7 @@ imap_metadata_entry2key(struct imap_metadata_transaction *imtrans,
 	if (imtrans->validated_only)
 		*type_r |= MAIL_ATTRIBUTE_TYPE_FLAG_VALIDATED;
 
-	if (str_begins(*key_r, MAILBOX_ATTRIBUTE_PREFIX_DOVECOT_PVT)) {
+	if (str_begins_with(*key_r, MAILBOX_ATTRIBUTE_PREFIX_DOVECOT_PVT)) {
 		/* Dovecot's internal attribute (mailbox or server).
 		   don't allow accessing this. */
 		return FALSE;
@@ -246,7 +244,6 @@ imap_metadata_transaction_begin_server(struct mail_user *user)
 	/* Server metadata shouldn't depend on INBOX's ACLs, so ignore them. */
 	box = mailbox_alloc(ns->list, "INBOX", MAILBOX_FLAG_IGNORE_ACLS |
 			    MAILBOX_FLAG_ATTRIBUTE_SESSION);
-	mailbox_set_reason(box, "Server METADATA");
 	imtrans = imap_metadata_transaction_begin(box);
 	imtrans->server = TRUE;
 	return imtrans;

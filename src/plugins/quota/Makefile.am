@@ -20,6 +20,7 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-storage/index/imapc \
 	-I$(top_srcdir)/src/lib-storage/index/maildir \
 	-I$(top_srcdir)/src/lib-program-client \
+	-I$(top_srcdir)/src/lib-doveadm \
 	-I$(top_srcdir)/src/doveadm \
 	$(LIBTIRPC_CFLAGS)
 
@@ -34,8 +35,6 @@ quota_dist_sources = \
 	quota.c \
 	quota-count.c \
 	quota-fs.c \
-	quota-dict.c \
-	quota-dirsize.c \
 	quota-imapc.c \
 	quota-maildir.c \
         quota-plugin.c \
@@ -46,8 +45,6 @@ quota_common_objects = \
 	quota.lo \
 	quota-count.lo \
 	quota-fs.lo \
-	quota-dict.lo \
-	quota-dirsize.lo \
 	quota-imapc.lo \
 	quota-maildir.lo \
         quota-plugin.lo \
@@ -84,10 +81,10 @@ quota_status_DEPENDENCIES = \
 if HAVE_RQUOTA
 RQUOTA_XDR = rquota_xdr.c
 RQUOTA_XDR_LO = rquota_xdr.lo
-#RQUOTA_X = /usr/include/rpcsvc/rquota.x
 RQUOTA_X = $(srcdir)/rquota.x
+RQUOTA_PRAGMAS_H = $(srcdir)/rquota-pragmas.h
 rquota_xdr.c: Makefile rquota.h
-	if [ "$(top_srcdir)" != "$(top_builddir)" ]; then \
+	$(AM_V_GEN)if [ "$(top_srcdir)" != "$(top_builddir)" ]; then \
 	  cp $(RQUOTA_X) $(top_builddir)/src/plugins/quota/; \
 	fi; \
 	(echo '#include "lib.h"'; \
@@ -95,14 +92,17 @@ rquota_xdr.c: Makefile rquota.h
 	 echo '#undef TRUE'; \
 	 echo '#include <rpc/rpc.h>'; \
 	 $(RPCGEN) -c $(top_builddir)/src/plugins/quota/rquota.x | \
-	  sed -e 's/IXDR_PUT/(void)IXDR_PUT/g' \
+	  sed \
+	    -e 's/IXDR_PUT/(void)IXDR_PUT/g' \
 	    -e 's,!xdr_,0 == xdr_,' \
 	    -e 's,/usr/include/rpcsvc/rquota.h,rquota.h,' \
 	    -e 's/int32_t \*buf/int32_t *buf ATTR_UNUSED/' \
-	    -e 's/^static char rcsid.*//' ) > rquota_xdr.c
+	    -e 's/^static char rcsid.*//' ) > rquota_xdr.c.tmp
+	$(AM_V_at) cat $(RQUOTA_PRAGMAS_H) rquota_xdr.c.tmp > rquota_xdr.c
 
 rquota.h: Makefile $(RQUOTA_X)
-	$(RPCGEN) -h $(RQUOTA_X) > rquota.h
+	$(AM_V_GEN)$(RPCGEN) -h $(RQUOTA_X) > rquota.h.tmp
+	$(AM_V_at) cat $(RQUOTA_PRAGMAS_H) rquota.h.tmp > rquota.h
 
 quota-fs.lo: rquota.h
 
@@ -115,7 +115,8 @@ pkginc_lib_HEADERS = \
 	quota-plugin.h \
 	quota-private.h
 noinst_HEADERS = \
-	quota-status-settings.h
+	quota-status-settings.h \
+	rquota-pragmas.h
 
 EXTRA_DIST = rquota.x
 

@@ -173,8 +173,8 @@ struct mailbox_transaction_context;
 /* User can get/set all non-pvt/ attributes and also pvt/server/
    (but not pvt/server/pvt/) attributes. */
 #define MAILBOX_ATTRIBUTE_KEY_IS_USER_ACCESSIBLE(key) \
-	(!str_begins(key, MAILBOX_ATTRIBUTE_PREFIX_DOVECOT_PVT) || \
-	 (str_begins(key, MAILBOX_ATTRIBUTE_PREFIX_DOVECOT_PVT_SERVER) && \
+	(!str_begins_with(key, MAILBOX_ATTRIBUTE_PREFIX_DOVECOT_PVT) || \
+	 (str_begins_with(key, MAILBOX_ATTRIBUTE_PREFIX_DOVECOT_PVT_SERVER) && \
 	  strncmp(key, MAILBOX_ATTRIBUTE_PREFIX_DOVECOT_PVT_SERVER MAILBOX_ATTRIBUTE_PREFIX_DOVECOT_PVT, \
 		 strlen(MAILBOX_ATTRIBUTE_PREFIX_DOVECOT_PVT_SERVER MAILBOX_ATTRIBUTE_PREFIX_DOVECOT_PVT)) != 0))
 
@@ -216,7 +216,7 @@ enum mail_attribute_internal_rank {
 	   when the normal mailbox attribute storage has no entry for this
 	   attribute. Otherwise it is ignored. The `set' function is called
 	   only as a notification, not with the intention to store the value.
-	   The value is always assigned to the normal mailbox attribute storage. 
+	   The value is always assigned to the normal mailbox attribute storage.
 	 */
 	MAIL_ATTRIBUTE_INTERNAL_RANK_DEFAULT = 0,
 	/* The internal attribute serves as the main source of the attribute

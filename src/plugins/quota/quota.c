@@ -38,8 +38,6 @@ struct quota_root_iter {
 unsigned int quota_module_id = 0;
 
 extern struct quota_backend quota_backend_count;
-extern struct quota_backend quota_backend_dict;
-extern struct quota_backend quota_backend_dirsize;
 extern struct quota_backend quota_backend_fs;
 extern struct quota_backend quota_backend_imapc;
 extern struct quota_backend quota_backend_maildir;
@@ -49,8 +47,6 @@ static const struct quota_backend *quota_internal_backends[] = {
 	&quota_backend_fs,
 #endif
 	&quota_backend_count,
-	&quota_backend_dict,
-	&quota_backend_dirsize,
 	&quota_backend_imapc,
 	&quota_backend_maildir
 };
@@ -184,11 +180,11 @@ quota_root_parse_set(struct mail_user *user, const char *root_name,
 	if (value == NULL)
 		return 0;
 
-	if (!str_begins(value, "dict:")) {
+	if (!str_begins(value, "dict:", &value)) {
 		*error_r = t_strdup_printf("%s supports only dict backend", name);
 		return -1;
 	}
-	root_set->limit_set = p_strdup(root_set->set->pool, value+5);
+	root_set->limit_set = p_strdup(root_set->set->pool, value);
 	return 0;
 }
 
@@ -315,7 +311,6 @@ int quota_user_read_settings(struct mail_user *user,
 		mail_user_plugin_getenv(user, "quota_exceeded_message");
 	if (quota_set->quota_exceeded_msg == NULL)
 		quota_set->quota_exceeded_msg = DEFAULT_QUOTA_EXCEEDED_MSG;
-	quota_set->vsizes = mail_user_plugin_getenv_bool(user, "quota_vsizes");
 
 	const char *max_size = mail_user_plugin_getenv(user,
 						       "quota_max_mail_size");
@@ -465,8 +460,14 @@ int quota_init(struct quota_settings *quota_set, struct mail_user *user,
 			quota_deinit(&quota);
 			return -1;
 		}
-		if (ret > 0)
+		if (ret > 0) {
 			array_push_back(&quota->roots, &root);
+			/* If a quota backend needs virtual size instead of physical
+			   size, use this for all backends. This is not ideal, but
+			   works. */
+			if (root->set->backend->use_vsize)
+				quota->set->vsizes = TRUE;
+		}
 	}
 	*quota_r = quota;
 	return 0;
@@ -678,7 +679,8 @@ bool quota_root_is_namespace_visible(struct quota_root *root,
 	struct mail_storage *storage;
 
 	/* this check works as long as there is only one storage per list */
-	if (mailbox_list_get_storage(&list, "", &storage) == 0 &&
+	const char *vname = "";
+	if (mailbox_list_get_storage(&list, &vname, 0, &storage) == 0 &&
 	    (storage->class_flags & MAIL_STORAGE_CLASS_FLAG_NOQUOTA) != 0)
 		return FALSE;
 	if (root->quota->unwanted_ns == ns)

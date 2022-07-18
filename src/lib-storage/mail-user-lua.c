@@ -33,16 +33,16 @@ void dlua_push_mail_user(lua_State *L, struct mail_user *user)
 	lua_setmetatable(L, -2);
 	lua_setfield(L, -2, "item");
 
-#undef LUA_TABLE_SETNUMBER
-#define LUA_TABLE_SETNUMBER(field) \
+#undef LUA_TABLE_SET_NUMBER
+#define LUA_TABLE_SET_NUMBER(field) \
 	lua_pushnumber(L, user->field); \
 	lua_setfield(L, -2, #field);
-#undef LUA_TABLE_SETBOOL
-#define LUA_TABLE_SETBOOL(field) \
+#undef LUA_TABLE_SET_BOOL
+#define LUA_TABLE_SET_BOOL(field) \
 	lua_pushboolean(L, user->field); \
 	lua_setfield(L, -2, #field);
-#undef LUA_TABLE_SETSTRING
-#define LUA_TABLE_SETSTRING(field) \
+#undef LUA_TABLE_SET_STRING
+#define LUA_TABLE_SET_STRING(field) \
 	lua_pushstring(L, user->field); \
 	lua_setfield(L, -2, #field);
 
@@ -52,21 +52,21 @@ void dlua_push_mail_user(lua_State *L, struct mail_user *user)
 	lua_pushstring(L, home);
 	lua_setfield(L, -2, "home");
 
-	LUA_TABLE_SETSTRING(username);
-	LUA_TABLE_SETNUMBER(uid);
-	LUA_TABLE_SETNUMBER(gid);
-	LUA_TABLE_SETSTRING(service);
-	LUA_TABLE_SETSTRING(session_id);
-	LUA_TABLE_SETNUMBER(session_create_time);
+	LUA_TABLE_SET_STRING(username);
+	LUA_TABLE_SET_NUMBER(uid);
+	LUA_TABLE_SET_NUMBER(gid);
+	LUA_TABLE_SET_STRING(service);
+	LUA_TABLE_SET_STRING(session_id);
+	LUA_TABLE_SET_NUMBER(session_create_time);
 
-	LUA_TABLE_SETBOOL(nonexistent);
-	LUA_TABLE_SETBOOL(anonymous);
-	LUA_TABLE_SETBOOL(autocreated);
-	LUA_TABLE_SETBOOL(mail_debug);
-	LUA_TABLE_SETBOOL(fuzzy_search);
-	LUA_TABLE_SETBOOL(dsyncing);
-	LUA_TABLE_SETBOOL(admin);
-	LUA_TABLE_SETBOOL(session_restored);
+	LUA_TABLE_SET_BOOL(nonexistent);
+	LUA_TABLE_SET_BOOL(anonymous);
+	LUA_TABLE_SET_BOOL(autocreated);
+	LUA_TABLE_SET_BOOL(mail_debug);
+	LUA_TABLE_SET_BOOL(fuzzy_search);
+	LUA_TABLE_SET_BOOL(dsyncing);
+	LUA_TABLE_SET_BOOL(admin);
+	LUA_TABLE_SET_BOOL(session_restored);
 }
 
 static struct mail_user *
@@ -135,7 +135,7 @@ static int lua_storage_mail_user_var_expand(lua_State *L)
 	const struct var_expand_table *table = mail_user_var_expand_table(user);
 	string_t *str = t_str_new(128);
 	if (var_expand_with_funcs(str, format, table, mail_user_var_expand_func_table,
-				  user, &error) < 0) {
+				  user, &error) <= 0) {
 		return luaL_error(L, "var_expand(%s) failed: %s",
 				  format, error);
 	}
@@ -182,14 +182,14 @@ static int lua_storage_mail_user_unref(lua_State *L)
 
 static const char *lua_storage_mail_user_metadata_key(const char *key)
 {
-	if (str_begins(key, "/private/")) {
+	if (str_begins(key, "/private/", &key)) {
 		return t_strdup_printf("/private/%s%s",
 				       MAILBOX_ATTRIBUTE_PREFIX_DOVECOT_PVT_SERVER,
-				       key + 9);
-	} else if (str_begins(key, "/shared/")) {
+				       key);
+	} else if (str_begins(key, "/shared/", &key)) {
 		return t_strdup_printf("/shared/%s%s",
 				       MAILBOX_ATTRIBUTE_PREFIX_DOVECOT_PVT_SERVER,
-				       key + 8);
+				       key);
 	}
 	return NULL;
 }

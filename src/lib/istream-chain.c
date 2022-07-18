@@ -2,6 +2,7 @@
 
 #include "lib.h"
 #include "llist.h"
+#include "memarea.h"
 #include "istream-private.h"
 #include "istream-chain.h"
 
@@ -28,7 +29,6 @@ struct chain_istream {
 	   the beginning of the current link's stream. */
 	size_t prev_stream_left;
 	size_t prev_skip;
-	bool have_explicit_max_buffer_size;
 	
 	struct istream_chain chain;
 };
@@ -50,17 +50,8 @@ i_stream_chain_append_internal(struct istream_chain *chain,
 		i_stream_ref(stream);	
 
 	if (chain->head == NULL && stream != NULL) {
-		struct chain_istream *cstream = chain->stream;
-
-		if (cstream->have_explicit_max_buffer_size) {
-			i_stream_set_max_buffer_size(stream,
-				chain->stream->istream.max_buffer_size);
-		} else {
-			size_t max_size = i_stream_get_max_buffer_size(stream);
-
-			if (cstream->istream.max_buffer_size < max_size)
-				cstream->istream.max_buffer_size = max_size;
-		}
+		i_stream_set_max_buffer_size(stream,
+			chain->stream->istream.max_buffer_size);
 	}
 	DLLIST2_APPEND(&chain->head, &chain->tail, link);
 	/* if io_add_istream() has been added to this chain stream, notify
@@ -87,7 +78,6 @@ i_stream_chain_set_max_buffer_size(struct iostream_private *stream,
 		container_of(stream, struct chain_istream, istream.iostream);
 	struct istream_chain_link *link = cstream->chain.head;
 
-	cstream->have_explicit_max_buffer_size = TRUE;
 	cstream->istream.max_buffer_size = max_size;
 	while (link != NULL) {
 		if (link->stream != NULL)
@@ -153,6 +143,9 @@ static void i_stream_chain_read_next(struct chain_istream *cstream)
 	}
 
 	if (data_size > 0) {
+		if (cstream->istream.memarea != NULL &&
+		    memarea_get_refcount(cstream->istream.memarea) > 1)
+			i_stream_memarea_detach(&cstream->istream);
 		memcpy(i_stream_alloc(&cstream->istream, data_size),
 		       data, data_size);
 		cstream->istream.pos += data_size;
@@ -224,12 +217,9 @@ static ssize_t i_stream_chain_read(struct istream_private *stream)
 	if (data_size > cur_data_pos)
 		ret = 0;
 	else {
-		/* need to read more - NOTE: Can't use i_stream_read_memarea()
-		   here, because our stream->buffer may point to the parent
-		   istream. This could be avoided if we implemented
-		   snapshotting ourself. */
+		/* need to read more */
 		i_assert(cur_data_pos == data_size);
-		ret = i_stream_read(link->stream);
+		ret = i_stream_read_memarea(link->stream);
 		if (ret == -2 || ret == 0)
 			return ret;
 
@@ -300,12 +290,47 @@ static void i_stream_chain_close(struct iostream_private *stream,
 	}
 }
 
-struct istream *i_stream_create_chain(struct istream_chain **chain_r)
+static struct istream_snapshot *
+i_stream_chain_snapshot(struct istream_private *stream,
+			struct istream_snapshot *prev_snapshot)
+{
+	if (stream->buffer == stream->w_buffer) {
+		/* Two or more istreams have been combined. Snapshot the
+		   w_buffer's contents that contains their data. */
+		i_assert(stream->memarea != NULL);
+		return i_stream_default_snapshot(stream, prev_snapshot);
+	}
+	/* Individual istreams are being read. Snapshot the istream directly. */
+	struct chain_istream *cstream =
+		container_of(stream, struct chain_istream, istream);
+	struct istream_chain_link *link = cstream->chain.head;
+	if (link == NULL || link->stream == NULL)
+		return prev_snapshot;
+
+	struct istream_private *_link_stream = link->stream->real_stream;
+	struct istream_snapshot *snapshot = i_new(struct istream_snapshot, 1);
+	snapshot->prev_snapshot =
+		_link_stream->snapshot(_link_stream, prev_snapshot);
+	if (snapshot->prev_snapshot == prev_snapshot) {
+		/* The link stream didn't implement snapshotting in any way.
+		   This could cause trouble if the link stream is freed while
+		   it's still referred to in this snapshot. Fix this by
+		   referencing the link istream. Normally avoid doing this,
+		   since the extra references can cause unexpected problems. */
+		snapshot->istream = link->stream;
+		i_stream_ref(snapshot->istream);
+	}
+	return snapshot;
+}
+
+struct istream *i_stream_create_chain(struct istream_chain **chain_r,
+				      size_t max_buffer_size)
 {
 	struct chain_istream *cstream;
 
 	cstream = i_new(struct chain_istream, 1);
 	cstream->chain.stream = cstream;
+	cstream->istream.max_buffer_size = max_buffer_size;
 
 	cstream->istream.iostream.close = i_stream_chain_close;
 	cstream->istream.iostream.destroy = i_stream_chain_destroy;
@@ -313,12 +338,12 @@ struct istream *i_stream_create_chain(struct istream_chain **chain_r)
 		i_stream_chain_set_max_buffer_size;
 
 	cstream->istream.read = i_stream_chain_read;
+	cstream->istream.snapshot = i_stream_chain_snapshot;
 
 	cstream->istream.istream.readable_fd = FALSE;
 	cstream->istream.istream.blocking = FALSE;
 	cstream->istream.istream.seekable = FALSE;
 
 	*chain_r = &cstream->chain;
-	return i_stream_create(&cstream->istream, NULL, -1,
-			       ISTREAM_CREATE_FLAG_NOOP_SNAPSHOT);
+	return i_stream_create(&cstream->istream, NULL, -1, 0);
 }

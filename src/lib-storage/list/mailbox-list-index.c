@@ -305,13 +305,20 @@ static int mailbox_list_index_parse_records(struct mailbox_list_index *ilist,
 	const void *data;
 	bool expunged;
 	uint32_t seq, uid, count;
+	HASH_TABLE(uint8_t *, struct mailbox_list_index_node *) duplicate_guid;
 
 	*error_r = NULL;
 
-	hash_table_create(&duplicate_hash, default_pool, 0,
+	pool_t dup_pool =
+		pool_alloconly_create(MEMPOOL_GROWING"duplicate pool", 2048);
+	hash_table_create(&duplicate_hash, dup_pool, 0,
 			  mailbox_list_index_node_hash,
 			  mailbox_list_index_node_cmp);
 	count = mail_index_view_get_messages_count(view);
+	if (!ilist->has_backing_store)
+		hash_table_create(&duplicate_guid, dup_pool, 0, guid_128_hash,
+				  guid_128_cmp);
+
 	for (seq = 1; seq <= count; seq++) {
 		node = p_new(ilist->mailbox_pool,
 			     struct mailbox_list_index_node, 1);
@@ -366,6 +373,24 @@ static int mailbox_list_index_parse_records(struct mailbox_list_index *ilist,
 				"non-selectable mailbox '%s' (uid=%u) already has GUID - "
 				"marking it selectable", node->raw_name, node->uid);
 			node->corrupted_flags = TRUE;
+		}
+
+		if (!ilist->has_backing_store && !guid_128_is_empty(irec->guid)) {
+			struct mailbox_list_index_node *dup_node;
+			uint8_t *guid_p = p_memdup(dup_pool, irec->guid,
+						   sizeof(guid_128_t));
+			if ((dup_node = hash_table_lookup(duplicate_guid, guid_p)) != NULL) {
+				*error_r = t_strdup_printf(
+						"duplicate GUID %s for mailbox '%s' and '%s'",
+						guid_128_to_string(guid_p),
+						node->raw_name,
+						dup_node->raw_name);
+				node->corrupted_ext = TRUE;
+				ilist->corrupted_names_or_parents = TRUE;
+				ilist->call_corruption_callback = TRUE;
+			} else {
+				hash_table_insert(duplicate_guid, guid_p, node);
+			}
 		}
 
 		hash_table_insert(ilist->mailbox_hash,
@@ -442,6 +467,9 @@ static int mailbox_list_index_parse_records(struct mailbox_list_index *ilist,
 		}
 	}
 	hash_table_destroy(&duplicate_hash);
+	if (!ilist->has_backing_store)
+		hash_table_destroy(&duplicate_guid);
+	pool_unref(&dup_pool);
 	return *error_r == NULL ? 0 : -1;
 }
 
@@ -520,7 +548,7 @@ int mailbox_list_index_refresh(struct mailbox_list *list)
 		   it. when we're accessing many mailboxes at once (e.g.
 		   opening a virtual mailbox) we don't want to stat/read the
 		   index every single time. */
-		return 0;
+		return ilist->last_refresh_success ? 0 : -1;
 	}
 
 	return mailbox_list_index_refresh_force(list);
@@ -531,11 +559,10 @@ int mailbox_list_index_refresh_force(struct mailbox_list *list)
 	struct mailbox_list_index *ilist = INDEX_LIST_CONTEXT_REQUIRE(list);
 	struct mail_index_view *view;
 	int ret;
-	bool refresh;
+	bool refresh, handle_corruption = TRUE;
 
 	i_assert(!ilist->syncing);
 
-	ilist->last_refresh_timeval = ioloop_timeval;
 	if (mailbox_list_index_index_open(list) < 0)
 		return -1;
 	if (mail_index_refresh(ilist->index) < 0) {
@@ -548,12 +575,18 @@ int mailbox_list_index_refresh_force(struct mailbox_list *list)
 	    ilist->mailbox_tree == NULL) {
 		/* refresh list of mailboxes */
 		ret = mailbox_list_index_sync(list, refresh);
+		if (ret < 0) {
+			/* I/O failure - don't try to handle corruption,
+			   since we don't have the latest state. */
+			handle_corruption = FALSE;
+		}
 	} else {
 		ret = mailbox_list_index_parse(list, view, FALSE);
 	}
 	mail_index_view_close(&view);
 
-	if (mailbox_list_index_handle_corruption(list) < 0) {
+	if (handle_corruption &&
+	    mailbox_list_index_handle_corruption(list) < 0) {
 		const char *errstr;
 		enum mail_error error;
 
@@ -562,6 +595,8 @@ int mailbox_list_index_refresh_force(struct mailbox_list *list)
 			"Failed to rebuild mailbox list index: %s", errstr));
 		ret = -1;
 	}
+	ilist->last_refresh_timeval = ioloop_timeval;
+	ilist->last_refresh_success = (ret == 0);
 	return ret;
 }
 
@@ -648,6 +683,9 @@ int mailbox_list_index_handle_corruption(struct mailbox_list *list)
 	else
 		return 0;
 
+	if (list->disable_rebuild_on_corruption)
+		return 0;
+
 	/* make sure we don't recurse */
 	if (ilist->handling_corruption)
 		return 0;
@@ -702,6 +740,7 @@ int mailbox_list_index_view_open(struct mailbox *box, bool require_refreshed,
 	struct mailbox_list_index *ilist = INDEX_LIST_CONTEXT(box->list);
 	struct mailbox_list_index_node *node;
 	struct mail_index_view *view;
+	const char *reason = NULL;
 	uint32_t seq;
 	int ret;
 
@@ -723,6 +762,8 @@ int mailbox_list_index_view_open(struct mailbox *box, bool require_refreshed,
 	node = mailbox_list_index_lookup(box->list, box->name);
 	if (node == NULL) {
 		/* mailbox not found */
+		e_debug(box->event, "Couldn't open mailbox in list index: "
+			"Mailbox not found");
 		return 0;
 	}
 
@@ -730,24 +771,33 @@ int mailbox_list_index_view_open(struct mailbox *box, bool require_refreshed,
 	if (mailbox_list_index_need_refresh(ilist, view)) {
 		/* mailbox_list_index_refresh_later() was called.
 		   Can't trust the index's contents. */
+		reason = "Refresh-flag set";
 		ret = 1;
 	} else if (!mail_index_lookup_seq(view, node->uid, &seq)) {
 		/* our in-memory tree is out of sync */
 		ret = 1;
+		reason = "Mailbox no longer exists in index";
 	} else if (!require_refreshed) {
 		/* this operation doesn't need the index to be up-to-date */
 		ret = 0;
-	} else T_BEGIN {
+	} else {
 		ret = box->v.list_index_has_changed == NULL ? 0 :
-			box->v.list_index_has_changed(box, view, seq, FALSE);
-	} T_END;
+			box->v.list_index_has_changed(box, view, seq, FALSE,
+						      &reason);
+		i_assert(ret <= 0 || reason != NULL);
+	}
 
 	if (ret != 0) {
 		/* error / mailbox has changed. we'll need to sync it. */
 		if (ret < 0)
 			mailbox_list_index_refresh_later(box->list);
-		else
+		else {
+			i_assert(reason != NULL);
+			e_debug(box->event,
+				"Couldn't open mailbox in list index: %s",
+				reason);
 			ilist->index_last_check_changed = TRUE;
+		}
 		mail_index_view_close(&view);
 		return ret < 0 ? -1 : 0;
 	}
@@ -928,11 +978,11 @@ mailbox_list_index_set_subscribed(struct mailbox_list *_list,
 	view = mail_index_view_open(ilist->index);
 	mail_index_get_header_ext(view, ilist->subs_hdr_ext_id, &data, &size);
 	if (size != sizeof(counter))
-		counter = ioloop_time;
+		counter = ioloop_time32;
 	else {
 		memcpy(&counter, data, size);
-		if (++counter < (uint32_t)ioloop_time)
-			counter = ioloop_time;
+		if (++counter < ioloop_time32)
+			counter = ioloop_time32;
 	}
 
 	trans = mail_index_transaction_begin(view,

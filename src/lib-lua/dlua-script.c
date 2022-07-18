@@ -197,7 +197,7 @@ int dlua_script_init(struct dlua_script *script, const char **error_r)
 static int dlua_atpanic(lua_State *L)
 {
 	struct dlua_script *script = dlua_script_from_state(L);
-	const char *error = lua_tostring(script->L, -1);
+	const char *error = lua_tostring(L, -1);
 	i_panic("Lua script '%s': %s", script->filename, error);
 }
 
@@ -381,13 +381,15 @@ void dlua_script_unref(struct dlua_script **_script)
 bool dlua_script_has_function(struct dlua_script *script, const char *fn)
 {
 	i_assert(script != NULL);
-	lua_getglobal(script->L, fn);
+	lua_getglobal(script->L, "_G");
+	lua_pushstring(script->L, fn);
+	lua_rawget(script->L, -2);
 	bool ret = lua_isfunction(script->L, -1);
-	lua_pop(script->L, 1);
+	lua_pop(script->L, 2);
 	return ret;
 }
 
-void dlua_setmembers(lua_State *L, const struct dlua_table_values *values,
+void dlua_set_members(lua_State *L, const struct dlua_table_values *values,
 		     int idx)
 {
 	i_assert(L != NULL);

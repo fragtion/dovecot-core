@@ -11,7 +11,7 @@
 
 struct altmove_cmd_context {
 	struct doveadm_mail_cmd_context ctx;
-	bool reverse;
+	bool reverse:1;
 };
 
 static int
@@ -24,9 +24,10 @@ cmd_altmove_box(struct doveadm_mail_cmd_context *ctx,
 	enum modify_type modify_type =
 		!reverse ? MODIFY_ADD : MODIFY_REMOVE;
 
-	if (doveadm_mail_iter_init(ctx, info, search_args, 0, NULL, FALSE,
-				   &iter) < 0)
-		return -1;
+	int ret = doveadm_mail_iter_init(ctx, info, search_args, 0, NULL, 0,
+					 &iter);
+	if (ret <= 0)
+		return ret;
 
 	while (doveadm_mail_iter_next(iter, &mail)) {
 		if (doveadm_debug) {
@@ -55,7 +56,8 @@ ns_purge(struct doveadm_mail_cmd_context *ctx, struct mail_namespace *ns,
 static int
 cmd_altmove_run(struct doveadm_mail_cmd_context *_ctx, struct mail_user *user)
 {
-	struct altmove_cmd_context *ctx = (struct altmove_cmd_context *)_ctx;
+	struct altmove_cmd_context *ctx =
+		container_of(_ctx, struct altmove_cmd_context, ctx);
 	const enum mailbox_list_iter_flags iter_flags =
 		MAILBOX_LIST_ITER_NO_AUTO_BOXES |
 		MAILBOX_LIST_ITER_RETURN_NO_FLAGS;
@@ -115,27 +117,18 @@ cmd_altmove_run(struct doveadm_mail_cmd_context *_ctx, struct mail_user *user)
 	return ret;
 }
 
-static void cmd_altmove_init(struct doveadm_mail_cmd_context *ctx,
-			     const char *const args[])
+static void cmd_altmove_init(struct doveadm_mail_cmd_context *_ctx)
 {
-	if (args[0] == NULL)
+	struct doveadm_cmd_context *cctx = _ctx->cctx;
+	struct altmove_cmd_context *ctx =
+		container_of(_ctx, struct altmove_cmd_context, ctx);
+
+	ctx->reverse = doveadm_cmd_param_flag(cctx, "reverse");
+
+	const char *const *query;
+	if (!doveadm_cmd_param_array(cctx, "query", &query))
 		doveadm_mail_help_name("altmove");
-	ctx->search_args = doveadm_mail_build_search_args(args);
-}
-
-static bool
-cmd_mailbox_altmove_parse_arg(struct doveadm_mail_cmd_context *_ctx, int c)
-{
-	struct altmove_cmd_context *ctx = (struct altmove_cmd_context *)_ctx;
-
-	switch (c) {
-	case 'r':
-		ctx->reverse = TRUE;
-		break;
-	default:
-		return FALSE;
-	}
-	return TRUE;
+	_ctx->search_args = doveadm_mail_build_search_args(query);
 }
 
 static struct doveadm_mail_cmd_context *cmd_altmove_alloc(void)
@@ -143,8 +136,6 @@ static struct doveadm_mail_cmd_context *cmd_altmove_alloc(void)
 	struct altmove_cmd_context *ctx;
 
 	ctx = doveadm_mail_cmd_alloc(struct altmove_cmd_context);
-	ctx->ctx.getopt_args = "r";
-	ctx->ctx.v.parse_arg = cmd_mailbox_altmove_parse_arg;
 	ctx->ctx.v.init = cmd_altmove_init;
 	ctx->ctx.v.run = cmd_altmove_run;
 	return &ctx->ctx;

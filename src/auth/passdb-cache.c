@@ -4,8 +4,7 @@
 #include "str.h"
 #include "strescape.h"
 #include "restrict-process-size.h"
-#include "auth-request-stats.h"
-#include "auth-worker-server.h"
+#include "auth-worker-connection.h"
 #include "password-scheme.h"
 #include "passdb.h"
 #include "passdb-cache.h"
@@ -32,33 +31,38 @@ passdb_cache_lookup(struct auth_request *request, const char *key,
 		    bool use_expired, struct auth_cache_node **node_r,
 		    const char **value_r, bool *neg_expired_r)
 {
-	struct auth_stats *stats = auth_request_stats_get(request);
 	const char *value;
 	bool expired;
+
+	request->passdb_cache_result = AUTH_REQUEST_CACHE_MISS;
 
 	/* value = password \t ... */
 	value = auth_cache_lookup(passdb_cache, request, key, node_r,
 				  &expired, neg_expired_r);
 	if (value == NULL || (expired && !use_expired)) {
-		stats->auth_cache_miss_count++;
 		e_debug(authdb_event(request),
 			value == NULL ? "cache miss" :
 			"cache expired");
 		return FALSE;
 	}
-	stats->auth_cache_hit_count++;
 	passdb_cache_log_hit(request, value);
+	request->passdb_cache_result = AUTH_REQUEST_CACHE_HIT;
 
 	*value_r = value;
 	return TRUE;
 }
 
-static bool passdb_cache_verify_plain_callback(const char *reply, void *context)
+static bool
+passdb_cache_verify_plain_callback(struct auth_worker_connection *conn ATTR_UNUSED,
+				   const char *const *args,
+				   void *context)
 {
 	struct auth_request *request = context;
 	enum passdb_result result;
 
-	result = passdb_blocking_auth_worker_reply_parse(request, reply);
+	result = passdb_blocking_auth_worker_reply_parse(request, args);
+	if (result != PASSDB_RESULT_OK)
+		auth_fields_rollback(request->fields.extra_fields);
 	auth_request_verify_plain_callback_finish(result, request);
 	auth_request_unref(&request);
 	return TRUE;
@@ -110,6 +114,10 @@ bool passdb_cache_verify_plain(struct auth_request *request, const char *key,
 		e_debug(authdb_event(request), "cache: "
 			"validating password on worker");
 		auth_request_ref(request);
+		/* Save the extra fields already here, and take a snapshot.
+		   If verification fails, roll back fields. */
+		auth_request_set_fields(request, list + 1, NULL);
+		auth_fields_snapshot(request->fields.extra_fields);
 		auth_worker_call(request->pool, request->fields.user, str_c(str),
 				 passdb_cache_verify_plain_callback, request);
 		return TRUE;

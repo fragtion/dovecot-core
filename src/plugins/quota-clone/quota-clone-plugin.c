@@ -34,12 +34,16 @@ struct quota_clone_user {
 	struct timeout *to_quota_flush;
 	bool quota_changed;
 	bool quota_flushing;
+	bool unset;
 };
 
 static void
 quota_clone_dict_commit(const struct dict_commit_result *result,
-			struct quota_clone_user *quser)
+			struct mail_user *user)
 {
+	struct quota_clone_user *quser =
+		QUOTA_CLONE_USER_CONTEXT_REQUIRE(user);
+
 	switch (result->ret) {
 	case DICT_COMMIT_RET_OK:
 	case DICT_COMMIT_RET_NOTFOUND:
@@ -48,12 +52,12 @@ quota_clone_dict_commit(const struct dict_commit_result *result,
 		break;
 	case DICT_COMMIT_RET_FAILED:
 		quser->quota_changed = TRUE;
-		i_error("quota_clone_dict: Failed to write value: %s",
+		e_error(user->event, "quota_clone_dict: Failed to write value: %s",
 			result->error);
 		break;
 	case DICT_COMMIT_RET_WRITE_UNCERTAIN:
 		quser->quota_changed = TRUE;
-		i_error("quota_clone_dict: Write was unconfirmed (timeout or disconnect): %s",
+		e_error(user->event, "quota_clone_dict: Write was unconfirmed (timeout or disconnect): %s",
 			result->error);
 		break;
 	}
@@ -86,7 +90,7 @@ static bool quota_clone_flush_real(struct mail_user *user)
 	bytes_res = quota_get_resource(root, "", QUOTA_NAME_STORAGE_BYTES,
 				       &bytes_value, &limit, &error);
 	if (bytes_res == QUOTA_GET_RESULT_INTERNAL_ERROR) {
-		i_error("quota_clone_plugin: "
+		e_error(user->event, "quota_clone_plugin: "
 			"Failed to get quota resource "QUOTA_NAME_STORAGE_BYTES": %s",
 			error);
 		return TRUE;
@@ -94,7 +98,7 @@ static bool quota_clone_flush_real(struct mail_user *user)
 	count_res = quota_get_resource(root, "", QUOTA_NAME_MESSAGES,
 				       &count_value, &limit, &error);
 	if (count_res == QUOTA_GET_RESULT_INTERNAL_ERROR) {
-		i_error("quota_clone_plugin: "
+		e_error(user->event, "quota_clone_plugin: "
 			"Failed to get quota resource "QUOTA_NAME_MESSAGES": %s",
 			error);
 		return TRUE;
@@ -120,16 +124,20 @@ static bool quota_clone_flush_real(struct mail_user *user)
 	trans = dict_transaction_begin(quser->dict, set);
 	if (bytes_res == QUOTA_GET_RESULT_LIMITED ||
 	    bytes_res == QUOTA_GET_RESULT_UNLIMITED) {
+		if (quser->unset)
+			dict_unset(trans, DICT_QUOTA_CLONE_BYTES_PATH);
 		dict_set(trans, DICT_QUOTA_CLONE_BYTES_PATH,
 			 t_strdup_printf("%"PRIu64, bytes_value));
 	}
 	if (count_res == QUOTA_GET_RESULT_LIMITED ||
 	    count_res == QUOTA_GET_RESULT_UNLIMITED) {
+		if (quser->unset)
+			dict_unset(trans, DICT_QUOTA_CLONE_COUNT_PATH);
 		dict_set(trans, DICT_QUOTA_CLONE_COUNT_PATH,
 			 t_strdup_printf("%"PRIu64, count_value));
 	}
 	quser->quota_changed = FALSE;
-	dict_transaction_commit_async(&trans, quota_clone_dict_commit, quser);
+	dict_transaction_commit_async(&trans, quota_clone_dict_commit, user);
 	return FALSE;
 }
 
@@ -276,7 +284,7 @@ static void quota_clone_mail_user_created(struct mail_user *user)
 	dict_set.base_dir = user->set->base_dir;
 	dict_set.event_parent = user->event;
 	if (dict_init(uri, &dict_set, &dict, &error) < 0) {
-		i_error("quota_clone_dict: Failed to initialize '%s': %s",
+		e_error(user->event, "quota_clone_dict: Failed to initialize '%s': %s",
 			uri, error);
 		return;
 	}
@@ -287,6 +295,7 @@ static void quota_clone_mail_user_created(struct mail_user *user)
 	v->deinit_pre = quota_clone_mail_user_deinit_pre;
 	v->deinit = quota_clone_mail_user_deinit;
 	quser->dict = dict;
+	quser->unset = mail_user_plugin_getenv_bool(user, "quota_clone_unset");
 	MODULE_CONTEXT_SET(user, quota_clone_user_module, quser);
 }
 

@@ -77,8 +77,8 @@ config_request_get_strings(const char *key, const char *value,
 	case CONFIG_KEY_UNIQUE_KEY:
 		p = strrchr(key, '/');
 		i_assert(p != NULL);
-		value = p_strdup_printf(ctx->pool, "%s/"UNIQUE_KEY_SUFFIX"%s=%s",
-					t_strdup_until(key, p), p + 1, value);
+		value = p_strdup_printf(ctx->pool, "%.*s/"UNIQUE_KEY_SUFFIX"%s=%s",
+					(int)(p - key), key, p + 1, value);
 		break;
 	case CONFIG_KEY_ERROR:
 		value = p_strdup(ctx->pool, value);
@@ -154,7 +154,7 @@ config_dump_human_init(const char *const *modules, enum config_dump_scope scope,
 		flags |= CONFIG_DUMP_FLAG_CHECK_SETTINGS;
 	if (in_section)
 		flags |= CONFIG_DUMP_FLAG_IN_SECTION;
-	ctx->export_ctx = config_export_init(modules, scope, flags,
+	ctx->export_ctx = config_export_init(modules, NULL, scope, flags,
 					     config_request_get_strings, ctx);
 	return ctx;
 }
@@ -247,7 +247,7 @@ static inline bool key_ends_with(const char *key, const char *eptr,
 {
 	/* take = into account */
 	size_t n = strlen(suffix)+1;
-	return (eptr-key > (ptrdiff_t)n && str_begins(eptr-n, suffix));
+	return (eptr-key > (ptrdiff_t)n && str_begins_with(eptr-n, suffix));
 }
 
 static bool
@@ -260,7 +260,7 @@ hide_secrets_from_value(struct ostream *output, const char *key,
 	    (key_ends_with(key, value, "_password") ||
 	     key_ends_with(key, value, "_key") ||
 	     key_ends_with(key, value, "_nonce") ||
-	     str_begins(key, "ssl_dh"))) {
+	     str_begins_with(key, "ssl_dh"))) {
 		o_stream_nsend_str(output, "# hidden, use -P to show it");
 		return TRUE;
 	}
@@ -998,7 +998,7 @@ int main(int argc, char *argv[])
 	if (simple_output) {
 		struct config_export_context *ctx;
 
-		ctx = config_export_init(wanted_modules, scope,
+		ctx = config_export_init(wanted_modules, NULL, scope,
 					 CONFIG_DUMP_FLAG_CHECK_SETTINGS,
 					 config_request_simple_stdout,
 					 setting_name_filters);
@@ -1032,7 +1032,7 @@ int main(int argc, char *argv[])
 	} else {
 		struct config_export_context *ctx;
 
-		ctx = config_export_init(wanted_modules, CONFIG_DUMP_SCOPE_SET,
+		ctx = config_export_init(wanted_modules, NULL, CONFIG_DUMP_SCOPE_SET,
 					 CONFIG_DUMP_FLAG_CHECK_SETTINGS,
 					 config_request_putenv, NULL);
 		config_export_by_filter(ctx, &filter);

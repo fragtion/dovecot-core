@@ -8,7 +8,9 @@
 #include "time-util.h"
 #include "str.h"
 #include "strescape.h"
-#include "ioloop.h"
+#include "ioloop-private.h"
+
+#include <ctype.h>
 
 enum event_code {
 	EVENT_CODE_ALWAYS_LOG_SOURCE	= 'a',
@@ -20,6 +22,7 @@ enum event_code {
 	EVENT_CODE_FIELD_INTMAX		= 'I',
 	EVENT_CODE_FIELD_STR		= 'S',
 	EVENT_CODE_FIELD_TIMEVAL	= 'T',
+	EVENT_CODE_FIELD_STRLIST	= 'L',
 };
 
 /* Internal event category state.
@@ -54,11 +57,15 @@ struct event_internal_category {
 	int refcount;
 };
 
-extern const struct event_passthrough event_passthrough_vfuncs;
+struct event_reason {
+	struct event *event;
+};
+
+extern struct event_passthrough event_passthrough_vfuncs;
 
 static struct event *events = NULL;
 static struct event *current_global_event = NULL;
-static struct event_passthrough *event_last_passthrough = NULL;
+static struct event *event_last_passthrough = NULL;
 static ARRAY(event_callback_t *) event_handlers;
 static ARRAY(event_category_callback_t *) event_category_callbacks;
 static ARRAY(struct event_internal_category *) event_registered_categories_internal;
@@ -80,8 +87,8 @@ event_category_find_internal(const char *name);
 
 static struct event *last_passthrough_event(void)
 {
-	return container_of(event_last_passthrough,
-			    struct event, event_passthrough);
+	i_assert(event_last_passthrough != NULL);
+	return event_last_passthrough;
 }
 
 static void event_copy_parent_defaults(struct event *event,
@@ -91,6 +98,7 @@ static void event_copy_parent_defaults(struct event *event,
 	event->passthrough = parent->passthrough;
 	event->min_log_level = parent->min_log_level;
 	event->forced_debug = parent->forced_debug;
+	event->disable_callbacks = parent->disable_callbacks;
 }
 
 static bool
@@ -112,6 +120,9 @@ event_call_callbacks(struct event *event, enum event_callback_type type,
 		     struct failure_context *ctx, const char *fmt, va_list args)
 {
 	event_callback_t *callback;
+
+	if (event->disable_callbacks)
+		return TRUE;
 
 	array_foreach_elem(&event_handlers, callback) {
 		bool ret;
@@ -153,6 +164,9 @@ void event_copy_categories(struct event *to, struct event *from)
 void event_copy_fields(struct event *to, struct event *from)
 {
 	const struct event_field *fld;
+	unsigned int count;
+	const char *const *values;
+
 	if (!array_is_created(&from->fields))
 		return;
 	array_foreach(&from->fields, fld) {
@@ -165,6 +179,11 @@ void event_copy_fields(struct event *to, struct event *from)
 			break;
 		case EVENT_FIELD_VALUE_TYPE_TIMEVAL:
 			event_add_timeval(to, fld->key, &fld->value.timeval);
+			break;
+		case EVENT_FIELD_VALUE_TYPE_STRLIST:
+			values = array_get(&fld->value.strlist, &count);
+			for (unsigned int i = 0; i < count; i++)
+				event_strlist_append(to, fld->key, values[i]);
 			break;
 		default:
 			break;
@@ -232,8 +251,9 @@ struct event *event_flatten(struct event *src)
 {
 	struct event *dst;
 
-	/* If we don't have a parent, we have nothing to flatten. */
-	if (src->parent == NULL)
+	/* If we don't have a parent or a global event,
+	   we have nothing to flatten. */
+	if (src->parent == NULL && current_global_event == NULL)
 		return event_ref(src);
 
 	/* We have to flatten the event. */
@@ -242,6 +262,8 @@ struct event *event_flatten(struct event *src)
 				    src->source_linenum);
 	dst = event_set_name(dst, src->sending_name);
 
+	if (current_global_event != NULL)
+		event_flatten_recurse(dst, current_global_event, NULL);
 	event_flatten_recurse(dst, src, NULL);
 
 	dst->tv_created_ioloop = src->tv_created_ioloop;
@@ -372,10 +394,9 @@ event_create_internal(struct event *parent, const char *source_filename,
 		      unsigned int source_linenum)
 {
 	struct event *event;
-	pool_t pool = pool_alloconly_create(MEMPOOL_GROWING"event", 64);
+	pool_t pool = pool_alloconly_create(MEMPOOL_GROWING"event", 1024);
 
 	event = p_new(pool, struct event, 1);
-	event->event_passthrough = event_passthrough_vfuncs;
 	event->refcount = 1;
 	event->id = ++event_id_counter;
 	event->pool = pool;
@@ -424,11 +445,11 @@ event_create_passthrough(struct event *parent, const char *source_filename,
 		event->tv_created_ioloop = parent->tv_created_ioloop;
 		event->tv_created = parent->tv_created;
 		memcpy(&event->ru_last, &parent->ru_last, sizeof(parent->ru_last));
-		event_last_passthrough = &event->event_passthrough;
+		event_last_passthrough = event;
 	} else {
-		event_last_passthrough = &parent->event_passthrough;
+		event_last_passthrough = parent;
 	}
-	return event_last_passthrough;
+	return &event_passthrough_vfuncs;
 }
 
 struct event *event_ref(struct event *event)
@@ -454,7 +475,7 @@ void event_unref(struct event **_event)
 
 	event_call_callbacks_noargs(event, EVENT_CALLBACK_TYPE_FREE);
 
-	if (last_passthrough_event() == event)
+	if (event_last_passthrough == event)
 		event_last_passthrough = NULL;
 	if (event->log_prefix_from_system_pool)
 		i_free(event->log_prefix);
@@ -472,6 +493,8 @@ struct event *events_get_head(void)
 
 struct event *event_push_global(struct event *event)
 {
+	i_assert(event != NULL);
+
 	if (current_global_event != NULL) {
 		if (!array_is_created(&global_event_stack))
 			i_array_init(&global_event_stack, 4);
@@ -485,6 +508,10 @@ struct event *event_pop_global(struct event *event)
 {
 	i_assert(event != NULL);
 	i_assert(event == current_global_event);
+	/* If the active context's root event is popped, we'll assert-crash
+	   later on when deactivating the context and the root event no longer
+	   exists. */
+	i_assert(event != io_loop_get_active_global_root());
 
 	if (!array_is_created(&global_event_stack) ||
 	    array_count(&global_event_stack) == 0)
@@ -504,6 +531,94 @@ struct event *event_pop_global(struct event *event)
 struct event *event_get_global(void)
 {
 	return current_global_event;
+}
+
+#undef event_reason_begin
+struct event_reason *
+event_reason_begin(const char *reason_code, const char *source_filename,
+		   unsigned int source_linenum)
+{
+	struct event_reason *reason;
+
+	reason = i_new(struct event_reason, 1);
+	reason->event = event_create(event_get_global(),
+				     source_filename, source_linenum);
+	event_strlist_append(reason->event, EVENT_REASON_CODE, reason_code);
+	event_push_global(reason->event);
+	return reason;
+}
+
+void event_reason_end(struct event_reason **_reason)
+{
+	struct event_reason *reason = *_reason;
+
+	if (reason == NULL)
+		return;
+	event_pop_global(reason->event);
+	/* This event was created only for global use. It shouldn't be
+	   permanently stored anywhere. This assert could help catch bugs. */
+	i_assert(reason->event->refcount == 1);
+	event_unref(&reason->event);
+	i_free(reason);
+}
+
+const char *event_reason_code(const char *module, const char *name)
+{
+	return event_reason_code_prefix(module, "", name);
+}
+
+static bool event_reason_code_module_validate(const char *module)
+{
+	const char *p;
+
+	for (p = module; *p != '\0'; p++) {
+		if (*p == ' ' || *p == '-' || *p == ':')
+			return FALSE;
+		if (i_isupper(*p))
+			return FALSE;
+	}
+	return TRUE;
+}
+
+const char *event_reason_code_prefix(const char *module,
+				     const char *name_prefix, const char *name)
+{
+	const char *p;
+
+	i_assert(module[0] != '\0');
+	i_assert(name[0] != '\0');
+
+	if (!event_reason_code_module_validate(module)) {
+		i_panic("event_reason_code_prefix(): "
+			"Invalid module '%s'", module);
+	}
+	if (!event_reason_code_module_validate(name_prefix)) {
+		i_panic("event_reason_code_prefix(): "
+			"Invalid name_prefix '%s'", name_prefix);
+	}
+
+	string_t *str = t_str_new(strlen(module) + 1 +
+				  strlen(name_prefix) + strlen(name));
+	str_append(str, module);
+	str_append_c(str, ':');
+	str_append(str, name_prefix);
+
+	for (p = name; *p != '\0'; p++) {
+		switch (*p) {
+		case ' ':
+		case '-':
+			str_append_c(str, '_');
+			break;
+		case ':':
+			i_panic("event_reason_code_prefix(): "
+				"name has ':' (%s, %s%s)",
+				module, name_prefix, name);
+		default:
+			str_append_c(str, i_tolower(*p));
+			break;
+		}
+	}
+	return str_c(str);
 }
 
 static struct event *
@@ -571,6 +686,11 @@ event_set_log_message_callback(struct event *event,
 	event->log_message_callback = callback;
 	event->log_message_callback_context = context;
 	return event;
+}
+
+void event_disable_callbacks(struct event *event)
+{
+	event->disable_callbacks = TRUE;
 }
 
 struct event *
@@ -826,7 +946,42 @@ event_find_field_recursive(const struct event *event, const char *key)
 			return field;
 		event = event->parent;
 	} while (event != NULL);
+
+	/* check also the global event and its parents */
+	event = event_get_global();
+	while (event != NULL) {
+		if ((field = event_find_field_nonrecursive(event, key)) != NULL)
+			return field;
+		event = event->parent;
+	}
 	return NULL;
+}
+
+static void
+event_get_recursive_strlist(const struct event *event, pool_t pool,
+			    const char *key, ARRAY_TYPE(const_string) *dest)
+{
+	const struct event_field *field;
+	const char *str;
+
+	if (event == NULL)
+		return;
+
+	field = event_find_field_nonrecursive(event, key);
+	if (field != NULL) {
+		if (field->value_type != EVENT_FIELD_VALUE_TYPE_STRLIST) {
+			/* Value type unexpectedly changed. Stop recursing. */
+			return;
+		}
+		array_foreach_elem(&field->value.strlist, str) {
+			if (array_lsearch(dest, &str, i_strcmp_p) == NULL) {
+				if (pool != NULL)
+					str = p_strdup(pool, str);
+				array_push_back(dest, &str);
+			}
+		}
+	}
+	event_get_recursive_strlist(event->parent, pool, key, dest);
 }
 
 const char *
@@ -847,12 +1002,23 @@ event_find_field_recursive_str(const struct event *event, const char *key)
 		return t_strdup_printf("%"PRIdTIME_T".%u",
 			field->value.timeval.tv_sec,
 			(unsigned int)field->value.timeval.tv_usec);
+	case EVENT_FIELD_VALUE_TYPE_STRLIST: {
+		ARRAY_TYPE(const_string) list;
+		t_array_init(&list, 8);
+		/* This is a bit different, because it needs to be merging
+		   all of the parent events' and global events' lists
+		   together. */
+		event_get_recursive_strlist(event, NULL, key, &list);
+		event_get_recursive_strlist(event_get_global(), NULL,
+					    key, &list);
+		return t_array_const_string_join(&list, ",");
+	}
 	}
 	i_unreached();
 }
 
 static struct event_field *
-event_get_field(struct event *event, const char *key)
+event_get_field(struct event *event, const char *key, bool clear)
 {
 	struct event_field *field;
 
@@ -862,6 +1028,8 @@ event_get_field(struct event *event, const char *key)
 			p_array_init(&event->fields, event->pool, 8);
 		field = array_append_space(&event->fields);
 		field->key = p_strdup(event->pool, key);
+	} else if (clear) {
+		i_zero(&field->value);
 	}
 	event_set_changed(event);
 	return field;
@@ -877,11 +1045,56 @@ event_add_str(struct event *event, const char *key, const char *value)
 		return event;
 	}
 
-	field = event_get_field(event, key);
+	field = event_get_field(event, key, TRUE);
 	field->value_type = EVENT_FIELD_VALUE_TYPE_STR;
-	i_zero(&field->value);
 	field->value.str = p_strdup(event->pool, value);
 	return event;
+}
+
+struct event *
+event_strlist_append(struct event *event, const char *key, const char *value)
+{
+	struct event_field *field = event_get_field(event, key, FALSE);
+
+	if (field->value_type != EVENT_FIELD_VALUE_TYPE_STRLIST)
+		i_zero(&field->value);
+	field->value_type = EVENT_FIELD_VALUE_TYPE_STRLIST;
+
+	if (!array_is_created(&field->value.strlist))
+		p_array_init(&field->value.strlist, event->pool, 1);
+
+	/* lets not add empty values there though */
+	if (value == NULL)
+		return event;
+
+	const char *str = p_strdup(event->pool, value);
+	if (array_lsearch(&field->value.strlist, &str, i_strcmp_p) == NULL)
+		array_push_back(&field->value.strlist, &str);
+	return event;
+}
+
+struct event *
+event_strlist_replace(struct event *event, const char *key,
+		      const char *const *values, unsigned int count)
+{
+	struct event_field *field = event_get_field(event, key, TRUE);
+	field->value_type = EVENT_FIELD_VALUE_TYPE_STRLIST;
+
+	for (unsigned int i = 0; i < count; i++)
+		event_strlist_append(event, key, values[i]);
+	return event;
+}
+
+struct event *
+event_strlist_copy_recursive(struct event *dest, const struct event *src,
+			     const char *key)
+{
+	event_strlist_append(dest, key, NULL);
+	struct event_field *field = event_get_field(dest, key, FALSE);
+	i_assert(field != NULL);
+	event_get_recursive_strlist(src, dest->pool, key,
+				    &field->value.strlist);
+	return dest;
 }
 
 struct event *
@@ -889,10 +1102,17 @@ event_add_int(struct event *event, const char *key, intmax_t num)
 {
 	struct event_field *field;
 
-	field = event_get_field(event, key);
+	field = event_get_field(event, key, TRUE);
 	field->value_type = EVENT_FIELD_VALUE_TYPE_INTMAX;
-	i_zero(&field->value);
 	field->value.intmax = num;
+	return event;
+}
+
+struct event *
+event_add_int_nonzero(struct event *event, const char *key, intmax_t num)
+{
+	if (num != 0)
+		return event_add_int(event, key, num);
 	return event;
 }
 
@@ -916,9 +1136,8 @@ event_add_timeval(struct event *event, const char *key,
 {
 	struct event_field *field;
 
-	field = event_get_field(event, key);
+	field = event_get_field(event, key, TRUE);
 	field->value_type = EVENT_FIELD_VALUE_TYPE_TIMEVAL;
-	i_zero(&field->value);
 	field->value.timeval = *tv;
 	return event;
 }
@@ -1058,6 +1277,18 @@ event_export_field_value(string_t *dest, const struct event_field *field)
 			    field->value.timeval.tv_sec,
 			    (unsigned int)field->value.timeval.tv_usec);
 		break;
+	case EVENT_FIELD_VALUE_TYPE_STRLIST: {
+		unsigned int count;
+		const char *const *strlist =
+			array_get(&field->value.strlist, &count);
+		str_append_c(dest, EVENT_CODE_FIELD_STRLIST);
+		str_append_tabescaped(dest, field->key);
+		str_printfa(dest, "\t%u", count);
+		for (unsigned int i = 0; i < count; i++) {
+			str_append_c(dest, '\t');
+			str_append_tabescaped(dest, strlist[i]);
+		}
+	}
 	}
 }
 
@@ -1137,6 +1368,159 @@ static bool event_import_tv(const char *arg_secs, const char *arg_usecs,
 	return TRUE;
 }
 
+static bool
+event_import_strlist(struct event *event, struct event_field *field,
+		     const char *const **_args, const char **error_r)
+{
+	const char *const *args = *_args;
+	unsigned int count, i;
+
+	field->value_type = EVENT_FIELD_VALUE_TYPE_STRLIST;
+	if (str_to_uint(args[0], &count) < 0) {
+		*error_r = t_strdup_printf("Field '%s' has invalid count: '%s'",
+					   field->key, args[0]);
+		return FALSE;
+	}
+	p_array_init(&field->value.strlist, event->pool, count);
+	for (i = 1; i <= count && args[i] != NULL; i++) {
+		const char *str = p_strdup(event->pool, args[i]);
+		array_push_back(&field->value.strlist, &str);
+	}
+	if (i < count) {
+		*error_r = t_strdup_printf("Field '%s' has too few values",
+					   field->key);
+		return FALSE;
+	}
+	*_args += count;
+	return TRUE;
+}
+
+static bool
+event_import_field(struct event *event, enum event_code code, const char *arg,
+		   const char *const **_args, const char **error_r)
+{
+	const char *const *args = *_args;
+	const char *error;
+
+	if (*arg == '\0') {
+		*error_r = "Field name is missing";
+		return FALSE;
+	}
+	struct event_field *field = event_get_field(event, arg, TRUE);
+	if (args[0] == NULL) {
+		*error_r = "Field value is missing";
+		return FALSE;
+	}
+	switch (code) {
+	case EVENT_CODE_FIELD_INTMAX:
+		field->value_type = EVENT_FIELD_VALUE_TYPE_INTMAX;
+		if (str_to_intmax(*args, &field->value.intmax) < 0) {
+			*error_r = t_strdup_printf(
+				"Invalid field value '%s' number for '%s'",
+				*args, field->key);
+			return FALSE;
+		}
+		break;
+	case EVENT_CODE_FIELD_STR:
+		if (field->value_type == EVENT_FIELD_VALUE_TYPE_STR &&
+		    null_strcmp(field->value.str, *args) == 0) {
+			/* already identical value */
+			break;
+		}
+		field->value_type = EVENT_FIELD_VALUE_TYPE_STR;
+		field->value.str = p_strdup(event->pool, *args);
+		break;
+	case EVENT_CODE_FIELD_TIMEVAL:
+		field->value_type = EVENT_FIELD_VALUE_TYPE_TIMEVAL;
+		if (!event_import_tv(args[0], args[1],
+				     &field->value.timeval, &error)) {
+			*error_r = t_strdup_printf("Field '%s' value '%s': %s",
+						   field->key, args[1], error);
+			return FALSE;
+		}
+		args++;
+		break;
+	case EVENT_CODE_FIELD_STRLIST:
+		if (!event_import_strlist(event, field, &args, error_r))
+			return FALSE;
+		break;
+	default:
+		i_unreached();
+	}
+	*_args = args;
+	return TRUE;
+}
+
+
+static bool
+event_import_arg(struct event *event, const char *const **_args,
+		 const char **error_r)
+{
+	const char *const *args = *_args;
+	const char *error, *arg = *args;
+	enum event_code code = arg[0];
+
+	arg++;
+	switch (code) {
+	case EVENT_CODE_ALWAYS_LOG_SOURCE:
+		event->always_log_source = TRUE;
+		break;
+	case EVENT_CODE_CATEGORY: {
+		struct event_category *category =
+			event_category_find_registered(arg);
+		if (category == NULL) {
+			*error_r = t_strdup_printf(
+				"Unregistered category: '%s'", arg);
+			return FALSE;
+		}
+		if (!array_is_created(&event->categories))
+			p_array_init(&event->categories, event->pool, 4);
+		if (!event_find_category(event, category))
+			array_push_back(&event->categories, &category);
+		break;
+	}
+	case EVENT_CODE_TV_LAST_SENT:
+		if (!event_import_tv(arg, args[1], &event->tv_last_sent,
+				     &error)) {
+			*error_r = t_strdup_printf(
+				"Invalid tv_last_sent: %s", error);
+			return FALSE;
+		}
+		args++;
+		break;
+	case EVENT_CODE_SENDING_NAME:
+		i_free(event->sending_name);
+		event->sending_name = i_strdup(arg);
+		break;
+	case EVENT_CODE_SOURCE: {
+		unsigned int linenum;
+
+		if (args[1] == NULL) {
+			*error_r = "Source line number missing";
+			return FALSE;
+		}
+		if (str_to_uint(args[1], &linenum) < 0) {
+			*error_r = "Invalid Source line number";
+			return FALSE;
+		}
+		event_set_source(event, arg, linenum, FALSE);
+		args++;
+		break;
+	}
+	case EVENT_CODE_FIELD_INTMAX:
+	case EVENT_CODE_FIELD_STR:
+	case EVENT_CODE_FIELD_STRLIST:
+	case EVENT_CODE_FIELD_TIMEVAL: {
+		args++;
+		if (!event_import_field(event, code, arg, &args, error_r))
+			return FALSE;
+		break;
+	}
+	}
+	*_args = args;
+	return TRUE;
+}
+
 bool event_import_unescaped(struct event *event, const char *const *args,
 			    const char **error_r)
 {
@@ -1161,107 +1545,8 @@ bool event_import_unescaped(struct event *event, const char *const *args,
 
 	/* optional fields: */
 	while (*args != NULL) {
-		const char *arg = *args;
-		enum event_code code = arg[0];
-
-		arg++;
-		switch (code) {
-		case EVENT_CODE_ALWAYS_LOG_SOURCE:
-			event->always_log_source = TRUE;
-			break;
-		case EVENT_CODE_CATEGORY: {
-			struct event_category *category =
-				event_category_find_registered(arg);
-			if (category == NULL) {
-				*error_r = t_strdup_printf("Unregistered category: '%s'", arg);
-				return FALSE;
-			}
-			if (!array_is_created(&event->categories))
-				p_array_init(&event->categories, event->pool, 4);
-			if (!event_find_category(event, category))
-				array_push_back(&event->categories, &category);
-			break;
-		}
-		case EVENT_CODE_TV_LAST_SENT:
-			if (!event_import_tv(arg, args[1], &event->tv_last_sent,
-					     &error)) {
-				*error_r = t_strdup_printf(
-					"Invalid tv_last_sent: %s", error);
-				return FALSE;
-			}
-			args++;
-			break;
-		case EVENT_CODE_SENDING_NAME:
-			i_free(event->sending_name);
-			event->sending_name = i_strdup(arg);
-			break;
-		case EVENT_CODE_SOURCE: {
-			unsigned int linenum;
-
-			if (args[1] == NULL) {
-				*error_r = "Source line number missing";
-				return FALSE;
-			}
-			if (str_to_uint(args[1], &linenum) < 0) {
-				*error_r = "Invalid Source line number";
-				return FALSE;
-			}
-			event_set_source(event, arg, linenum, FALSE);
-			args++;
-			break;
-		}
-
-		case EVENT_CODE_FIELD_INTMAX:
-		case EVENT_CODE_FIELD_STR:
-		case EVENT_CODE_FIELD_TIMEVAL: {
-			if (*arg == '\0') {
-				*error_r = "Field name is missing";
-				return FALSE;
-			}
-			struct event_field *field =
-				event_get_field(event, arg);
-			if (args[1] == NULL) {
-				*error_r = "Field value is missing";
-				return FALSE;
-			}
-			args++;
-			i_zero(&field->value);
-			switch (code) {
-			case EVENT_CODE_FIELD_INTMAX:
-				field->value_type = EVENT_FIELD_VALUE_TYPE_INTMAX;
-				if (str_to_intmax(*args, &field->value.intmax) < 0) {
-					*error_r = t_strdup_printf(
-						"Invalid field value '%s' number for '%s'",
-						*args, field->key);
-					return FALSE;
-				}
-				break;
-			case EVENT_CODE_FIELD_STR:
-				if (field->value_type == EVENT_FIELD_VALUE_TYPE_STR &&
-				    null_strcmp(field->value.str, *args) == 0) {
-					/* already identical value */
-					break;
-				}
-				field->value_type = EVENT_FIELD_VALUE_TYPE_STR;
-				field->value.str = p_strdup(event->pool, *args);
-				break;
-			case EVENT_CODE_FIELD_TIMEVAL:
-				field->value_type = EVENT_FIELD_VALUE_TYPE_TIMEVAL;
-				if (!event_import_tv(args[0], args[1],
-						     &field->value.timeval, &error)) {
-					*error_r = t_strdup_printf(
-						"Field '%s' value '%s': %s",
-						field->key, args[1], error);
-					return FALSE;
-				}
-				args++;
-				break;
-			default:
-				i_unreached();
-			}
-			break;
-		}
-		}
+		if (!event_import_arg(event, &args, error_r))
+			return FALSE;
 		args++;
 	}
 	return TRUE;
@@ -1312,21 +1597,21 @@ static struct event_passthrough *
 event_passthrough_set_append_log_prefix(const char *prefix)
 {
 	event_set_append_log_prefix(last_passthrough_event(), prefix);
-	return event_last_passthrough;
+	return &event_passthrough_vfuncs;
 }
 
 static struct event_passthrough *
 event_passthrough_replace_log_prefix(const char *prefix)
 {
 	event_replace_log_prefix(last_passthrough_event(), prefix);
-	return event_last_passthrough;
+	return &event_passthrough_vfuncs;
 }
 
 static struct event_passthrough *
 event_passthrough_set_name(const char *name)
 {
 	event_set_name(last_passthrough_event(), name);
-	return event_last_passthrough;
+	return &event_passthrough_vfuncs;
 }
 
 static struct event_passthrough *
@@ -1335,70 +1620,92 @@ event_passthrough_set_source(const char *filename,
 {
 	event_set_source(last_passthrough_event(), filename,
 			 linenum, literal_fname);
-	return event_last_passthrough;
+	return &event_passthrough_vfuncs;
 }
 
 static struct event_passthrough *
 event_passthrough_set_always_log_source(void)
 {
 	event_set_always_log_source(last_passthrough_event());
-	return event_last_passthrough;
+	return &event_passthrough_vfuncs;
 }
 
 static struct event_passthrough *
 event_passthrough_add_categories(struct event_category *const *categories)
 {
 	event_add_categories(last_passthrough_event(), categories);
-	return event_last_passthrough;
+	return &event_passthrough_vfuncs;
 }
 
 static struct event_passthrough *
 event_passthrough_add_category(struct event_category *category)
 {
 	event_add_category(last_passthrough_event(), category);
-	return event_last_passthrough;
+	return &event_passthrough_vfuncs;
 }
 
 static struct event_passthrough *
 event_passthrough_add_fields(const struct event_add_field *fields)
 {
 	event_add_fields(last_passthrough_event(), fields);
-	return event_last_passthrough;
+	return &event_passthrough_vfuncs;
 }
 
 static struct event_passthrough *
 event_passthrough_add_str(const char *key, const char *value)
 {
 	event_add_str(last_passthrough_event(), key, value);
-	return event_last_passthrough;
+	return &event_passthrough_vfuncs;
+}
+
+static struct event_passthrough *
+event_passthrough_strlist_append(const char *key, const char *value)
+{
+	event_strlist_append(last_passthrough_event(), key, value);
+	return &event_passthrough_vfuncs;
+}
+
+static struct event_passthrough *
+event_passthrough_strlist_replace(const char *key, const char *const *values,
+				  unsigned int count)
+{
+	event_strlist_replace(last_passthrough_event(), key, values, count);
+	return &event_passthrough_vfuncs;
 }
 
 static struct event_passthrough *
 event_passthrough_add_int(const char *key, intmax_t num)
 {
 	event_add_int(last_passthrough_event(), key, num);
-	return event_last_passthrough;
+	return &event_passthrough_vfuncs;
+}
+
+static struct event_passthrough *
+event_passthrough_add_int_nonzero(const char *key, intmax_t num)
+{
+	event_add_int_nonzero(last_passthrough_event(), key, num);
+	return &event_passthrough_vfuncs;
 }
 
 static struct event_passthrough *
 event_passthrough_add_timeval(const char *key, const struct timeval *tv)
 {
 	event_add_timeval(last_passthrough_event(), key, tv);
-	return event_last_passthrough;
+	return &event_passthrough_vfuncs;
 }
 
 static struct event_passthrough *
 event_passthrough_inc_int(const char *key, intmax_t num)
 {
 	event_inc_int(last_passthrough_event(), key, num);
-	return event_last_passthrough;
+	return &event_passthrough_vfuncs;
 }
 
 static struct event_passthrough *
 event_passthrough_clear_field(const char *key)
 {
 	event_field_clear(last_passthrough_event(), key);
-	return event_last_passthrough;
+	return &event_passthrough_vfuncs;
 }
 
 static struct event *event_passthrough_event(void)
@@ -1408,7 +1715,7 @@ static struct event *event_passthrough_event(void)
 	return event;
 }
 
-const struct event_passthrough event_passthrough_vfuncs = {
+struct event_passthrough event_passthrough_vfuncs = {
 	.append_log_prefix = event_passthrough_set_append_log_prefix,
 	.replace_log_prefix = event_passthrough_replace_log_prefix,
 	.set_name = event_passthrough_set_name,
@@ -1419,8 +1726,11 @@ const struct event_passthrough event_passthrough_vfuncs = {
 	.add_fields = event_passthrough_add_fields,
 	.add_str = event_passthrough_add_str,
 	.add_int = event_passthrough_add_int,
+	.add_int_nonzero = event_passthrough_add_int_nonzero,
 	.add_timeval = event_passthrough_add_timeval,
 	.inc_int = event_passthrough_inc_int,
+	.strlist_append = event_passthrough_strlist_append,
+	.strlist_replace = event_passthrough_strlist_replace,
 	.clear_field = event_passthrough_clear_field,
 	.event = event_passthrough_event,
 };

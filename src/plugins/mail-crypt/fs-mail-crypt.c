@@ -22,7 +22,10 @@ int fs_crypt_load_keys(struct crypt_fs *fs, const char **error_r)
 		return -1;
 	}
 
-	if (mail_crypt_global_keys_load(mailbox_list_get_namespace(list)->user, 
+	struct mail_namespace *ns = mailbox_list_get_namespace(list);
+	if (null_strcmp(mail_user_plugin_getenv(ns->user, "mail_crypt_save_version"), "0") == 0)
+		fs->allow_missing_keys = TRUE;
+	if (mail_crypt_global_keys_load(ns->user,
 					fs->set_prefix, &fs->keys, FALSE,
 					&error) < 0) {
 		*error_r = t_strdup_printf("%s: %s", fs->set_prefix, error);

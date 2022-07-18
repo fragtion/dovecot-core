@@ -8,6 +8,7 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-settings \
 	-I$(top_srcdir)/src/lib-dict \
 	-I$(top_srcdir)/src/lib-master \
+	-I$(top_srcdir)/src/lib-login \
 	-I$(top_srcdir)/src/lib-mail \
 	-I$(top_srcdir)/src/lib-smtp \
 	-I$(top_srcdir)/src/lib-imap \
@@ -64,9 +65,7 @@ cmds = \
 	cmd-thread.c \
 	cmd-unselect.c \
 	cmd-unsubscribe.c \
-	cmd-urlfetch.c \
-	cmd-x-cancel.c \
-	cmd-x-state.c
+	cmd-urlfetch.c
 
 common_sources = \
 	$(cmds) \

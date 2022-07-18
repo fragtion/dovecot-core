@@ -17,16 +17,21 @@ struct lua_dict_txn {
 	} state;
 
 	lua_State *L;
+	const char *username;
 };
 
 static int lua_dict_transaction_rollback(lua_State *L);
 static int lua_dict_transaction_commit(lua_State *L);
 static int lua_dict_set(lua_State *L);
+static int lua_dict_unset(lua_State *L);
+static int lua_dict_set_timestamp(lua_State *L);
 
 static luaL_Reg lua_dict_txn_methods[] = {
 	{ "rollback", lua_dict_transaction_rollback },
 	{ "commit", lua_dict_transaction_commit },
 	{ "set", lua_dict_set },
+	{ "unset", lua_dict_unset },
+	{ "set_timestamp", lua_dict_set_timestamp },
 	{ NULL, NULL },
 };
 
@@ -157,6 +162,7 @@ static int lua_dict_set(lua_State *L)
 	txn = xlua_dict_txn_getptr(L, 1, NULL);
 	key = luaL_checkstring(L, 2);
 	value = luaL_checkstring(L, 3);
+	lua_dict_check_key_prefix(L, key, txn->username);
 
 	dict_set(txn->txn, key, value);
 
@@ -164,11 +170,35 @@ static int lua_dict_set(lua_State *L)
 }
 
 /*
- * Start a dict transaction [-(1|2),+1,e]
+ * Unset key [-2,+0,e]
+ *
+ * Args:
+ *   1) userdata: struct lua_dict_txn *
+ *   2) string: key
+ */
+static int lua_dict_unset(lua_State *L)
+{
+	struct lua_dict_txn *txn;
+	const char *key;
+
+	DLUA_REQUIRE_ARGS(L, 2);
+
+	txn = xlua_dict_txn_getptr(L, 1, NULL);
+	key = luaL_checkstring(L, 2);
+	lua_dict_check_key_prefix(L, key, txn->username);
+
+	dict_unset(txn->txn, key);
+
+	return 0;
+}
+
+/*
+ * Start a dict transaction [-(1|2|3),+1,e]
  *
  * Args:
  *   1) userdata: struct dict *
  *   2*) string: username
+ *   3*) integer: expire_secs
  *
  * Returns:
  *   Returns a new transaction object.
@@ -178,14 +208,17 @@ int lua_dict_transaction_begin(lua_State *L)
 {
 	struct lua_dict_txn *txn;
 	struct dict *dict;
+	lua_Integer expire_secs = 0;
 	const char *username = NULL;
 	pool_t pool;
 
-	DLUA_REQUIRE_ARGS_IN(L, 1, 2);
+	DLUA_REQUIRE_ARGS_IN(L, 1, 3);
 
 	dict = dlua_check_dict(L, 1);
 	if (lua_gettop(L) >= 2)
 		username = luaL_checkstring(L, 2);
+	if (lua_gettop(L) >= 3)
+		expire_secs = luaL_checkinteger(L, 3);
 
 	pool = pool_alloconly_create("lua dict txn", 128);
 	txn = p_new(pool, struct lua_dict_txn, 1);
@@ -193,12 +226,42 @@ int lua_dict_transaction_begin(lua_State *L)
 
 	struct dict_op_settings set = {
 		.username = username,
+		.expire_secs = expire_secs,
 	};
 	txn->txn = dict_transaction_begin(dict, &set);
 	txn->state = STATE_OPEN;
 	txn->L = L;
+	txn->username = p_strdup(txn->pool, username);
 
 	xlua_pushdict_txn(L, txn, FALSE);
 
 	return 1;
+}
+
+/*
+ * Set timestamp to the transaction [-2,+0,e]
+ *
+ * Args:
+ *   1) userdata: struct lua_dict_txn *
+ *   2) PosixTimespec : { tv_sec, tv_nsec }
+ */
+static int lua_dict_set_timestamp(lua_State *L)
+{
+	struct lua_dict_txn *txn;
+	lua_Number tv_sec, tv_nsec;
+
+	DLUA_REQUIRE_ARGS(L, 2);
+
+	txn = xlua_dict_txn_getptr(L, 1, NULL);
+	if (dlua_table_get_number_by_str(L, 2, "tv_sec", &tv_sec) <= 0)
+		luaL_error(L, "tv_sec missing from table");
+	if (dlua_table_get_number_by_str(L, 2, "tv_nsec", &tv_nsec) <= 0)
+		luaL_error(L, "tv_nsec missing from table");
+
+	struct timespec ts = {
+		.tv_sec = tv_sec,
+		.tv_nsec = tv_nsec
+	};
+	dict_transaction_set_timestamp(txn->txn, &ts);
+	return 0;
 }

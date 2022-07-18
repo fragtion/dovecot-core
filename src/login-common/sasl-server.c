@@ -1,6 +1,7 @@
 /* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
 
 #include "login-common.h"
+#include "array.h"
 #include "str.h"
 #include "base64.h"
 #include "buffer.h"
@@ -16,7 +17,7 @@
 #include "master-service.h"
 #include "master-service-ssl-settings.h"
 #include "master-interface.h"
-#include "master-auth.h"
+#include "login-client.h"
 #include "client-common.h"
 
 #include <unistd.h>
@@ -28,7 +29,7 @@
 struct anvil_request {
 	struct client *client;
 	unsigned int auth_pid;
-	unsigned char cookie[MASTER_AUTH_COOKIE_SIZE];
+	unsigned char cookie[LOGIN_REQUEST_COOKIE_SIZE];
 };
 
 static bool
@@ -130,7 +131,7 @@ call_client_callback(struct client *client, enum sasl_server_reply reply,
 }
 
 static void
-master_auth_callback(const struct master_auth_reply *reply, void *context)
+login_callback(const struct login_reply *reply, void *context)
 {
 	struct client *client = context;
 	enum sasl_server_reply sasl_reply = SASL_SERVER_REPLY_MASTER_FAILED;
@@ -140,10 +141,10 @@ master_auth_callback(const struct master_auth_reply *reply, void *context)
 	client->authenticating = FALSE;
 	if (reply != NULL) {
 		switch (reply->status) {
-		case MASTER_AUTH_STATUS_OK:
+		case LOGIN_REPLY_STATUS_OK:
 			sasl_reply = SASL_SERVER_REPLY_SUCCESS;
 			break;
-		case MASTER_AUTH_STATUS_INTERNAL_ERROR:
+		case LOGIN_REPLY_STATUS_INTERNAL_ERROR:
 			sasl_reply = SASL_SERVER_REPLY_MASTER_FAILED;
 			break;
 		}
@@ -157,8 +158,8 @@ master_auth_callback(const struct master_auth_reply *reply, void *context)
 static int master_send_request(struct anvil_request *anvil_request)
 {
 	struct client *client = anvil_request->client;
-	struct master_auth_request_params params;
-	struct master_auth_request req;
+	struct login_client_request_params params;
+	struct login_request req;
 	const unsigned char *data;
 	size_t size;
 	buffer_t *buf;
@@ -179,11 +180,13 @@ static int master_send_request(struct anvil_request *anvil_request)
 	req.client_pid = getpid();
 	if (client->ssl_iostream != NULL &&
 	    ssl_iostream_get_compression(client->ssl_iostream) != NULL)
-		req.flags |= MAIL_AUTH_REQUEST_FLAG_TLS_COMPRESSION;
+		req.flags |= LOGIN_REQUEST_FLAG_TLS_COMPRESSION;
 	if (client->secured)
-		req.flags |= MAIL_AUTH_REQUEST_FLAG_CONN_SECURED;
+		req.flags |= LOGIN_REQUEST_FLAG_CONN_SECURED;
 	if (client->ssl_secured)
-		req.flags |= MAIL_AUTH_REQUEST_FLAG_CONN_SSL_SECURED;
+		req.flags |= LOGIN_REQUEST_FLAG_CONN_SSL_SECURED;
+	if (HAS_ALL_BITS(client->auth_flags, SASL_SERVER_AUTH_FLAG_IMPLICIT))
+		req.flags |= LOGIN_REQUEST_FLAG_IMPLICIT;
 	memcpy(req.cookie, anvil_request->cookie, sizeof(req.cookie));
 
 	buf = t_buffer_create(256);
@@ -205,17 +208,16 @@ static int master_send_request(struct anvil_request *anvil_request)
 	params.socket_path = client->postlogin_socket_path;
 	params.request = req;
 	params.data = buf->data;
-	master_auth_request_full(master_auth, &params, master_auth_callback,
-				 client, &client->master_tag);
+	login_client_request(login_client_list, &params, login_callback,
+			     client, &client->master_tag);
 	if (close_fd)
 		i_close_fd(&fd);
 	return 0;
 }
 
 static void ATTR_NULL(1)
-anvil_lookup_callback(const char *reply, void *context)
+anvil_lookup_callback(const char *reply, struct anvil_request *req)
 {
-	struct anvil_request *req = context;
 	struct client *client = req->client;
 	const struct login_settings *set = client->set;
 	const char *errmsg;
@@ -262,7 +264,7 @@ anvil_check_too_many_connections(struct client *client,
 
 	buffer_create_from_data(&buf, req->cookie, sizeof(req->cookie));
 	cookie = auth_client_request_get_cookie(request);
-	if (strlen(cookie) == MASTER_AUTH_COOKIE_SIZE*2)
+	if (strlen(cookie) == LOGIN_REQUEST_COOKIE_SIZE*2)
 		(void)hex_to_binary(cookie, &buf);
 
 	if (client->virtual_user == NULL ||
@@ -271,12 +273,15 @@ anvil_check_too_many_connections(struct client *client,
 		return;
 	}
 
-	query = t_strconcat("LOOKUP\t", login_binary->protocol, "/",
-			    net_ip2addr(&client->ip), "/",
-			    str_tabescape(client->virtual_user), NULL);
+	query = t_strconcat("LOOKUP\t",
+			    str_tabescape(client->virtual_user), "\t",
+			    login_binary->protocol, "\t",
+			    net_ip2addr(&client->ip), NULL);
 	client->anvil_request = req;
 	client->anvil_query =
-		anvil_client_query(anvil, query, anvil_lookup_callback, req);
+		anvil_client_query(anvil, query,
+				   ANVIL_DEFAULT_LOOKUP_TIMEOUT_MSECS,
+				   anvil_lookup_callback, req);
 }
 
 static bool
@@ -297,18 +302,20 @@ sasl_server_check_login(struct client *client)
 
 static bool args_parse_user(struct client *client, const char *arg)
 {
-	if (str_begins(arg, "user=")) {
+	const char *value;
+
+	if (str_begins(arg, "user=", &value)) {
 		i_free(client->virtual_user);
 		i_free_and_null(client->virtual_user_orig);
 		i_free_and_null(client->virtual_auth_user);
-		client->virtual_user = i_strdup(arg + 5);
+		client->virtual_user = i_strdup(value);
 		event_add_str(client->event, "user", client->virtual_user);
-	} else if (str_begins(arg, "original_user=")) {
+	} else if (str_begins(arg, "original_user=", &value)) {
 		i_free(client->virtual_user_orig);
-		client->virtual_user_orig = i_strdup(arg + 14);
-	} else if (str_begins(arg, "auth_user=")) {
+		client->virtual_user_orig = i_strdup(value);
+	} else if (str_begins(arg, "auth_user=", &value)) {
 		i_free(client->virtual_auth_user);
-		client->virtual_auth_user = i_strdup(arg + 10);
+		client->virtual_auth_user = i_strdup(value);
 	} else {
 		return FALSE;
 	}
@@ -321,6 +328,7 @@ authenticate_callback(struct auth_client_request *request,
 		      const char *const *args, void *context)
 {
 	struct client *client = context;
+	const char *value;
 	unsigned int i;
 	bool nologin;
 
@@ -349,19 +357,19 @@ authenticate_callback(struct auth_client_request *request,
 		for (i = 0; args[i] != NULL; i++) {
 			if (args_parse_user(client, args[i]))
 				;
-			else if (str_begins(args[i], "postlogin_socket=")) {
+			else if (str_begins(args[i], "postlogin_socket=", &value)) {
 				client->postlogin_socket_path =
-					p_strdup(client->pool, args[i] + 17);
+					p_strdup(client->pool, value);
 			} else if (strcmp(args[i], "nologin") == 0 ||
 				   strcmp(args[i], "proxy") == 0) {
 				/* user can't login */
 				nologin = TRUE;
 			} else if (strcmp(args[i], "anonymous") == 0 ) {
 				client->auth_anonymous = TRUE;
-			} else if (str_begins(args[i], "resp=") &&
+			} else if (str_begins(args[i], "resp=", &value) &&
 				   login_binary->sasl_support_final_reply) {
 				client->sasl_final_resp =
-					p_strdup(client->pool, args[i] + 5);
+					p_strdup(client->pool, value);
 			}
 		}
 
@@ -432,14 +440,60 @@ static bool get_cert_username(struct client *client, const char **username_r,
 	return TRUE;
 }
 
-void sasl_server_auth_begin(struct client *client,
-			    const char *service, const char *mech_name,
-			    bool private, const char *initial_resp_base64,
+int sasl_server_auth_request_info_fill(struct client *client,
+				       struct auth_request_info *info_r,
+				       const char **client_error_r)
+{
+	const char *error;
+
+	i_zero(info_r);
+	info_r->service = login_binary->protocol;
+	info_r->session_id = client_get_session_id(client);
+
+	if (!get_cert_username(client, &info_r->cert_username, &error)) {
+		e_error(client->event,
+			"Cannot get username from certificate: %s", error);
+		*client_error_r = "Unable to validate certificate";
+		return -1;
+	}
+
+	if (client->ssl_iostream != NULL) {
+		info_r->cert_username = ssl_iostream_get_peer_name(client->ssl_iostream);
+		info_r->ssl_cipher = ssl_iostream_get_cipher(client->ssl_iostream,
+							 &info_r->ssl_cipher_bits);
+		info_r->ssl_pfs = ssl_iostream_get_pfs(client->ssl_iostream);
+		info_r->ssl_protocol =
+			ssl_iostream_get_protocol_name(client->ssl_iostream);
+	}
+	info_r->flags = client_get_auth_flags(client);
+	info_r->local_ip = client->local_ip;
+	info_r->remote_ip = client->ip;
+	info_r->local_port = client->local_port;
+	info_r->local_name = client->local_name;
+	info_r->remote_port = client->remote_port;
+	info_r->real_local_ip = client->real_local_ip;
+	info_r->real_remote_ip = client->real_remote_ip;
+	info_r->real_local_port = client->real_local_port;
+	info_r->real_remote_port = client->real_remote_port;
+	if (client->client_id != NULL)
+		info_r->client_id = str_c(client->client_id);
+	if (array_is_created(&client->forward_fields)) {
+		array_append_zero(&client->forward_fields);
+		array_pop_back(&client->forward_fields);
+		info_r->forward_fields = array_front(&client->forward_fields);
+	}
+	return 0;
+}
+
+void sasl_server_auth_begin(struct client *client, const char *mech_name,
+			    enum sasl_server_auth_flags flags,
+			    const char *initial_resp_base64,
 			    sasl_server_callback_t *callback)
 {
 	struct auth_request_info info;
 	const struct auth_mech_desc *mech;
-	const char *error;
+	bool private = HAS_ALL_BITS(flags, SASL_SERVER_AUTH_FLAG_PRIVATE);
+	const char *client_error;
 
 	i_assert(auth_client_is_connected(auth_client));
 
@@ -451,6 +505,7 @@ void sasl_server_auth_begin(struct client *client,
 	i_free(client->auth_mech_name);
 	client->auth_mech_name = str_ucase(i_strdup(mech_name));
 	client->auth_anonymous = FALSE;
+	client->auth_flags = flags;
 	client->sasl_callback = callback;
 
 	mech = sasl_server_find_available_mech(client, mech_name);
@@ -472,44 +527,13 @@ void sasl_server_auth_begin(struct client *client,
 		return;
 	}
 
-	i_zero(&info);
-	info.mech = mech->name;
-	info.service = service;
-	info.session_id = client_get_session_id(client);
-
-	if (!get_cert_username(client, &info.cert_username, &error)) {
-		e_error(client->event,
-			"Cannot get username from certificate: %s", error);
-		sasl_server_auth_failed(client,
-			"Unable to validate certificate",
-			AUTH_CLIENT_FAIL_CODE_AUTHZFAILED);
+	if (sasl_server_auth_request_info_fill(client, &info, &client_error) < 0) {
+		sasl_server_auth_failed(client, client_error,
+					AUTH_CLIENT_FAIL_CODE_AUTHZFAILED);
 		return;
 	}
-
-	if (client->ssl_iostream != NULL) {
-		info.cert_username = ssl_iostream_get_peer_name(client->ssl_iostream);
-		info.ssl_cipher = ssl_iostream_get_cipher(client->ssl_iostream,
-							 &info.ssl_cipher_bits);
-		info.ssl_pfs = ssl_iostream_get_pfs(client->ssl_iostream);
-		info.ssl_protocol =
-			ssl_iostream_get_protocol_name(client->ssl_iostream);
-	}
-	info.flags = client_get_auth_flags(client);
-	info.local_ip = client->local_ip;
-	info.remote_ip = client->ip;
-	info.local_port = client->local_port;
-	info.local_name = client->local_name;
-	info.remote_port = client->remote_port;
-	info.real_local_ip = client->real_local_ip;
-	info.real_remote_ip = client->real_remote_ip;
-	info.real_local_port = client->real_local_port;
-	info.real_remote_port = client->real_remote_port;
-	if (client->client_id != NULL)
-		info.client_id = str_c(client->client_id);
-	if (client->forward_fields != NULL)
-		info.forward_fields = str_c(client->forward_fields);
+	info.mech = mech->name;
 	info.initial_resp_base64 = initial_resp_base64;
-
 	client->auth_request =
 		auth_client_request_new(auth_client, &info,
 					authenticate_callback, client);
@@ -559,5 +583,6 @@ void sasl_server_auth_abort(struct client *client)
 		anvil_client_query_abort(anvil, &client->anvil_query);
 		i_free(client->anvil_request);
 	}
-	sasl_server_auth_cancel(client, NULL, NULL, SASL_SERVER_REPLY_AUTH_ABORTED);
+	sasl_server_auth_cancel(client, "Aborted", NULL,
+				SASL_SERVER_REPLY_AUTH_ABORTED);
 }

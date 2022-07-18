@@ -324,7 +324,6 @@ cmd_setmetadata_mailbox(struct imap_setmetadata_context *ctx,
 	else {
 		ctx->box = mailbox_alloc(ns->list, mailbox,
 					 MAILBOX_FLAG_ATTRIBUTE_SESSION);
-		mailbox_set_reason(ctx->box, "SETMETADATA");
 		enum mailbox_existence existence;
 		if (mailbox_exists(ctx->box, TRUE, &existence) < 0) {
 			client_send_box_error(cmd, ctx->box);
@@ -339,7 +338,8 @@ cmd_setmetadata_mailbox(struct imap_setmetadata_context *ctx,
 			return TRUE;
 		}
 	}
-	event_add_str(ctx->cmd->event, "mailbox", mailbox_get_vname(ctx->box));
+	event_add_str(ctx->cmd->global_event, "mailbox",
+		      mailbox_get_vname(ctx->box));
 	ctx->trans = imap_metadata_transaction_begin(ctx->box);
 	return cmd_setmetadata_start(ctx);
 }

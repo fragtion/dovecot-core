@@ -23,7 +23,7 @@
 #include "master-interface.h"
 #include "master-service.h"
 #include "master-service-ssl-settings.h"
-#include "master-auth.h"
+#include "login-client.h"
 #include "anvil-client.h"
 #include "auth-client.h"
 #include "dsasl-client.h"
@@ -170,7 +170,8 @@ struct client *
 client_alloc(int fd, pool_t pool,
 	     const struct master_service_connection *conn,
 	     const struct login_settings *set,
-	     const struct master_service_ssl_settings *ssl_set)
+	     const struct master_service_ssl_settings *ssl_set,
+	     const struct master_service_ssl_server_settings *ssl_server_set)
 {
 	struct client *client;
 
@@ -190,6 +191,7 @@ client_alloc(int fd, pool_t pool,
 	client->preproxy_pool = pool_alloconly_create(MEMPOOL_GROWING"preproxy pool", 256);
 	client->set = set;
 	client->ssl_set = ssl_set;
+	client->ssl_server_set = ssl_server_set;
 	p_array_init(&client->module_contexts, client->pool, 5);
 
 	client->fd = fd;
@@ -202,6 +204,16 @@ client_alloc(int fd, pool_t pool,
 	client->real_remote_ip = conn->real_remote_ip;
 	client->real_remote_port = conn->real_remote_port;
 	client->listener_name = p_strdup(client->pool, conn->name);
+	/* This event must exist before client_is_trusted() is called */
+	client->event = event_create(NULL);
+	event_add_category(client->event, &login_binary->event_category);
+	event_add_str(client->event, "local_ip", net_ip2addr(&conn->local_ip));
+	event_add_int(client->event, "local_port", conn->local_port);
+	event_add_str(client->event, "remote_ip", net_ip2addr(&conn->remote_ip));
+	event_add_int(client->event, "remote_port", conn->remote_port);
+	event_add_str(client->event, "service", login_binary->protocol);
+	event_set_log_message_callback(client->event, client_log_msg_callback,
+				       client);
 	client->trusted = client_is_trusted(client);
 
 	if (conn->proxied) {
@@ -216,14 +228,6 @@ client_alloc(int fd, pool_t pool,
 	}
 	client->proxy_ttl = LOGIN_PROXY_TTL;
 
-	client->event = event_create(NULL);
-	event_add_category(client->event, &login_binary->event_category);
-	event_add_str(client->event, "local_ip", net_ip2addr(&conn->local_ip));
-	event_add_int(client->event, "local_port", conn->local_port);
-	event_add_str(client->event, "remote_ip", net_ip2addr(&conn->remote_ip));
-	event_add_int(client->event, "remote_port", conn->remote_port);
-	event_set_log_message_callback(client->event, client_log_msg_callback,
-				       client);
 
 	client_open_streams(client);
 	return client;
@@ -280,12 +284,21 @@ void client_disconnect(struct client *client, const char *reason,
 	if (client->output != NULL)
 		o_stream_uncork(client->output);
 	if (!client->login_success) {
+		bool unref = FALSE;
+
 		io_remove(&client->io);
 		ssl_iostream_destroy(&client->ssl_iostream);
-		iostream_proxy_unref(&client->iostream_fd_proxy);
+		if (client->iostream_fd_proxy != NULL) {
+			iostream_proxy_unref(&client->iostream_fd_proxy);
+			unref = TRUE;
+		}
 		i_stream_close(client->input);
 		o_stream_close(client->output);
 		i_close_fd(&client->fd);
+		if (unref) {
+			i_assert(client->refcount > 1);
+			client_unref(&client);
+		}
 	} else {
 		/* Login was successful. We may now be proxying the connection,
 		   so don't disconnect the client until client_unref(). */
@@ -322,13 +335,16 @@ void client_destroy(struct client *client, const char *reason)
 	client_disconnect(client, reason, !client->login_success);
 
 	pool_unref(&client->preproxy_pool);
+	i_zero(&client->forward_fields);
+	client->client_id = NULL;
 
 	if (client->master_tag != 0) {
 		i_assert(client->auth_request == NULL);
 		i_assert(client->authenticating);
 		i_assert(client->refcount > 1);
 		client->authenticating = FALSE;
-		master_auth_request_abort(master_auth, client->master_tag);
+		login_client_request_abort(login_client_list,
+					   client->master_tag);
 		client->refcount--;
 	} else if (client->auth_request != NULL ||
 		   client->anvil_query != NULL) {
@@ -338,6 +354,14 @@ void client_destroy(struct client *client, const char *reason)
 	i_assert(!client->authenticating);
 	i_assert(client->auth_request == NULL);
 	i_assert(client->anvil_query == NULL);
+
+	if (client->reauth_request != NULL) {
+		struct auth_client_request *reauth_request =
+			client->reauth_request;
+		auth_client_request_abort(&reauth_request, "Aborted");
+		/* callback sets this to NULL */
+		i_assert(client->reauth_request == NULL);
+	}
 
 	timeout_remove(&client->to_disconnect);
 	timeout_remove(&client->to_auth_waiting);
@@ -349,8 +373,7 @@ void client_destroy(struct client *client, const char *reason)
 		i_free_and_null(client->proxy_password);
 	}
 
-	if (client->proxy_sasl_client != NULL)
-		dsasl_client_free(&client->proxy_sasl_client);
+	dsasl_client_free(&client->proxy_sasl_client);
 	if (client->login_proxy != NULL)
 		login_proxy_free(&client->login_proxy);
 	if (client->v.destroy != NULL)
@@ -514,11 +537,11 @@ static int client_sni_callback(const char *name, const char **error_r,
 	client->local_name = p_strdup(client->pool, name);
 	client->set = login_settings_read(client->pool, &client->local_ip,
 					  &client->ip, name,
-					  &client->ssl_set, &other_sets);
+					  &client->ssl_set,
+					  &client->ssl_server_set, &other_sets);
 
-	master_service_ssl_settings_to_iostream_set(client->ssl_set,
-		pool_datastack_create(),
-		MASTER_SERVICE_SSL_SETTINGS_TYPE_SERVER, &ssl_set);
+	master_service_ssl_server_settings_to_iostream_set(client->ssl_set,
+		client->ssl_server_set, pool_datastack_create(), &ssl_set);
 	if (ssl_iostream_server_context_cache_get(&ssl_set, &ssl_ctx, &error) < 0) {
 		*error_r = t_strdup_printf(
 			"Failed to initialize SSL server context: %s", error);
@@ -542,9 +565,8 @@ int client_init_ssl(struct client *client)
 		return -1;
 	}
 
-	master_service_ssl_settings_to_iostream_set(client->ssl_set,
-		pool_datastack_create(),
-		MASTER_SERVICE_SSL_SETTINGS_TYPE_SERVER, &ssl_set);
+	master_service_ssl_server_settings_to_iostream_set(client->ssl_set,
+		client->ssl_server_set, pool_datastack_create(), &ssl_set);
 	/* If the client cert is invalid, we'll reply NO to the login
 	   command. */
 	ssl_set.allow_invalid_cert = TRUE;
@@ -553,7 +575,7 @@ int client_init_ssl(struct client *client)
 			"Failed to initialize SSL server context: %s", error);
 		return -1;
 	}
-	if (io_stream_create_ssl_server(ssl_ctx, &ssl_set,
+	if (io_stream_create_ssl_server(ssl_ctx, &ssl_set, client->event,
 					&client->input, &client->output,
 					&client->ssl_iostream, &error) < 0) {
 		e_error(client->event,
@@ -717,14 +739,29 @@ struct client *clients_get_first_fd_proxy(void)
 void client_add_forward_field(struct client *client, const char *key,
 			      const char *value)
 {
-	if (client->forward_fields == NULL)
-		client->forward_fields = str_new(client->preproxy_pool, 32);
-	else
-		str_append_c(client->forward_fields, '\t');
+	if (!array_is_created(&client->forward_fields))
+		p_array_init(&client->forward_fields, client->preproxy_pool, 8);
 	/* prefixing is done by auth process */
-	str_append_tabescaped(client->forward_fields, key);
-	str_append_c(client->forward_fields, '=');
-	str_append_tabescaped(client->forward_fields, value);
+	const char *entry =
+		p_strdup_printf(client->preproxy_pool, "%s=%s", key, value);
+	array_push_back(&client->forward_fields, &entry);
+}
+
+bool client_forward_decode_base64(struct client *client, const char *value)
+{
+	size_t value_len = strlen(value);
+	string_t *str = t_str_new(MAX_BASE64_DECODED_SIZE(value_len));
+	if (base64_decode(value, value_len, str) < 0)
+		return FALSE;
+
+	char **_fields = p_strsplit_tabescaped(client->preproxy_pool,
+					       str_c(str));
+	const char *const *fields = (const char *const *)_fields;
+	unsigned int fields_count = str_array_length(fields);
+	p_array_init(&client->forward_fields,
+		     client->preproxy_pool, fields_count);
+	array_append(&client->forward_fields, fields, fields_count);
+	return TRUE;
 }
 
 const char *client_get_session_id(struct client *client)
@@ -758,6 +795,10 @@ const char *client_get_session_id(struct client *client)
 	client->session_id = p_strdup(client->pool, str_c(base64_buf));
 	return client->session_id;
 }
+
+/* increment index if new proper login variables are added
+ * make sure the aliases stay in the current order */
+#define VAR_EXPAND_ALIAS_INDEX_START 27
 
 static struct var_expand_table login_var_expand_empty_tab[] = {
 	{ 'u', NULL, "user" },
@@ -832,20 +873,25 @@ get_var_expand_table(struct client *client)
 		get_var_expand_users(tab, client->virtual_user);
 	tab[3].value = login_binary->protocol;
 	tab[4].value = getenv("HOME");
-	tab[27].value = tab[5].value = net_ip2addr(&client->local_ip);
-	tab[28].value = tab[6].value = net_ip2addr(&client->ip);
+	tab[VAR_EXPAND_ALIAS_INDEX_START].value = tab[5].value =
+		net_ip2addr(&client->local_ip);
+	tab[VAR_EXPAND_ALIAS_INDEX_START + 1].value = tab[6].value =
+		net_ip2addr(&client->ip);
 	tab[7].value = my_pid;
-	tab[35].value = tab[8].value = client->auth_mech_name == NULL ? NULL :
-		str_sanitize(client->auth_mech_name, MAX_MECH_NAME);
-	tab[29].value = tab[9].value = dec2str(client->local_port);
-	tab[30].value = tab[10].value = dec2str(client->remote_port);
+	tab[VAR_EXPAND_ALIAS_INDEX_START + 8].value = tab[8].value =
+		client->auth_mech_name == NULL ? NULL :
+			str_sanitize(client->auth_mech_name, MAX_MECH_NAME);
+	tab[VAR_EXPAND_ALIAS_INDEX_START + 2].value = tab[9].value =
+		dec2str(client->local_port);
+	tab[VAR_EXPAND_ALIAS_INDEX_START + 3].value = tab[10].value =
+		dec2str(client->remote_port);
 	if (!client->tls) {
 		tab[11].value = client->secured ? "secured" : NULL;
 		tab[12].value = "";
 	} else if (client->proxied_ssl) {
 		tab[11].value = "TLS";
 		tab[12].value = "(proxied)";
-	} else {
+	} else if (client->ssl_iostream != NULL) {
 		const char *ssl_state =
 			ssl_iostream_is_handshaked(client->ssl_iostream) ?
 			"TLS" : "TLS handshaking";
@@ -856,20 +902,27 @@ get_var_expand_table(struct client *client)
 			t_strdup_printf("%s: %s", ssl_state, ssl_error);
 		tab[12].value =
 			ssl_iostream_get_security_string(client->ssl_iostream);
+	} else {
+		tab[11].value = "TLS";
+		tab[12].value = "";
 	}
 	tab[13].value = client->mail_pid == 0 ? "" :
 		dec2str(client->mail_pid);
 	tab[14].value = client_get_session_id(client);
-	tab[31].value = tab[15].value = net_ip2addr(&client->real_local_ip);
-	tab[32].value = tab[16].value = net_ip2addr(&client->real_remote_ip);
-	tab[33].value = tab[17].value = dec2str(client->real_local_port);
-	tab[34].value = tab[18].value = dec2str(client->real_remote_port);
+	tab[VAR_EXPAND_ALIAS_INDEX_START + 4].value = tab[15].value =
+		net_ip2addr(&client->real_local_ip);
+	tab[VAR_EXPAND_ALIAS_INDEX_START + 5].value = tab[16].value =
+		net_ip2addr(&client->real_remote_ip);
+	tab[VAR_EXPAND_ALIAS_INDEX_START + 6].value = tab[17].value =
+		dec2str(client->real_local_port);
+	tab[VAR_EXPAND_ALIAS_INDEX_START + 7].value = tab[18].value =
+		dec2str(client->real_remote_port);
 	if (client->virtual_user_orig != NULL)
 		get_var_expand_users(tab+19, client->virtual_user_orig);
 	else {
-		tab[36].value = tab[19].value = tab[0].value;
-		tab[37].value = tab[20].value = tab[1].value;
-		tab[38].value = tab[21].value = tab[2].value;
+		tab[VAR_EXPAND_ALIAS_INDEX_START + 9].value = tab[19].value = tab[0].value;
+		tab[VAR_EXPAND_ALIAS_INDEX_START + 10].value = tab[20].value = tab[1].value;
+		tab[VAR_EXPAND_ALIAS_INDEX_START + 11].value = tab[21].value = tab[2].value;
 	}
 	if (client->virtual_auth_user != NULL)
 		get_var_expand_users(tab+22, client->virtual_auth_user);
@@ -1048,6 +1101,8 @@ const char *client_get_extra_disconnect_reason(struct client *client)
 	if (client->auth_process_comm_fail)
 		return "(auth process communication failure)";
 
+	if (client->auth_nologin_referral)
+		return "(auth referral)";
 	if (client->proxy_auth_failed)
 		return "(proxy dest auth failed)";
 	if (client->auth_successes > 0) {

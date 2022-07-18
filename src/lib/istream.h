@@ -60,6 +60,8 @@ i_stream_create_copy_from_data(const void *data, size_t size);
 	i_stream_create_copy_from_data((buf)->data, (buf)->used)
 #define i_stream_create_copy_from_string(str) \
 	i_stream_create_copy_from_data(str_data(str), str_len(str))
+/* Create a no-operation wrapper to allow input to be used as child stream. */
+struct istream *i_stream_create_noop(struct istream *input);
 struct istream *i_stream_create_limit(struct istream *input, uoff_t v_size);
 struct istream *i_stream_create_range(struct istream *input,
 				      uoff_t v_offset, uoff_t v_size);
@@ -101,6 +103,9 @@ int i_stream_get_fd(struct istream *stream);
    The readable_fd is preserved. Assert-crashes if source doesn't have a
    file descriptor. */
 void i_stream_copy_fd(struct istream *dest, struct istream *source);
+/* Set error for istream. */
+void i_stream_set_error(struct istream *stream, int stream_errno,
+			const char *fmt, ...) ATTR_FORMAT(3, 4);
 /* Returns error string for the last error. It also returns "EOF" in case there
    is no error, but eof is set. Otherwise it returns "<no error>". */
 const char *i_stream_get_error(struct istream *stream);
@@ -228,6 +233,14 @@ i_stream_read_more(struct istream *stream, const unsigned char **data_r,
 	i_assert(ret != -2); /* stream must have space for at least 1 byte */
 	return ret;
 }
+/* Like i_stream_read_more(), but tries to avoid buffering more than the
+   indicated limit. Use this function to prevent growing the stream buffer
+   beyond what the application is willing to read immediately. Since this
+   function doesn't fully prevent buffering beyond the limit, the amount of data
+   actually buffered can exceed the limit. However, *size_r will allways be <=
+   limit to avoid confusion. */
+int i_stream_read_limited(struct istream *stream, const unsigned char **data_r,
+			  size_t *size_r, size_t limit);
 /* Return the timestamp when istream last successfully read something.
    The timestamp is 0 if nothing has ever been read. */
 void i_stream_get_last_read_time(struct istream *stream, struct timeval *tv_r);

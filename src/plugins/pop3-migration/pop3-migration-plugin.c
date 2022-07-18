@@ -181,7 +181,8 @@ pop3_header_filter_callback(struct header_filter_istream *input ATTR_UNUSED,
 		if (ctx->stop)
 			*matched = TRUE;
 	} else {
-		if (strspn(hdr->name, "\r") == hdr->name_len) {
+		if (hdr->value_len > 0 && hdr->middle_len == 0 && hdr->name_len == 0 &&
+		    i_memspn(hdr->value, hdr->value_len, "\r", 1U) == hdr->value_len) {
 			/* CR+CR+LF - some servers stop the header processing
 			 here while others don't. To make sure they can be
 			 matched correctly we want to stop here entirely. */
@@ -348,7 +349,6 @@ static struct mailbox *pop3_mailbox_alloc(struct mail_storage *storage)
 	i_assert(ns != NULL);
 	box = mailbox_alloc(ns->list, mstorage->pop3_box_vname,
 			    MAILBOX_FLAG_READONLY | MAILBOX_FLAG_POP3_SESSION);
-	mailbox_set_reason(box, "pop3_migration");
 	return box;
 }
 
@@ -865,12 +865,20 @@ static int pop3_migration_uidl_sync(struct mailbox *box)
 static int pop3_migration_uidl_sync_if_needed(struct mailbox *box)
 {
 	struct pop3_migration_mailbox *mbox = POP3_MIGRATION_CONTEXT_REQUIRE(box);
+	int ret = 0;
 
 	if (mbox->uidl_synced)
 		return 0;
 
-	if (mbox->uidl_sync_failed ||
-	    pop3_migration_uidl_sync(box) < 0) {
+	if (mbox->uidl_sync_failed)
+		ret = -1;
+	else {
+		struct event_reason *reason =
+			event_reason_begin("pop3_migration:uidl_sync");
+		ret = pop3_migration_uidl_sync(box);
+		event_reason_end(&reason);
+	}
+	if (ret < 0) {
 		mbox->uidl_sync_failed = TRUE;
 		mail_storage_set_error(box->storage, MAIL_ERROR_TEMP,
 				       "POP3 UIDLs couldn't be synced");

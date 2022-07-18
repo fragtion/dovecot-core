@@ -87,10 +87,10 @@ struct index_mail_data {
 	const char *from_envelope, *body_snippet;
 	struct message_part_envelope *envelope_data;
 
-	uint32_t seq;
 	uint32_t cache_flags;
 	uint64_t modseq, pvt_modseq;
 	enum index_mail_access_part access_part;
+	const char *access_reason_code;
 	/* dont_cache_fields overrides cache_fields */
 	enum mail_fetch_field cache_fetch_fields, dont_cache_fetch_fields;
 	unsigned int dont_cache_field_idx;
@@ -131,6 +131,7 @@ struct index_mail_data {
 	bool destroy_callback_set:1;
 	bool prefetch_sent:1;
 	bool header_parser_initialized:1;
+	bool attachment_flags_updating:1;
 	/* virtual_size and physical_size may not match the stream size.
 	   Try to avoid trusting them too much. */
 	bool inexact_total_sizes:1;
@@ -198,12 +199,14 @@ int index_mail_parse_headers(struct index_mail *mail,
 			     struct mailbox_header_lookup_ctx *headers,
 			     const char *reason)
 	ATTR_NULL(2);
+void index_mail_parse_header_deinit(struct index_mail *mail);
 /* Same as index_mail_parse_headers(), but assume that the stream is
    already opened. */
 int index_mail_parse_headers_internal(struct index_mail *mail,
 				      struct mailbox_header_lookup_ctx *headers)
 	ATTR_NULL(2);
 int index_mail_headers_get_envelope(struct index_mail *mail);
+void index_mail_parts_reset(struct index_mail *mail);
 
 int index_mail_get_first_header(struct mail *_mail, const char *field,
 				bool decode_to_utf8, const char **value_r);

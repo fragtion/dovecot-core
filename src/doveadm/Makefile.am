@@ -13,9 +13,11 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-auth \
 	-I$(top_srcdir)/src/lib-compression \
 	-I$(top_srcdir)/src/lib-dict \
+	-I$(top_srcdir)/src/lib-doveadm \
 	-I$(top_srcdir)/src/lib-fs \
 	-I$(top_srcdir)/src/lib-ssl-iostream \
 	-I$(top_srcdir)/src/lib-master \
+	-I$(top_srcdir)/src/lib-login \
 	-I$(top_srcdir)/src/lib-mail \
 	-I$(top_srcdir)/src/lib-imap \
 	-I$(top_srcdir)/src/lib-index \
@@ -24,6 +26,7 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-http \
 	-I$(top_srcdir)/src/lib-dcrypt \
 	-I$(top_srcdir)/src/auth \
+	-I$(top_srcdir)/src/stats \
 	-DMODULEDIR=\""$(moduledir)"\" \
 	-DAUTH_MODULE_DIR=\""$(moduledir)/auth"\" \
 	-DDOVEADM_MODULEDIR=\""$(doveadm_moduledir)"\" \
@@ -75,13 +78,13 @@ doveadm_common_cmds = \
 	doveadm-dict.c \
 	doveadm-director.c \
 	doveadm-fs.c \
+	doveadm-indexer.c \
 	doveadm-instance.c \
 	doveadm-kick.c \
 	doveadm-log.c \
 	doveadm-master.c \
 	doveadm-mutf7.c \
 	doveadm-penalty.c \
-	doveadm-proxy.c \
 	doveadm-replicator.c \
 	doveadm-sis.c \
 	doveadm-stats.c \
@@ -92,7 +95,6 @@ doveadm_common_mail_cmds = \
 	doveadm-dsync.c \
 	doveadm-mail.c \
 	doveadm-mail-altmove.c \
-	doveadm-mail-batch.c \
 	doveadm-mail-deduplicate.c \
 	doveadm-mail-expunge.c \
 	doveadm-mail-fetch.c \
@@ -130,10 +132,10 @@ common = \
 	$(doveadm_common_mail_cmds) \
 	$(doveadm_common_dump_cmds) \
 	doveadm-cmd.c \
+	doveadm-cmd-parse.c \
 	doveadm-print.c \
 	doveadm-settings.c \
 	doveadm-util.c \
-	server-connection.c \
 	doveadm-print-formatted.c
 
 doveadm_SOURCES = \
@@ -160,6 +162,7 @@ pkginc_libdir = $(pkgincludedir)
 pkginc_lib_HEADERS = \
 	doveadm.h \
 	doveadm-cmd.h \
+	doveadm-cmd-parse.h \
 	doveadm-dsync.h \
 	doveadm-dump.h \
 	doveadm-mail.h \
@@ -173,15 +176,10 @@ pkginc_lib_HEADERS = \
 noinst_HEADERS = \
 	client-connection.h \
 	client-connection-private.h \
-	server-connection.h \
-	doveadm-server.h \
 	doveadm-who.h
 
-install-exec-local:
-	rm -f $(DESTDIR)$(bindir)/dsync
-	$(LN_S) doveadm $(DESTDIR)$(bindir)/dsync
-
 test_programs = \
+	test-doveadm-cmd \
 	test-doveadm-util
 noinst_PROGRAMS = $(test_programs)
 
@@ -189,6 +187,10 @@ test_libs = \
 	../lib-test/libtest.la \
 	../lib/liblib.la
 test_deps = $(noinst_LTLIBRARIES) $(test_libs)
+
+test_doveadm_cmd_SOURCES = doveadm-cmd-parse.c test-doveadm-cmd-parse.c
+test_doveadm_cmd_LDADD = $(test_libs) $(MODULE_LIBS)
+test_doveadm_cmd_DEPENDENCIES = $(test_deps)
 
 test_doveadm_util_SOURCES = doveadm-util.c test-doveadm-util.c
 test_doveadm_util_LDADD = $(test_libs) $(MODULE_LIBS)

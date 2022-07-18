@@ -6,6 +6,7 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-settings \
 	-I$(top_srcdir)/src/lib-master \
 	-I$(top_srcdir)/src/lib-sasl \
+	-I$(top_srcdir)/src/lib-auth \
 	-I$(top_srcdir)/src/lib-ssl-iostream \
 	-I$(top_srcdir)/src/lib-dns \
 	-I$(top_srcdir)/src/lib-program-client \
@@ -46,7 +47,8 @@ libsmtp_la_SOURCES = \
 	smtp-server-connection.c \
 	smtp-server.c \
 	smtp-submit-settings.c \
-	smtp-submit.c
+	smtp-submit.c \
+	smtp-dovecot.c
 
 headers = \
 	smtp-parser.h \
@@ -66,7 +68,8 @@ headers = \
 	smtp-server-private.h \
 	smtp-server.h \
 	smtp-submit-settings.h \
-	smtp-submit.h
+	smtp-submit.h \
+	smtp-dovecot.h
 
 pkginc_libdir=$(pkgincludedir)
 pkginc_lib_HEADERS = $(headers)
@@ -126,10 +129,7 @@ test_deps = \
 	../lib-test/libtest.la \
 	../lib/liblib.la
 
-test_libs_ssl=
-if BUILD_OPENSSL
-test_libs_ssl += ../lib-ssl-iostream/libssl_iostream_openssl.la
-endif
+test_libs_ssl = ../lib-ssl-iostream/libssl_iostream_openssl.la
 
 test_smtp_syntax_SOURCES = test-smtp-syntax.c
 test_smtp_syntax_LDADD = $(test_libs)

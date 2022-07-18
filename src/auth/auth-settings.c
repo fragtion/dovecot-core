@@ -91,7 +91,7 @@ struct service_settings auth_worker_service_settings = {
 	.drop_priv_before_exec = FALSE,
 
 	.process_min_avail = 0,
-	.process_limit = 0,
+	.process_limit = 30,
 	.client_limit = 1,
 	.service_count = 0,
 	.idle_kill = 0,
@@ -228,7 +228,7 @@ const struct setting_parser_info auth_userdb_setting_parser_info = {
 static const struct setting_define auth_setting_defines[] = {
 	DEF(STR, mechanisms),
 	DEF(STR, realms),
-	DEF(STR, default_realm),
+	DEF(STR, default_domain),
 	DEF(SIZE, cache_size),
 	DEF(TIME, cache_ttl),
 	DEF(TIME, cache_negative_ttl),
@@ -257,16 +257,14 @@ static const struct setting_define auth_setting_defines[] = {
 	DEF(BOOL, policy_log_only),
 	DEF(UINT, policy_hash_truncate),
 
-	DEF(BOOL, stats),
 	DEF(BOOL, verbose),
 	DEF(BOOL, debug),
 	DEF(BOOL, debug_passwords),
+	DEF(BOOL, allow_weak_schemes),
 	DEF(STR, verbose_passwords),
 	DEF(BOOL, ssl_require_client_cert),
 	DEF(BOOL, ssl_username_from_cert),
 	DEF(BOOL, use_winbind),
-
-	DEF(UINT, worker_max_count),
 
 	DEFLIST(passdbs, "passdb", &auth_passdb_setting_parser_info),
 	DEFLIST(userdbs, "userdb", &auth_userdb_setting_parser_info),
@@ -287,7 +285,7 @@ static const struct setting_define auth_setting_defines[] = {
 static const struct auth_settings auth_default_settings = {
 	.mechanisms = "plain",
 	.realms = "",
-	.default_realm = "",
+	.default_domain = "",
 	.cache_size = 0,
 	.cache_ttl = 60*60,
 	.cache_negative_ttl = 60*60,
@@ -316,10 +314,10 @@ static const struct auth_settings auth_default_settings = {
 	.policy_log_only = FALSE,
 	.policy_hash_truncate = 12,
 
-	.stats = FALSE,
 	.verbose = FALSE,
 	.debug = FALSE,
 	.debug_passwords = FALSE,
+	.allow_weak_schemes = FALSE,
 	.verbose_passwords = "no",
 	.ssl_require_client_cert = FALSE,
 	.ssl_username_from_cert = FALSE,
@@ -327,8 +325,6 @@ static const struct auth_settings auth_default_settings = {
 	.ssl_client_ca_file = "",
 
 	.use_winbind = FALSE,
-
-	.worker_max_count = 30,
 
 	.passdbs = ARRAY_INIT,
 	.userdbs = ARRAY_INIT,
@@ -429,11 +425,6 @@ static bool auth_settings_check(void *_set, pool_t pool,
 	if (set->debug)
 		set->verbose = TRUE;
 
-	if (set->worker_max_count == 0) {
-		*error_r = "auth_worker_max_count must be above zero";
-		return FALSE;
-	}
-
 	if (set->cache_size > 0 && set->cache_size < 1024) {
 		/* probably a configuration error.
 		   older versions used megabyte numbers */
@@ -528,7 +519,7 @@ auth_settings_read(const char *service, pool_t pool,
 		&auth_setting_parser_info,
 		NULL
 	};
- 	struct master_service_settings_input input;
+	struct master_service_settings_input input;
 	struct setting_parser_context *set_parser;
 	const char *error;
 	void **sets;

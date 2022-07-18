@@ -69,7 +69,7 @@ HASH_TABLE_DEFINE_TYPE(setting_link, struct setting_link *,
 		       struct setting_link *);
 
 static void
-setting_parser_copy_defaults(struct setting_parser_context *ctx, 
+setting_parser_copy_defaults(struct setting_parser_context *ctx,
 			     const struct setting_parser_info *info,
 			     struct setting_link *link);
 static int
@@ -85,7 +85,7 @@ settings_parser_init(pool_t set_pool, const struct setting_parser_info *root,
 }
 
 static void
-copy_unique_defaults(struct setting_parser_context *ctx, 
+copy_unique_defaults(struct setting_parser_context *ctx,
 		     const struct setting_define *def,
 		     struct setting_link *link)
 {
@@ -149,7 +149,7 @@ copy_unique_defaults(struct setting_parser_context *ctx,
 }
 
 static void
-setting_parser_copy_defaults(struct setting_parser_context *ctx, 
+setting_parser_copy_defaults(struct setting_parser_context *ctx,
 			     const struct setting_parser_info *info,
 			     struct setting_link *link)
 {
@@ -299,8 +299,8 @@ setting_define_find(const struct setting_parser_info *info, const char *key)
 	return NULL;
 }
 
-static int
-get_bool(struct setting_parser_context *ctx, const char *value, bool *result_r)
+int settings_get_bool(const char *value, bool *result_r,
+		      const char **error_r)
 {
 	/* FIXME: eventually we'd want to support only yes/no */
 	if (strcasecmp(value, "yes") == 0 ||
@@ -309,12 +309,21 @@ get_bool(struct setting_parser_context *ctx, const char *value, bool *result_r)
 	else if (strcasecmp(value, "no") == 0)
 		*result_r = FALSE;
 	else {
-		ctx->error = p_strdup_printf(ctx->parser_pool,
-			"Invalid boolean value: %s (use yes or no)", value);
+		*error_r = t_strdup_printf("Invalid boolean value: %s (use yes or no)",
+					   value);
 		return -1;
 	}
 
 	return 0;
+}
+
+static int
+get_bool(struct setting_parser_context *ctx, const char *value, bool *result_r)
+{
+	int ret;
+	if ((ret = settings_get_bool(value, result_r, &ctx->error)) < 0)
+		ctx->error = p_strdup(ctx->parser_pool, ctx->error);
+	return ret;
 }
 
 static int
@@ -367,19 +376,19 @@ static int settings_get_time_full(const char *str, unsigned int *interval_r,
 	switch (i_toupper(*p)) {
 	case 'S':
 		multiply *= 1;
-		if (strncasecmp(p, "secs", strlen(p)) == 0 ||
-		    strncasecmp(p, "seconds", strlen(p)) == 0)
+		if (str_begins_icase_with("secs", p) ||
+		    str_begins_icase_with("seconds", p))
 			p = "";
 		break;
 	case 'M':
 		multiply *= 60;
-		if (strncasecmp(p, "mins", strlen(p)) == 0 ||
-		    strncasecmp(p, "minutes", strlen(p)) == 0)
+		if (str_begins_icase_with("mins", p) ||
+		    str_begins_icase_with("minutes", p))
 			p = "";
-		else if (strncasecmp(p, "msecs", strlen(p)) == 0 ||
-			 strncasecmp(p, "mseconds", strlen(p)) == 0 ||
-			 strncasecmp(p, "millisecs", strlen(p)) == 0 ||
-			 strncasecmp(p, "milliseconds", strlen(p)) == 0) {
+		else if (str_begins_icase_with("msecs", p) ||
+			 str_begins_icase_with("mseconds", p) ||
+			 str_begins_icase_with("millisecs", p) ||
+			 str_begins_icase_with("milliseconds", p)) {
 			if (milliseconds || (num % 1000) == 0) {
 				if (!milliseconds) {
 					/* allow ms also for seconds, as long
@@ -397,17 +406,17 @@ static int settings_get_time_full(const char *str, unsigned int *interval_r,
 		break;
 	case 'H':
 		multiply *= 60*60;
-		if (strncasecmp(p, "hours", strlen(p)) == 0)
+		if (str_begins_icase_with("hours", p))
 			p = "";
 		break;
 	case 'D':
 		multiply *= 60*60*24;
-		if (strncasecmp(p, "days", strlen(p)) == 0)
+		if (str_begins_icase_with("days", p))
 			p = "";
 		break;
 	case 'W':
 		multiply *= 60*60*24*7;
-		if (strncasecmp(p, "weeks", strlen(p)) == 0)
+		if (str_begins_icase_with("weeks", p))
 			p = "";
 		break;
 	}
@@ -718,7 +727,6 @@ settings_parse(struct setting_parser_context *ctx, struct setting_link *link,
 	}
 	case SET_ALIAS:
 		i_unreached();
-		break;
 	}
 
 	if (change_ptr != NULL)
@@ -982,8 +990,8 @@ int settings_parse_stream(struct setting_parser_context *ctx,
 			return 0;
 		}
 		ctx->linenum++;
-		if (ctx->linenum == 1 && str_begins(line, "ERROR ")) {
-			ctx->error = p_strdup(ctx->parser_pool, line + 6);
+		if (ctx->linenum == 1 && str_begins(line, "ERROR ", &line)) {
+			ctx->error = p_strdup(ctx->parser_pool, line);
 			return -1;
 		}
 
@@ -2222,5 +2230,17 @@ const char *settings_section_escape(const char *name)
 		}
 	}
 	return str_c(str);
+}
+
+static bool config_binary = FALSE;
+
+bool is_config_binary(void)
+{
+	return config_binary;
+}
+
+void set_config_binary(bool value)
+{
+	config_binary = value;
 }
 

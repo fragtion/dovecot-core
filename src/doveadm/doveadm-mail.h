@@ -16,8 +16,6 @@ struct mail_user;
 struct doveadm_mail_cmd_context;
 
 struct doveadm_mail_cmd_vfuncs {
-	/* Parse one getopt() parameter. This is called for each parameter. */
-	bool (*parse_arg)(struct doveadm_mail_cmd_context *ctx, int c);
 	/* Usually not needed. The preinit() is called just after parsing all
 	   parameters, but before any userdb lookups are done. This allows the
 	   preinit() to alter the userdb lookup behavior (especially
@@ -28,8 +26,7 @@ struct doveadm_mail_cmd_vfuncs {
 	   do any actual work. The init() is called also when doveadm is
 	   performing the work via doveadm-server, which could be running
 	   remotely with completely different Dovecot configuration. */
-	void (*init)(struct doveadm_mail_cmd_context *ctx,
-		     const char *const args[]);
+	void (*init)(struct doveadm_mail_cmd_context *ctx);
 	/* Usually not needed. When iterating through multiple users, use this
 	   function to get the next username. Overriding this is usually done
 	   only when there's a known username filter, such as the expire
@@ -64,11 +61,6 @@ struct doveadm_mail_cmd_context {
 	pool_t pool;
 	struct doveadm_cmd_context *cctx;
 	const struct doveadm_mail_cmd *cmd;
-	const char *const *args;
-	/* args including -options */
-	const char *const *full_args;
-
-	const char *getopt_args;
 	const struct doveadm_settings *set;
 	enum mail_storage_service_flags service_flags;
 	enum mailbox_transaction_flags transaction_flags;
@@ -77,6 +69,12 @@ struct doveadm_mail_cmd_context {
 	/* search args aren't set for all mail commands */
 	struct mail_search_args *search_args;
 	struct istream *users_list_input;
+	int proxy_ttl;
+	/* forward_fields sent by the connecting doveadm proxy. */
+	ARRAY_TYPE(const_string) proxy_forward_fields;
+	/* forward_fields set by the last passdb lookup. These will be sent to
+	   outgoing proxy connections. */
+	ARRAY_TYPE(const_string) auth_proxy_forward_fields;
 
 	struct mail_storage_service_user *cur_service_user;
 	struct mail_user *cur_mail_user;
@@ -111,7 +109,6 @@ extern struct doveadm_mail_cmd_module_register doveadm_mail_cmd_module_register;
 extern char doveadm_mail_cmd_hide;
 
 bool doveadm_is_killed(void);
-int doveadm_killed_signo(void);
 
 void doveadm_mail_help(const struct doveadm_mail_cmd *cmd) ATTR_NORETURN;
 void doveadm_mail_help_name(const char *cmd_name) ATTR_NORETURN;
@@ -124,21 +121,25 @@ void doveadm_mail_deinit(void);
 struct doveadm_mail_cmd_context *
 doveadm_mail_cmd_init(const struct doveadm_mail_cmd *cmd,
 		      const struct doveadm_settings *set);
+void doveadm_mail_cmd_deinit(struct doveadm_mail_cmd_context *ctx);
+void doveadm_mail_cmd_free(struct doveadm_mail_cmd_context *ctx);
 int doveadm_mail_single_user(struct doveadm_mail_cmd_context *ctx,
 			     const char **error_r);
 int doveadm_mail_server_user(struct doveadm_mail_cmd_context *ctx,
-			     const struct mail_storage_service_input *input,
 			     const char **error_r);
 void doveadm_mail_server_flush(void);
 
 /* Request input stream to be read (from stdin). This must be called from
    the command's init() function. */
 void doveadm_mail_get_input(struct doveadm_mail_cmd_context *ctx);
+const char *const *
+doveadm_mail_get_forward_fields(struct doveadm_mail_cmd_context *ctx);
 
 struct mailbox *
 doveadm_mailbox_find(struct mail_user *user, const char *mailbox);
 struct mail_search_args *
 doveadm_mail_build_search_args(const char *const args[]);
+void doveadm_mailbox_args_check_array(ARRAY_TYPE(const_string) *args);
 void doveadm_mailbox_args_check(const char *const args[]);
 struct mail_search_args *
 doveadm_mail_mailbox_search_args_build(const char *const args[]);
@@ -159,7 +160,6 @@ void doveadm_mail_failed_mailbox(struct doveadm_mail_cmd_context *ctx,
 void doveadm_mail_failed_list(struct doveadm_mail_cmd_context *ctx,
 			      struct mailbox_list *list);
 
-extern struct doveadm_cmd_ver2 doveadm_cmd_batch;
 extern struct doveadm_cmd_ver2 doveadm_cmd_mailbox_metadata_set_ver2;
 extern struct doveadm_cmd_ver2 doveadm_cmd_mailbox_metadata_unset_ver2;
 extern struct doveadm_cmd_ver2 doveadm_cmd_mailbox_metadata_get_ver2;

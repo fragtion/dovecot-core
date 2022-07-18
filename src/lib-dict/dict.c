@@ -33,6 +33,7 @@ static ARRAY(struct dict *) dict_drivers;
 
 static void
 dict_commit_async_timeout(struct dict_commit_callback_ctx *ctx);
+static void dict_rollback_async_timeout(struct dict_transaction_context *ctx);
 
 static struct event_category event_category_dict = {
 	.name = "dict",
@@ -120,6 +121,8 @@ int dict_init(const char *uri, const struct dict_settings *set,
 	i_assert(*dict_r != NULL);
 	(*dict_r)->refcount++;
 	(*dict_r)->event = event;
+	e_debug(event_create_passthrough(event)->set_name("dict_created")->event(),
+		"dict created (uri=%s, base_dir=%s)", uri, set->base_dir);
 
 	return 0;
 }
@@ -141,6 +144,8 @@ static void dict_unref(struct dict **_dict)
 	i_assert(dict->refcount > 0);
 	if (--dict->refcount == 0) {
 		dict->v.deinit(dict);
+		e_debug(event_create_passthrough(event)->
+			set_name("dict_destroyed")->event(), "dict destroyed");
 		event_unref(&event);
 	}
 }
@@ -149,18 +154,19 @@ void dict_deinit(struct dict **_dict)
 {
 	struct dict *dict = *_dict;
 
+	if (dict == NULL)
+		return;
 	*_dict = NULL;
 
-	i_assert(dict->iter_count == 0);
-	i_assert(dict->transaction_count == 0);
+	i_assert(!dict_have_async_operations(dict));
 	i_assert(dict->transactions == NULL);
-	i_assert(dict->commits == NULL);
 	dict_unref(&dict);
 }
 
 void dict_wait(struct dict *dict)
 {
 	struct dict_commit_callback_ctx *commit, *next;
+	struct dict_transaction_context *rollback, *next_rollback;
 
 	e_debug(dict->event, "Waiting for dict to finish pending operations");
 	if (dict->v.wait != NULL)
@@ -169,6 +175,17 @@ void dict_wait(struct dict *dict)
 		next = commit->next;
 		dict_commit_async_timeout(commit);
 	}
+	for (rollback = dict->rollbacks; rollback != NULL; rollback = next_rollback) {
+		next_rollback = rollback->next;
+		dict_rollback_async_timeout(rollback);
+	}
+}
+
+bool dict_have_async_operations(struct dict *dict)
+{
+	return dict->iter_count != 0 ||
+		dict->transaction_count != 0 ||
+		dict->commits != NULL;
 }
 
 bool dict_switch_ioloop(struct dict *dict)
@@ -187,11 +204,19 @@ bool dict_switch_ioloop(struct dict *dict)
 	return ret;
 }
 
+int dict_expire_scan(struct dict *dict, const char **error_r)
+{
+	if (dict->v.expire_scan == NULL)
+		return 0;
+	else
+		return dict->v.expire_scan(dict, error_r);
+}
+
 static bool dict_key_prefix_is_valid(const char *key, const char *username)
 {
-	if (str_begins(key, DICT_PATH_SHARED))
+	if (str_begins_with(key, DICT_PATH_SHARED))
 		return TRUE;
-	if (str_begins(key, DICT_PATH_PRIVATE)) {
+	if (str_begins_with(key, DICT_PATH_PRIVATE)) {
 		i_assert(username != NULL && username[0] != '\0');
 		return TRUE;
 	}
@@ -264,6 +289,23 @@ dict_lookup_callback(const struct dict_lookup_result *result,
 	i_free(ctx);
 }
 
+static void dict_transaction_rollback_run(struct dict_transaction_context *ctx)
+{
+	struct event *event = ctx->event;
+	struct dict_op_settings_private set_copy = ctx->set;
+	ctx->dict->v.transaction_rollback(ctx);
+	dict_transaction_finished(event, DICT_COMMIT_RET_OK, TRUE, NULL);
+	dict_op_settings_private_free(&set_copy);
+	event_unref(&event);
+}
+
+static void dict_rollback_async_timeout(struct dict_transaction_context *ctx)
+{
+	DLLIST_REMOVE(&ctx->dict->rollbacks, ctx);
+	timeout_remove(&ctx->to_rollback);
+	dict_transaction_rollback_run(ctx);
+}
+
 static void
 dict_commit_async_timeout(struct dict_commit_callback_ctx *ctx)
 {
@@ -311,13 +353,28 @@ int dict_lookup(struct dict *dict, const struct dict_op_settings *set,
 		pool_t pool, const char *key,
 		const char **value_r, const char **error_r)
 {
+	const char *const *values;
+	int ret = dict_lookup_values(dict, set, pool, key, &values, error_r);
+	if (ret > 0)
+		*value_r = values[0];
+	else if (ret == 0)
+		*value_r = NULL;
+	return ret;
+}
+
+int dict_lookup_values(struct dict *dict, const struct dict_op_settings *set,
+		       pool_t pool, const char *key,
+		       const char *const **values_r, const char **error_r)
+{
 	struct event *event = dict_event_create(dict, set);
 	int ret;
 	i_assert(dict_key_prefix_is_valid(key, set->username));
 
 	e_debug(event, "Looking up '%s'", key);
 	event_add_str(event, "key", key);
-	ret = dict->v.lookup(dict, set, pool, key, value_r, error_r);
+	ret = dict->v.lookup(dict, set, pool, key, values_r, error_r);
+	if (ret == 0)
+		*values_r = NULL;
 	dict_lookup_finished(event, ret, *error_r);
 	event_unref(&event);
 	return ret;
@@ -328,6 +385,7 @@ void dict_lookup_async(struct dict *dict, const struct dict_op_settings *set,
 		       const char *key, dict_lookup_callback_t *callback,
 		       void *context)
 {
+	i_assert(dict_key_prefix_is_valid(key, set->username));
 	if (dict->v.lookup_async == NULL) {
 		struct dict_lookup_result result;
 
@@ -390,6 +448,8 @@ bool dict_iterate(struct dict_iterate_context *ctx,
 		return FALSE;
 	if ((ctx->flags & DICT_ITERATE_FLAG_NO_VALUE) == 0)
 		*value_r = values[0];
+	else
+		*value_r = NULL;
 	return TRUE;
 }
 
@@ -486,6 +546,9 @@ dict_transaction_begin(struct dict *dict, const struct dict_op_settings *set)
 	/* the dict in context can differ from the dict
 	   passed as parameter, e.g. it can be dict-fail when
 	   transactions are not supported. */
+	if (set->expire_secs > 0 &&
+	    (dict->flags & DICT_DRIVER_FLAG_SUPPORT_EXPIRE_SECS) == 0)
+		ctx->error = "Expiration not supported by dict driver";
 	ctx->dict->transaction_count++;
 	DLLIST_PREPEND(&ctx->dict->transactions, ctx);
 	ctx->event = dict_event_create(dict, set);
@@ -495,11 +558,6 @@ dict_transaction_begin(struct dict *dict, const struct dict_op_settings *set)
 	event_set_name(ctx->event, "dict_transaction_started");
 	e_debug(ctx->event, "Starting transaction");
 	return ctx;
-}
-
-void dict_transaction_no_slowness_warning(struct dict_transaction_context *ctx)
-{
-	ctx->no_slowness_warning = TRUE;
 }
 
 void dict_transaction_set_timestamp(struct dict_transaction_context *ctx,
@@ -541,13 +599,20 @@ dict_transaction_commit_sync_callback(const struct dict_commit_result *result,
 int dict_transaction_commit(struct dict_transaction_context **_ctx,
 			    const char **error_r)
 {
-	pool_t pool = pool_alloconly_create("dict_commit_callback_ctx", 64);
-	struct dict_commit_callback_ctx *cctx =
-		p_new(pool, struct dict_commit_callback_ctx, 1);
 	struct dict_transaction_context *ctx = *_ctx;
 	struct dict_commit_sync_result result;
 
+	if (ctx->error != NULL) {
+		*error_r = t_strdup(ctx->error);
+		dict_transaction_rollback(_ctx);
+		return -1;
+	}
+
 	*_ctx = NULL;
+
+	pool_t pool = pool_alloconly_create("dict_commit_callback_ctx", 64);
+	struct dict_commit_callback_ctx *cctx =
+		p_new(pool, struct dict_commit_callback_ctx, 1);
 	cctx->pool = pool;
 	i_zero(&result);
 	i_assert(ctx->dict->transaction_count > 0);
@@ -572,15 +637,21 @@ void dict_transaction_commit_async(struct dict_transaction_context **_ctx,
 				   dict_transaction_commit_callback_t *callback,
 				   void *context)
 {
-	pool_t pool = pool_alloconly_create("dict_commit_callback_ctx", 64);
-	struct dict_commit_callback_ctx *cctx =
-		p_new(pool, struct dict_commit_callback_ctx, 1);
 	struct dict_transaction_context *ctx = *_ctx;
 
 	*_ctx = NULL;
 	i_assert(ctx->dict->transaction_count > 0);
 	ctx->dict->transaction_count--;
 	DLLIST_REMOVE(&ctx->dict->transactions, ctx);
+
+	if (ctx->error != NULL) {
+		ctx->to_rollback = timeout_add_short(0,
+			dict_rollback_async_timeout, ctx);
+		return;
+	}
+	pool_t pool = pool_alloconly_create("dict_commit_callback_ctx", 64);
+	struct dict_commit_callback_ctx *cctx =
+		p_new(pool, struct dict_commit_callback_ctx, 1);
 	DLLIST_PREPEND(&ctx->dict->commits, cctx);
 	if (callback == NULL)
 		callback = dict_transaction_commit_async_noop_callback;
@@ -609,17 +680,12 @@ void dict_transaction_rollback(struct dict_transaction_context **_ctx)
 	if (ctx == NULL)
 		return;
 
-	struct event *event = ctx->event;
-
 	*_ctx = NULL;
 	i_assert(ctx->dict->transaction_count > 0);
 	ctx->dict->transaction_count--;
 	DLLIST_REMOVE(&ctx->dict->transactions, ctx);
-	struct dict_op_settings_private set_copy = ctx->set;
-	ctx->dict->v.transaction_rollback(ctx);
-	dict_transaction_finished(event, DICT_COMMIT_RET_OK, TRUE, NULL);
-	dict_op_settings_private_free(&set_copy);
-	event_unref(&event);
+
+	dict_transaction_rollback_run(ctx);
 }
 
 void dict_set(struct dict_transaction_context *ctx,
@@ -745,6 +811,8 @@ void dict_op_settings_dup(const struct dict_op_settings *source,
 	i_zero(dest_r);
 	dest_r->username = i_strdup(source->username);
 	dest_r->home_dir = i_strdup(source->home_dir);
+	dest_r->expire_secs = source->expire_secs;
+	dest_r->no_slowness_warning = source->no_slowness_warning;
 }
 
 void dict_op_settings_private_free(struct dict_op_settings_private *set)
