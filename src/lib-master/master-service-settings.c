@@ -572,7 +572,6 @@ int master_service_settings_read(struct master_service *service,
 	struct setting_parser_context *parser;
 	struct istream *istream;
 	const char *path = NULL, *error;
-	void **sets;
 	unsigned int i;
 	int ret, fd = -1;
 	time_t now, timeout;
@@ -607,7 +606,7 @@ int master_service_settings_read(struct master_service *service,
 
 	if (service->set_pool != NULL) {
 		if (service->set_parser != NULL)
-			settings_parser_deinit(&service->set_parser);
+			settings_parser_unref(&service->set_parser);
 		p_clear(service->set_pool);
 	} else {
 		service->set_pool =
@@ -666,7 +665,7 @@ int master_service_settings_read(struct master_service *service,
 			}
 			i_close_fd(&fd);
 			config_exec_fallback(service, input, error_r);
-			settings_parser_deinit(&parser);
+			settings_parser_unref(&parser);
 			return -1;
 		}
 
@@ -683,7 +682,7 @@ int master_service_settings_read(struct master_service *service,
 	if (use_environment || service->keep_environment) {
 		if (settings_parse_environ(parser) < 0) {
 			*error_r = t_strdup(settings_parser_get_error(parser));
-			settings_parser_deinit(&parser);
+			settings_parser_unref(&parser);
 			return -1;
 		}
 	}
@@ -691,19 +690,19 @@ int master_service_settings_read(struct master_service *service,
 	if (array_is_created(&service->config_overrides)) {
 		if (master_service_apply_config_overrides(service, parser,
 							  error_r) < 0) {
-			settings_parser_deinit(&parser);
+			settings_parser_unref(&parser);
 			return -1;
 		}
 	}
 
 	if (!settings_parser_check(parser, service->set_pool, &error)) {
 		*error_r = t_strdup_printf("Invalid settings: %s", error);
-		settings_parser_deinit(&parser);
+		settings_parser_unref(&parser);
 		return -1;
 	}
 
-	sets = settings_parser_get_list(parser);
-	service->set = sets[0];
+	service->set = settings_parser_get_root_set(parser,
+				&master_service_setting_parser_info);
 	service->set_parser = parser;
 
 	if (service->set->version_ignore &&
@@ -746,7 +745,7 @@ pool_t master_service_settings_detach(struct master_service *service)
 {
 	pool_t pool = service->set_pool;
 
-	settings_parser_deinit(&service->set_parser);
+	settings_parser_unref(&service->set_parser);
 	service->set_pool = NULL;
 	return pool;
 }
@@ -754,23 +753,21 @@ pool_t master_service_settings_detach(struct master_service *service)
 const struct master_service_settings *
 master_service_settings_get(struct master_service *service)
 {
-	void **sets;
-
-	sets = settings_parser_get_list(service->set_parser);
-	return sets[0];
+	return settings_parser_get_root_set(service->set_parser,
+		&master_service_setting_parser_info);
 }
 
-void **master_service_settings_get_others(struct master_service *service)
+void *master_service_settings_get_root_set(struct master_service *service,
+					   const struct setting_parser_info *root)
 {
-	return master_service_settings_parser_get_others(service,
-							 service->set_parser);
+	return settings_parser_get_root_set(service->set_parser,  root);
 }
 
-void **master_service_settings_parser_get_others(struct master_service *service,
-						 const struct setting_parser_context *set_parser)
+void *master_service_settings_get_root_set_dup(struct master_service *service,
+	const struct setting_parser_info *root, pool_t pool)
 {
-	return settings_parser_get_list(set_parser) + 2 +
-		(service->want_ssl_server ? 1 : 0);
+	return settings_dup(root,
+		master_service_settings_get_root_set(service, root), pool);
 }
 
 struct setting_parser_context *

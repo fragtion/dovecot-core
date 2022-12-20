@@ -3,6 +3,7 @@
 #include "lib.h"
 #include "ioloop.h"
 #include "str.h"
+#include "settings-parser.h"
 #include "imap-arg.h"
 #include "imap-resp-code.h"
 #include "mailbox-tree.h"
@@ -96,7 +97,7 @@ bool imapc_mailbox_has_modseqs(struct imapc_mailbox *mbox)
 {
 	return (mbox->capabilities & (IMAPC_CAPABILITY_CONDSTORE |
 				      IMAPC_CAPABILITY_QRESYNC)) != 0 &&
-		IMAPC_BOX_HAS_FEATURE(mbox, IMAPC_FEATURE_MODSEQ);
+		!IMAPC_BOX_HAS_FEATURE(mbox, IMAPC_FEATURE_NO_MODSEQ);
 }
 
 static struct mail_storage *imapc_storage_alloc(void)
@@ -379,7 +380,7 @@ int imapc_storage_client_create(struct mail_namespace *ns,
 	imapc_client_set_login_callback(client->client, imapc_storage_client_login_callback, client);
 
 	if ((ns->flags & NAMESPACE_FLAG_LIST_PREFIX) != 0 &&
-	    (imapc_set->parsed_features & IMAPC_FEATURE_DELAY_LOGIN) == 0) {
+	    (imapc_set->parsed_features & IMAPC_FEATURE_NO_DELAY_LOGIN) != 0) {
 		/* start logging in immediately */
 		imapc_storage_client_login(client, ns->user, set.host);
 	}
@@ -414,7 +415,8 @@ imapc_storage_create(struct mail_storage *_storage,
 	struct imapc_storage *storage = IMAPC_STORAGE(_storage);
 	struct imapc_mailbox_list *imapc_list = NULL;
 
-	storage->set = mail_namespace_get_driver_settings(ns, _storage);
+	storage->set = settings_parser_get_root_set(_storage->user->set_parser,
+		imapc_get_setting_parser_info());
 
 	/* serialize all the settings */
 	_storage->unique_root_dir = p_strdup_printf(_storage->pool,
@@ -449,7 +451,7 @@ imapc_storage_create(struct mail_storage *_storage,
 	}
 	storage->client->_storage = storage;
 	p_array_init(&storage->remote_namespaces, _storage->pool, 4);
-	if (IMAPC_HAS_FEATURE(storage, IMAPC_FEATURE_FETCH_BODYSTRUCTURE)) {
+	if (!IMAPC_HAS_FEATURE(storage, IMAPC_FEATURE_NO_FETCH_BODYSTRUCTURE)) {
 		_storage->nonbody_access_fields |=
 			MAIL_FETCH_IMAP_BODY | MAIL_FETCH_IMAP_BODYSTRUCTURE;
 	}
@@ -1093,6 +1095,15 @@ static int imapc_mailbox_get_status(struct mailbox *box,
 	} else {
 		if (imapc_mailbox_run_status(box, items, status_r) < 0)
 			return -1;
+		/* If this mailbox has private indexes make sure to check
+		   STATUS_UNSEEN from there. */
+		if (box->list->set.index_pvt_dir != NULL &&
+		    (items & (STATUS_UNSEEN)) != 0) {
+			struct mailbox_status pvt_idx_status;
+			index_storage_get_status(box, STATUS_UNSEEN,
+						 &pvt_idx_status);
+			status_r->unseen = pvt_idx_status.unseen;
+		}
 	}
 
 	if (box->opened && !box->deleting && (items & STATUS_UIDNEXT) != 0 &&

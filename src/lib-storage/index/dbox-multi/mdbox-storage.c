@@ -5,6 +5,7 @@
 #include "ioloop.h"
 #include "mkdir-parents.h"
 #include "master-service.h"
+#include "settings-parser.h"
 #include "mail-index-modseq.h"
 #include "mail-index-alloc-cache.h"
 #include "mailbox-log.h"
@@ -45,7 +46,8 @@ int mdbox_storage_create(struct mail_storage *_storage,
 	struct mdbox_storage *storage = MDBOX_STORAGE(_storage);
 	const char *dir;
 
-	storage->set = mail_namespace_get_driver_settings(ns, _storage);
+	storage->set = settings_parser_get_root_set(_storage->user->set_parser,
+		mdbox_get_setting_parser_info());
 	storage->preallocate_space = storage->set->mdbox_preallocate_space;
 
 	if (*ns->list->set.mailbox_dir_name == '\0') {
@@ -64,6 +66,10 @@ int mdbox_storage_create(struct mail_storage *_storage,
 							ns->list->set.alt_dir,
 							"/"MDBOX_GLOBAL_DIR_NAME, NULL);
 	}
+
+	event_set_append_log_prefix(_storage->event, t_strdup_printf(
+		"mdbox(%s): ", storage->storage_dir));
+
 	i_array_init(&storage->open_files, 64);
 
 	storage->map = mdbox_map_init(storage, ns->list);
@@ -89,19 +95,19 @@ void mdbox_storage_destroy(struct mail_storage *_storage)
 static const char *
 mdbox_storage_find_root_dir(const struct mail_namespace *ns)
 {
-	bool debug = ns->mail_set->mail_debug;
+	struct event *event = ns->user->event;
 	const char *home, *path;
 
 	if (ns->owner != NULL &&
 	    mail_user_get_home(ns->owner, &home) > 0) {
 		path = t_strconcat(home, "/mdbox", NULL);
 		if (access(path, R_OK|W_OK|X_OK) == 0) {
-			if (debug)
-				i_debug("mdbox: root exists (%s)", path);
+			e_debug(event,
+				"mdbox autodetect: root exists (%s)", path);
 			return path;
 		}
-		if (debug)
-			i_debug("mdbox: access(%s, rwx): failed: %m", path);
+		e_debug(event,
+			"mdbox autodetect: access(%s, rwx): failed: %m", path);
 	}
 	return NULL;
 }
@@ -109,7 +115,7 @@ mdbox_storage_find_root_dir(const struct mail_namespace *ns)
 static bool mdbox_storage_autodetect(const struct mail_namespace *ns,
 				     struct mailbox_list_settings *set)
 {
-	bool debug = ns->mail_set->mail_debug;
+	struct event *event = ns->user->event;
 	struct stat st;
 	const char *path, *root_dir;
 
@@ -118,22 +124,20 @@ static bool mdbox_storage_autodetect(const struct mail_namespace *ns,
 	else {
 		root_dir = mdbox_storage_find_root_dir(ns);
 		if (root_dir == NULL) {
-			if (debug)
-				i_debug("mdbox: couldn't find root dir");
+			e_debug(event,
+				"mdbox autodetect: couldn't find root dir");
 			return FALSE;
 		}
 	}
 
 	path = t_strconcat(root_dir, "/"MDBOX_GLOBAL_DIR_NAME, NULL);
 	if (stat(path, &st) < 0) {
-		if (debug)
-			i_debug("mdbox autodetect: stat(%s) failed: %m", path);
+		e_debug(event, "mdbox autodetect: stat(%s) failed: %m", path);
 		return FALSE;
 	}
 
 	if (!S_ISDIR(st.st_mode)) {
-		if (debug)
-			i_debug("mdbox autodetect: %s not a directory", path);
+		e_debug(event, "mdbox autodetect: %s not a directory", path);
 		return FALSE;
 	}
 

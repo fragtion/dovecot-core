@@ -41,6 +41,9 @@ struct module;
 #define CLIENT_UNAUTHENTICATED_LOGOUT_MSG \
 	"Aborted login by logging out"
 
+#define CLIENT_TRANSPORT_TLS "TLS"
+#define CLIENT_TRANSPORT_INSECURE "insecure"
+
 struct master_service_connection;
 
 enum client_disconnect_reason {
@@ -157,6 +160,7 @@ struct client {
 	struct timeval created;
 	int refcount;
 	struct event *event;
+	struct event *event_auth;
 
 	struct ip_addr local_ip;
 	struct ip_addr ip;
@@ -220,8 +224,6 @@ struct client {
 	   as in global_alt_usernames. If some field doesn't exist, it's "".
 	   Can also be NULL if there are no user_* fields. */
 	const char **alt_usernames;
-	/* director_username_hash cached, if non-zero */
-	unsigned int director_username_hash_cache;
 
 	bool create_finished:1;
 	bool disconnected:1;
@@ -229,12 +231,30 @@ struct client {
 	bool input_blocked:1;
 	bool login_success:1;
 	bool no_extra_disconnect_reason:1;
-	bool starttls:1;
-	bool tls:1;
-	bool proxied_ssl:1;
-	bool secured:1;
-	bool ssl_secured:1;
-	bool trusted:1;
+	/* Client/proxy connection is using TLS. Either Dovecot or HAProxy
+	   has terminated the TLS connection. */
+	bool connection_tls_secured:1;
+	/* connection_tls_secured=TRUE was started via STARTTLS command. */
+	bool connection_used_starttls:1;
+	/* HAProxy terminated the TLS connection. */
+	bool haproxy_terminated_tls:1;
+	/* Connection from the previous hop (client, proxy, haproxy) is
+	   considered secured. Either because TLS is used, or because the
+	   connection is otherwise considered not to need TLS. Note that this
+	   doesn't necessarily mean that the client connection behind the
+	   previous hop is secured. */
+	bool connection_secured:1;
+	/* End client is using TLS connection. The TLS termination may be either
+	   on Dovecot side or HAProxy side. This value is forwarded through
+	   trusted Dovecot proxies. */
+	bool end_client_tls_secured:1;
+	/* TRUE if end_client_tls_secured is set via ID/XCLIENT and must not
+	   be changed anymore. */
+	bool end_client_tls_secured_set:1;
+	/* Connection is from a trusted client/proxy, which is allowed to e.g.
+	   forward the original client IP address. Note that a trusted
+	   connection is not necessarily considered secured. */
+	bool connection_trusted:1;
 	bool ssl_servername_settings_read:1;
 	bool banner_sent:1;
 	bool authenticating:1;

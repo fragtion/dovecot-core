@@ -117,7 +117,8 @@ create_raw_stream(struct mail_deliver_input *dinput,
 		if (smtp_address_parse_mailbox(pool_datastack_create(),
 					       sender, 0, &mail_from,
 					       &error) < 0) {
-			i_warning("Failed to parse address from `From_'-line: %s",
+			e_warning(dinput->event_parent,
+				  "Failed to parse address from `From_'-line: %s",
 				  error);
 		}
 		dinput->mail_from = mail_from;
@@ -149,13 +150,10 @@ lda_raw_mail_open(struct mail_deliver_input *dinput, const char *path)
 	struct mailbox_header_lookup_ctx *headers_ctx;
 	const struct smtp_address *mail_from;
 	struct istream *input;
-	void **sets;
 	time_t mtime;
 	int ret;
 
-	sets = master_service_settings_get_others(master_service);
-	raw_mail_user = raw_storage_create_from_set(dinput->rcpt_user->set_info,
-						    sets[0]);
+	raw_mail_user = raw_storage_create_from_set(dinput->rcpt_user->unexpanded_set_parser);
 
 	mail_from = (dinput->mail_from != NULL ?
 		     dinput->mail_from : &default_envelope_sender);
@@ -280,35 +278,17 @@ lda_do_deliver(struct mail_deliver_context *ctx, bool stderr_rejection)
 
 static int
 lda_deliver(struct mail_deliver_input *dinput,
-	    struct mail_storage_service_user *service_user,
 	    const char *user, const char *path,
 	    struct smtp_address *rcpt_to, const char *rcpt_to_source,
 	    bool stderr_rejection)
 {
 	struct mail_deliver_context ctx;
-	const struct var_expand_table *var_table;
-	struct lda_settings *lda_set;
-	struct smtp_submit_settings *smtp_set;
-	const char *errstr;
 	int ret;
 
-	var_table = mail_user_var_expand_table(dinput->rcpt_user);
-	smtp_set = mail_storage_service_user_get_set(service_user)[1];
-	lda_set = mail_storage_service_user_get_set(service_user)[2];
-	ret = settings_var_expand(
-		&lda_setting_parser_info,
-		lda_set, dinput->rcpt_user->pool, var_table,
-		&errstr);
-	if (ret > 0) {
-		ret = settings_var_expand(
-			&smtp_submit_setting_parser_info,
-			smtp_set, dinput->rcpt_user->pool, var_table,
-			&errstr);
-	}
-	if (ret <= 0)
-		i_fatal("Failed to expand settings: %s", errstr);
-	dinput->set = lda_set;
-	dinput->smtp_set = smtp_set;
+	dinput->set = settings_parser_get_root_set(dinput->rcpt_user->set_parser,
+						   &lda_setting_parser_info);
+	dinput->smtp_set = settings_parser_get_root_set(dinput->rcpt_user->set_parser,
+							&smtp_submit_setting_parser_info);
 
 	dinput->src_mail = lda_raw_mail_open(dinput, path);
 	lda_set_rcpt_to(dinput, rcpt_to, user, rcpt_to_source);
@@ -572,7 +552,7 @@ int main(int argc, char *argv[])
 				mail_from_error);
 		}
 
-		ret = lda_deliver(&dinput, service_user, user, path,
+		ret = lda_deliver(&dinput, user, path,
 				  rcpt_to, rcpt_to_source, stderr_rejection);
 
 		struct mailbox_transaction_context *t =

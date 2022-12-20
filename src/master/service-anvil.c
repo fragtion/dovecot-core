@@ -82,7 +82,8 @@ service_process_write_anvil_kill(int fd, struct service_process *process)
 	data = t_strdup_printf("KILL\t%s\n", dec2str(process->pid));
 	if (write(fd, data, strlen(data)) < 0) {
 		if (errno != EAGAIN)
-			i_error("write(anvil process) failed: %m");
+			e_error(process->service->event,
+				"write(anvil process) failed: %m");
 		return -1;
 	}
 	return 0;
@@ -112,7 +113,7 @@ void service_anvil_process_created(struct service_process *process)
 
 	if (anvil_send_handshake(anvil->blocking_fd[1], &error) < 0 ||
 	    anvil_send_handshake(anvil->nonblocking_fd[1], &error) < 0)
-		service_error(process->service, "%s", error);
+		e_error(process->service->event, "%s", error);
 }
 
 void service_anvil_process_destroyed(struct service_process *process)

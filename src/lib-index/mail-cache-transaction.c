@@ -785,8 +785,7 @@ void mail_cache_add(struct mail_cache_transaction_ctx *ctx, uint32_t seq,
 	i_assert(field_idx < ctx->cache->fields_count);
 	i_assert(data_size < (uint32_t)-1);
 
-	if (ctx->cache->fields[field_idx].field.decision ==
-	    (MAIL_CACHE_DECISION_NO | MAIL_CACHE_DECISION_FORCED))
+	if (!mail_cache_field_can_add(ctx, seq, field_idx))
 		return;
 
 	if (seq >= ctx->trans->first_new_seq)
@@ -796,7 +795,12 @@ void mail_cache_add(struct mail_cache_transaction_ctx *ctx, uint32_t seq,
 	   read. */
 	mail_cache_transaction_refresh_decisions(ctx);
 
-	mail_cache_decision_add(ctx->view, seq, field_idx);
+	/* The decision to reject a field may come last minute during actual add,
+	   for example if the header count limit has been reached */
+	bool rejected;
+	mail_cache_decision_add(ctx->view, seq, field_idx, &rejected);
+	if (rejected)
+		return;
 
 	fixed_size = ctx->cache->fields[field_idx].field.field_size;
 	i_assert(fixed_size == UINT_MAX || fixed_size == data_size);
@@ -875,7 +879,7 @@ void mail_cache_add(struct mail_cache_transaction_ctx *ctx, uint32_t seq,
 
 	buffer_append(ctx->cache_data, data, data_size);
 	if ((data_size & 3) != 0)
-                buffer_append_zero(ctx->cache_data, 4 - (data_size & 3));
+		buffer_append_zero(ctx->cache_data, 4 - (data_size & 3));
 }
 
 bool mail_cache_field_want_add(struct mail_cache_transaction_ctx *ctx,
@@ -917,6 +921,11 @@ bool mail_cache_field_can_add(struct mail_cache_transaction_ctx *ctx,
 	decision = mail_cache_field_get_decision(ctx->view->cache, field_idx);
 	if (decision == (MAIL_CACHE_DECISION_FORCED | MAIL_CACHE_DECISION_NO))
 		return FALSE;
+
+	/* fields of bitmask type can be added multiple times */
+	const struct mail_cache_field *field = mail_cache_register_get_field(ctx->view->cache, field_idx);
+	if (field->type == MAIL_CACHE_FIELD_BITMASK)
+		return TRUE;
 
 	return mail_cache_field_exists(ctx->view, seq, field_idx) == 0;
 }

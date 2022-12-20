@@ -64,7 +64,7 @@ static const struct {
 	const char *required_keys;
 	const char *optional_keys;
 	unsigned int min_minor_version;
-} items[ITEM_END_OF_LIST+1] = {
+} items[] = {
 	{ NULL, '\0', NULL, NULL, 0 },
 	{ .name = "done",
 	  .chr = 'X',
@@ -139,6 +139,7 @@ static const struct {
 
 	{ "end_of_list", '\0', NULL, NULL, 0 }
 };
+static_assert_array_size(items, ITEM_END_OF_LIST+1);
 
 struct dsync_ibc_stream {
 	struct dsync_ibc ibc;
@@ -1653,6 +1654,8 @@ dsync_ibc_stream_send_change(struct dsync_ibc *_ibc,
 	case DSYNC_MAIL_CHANGE_TYPE_FLAG_CHANGE:
 		type[0] = 'f';
 		break;
+	case DSYNC_MAIL_CHANGE_TYPE_COUNT:
+		i_unreached();
 	}
 	i_assert(type[0] != '\0');
 	dsync_serializer_encode_add(encoder, "type", type);

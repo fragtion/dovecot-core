@@ -355,7 +355,11 @@ o_stream_encrypt_key_for_pubkey_v2(struct encrypt_ostream *stream,
 	char kt = ktype;
 	buffer_append(res, &kt, 1);
 	/* store hash of public key as ID */
-	dcrypt_key_id_public(stream->pub, "sha256", res, NULL);
+	if (!dcrypt_key_id_public(stream->pub, "sha256", res, &error)) {
+		io_stream_set_error(&stream->ostream.iostream,
+				    "Cannot hash public key: %s", error);
+		return -1;
+	}
 	/* store ephemeral key (if present) */
 	unsigned int val = cpu32_to_be(ephemeral_key->used);
 	buffer_append(res, &val, 4);
@@ -391,7 +395,7 @@ o_stream_encrypt_keydata_create_v2(struct encrypt_ostream *stream,
 	/* key data length for internal use */
 	if ((stream->flags & IO_STREAM_ENC_INTEGRITY_HMAC) ==
 		IO_STREAM_ENC_INTEGRITY_HMAC) {
-		tagsize = IOSTREAM_TAG_SIZE; 
+		tagsize = IOSTREAM_TAG_SIZE;
 	} else if ((stream->flags & IO_STREAM_ENC_INTEGRITY_AEAD) ==
 		IO_STREAM_ENC_INTEGRITY_AEAD) {
 		tagsize = IOSTREAM_TAG_SIZE;

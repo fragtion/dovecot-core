@@ -46,6 +46,8 @@ static const struct setting_define mail_storage_setting_defines[] = {
 	DEF(STR, mail_server_admin),
 	DEF(TIME_HIDDEN, mail_cache_unaccessed_field_drop),
 	DEF(SIZE_HIDDEN, mail_cache_record_max_size),
+	DEF(UINT_HIDDEN, mail_cache_max_header_name_length),
+	DEF(UINT_HIDDEN, mail_cache_max_headers_count),
 	DEF(SIZE_HIDDEN, mail_cache_max_size),
 	DEF(UINT_HIDDEN, mail_cache_min_mail_count),
 	DEF(SIZE_HIDDEN, mail_cache_purge_min_size),
@@ -103,6 +105,8 @@ const struct mail_storage_settings mail_storage_default_settings = {
 	.mail_cache_min_mail_count = 0,
 	.mail_cache_unaccessed_field_drop = 60*60*24*30,
 	.mail_cache_record_max_size = 64 * 1024,
+	.mail_cache_max_header_name_length = 100,
+	.mail_cache_max_headers_count = 100,
 	.mail_cache_max_size = 1024 * 1024 * 1024,
 	.mail_cache_purge_min_size = 32 * 1024,
 	.mail_cache_purge_delete_percentage = 20,
@@ -348,57 +352,11 @@ const struct setting_parser_info mail_user_setting_parser_info = {
 #endif
 };
 
-const void *
-mail_user_set_get_driver_settings(const struct setting_parser_info *info,
-				  const struct mail_user_settings *set,
-				  const char *driver)
-{
-	const void *dset;
-
-	dset = settings_find_dynamic(info, set, driver);
-	if (dset == NULL) {
-		i_panic("Default settings not found for storage driver %s",
-			driver);
-	}
-	return dset;
-}
-
 const struct mail_storage_settings *
 mail_user_set_get_storage_set(struct mail_user *user)
 {
-	return mail_user_set_get_driver_settings(user->set_info, user->set,
-						 MAIL_STORAGE_SET_DRIVER_NAME);
-}
-
-const void *mail_namespace_get_driver_settings(struct mail_namespace *ns,
-					       struct mail_storage *storage)
-{
-	return mail_user_set_get_driver_settings(storage->user->set_info,
-						 ns->user_set, storage->name);
-}
-
-const struct dynamic_settings_parser *
-mail_storage_get_dynamic_parsers(pool_t pool)
-{
-	struct dynamic_settings_parser *parsers;
-	struct mail_storage *const *storages;
-	unsigned int i, j, count;
-
-	storages = array_get(&mail_storage_classes, &count);
-	parsers = p_new(pool, struct dynamic_settings_parser, 1 + count + 1);
-	parsers[0].name = MAIL_STORAGE_SET_DRIVER_NAME;
-	parsers[0].info = &mail_storage_setting_parser_info;
-
-	for (i = 0, j = 1; i < count; i++) {
-		if (storages[i]->v.get_setting_parser_info == NULL)
-			continue;
-
-		parsers[j].name = storages[i]->name;
-		parsers[j].info = storages[i]->v.get_setting_parser_info();
-		j++;
-	}
-	parsers[j].name = NULL;
-	return parsers;
+	return settings_parser_get_root_set(user->set_parser,
+		&mail_storage_setting_parser_info);
 }
 
 static void
@@ -436,6 +394,12 @@ static bool mail_storage_settings_check(void *_set, pool_t pool,
 	const char *p, *value, *error;
 	bool uidl_format_ok;
 	char c;
+
+#ifndef CONFIG_BINARY
+	i_assert(set->mail_location[0] == SETTING_STRVAR_UNEXPANDED[0] ||
+		 set->mail_location[0] == SETTING_STRVAR_EXPANDED[0]);
+	set->unexpanded_mail_location = set->mail_location;
+#endif
 
 	if (set->mailbox_idle_check_interval == 0) {
 		*error_r = "mailbox_idle_check_interval must not be 0";
@@ -587,6 +551,12 @@ static bool namespace_settings_check(void *_set, pool_t pool ATTR_UNUSED,
 
 	name = ns->prefix != NULL ? ns->prefix : "";
 
+#ifndef CONFIG_BINARY
+	i_assert(ns->location[0] == SETTING_STRVAR_UNEXPANDED[0] ||
+		 ns->location[0] == SETTING_STRVAR_EXPANDED[0]);
+	ns->unexpanded_location = ns->location;
+#endif
+
 	if (ns->separator[0] != '\0' && ns->separator[1] != '\0') {
 		*error_r = t_strdup_printf("Namespace '%s': "
 			"Hierarchy separator must be only one character long",
@@ -653,9 +623,8 @@ static bool mailbox_special_use_exists(const char *name)
 	return FALSE;
 }
 
-static bool
-mailbox_special_use_check(struct mailbox_settings *set, pool_t pool,
-			  const char **error_r)
+static void
+mailbox_special_use_check(struct mailbox_settings *set, pool_t pool)
 {
 	const char *const *uses, *str;
 	unsigned int i;
@@ -663,17 +632,15 @@ mailbox_special_use_check(struct mailbox_settings *set, pool_t pool,
 	uses = t_strsplit_spaces(set->special_use, " ");
 	for (i = 0; uses[i] != NULL; i++) {
 		if (!mailbox_special_use_exists(uses[i])) {
-			*error_r = t_strdup_printf(
-				"mailbox %s: unknown special_use: %s",
-				set->name, uses[i]);
-			return FALSE;
+			i_warning("mailbox %s: special_use label %s is not an "
+				  "RFC-defined label - allowing anyway",
+				  set->name, uses[i]);
 		}
 	}
 	/* make sure there are no extra spaces */
 	str = t_strarray_join(uses, " ");
 	if (strcmp(str, set->special_use) != 0)
 		set->special_use = p_strdup(pool, str);
-	return TRUE;
 }
 
 static bool mailbox_settings_check(void *_set, pool_t pool,
@@ -687,8 +654,7 @@ static bool mailbox_settings_check(void *_set, pool_t pool,
 		return FALSE;
 	}
 	if (*set->special_use != '\0') {
-		if (!mailbox_special_use_check(set, pool, error_r))
-			return FALSE;
+		mailbox_special_use_check(set, pool);
 	}
 	return TRUE;
 }

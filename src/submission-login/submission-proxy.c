@@ -17,9 +17,11 @@
 
 #include <ctype.h>
 
-static const char *submission_proxy_state_names[SUBMISSION_PROXY_STATE_COUNT] = {
+static const char *submission_proxy_state_names[] = {
 	"banner", "ehlo", "starttls", "tls-ehlo", "xclient", "xclient-ehlo", "authenticate"
 };
+static_assert_array_size(submission_proxy_state_names,
+			 SUBMISSION_PROXY_STATE_COUNT);
 
 static void
 submission_proxy_success_reply_sent(
@@ -185,6 +187,11 @@ proxy_send_xclient(struct submission_client *client, struct ostream *output)
 	if (str_array_icase_find(client->proxy_xclient, "SESSION")) {
 		proxy_send_xclient_more(client, output, str, "SESSION",
 					client_get_session_id(&client->common));
+	}
+	if (str_array_icase_find(client->proxy_xclient, "CLIENT-TRANSPORT")) {
+		proxy_send_xclient_more(client, output, str, "CLIENT-TRANSPORT",
+			client->common.end_client_tls_secured ?
+			CLIENT_TRANSPORT_TLS : CLIENT_TRANSPORT_INSECURE);
 	}
 	if (str_array_icase_find(client->proxy_xclient, "FORWARD")) {
 		buffer_t *fwd = proxy_compose_xclient_forward(client);

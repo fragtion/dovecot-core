@@ -45,7 +45,7 @@ shared_storage_create(struct mail_storage *_storage, struct mail_namespace *ns,
 	driver = t_strdup_until(ns->set->location, p);
 	storage->location = p_strdup(_storage->pool, ns->set->location);
 	storage->unexpanded_location =
-		p_strdup(_storage->pool, ns->unexpanded_set->location);
+		p_strdup(_storage->pool, ns->set->unexpanded_location);
 	storage->storage_class_name = p_strdup(_storage->pool, driver);
 
 	if (mail_user_get_storage_class(_storage->user, driver) == NULL &&
@@ -138,7 +138,7 @@ int shared_storage_get_namespace(struct mail_namespace **_ns,
 	struct shared_storage *storage = SHARED_STORAGE(_storage);
 	struct mail_user *user = _storage->user;
 	struct mail_namespace *new_ns, *ns = *_ns;
-	struct mail_namespace_settings *ns_set, *unexpanded_ns_set;
+	struct mail_namespace_settings *ns_set;
 	struct mail_user *owner;
 	const char *domain = NULL, *username = NULL, *userdomain = NULL;
 	const char *name, *p, *next, **dest, *error;
@@ -249,7 +249,7 @@ int shared_storage_get_namespace(struct mail_namespace **_ns,
 	}
 
 	owner = mail_user_alloc(event_get_parent(user->event), userdomain,
-				user->set_info, user->unexpanded_set);
+				user->unexpanded_set_parser);
 	owner->_service_user = user->_service_user;
 	mail_storage_service_user_ref(owner->_service_user);
 	owner->creator = user;
@@ -313,16 +313,11 @@ int shared_storage_get_namespace(struct mail_namespace **_ns,
 	ns_set->separator = p_strdup_printf(user->pool, "%c", ns_sep);
 	ns_set->prefix = new_ns->prefix;
 	ns_set->location = p_strdup(user->pool, str_c(location));
+	ns_set->unexpanded_location =
+		p_strdup(user->pool, storage->unexpanded_location);
 	ns_set->hidden = TRUE;
 	ns_set->list = "yes";
 	new_ns->set = ns_set;
-
-	unexpanded_ns_set =
-		p_new(user->pool, struct mail_namespace_settings, 1);
-	*unexpanded_ns_set = *ns_set;
-	unexpanded_ns_set->location =
-		p_strdup(user->pool, storage->unexpanded_location);
-	new_ns->unexpanded_set = unexpanded_ns_set;
 
 	/* We need to create a prefix="" namespace for the owner */
 	if (mail_namespaces_init_location(owner, str_c(location), &error) < 0) {

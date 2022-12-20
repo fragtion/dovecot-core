@@ -91,7 +91,8 @@ int master_service_settings_cache_init_filter(struct master_service_settings_cac
 	if (cache->filters != NULL)
 		return 0;
 	if (master_service_settings_get_filters(cache->service, &filters, &error) < 0) {
-		i_error("master-service: cannot get filters: %s", error);
+		e_error(cache->service->event,
+			"master-service: cannot get filters: %s", error);
 		return -1;
 	}
 
@@ -185,13 +186,13 @@ void master_service_settings_cache_deinit(struct master_service_settings_cache *
 	for (entry = cache->oldest; entry != NULL; entry = next) {
 		next = entry->next;
 		i_assert(entry->parser != cache->global_parser);
-		settings_parser_deinit(&entry->parser);
+		settings_parser_unref(&entry->parser);
 		pool_unref(&entry->pool);
 	}
 	hash_table_destroy(&cache->local_name_hash);
 	hash_table_destroy(&cache->local_ip_hash);
 	if (cache->global_parser != NULL)
-		settings_parser_deinit(&cache->global_parser);
+		settings_parser_unref(&cache->global_parser);
 	pool_unref(&cache->pool);
 }
 
@@ -213,7 +214,7 @@ cache_can_return_global(struct master_service_settings_cache *cache,
 static bool
 cache_find(struct master_service_settings_cache *cache,
 	   const struct master_service_settings_input *input,
-	   const struct setting_parser_context **parser_r)
+	   struct setting_parser_context **parser_r)
 {
 	struct settings_entry *entry = NULL;
 
@@ -268,7 +269,7 @@ setting_entry_detach(struct master_service_settings_cache *cache,
 		hash_table_remove(cache->local_name_hash, entry->local_name);
 	else if (entry->local_ip.family != 0)
 		hash_table_remove(cache->local_ip_hash, &entry->local_ip);
-	settings_parser_deinit(&entry->parser);
+	settings_parser_unref(&entry->parser);
 }
 
 static struct setting_parser_context *
@@ -357,8 +358,7 @@ cache_add(struct master_service_settings_cache *cache,
 
 int master_service_settings_cache_read(struct master_service_settings_cache *cache,
 				       const struct master_service_settings_input *input,
-				       const struct dynamic_settings_parser *dyn_parsers,
-				       const struct setting_parser_context **parser_r,
+				       struct setting_parser_context **parser_r,
 				       const char **error_r)
 {
 	struct master_service_settings_output output;
@@ -378,10 +378,6 @@ int master_service_settings_cache_read(struct master_service_settings_cache *cac
 			return 0;
 	}
 
-	if (dyn_parsers != NULL) {
-		settings_parser_dyn_update(cache->pool, &new_input.roots,
-					   dyn_parsers);
-	}
 	if (master_service_settings_read(cache->service, &new_input,
 					 &output, error_r) < 0)
 		return -1;

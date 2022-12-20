@@ -190,7 +190,7 @@ openssl_iostream_set(struct ssl_iostream *ssl_io,
 			return -1;
 		}
 	}
-#ifdef HAVE_SSL_CTX_SET_CIPHERSUITES
+#ifdef HAVE_SSL_CTX_set_ciphersuites
         if (set->ciphersuites != NULL &&
 	    strcmp(ctx_set->ciphersuites, set->ciphersuites) != 0) {
 		if (SSL_set_ciphersuites(ssl_io->ssl, set->ciphersuites) == 0) {
@@ -204,7 +204,7 @@ openssl_iostream_set(struct ssl_iostream *ssl_io,
 	if (set->prefer_server_ciphers)
 		SSL_set_options(ssl_io->ssl, SSL_OP_CIPHER_SERVER_PREFERENCE);
 	if (set->min_protocol != NULL) {
-#if defined(HAVE_SSL_CLEAR_OPTIONS)
+#if defined(HAVE_SSL_clear_options)
 		SSL_clear_options(ssl_io->ssl, OPENSSL_ALL_PROTOCOL_OPTIONS);
 #endif
 		long opts;
@@ -216,7 +216,7 @@ openssl_iostream_set(struct ssl_iostream *ssl_io,
 					set->min_protocol);
 			return -1;
 		}
-#ifdef HAVE_SSL_CTX_SET_MIN_PROTO_VERSION
+#ifdef HAVE_SSL_CTX_set_min_proto_version
 		SSL_set_min_proto_version(ssl_io->ssl, min_protocol);
 #else
 		SSL_set_options(ssl_io->ssl, opts);
@@ -682,7 +682,8 @@ static int openssl_iostream_handshake(struct ssl_iostream *ssl_io)
 	const char *reason, *error = NULL;
 	int ret;
 
-	i_assert(!ssl_io->handshaked);
+	if (ssl_io->handshaked)
+		return openssl_iostream_bio_sync(ssl_io, OPENSSL_IOSTREAM_SYNC_TYPE_HANDSHAKE);
 
 	/* we are being destroyed, so do not do any more handshaking */
 	if (ssl_io->destroyed)
@@ -802,7 +803,11 @@ openssl_iostream_get_peer_name(struct ssl_iostream *ssl_io)
 	if (!ssl_iostream_has_valid_client_cert(ssl_io))
 		return NULL;
 
+#ifdef HAVE_SSL_get1_peer_certificate
+	x509 = SSL_get1_peer_certificate(ssl_io->ssl);
+#else
 	x509 = SSL_get_peer_certificate(ssl_io->ssl);
+#endif
 	i_assert(x509 != NULL);
 
 	len = X509_NAME_get_text_by_NID(X509_get_subject_name(x509),
@@ -917,6 +922,13 @@ openssl_iostream_get_protocol_name(struct ssl_iostream *ssl_io)
 	return SSL_get_version(ssl_io->ssl);
 }
 
+static const char *
+openssl_iostream_get_ja3(struct ssl_iostream *ssl_io)
+{
+	if (!ssl_io->handshaked)
+		return NULL;
+	return ssl_io->ja3_str;
+}
 
 static const struct iostream_ssl_vfuncs ssl_vfuncs = {
 	.global_init = openssl_iostream_global_init,
@@ -948,6 +960,7 @@ static const struct iostream_ssl_vfuncs ssl_vfuncs = {
 	.get_cipher = openssl_iostream_get_cipher,
 	.get_pfs = openssl_iostream_get_pfs,
 	.get_protocol_name = openssl_iostream_get_protocol_name,
+	.get_ja3 = openssl_iostream_get_ja3,
 };
 
 void ssl_iostream_openssl_init(void)

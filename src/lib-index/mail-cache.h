@@ -69,12 +69,17 @@ struct mail_cache *
 mail_cache_open_or_create_path(struct mail_index *index, const char *path);
 void mail_cache_free(struct mail_cache **cache);
 
-/* Register fields. fields[].idx is updated to contain field index.
-   If field already exists and its caching decision is NO, the decision is
-   updated to the input field's decision. */
+/* Register fields. fields[].idx is updated to contain field index. If field
+   already exists and its caching decision is NO, the decision is updated to
+   the input field's decision.
+
+   If a header field name is too long, a truncated version replaces the original
+   in the passed fields array. The new string is from the passed pool */
+#define MAIL_CACHE_TRUNCATE_NAME_FAIL NULL
 void mail_cache_register_fields(struct mail_cache *cache,
 				struct mail_cache_field *fields,
-				unsigned int fields_count);
+				unsigned int fields_count,
+				pool_t fields_modify_pool);
 /* Returns registered field index, or UINT_MAX if not found. */
 unsigned int
 mail_cache_register_lookup(struct mail_cache *cache, const char *name);
@@ -162,9 +167,10 @@ enum mail_cache_decision_type
 mail_cache_field_get_decision(struct mail_cache *cache, unsigned int field_idx);
 /* Notify the decision handling code when field is committed to cache.
    If this is the first time the field is added to cache, its caching decision
-   is updated to TEMP. */
+   is updated to TEMP. Sets rejected to true if header count limit has been
+   reached and the field has NOT been switched to TEMP */
 void mail_cache_decision_add(struct mail_cache_view *view, uint32_t seq,
-			     unsigned int field);
+			     unsigned int field, bool *rejected_r);
 
 /* Set data_r and size_r to point to wanted field in cache file.
    Returns 1 if field was found, 0 if not, -1 if error. */

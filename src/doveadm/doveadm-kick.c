@@ -19,6 +19,7 @@ struct kick_session {
 };
 
 struct kick_context {
+	struct event *event;
 	struct who_context who;
 	enum doveadm_client_type conn_type;
 	ARRAY(struct kick_session) kicks;
@@ -32,7 +33,8 @@ kick_user_anvil_callback(const char *reply, struct kick_context *ctx)
 
 	if (reply != NULL) {
 		if (str_to_uint(reply, &count) < 0)
-			i_error("Unexpected reply from anvil: %s", reply);
+			e_error(ctx->event,
+				"Unexpected reply from anvil: %s", reply);
 		else
 			ctx->kicked_count += count;
 	}
@@ -41,12 +43,15 @@ kick_user_anvil_callback(const char *reply, struct kick_context *ctx)
 
 static void kick_users_get_via_who(struct kick_context *ctx)
 {
+	const char *error;
+
 	/* get a list of all user+sessions matching the filter */
 	p_array_init(&ctx->kicks, ctx->who.pool, 64);
 	struct doveadm_who_iter *iter =
 		doveadm_who_iter_init(ctx->who.anvil_path);
 	if (!doveadm_who_iter_init_filter(iter, &ctx->who.filter)) {
-		doveadm_who_iter_deinit(&iter);
+		if (doveadm_who_iter_deinit(&iter, &error) < 0)
+			e_error(ctx->event, "%s", error);
 		return;
 	}
 	struct who_line who_line;
@@ -57,8 +62,10 @@ static void kick_users_get_via_who(struct kick_context *ctx)
 		session->username = p_strdup(ctx->who.pool, who_line.username);
 		guid_128_copy(session->conn_guid, who_line.conn_guid);
 	}
-	if (doveadm_who_iter_deinit(&iter) < 0)
+	if (doveadm_who_iter_deinit(&iter, &error) < 0) {
 		doveadm_exit_code = EX_TEMPFAIL;
+		e_error(ctx->event, "%s", error);
+	}
 }
 
 static void kick_users_via_anvil(struct kick_context *ctx)
@@ -126,6 +133,7 @@ static void cmd_kick(struct doveadm_cmd_context *cctx)
 		return;
 	}
 	ctx.conn_type = cctx->conn_type;
+	ctx.event = cctx->event;
 	ctx.who.pool = pool_alloconly_create("kick pids", 10240);
 
 	if (who_parse_args(&ctx.who, passdb_field, &dest_ip, masks) != 0) {

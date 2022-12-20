@@ -77,6 +77,7 @@ static const struct command imap_ext_commands[] = {
 	{ "UID THREAD",		cmd_thread,      COMMAND_FLAG_BREAKS_SEQS },
 	{ "UNSELECT",		cmd_unselect,    COMMAND_FLAG_BREAKS_MAILBOX },
 	{ "XLIST",		cmd_list,        0 },
+	{ "COMPRESS",           cmd_compress,    0 },
 	/* IMAP URLAUTH (RFC4467): */
 	{ "GENURLAUTH",		cmd_genurlauth,  0 },
 	{ "RESETKEY",		cmd_resetkey,    0 },
@@ -176,8 +177,8 @@ void command_stats_flush(struct client_command_context *cmd)
 		cmd->stats_start.lock_wait_usecs;
 	cmd->stats.bytes_in += i_stream_get_absolute_offset(cmd->client->input) -
 		cmd->stats_start.bytes_in;
-	cmd->stats.bytes_out += cmd->client->output->offset -
-		cmd->stats_start.bytes_out;
+	cmd->stats.bytes_out += cmd->client->prev_output_size +
+		cmd->client->output->offset - cmd->stats_start.bytes_out;
 	/* allow flushing multiple times */
 	command_stats_start(cmd);
 }

@@ -28,6 +28,10 @@
 #define IS_STANDALONE() \
         (getenv(MASTER_IS_PARENT_ENV) == NULL)
 
+struct event_category event_category_pop3 = {
+	.name = "pop3",
+};
+
 static bool verbose_proctitle = FALSE;
 static struct mail_storage_service_ctx *storage_service;
 static struct login_server *login_server = NULL;
@@ -115,9 +119,26 @@ client_create_from_input(const struct mail_storage_service_input *input,
 	struct mail_storage_service_user *user;
 	struct mail_user *mail_user;
 	struct pop3_settings *set;
-	const char *errstr;
 
-	if (mail_storage_service_lookup_next(storage_service, input,
+	struct event *event = event_create(NULL);
+	event_add_category(event, &event_category_pop3);
+	event_add_fields(event, (const struct event_add_field []){
+		{ .key = "user", .value = input->username },
+		{ .key = NULL }
+	});
+	if (input->local_ip.family != 0)
+		event_add_str(event, "local_ip", net_ip2addr(&input->local_ip));
+	if (input->local_port != 0)
+		event_add_int(event, "local_port", input->local_port);
+	if (input->remote_ip.family != 0)
+		event_add_str(event, "remote_ip", net_ip2addr(&input->remote_ip));
+	if (input->remote_port != 0)
+		event_add_int(event, "remote_port", input->remote_port);
+
+	struct mail_storage_service_input service_input = *input;
+	service_input.event_parent = event;
+
+	if (mail_storage_service_lookup_next(storage_service, &service_input,
 					     &user, &mail_user, error_r) <= 0) {
 		if (write(fd_out, lookup_error_str, strlen(lookup_error_str)) < 0) {
 			/* ignored */
@@ -126,20 +147,13 @@ client_create_from_input(const struct mail_storage_service_input *input,
 	}
 	restrict_access_allow_coredumps(TRUE);
 
-	set = mail_storage_service_user_get_set(user)[1];
+	set = settings_parser_get_root_set(mail_user->set_parser,
+			&pop3_setting_parser_info);
 	if (set->verbose_proctitle)
 		verbose_proctitle = TRUE;
 
-	if (settings_var_expand(&pop3_setting_parser_info, set,
-				mail_user->pool, mail_user_var_expand_table(mail_user),
-				&errstr) <= 0) {
-		*error_r = t_strdup_printf("Failed to expand settings: %s", errstr);
-		mail_user_deinit(&mail_user);
-		mail_storage_service_user_unref(&user);
-		return -1;
-	}
-
-	*client_r = client_create(fd_in, fd_out, mail_user, user, set);
+	*client_r = client_create(fd_in, fd_out, event, mail_user, user, set);
+	event_unref(&event);
 	return 0;
 }
 
@@ -171,7 +185,7 @@ static int init_namespaces(struct client *client, bool already_logged_in)
 		if (!already_logged_in)
 			client_send_line(client, MSG_BYE_INTERNAL_ERROR);
 
-		i_error("%s", error);
+		e_error(client->event, "%s", error);
 		client_destroy(client, error);
 		return -1;
 	}
@@ -224,7 +238,7 @@ static void client_init_session(struct client *client)
 	event_reason_end(&reason);
 
 	if (ret < 0) {
-		i_error("%s", error);
+		e_error(client->event, "%s", error);
 		client_destroy(client, error);
 	}
 }
@@ -281,10 +295,8 @@ login_request_finished(const struct login_server_request *login_client,
 	input.username = username;
 	input.userdb_fields = extra_fields;
 	input.session_id = login_client->session_id;
-	if ((flags & LOGIN_REQUEST_FLAG_CONN_SECURED) != 0)
-		input.conn_secured = TRUE;
-	if ((flags & LOGIN_REQUEST_FLAG_CONN_SSL_SECURED) != 0)
-		input.conn_ssl_secured = TRUE;
+	if ((flags & LOGIN_REQUEST_FLAG_END_CLIENT_SECURED_TLS) != 0)
+		input.end_client_tls_secured = TRUE;
 
 	buffer_create_from_const_data(&input_buf, login_client->data,
 				      login_client->auth_req.data_size);

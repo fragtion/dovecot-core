@@ -44,14 +44,14 @@ EXTRA_DIST = \
 	stopwords/stopwords_malformed.txt
 
 $(srcdir)/WordBreakProperty.txt:
-	$(AM_V_GEN)test -f $@ || wget -qO $@ https://dovecot.org/res/WordBreakProperty.txt
+	$(AM_V_at)test -f $@ || $(WGET) -nv -O $@ https://dovecot.org/res/WordBreakProperty.txt
 $(srcdir)/word-boundary-data.c: $(srcdir)/word-properties.pl $(srcdir)/WordBreakProperty.txt
-	$(AM_V_GEN)perl $(srcdir)/word-properties.pl boundaries $(srcdir)/WordBreakProperty.txt > $@
+	$(AM_V_at)perl $(srcdir)/word-properties.pl boundaries $(srcdir)/WordBreakProperty.txt > $@
 
 $(srcdir)/PropList.txt:
-	$(AM_V_GEN)test -f $@ || wget -qO $@ https://dovecot.org/res/PropList.txt
+	$(AM_V_at)test -f $@ || $(WGET) -nv -O $@ https://dovecot.org/res/PropList.txt
 $(srcdir)/word-break-data.c: $(srcdir)/word-properties.pl $(srcdir)/PropList.txt
-	$(AM_V_GEN)perl $(srcdir)/word-properties.pl breaks $(srcdir)/PropList.txt > $@
+	$(AM_V_at)perl $(srcdir)/word-properties.pl breaks $(srcdir)/PropList.txt > $@
 
 
 if BUILD_FTS_STEMMER
@@ -113,7 +113,7 @@ pkginc_lib_HEADERS = $(headers)
 deps=../lib-dovecot/libdovecot.la
 
 pkglib_LTLIBRARIES = libdovecot-fts.la
-libdovecot_fts_la_SOURCES = 
+libdovecot_fts_la_SOURCES =
 libdovecot_fts_la_LIBADD = libfts.la $(deps)
 libdovecot_fts_la_DEPENDENCIES = libfts.la $(deps)
 libdovecot_fts_la_LDFLAGS = -export-dynamic

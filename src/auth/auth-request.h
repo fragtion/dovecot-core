@@ -28,10 +28,10 @@ enum auth_request_state {
 	AUTH_REQUEST_STATE_MAX
 };
 
-enum auth_request_secured {
-	AUTH_REQUEST_SECURED_NONE,
-	AUTH_REQUEST_SECURED,
-	AUTH_REQUEST_SECURED_TLS,
+enum auth_request_conn_secured {
+	AUTH_REQUEST_CONN_SECURED_NONE,
+	AUTH_REQUEST_CONN_SECURED,
+	AUTH_REQUEST_CONN_SECURED_TLS,
 };
 
 enum auth_request_cache_result {
@@ -63,6 +63,7 @@ struct auth_request_fields {
 	const char *service, *mech_name, *session_id, *local_name, *client_id;
 	struct ip_addr local_ip, remote_ip, real_local_ip, real_remote_ip;
 	in_port_t local_port, remote_port, real_local_port, real_remote_port;
+	const char *ssl_ja3_hash;
 
         /* extra_fields are returned in authentication reply. Fields prefixed
            with "userdb_" are automatically placed to userdb_reply instead. */
@@ -77,7 +78,7 @@ struct auth_request_fields {
 	const unsigned char *delayed_credentials;
 	size_t delayed_credentials_size;
 
-	enum auth_request_secured secured;
+	enum auth_request_conn_secured conn_secured;
 
 	/* Authentication was successfully finished, including policy checks
 	   and such. There may still be some final delay or final SASL

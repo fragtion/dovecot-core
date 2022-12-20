@@ -2,6 +2,7 @@
 
 #include "login-common.h"
 #include "array.h"
+#include "md5.h"
 #include "str.h"
 #include "base64.h"
 #include "buffer.h"
@@ -50,7 +51,7 @@ sasl_server_get_advertised_mechs(struct client *client, unsigned int *count_r)
 	unsigned int i, j, count;
 
 	mech = auth_client_get_available_mechs(auth_client, &count);
-	if (count == 0 || (!client->secured &&
+	if (count == 0 || (!client->connection_secured &&
 			   strcmp(client->ssl_set->ssl, "required") == 0)) {
 		*count_r = 0;
 		return NULL;
@@ -68,7 +69,7 @@ sasl_server_get_advertised_mechs(struct client *client, unsigned int *count_r)
 		   c) we allow insecure authentication
 		*/
 		if ((fmech.flags & MECH_SEC_PRIVATE) == 0 &&
-		    (client->secured || !client->set->disable_plaintext_auth ||
+		    (client->connection_secured || client->set->auth_allow_cleartext ||
 		     (fmech.flags & MECH_SEC_PLAINTEXT) == 0))
 			ret_mech[j++] = fmech;
 	}
@@ -106,10 +107,10 @@ client_get_auth_flags(struct client *client)
 	if (client->ssl_iostream != NULL &&
 	    ssl_iostream_has_valid_client_cert(client->ssl_iostream))
 		auth_flags |= AUTH_REQUEST_FLAG_VALID_CLIENT_CERT;
-	if (client->tls || client->proxied_ssl)
-		auth_flags |= AUTH_REQUEST_FLAG_TRANSPORT_SECURITY_TLS;
-	if (client->secured)
-		auth_flags |= AUTH_REQUEST_FLAG_SECURED;
+	if (client->connection_tls_secured)
+		auth_flags |= AUTH_REQUEST_FLAG_CONN_SECURED_TLS;
+	if (client->connection_secured)
+		auth_flags |= AUTH_REQUEST_FLAG_CONN_SECURED;
 	if (login_binary->sasl_support_final_reply)
 		auth_flags |= AUTH_REQUEST_FLAG_SUPPORT_FINAL_RESP;
 	return auth_flags;
@@ -181,10 +182,8 @@ static int master_send_request(struct anvil_request *anvil_request)
 	if (client->ssl_iostream != NULL &&
 	    ssl_iostream_get_compression(client->ssl_iostream) != NULL)
 		req.flags |= LOGIN_REQUEST_FLAG_TLS_COMPRESSION;
-	if (client->secured)
-		req.flags |= LOGIN_REQUEST_FLAG_CONN_SECURED;
-	if (client->ssl_secured)
-		req.flags |= LOGIN_REQUEST_FLAG_CONN_SSL_SECURED;
+	if (client->end_client_tls_secured)
+		req.flags |= LOGIN_REQUEST_FLAG_END_CLIENT_SECURED_TLS;
 	if (HAS_ALL_BITS(client->auth_flags, SASL_SERVER_AUTH_FLAG_IMPLICIT))
 		req.flags |= LOGIN_REQUEST_FLAG_IMPLICIT;
 	memcpy(req.cookie, anvil_request->cookie, sizeof(req.cookie));
@@ -458,12 +457,20 @@ int sasl_server_auth_request_info_fill(struct client *client,
 	}
 
 	if (client->ssl_iostream != NULL) {
+		unsigned char hash[MD5_RESULTLEN];
 		info_r->cert_username = ssl_iostream_get_peer_name(client->ssl_iostream);
 		info_r->ssl_cipher = ssl_iostream_get_cipher(client->ssl_iostream,
 							 &info_r->ssl_cipher_bits);
 		info_r->ssl_pfs = ssl_iostream_get_pfs(client->ssl_iostream);
 		info_r->ssl_protocol =
 			ssl_iostream_get_protocol_name(client->ssl_iostream);
+		const char *ja3 = ssl_iostream_get_ja3(client->ssl_iostream);
+		/* See https://github.com/salesforce/ja3#how-it-works for reason
+		   why md5 is used. */
+		if (ja3 != NULL) {
+			md5_get_digest(ja3, strlen(ja3), hash);
+			info_r->ssl_ja3_hash = binary_to_hex(hash, sizeof(hash));
+		}
 	}
 	info_r->flags = client_get_auth_flags(client);
 	info_r->local_ip = client->local_ip;
@@ -519,10 +526,14 @@ void sasl_server_auth_begin(struct client *client, const char *mech_name,
 
 	i_assert(!private || (mech->flags & MECH_SEC_PRIVATE) != 0);
 
-	if (!client->secured && client->set->disable_plaintext_auth &&
+	if (!client->connection_secured && !client->set->auth_allow_cleartext &&
 	    (mech->flags & MECH_SEC_PLAINTEXT) != 0) {
+		client_notify_status(client, TRUE,
+			 "cleartext authentication not allowed "
+			 "without SSL/TLS, but your client did it anyway. "
+			 "If anyone was listening, the password was exposed.");
 		sasl_server_auth_failed(client,
-			"Plaintext authentication disabled.",
+			 AUTH_CLEARTEXT_DISABLED_MSG,
 			 AUTH_CLIENT_FAIL_CODE_MECH_SSL_REQUIRED);
 		return;
 	}
@@ -545,10 +556,10 @@ sasl_server_auth_cancel(struct client *client, const char *reason,
 {
 	i_assert(client->authenticating);
 
-	if (client->set->auth_verbose && reason != NULL) {
+	if (reason != NULL) {
 		const char *auth_name =
 			str_sanitize(client->auth_mech_name, MAX_MECH_NAME);
-		e_info(client->event, "Authenticate %s failed: %s",
+		e_info(client->event_auth, "Authenticate %s failed: %s",
 		       auth_name, reason);
 	}
 

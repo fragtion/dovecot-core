@@ -405,7 +405,7 @@ static void test_mail_cache_delete_too_large_int(bool exceed_on_first_write)
 
 		/* adding anything more will delete the cache. */
 		test_expect_error_string("Cache file too large");
-		test_mail_cache_add_field(&ctx, 1, ctx.cache_field2.idx, "bar1");
+		test_mail_cache_add_field(&ctx, 1, ctx.cache_field3.idx, "bar1");
 		test_expect_no_more_errors();
 	}
 	test_assert(stat(ctx.index->cache->filepath, &st) < 0 && errno == ENOENT);
@@ -707,7 +707,8 @@ static void test_mail_cache_purge_field_changes_int(enum test_drop drop)
 	   by purging (which is called to auto-create the cache). */
 	test_assert(mail_cache_purge(ctx.cache, (uint32_t)-1, "test") == 0);
 	mail_cache_register_fields(ctx.cache, cache_fields,
-				   N_ELEMENTS(cache_fields));
+				   N_ELEMENTS(cache_fields),
+				   unsafe_data_stack_pool);
 
 	trans = mail_index_transaction_begin(ctx.view, 0);
 	cache_view = mail_cache_view_open(ctx.cache, ctx.view);
@@ -891,7 +892,8 @@ static void test_mail_cache_purge_bitmask(void)
 	test_mail_cache_add_mail(&ctx, UINT_MAX, NULL);
 	test_mail_cache_add_mail(&ctx, UINT_MAX, NULL);
 	test_assert(mail_cache_purge(ctx.cache, (uint32_t)-1, "test") == 0);
-	mail_cache_register_fields(ctx.cache, &bitmask_field, 1);
+	mail_cache_register_fields(ctx.cache, &bitmask_field, 1,
+				   unsafe_data_stack_pool);
 
 	test_mail_cache_update_day_first_uid7(&ctx, 3);
 
@@ -1042,6 +1044,42 @@ static void test_mail_cache_update_need_purge_deleted_records2(void)
 	test_end();
 }
 
+static void test_mail_cache_purge_deadlines(void)
+{
+	static const uint32_t BASE_TIME = 1000;
+	static const uint32_t DROP_SECS =  100;
+
+	struct mail_cache cache;
+	struct mail_index index;
+	struct mail_index_header hdr;
+	struct mail_cache_purge_drop_ctx ctx;
+
+	i_zero(&cache);
+	i_zero(&index);
+	i_zero(&hdr);
+	i_zero(&ctx);
+
+	hdr.day_stamp = BASE_TIME;
+	index.optimization_set.cache.unaccessed_field_drop_secs = DROP_SECS;
+	index.optimization_set.cache.max_headers_count = 1;
+	cache.index = &index;
+
+	test_begin("mail cache purge deadlines");
+
+	mail_cache_purge_drop_init(&cache, &hdr, &ctx);
+	test_assert_cmp(cache.headers_capped, ==, FALSE);
+	test_assert_cmp(ctx.max_yes_downgrade_time, ==, BASE_TIME - DROP_SECS);
+	test_assert_cmp(ctx.max_temp_drop_time, ==, BASE_TIME - DROP_SECS - DROP_SECS);
+
+	cache.headers_capped = TRUE;
+	mail_cache_purge_drop_init(&cache, &hdr, &ctx);
+	test_assert_cmp(cache.headers_capped, ==, TRUE);
+	test_assert_cmp(ctx.max_yes_downgrade_time, ==, BASE_TIME - DROP_SECS/4);
+	test_assert_cmp(ctx.max_temp_drop_time, ==, BASE_TIME - DROP_SECS/4 - DROP_SECS/4);
+
+	test_end();
+}
+
 int main(void)
 {
 	static void (*const test_functions[])(void) = {
@@ -1070,6 +1108,7 @@ int main(void)
 		test_mail_cache_update_need_purge_continued_records2,
 		test_mail_cache_update_need_purge_deleted_records,
 		test_mail_cache_update_need_purge_deleted_records2,
+		test_mail_cache_purge_deadlines,
 		NULL
 	};
 	return test_run(test_functions);

@@ -46,7 +46,7 @@ static int client_input_status_overview(struct doveadm_connection *client)
 	while ((user = replicator_queue_iter_next(iter)) != NULL) {
 		if (user->priority != REPLICATION_PRIORITY_NONE)
 			pending_counts[user->priority]++;
-		else if (replicator_queue_want_sync_now(queue, user, &next_secs)) {
+		else if (replicator_queue_want_sync_now(user, &next_secs)) {
 			if (user->last_sync_failed)
 				pending_failed_count++;
 			else
@@ -84,6 +84,7 @@ client_input_status(struct doveadm_connection *client, const char *const *args)
 	struct replicator_queue_iter *iter;
 	struct replicator_user *user;
 	const char *mask = args[0];
+	unsigned int next_secs;
 	string_t *str = t_str_new(128);
 
 	if (mask == NULL)
@@ -98,11 +99,14 @@ client_input_status(struct doveadm_connection *client, const char *const *args)
 		str_append_tabescaped(str, user->username);
 		str_append_c(str, '\t');
 		str_append(str, replicator_priority_to_str(user->priority));
-		str_printfa(str, "\t%lld\t%lld\t%d\t%lld\n",
+		if (replicator_queue_want_sync_now(user, &next_secs))
+			next_secs = 0;
+		str_printfa(str, "\t%lld\t%lld\t%d\t%lld\t%u\n",
 			    (long long)user->last_fast_sync,
 			    (long long)user->last_full_sync,
 			    user->last_sync_failed ? 1 : 0,
-			    (long long)user->last_successful_sync);
+			    (long long)user->last_successful_sync,
+			    next_secs);
 		o_stream_nsend(client->conn.output, str_data(str), str_len(str));
 	}
 	replicator_queue_iter_deinit(&iter);
@@ -162,7 +166,7 @@ client_input_replicate(struct doveadm_connection *client, const char *const *arg
 
 	/* <priority> <flags> <username>|<mask> */
 	if (str_array_length(args) != 3) {
-		i_error("%s: REPLICATE: Invalid parameters", client->conn.name);
+		e_error(client->conn.event, "REPLICATE: Invalid parameters");
 		return -1;
 	}
 	if (replication_priority_parse(args[0], &priority) < 0) {
@@ -172,9 +176,14 @@ client_input_replicate(struct doveadm_connection *client, const char *const *arg
 	full = strchr(args[1], 'f') != NULL;
 	usermask = args[2];
 	if (strchr(usermask, '*') == NULL && strchr(usermask, '?') == NULL) {
-		user = replicator_queue_add(queue, usermask, priority);
+		struct replicator_user *user =
+			replicator_queue_get(queue, usermask);
 		if (full)
 			user->force_full_sync = TRUE;
+		e_debug(client->conn.event, "user %s: doveadm REPLICATE command (priority=%d full=%c)",
+			user->username, priority, full ? 'y' : 'n');
+		replicator_queue_update(queue, user, priority);
+		replicator_queue_add(queue, user);
 		o_stream_nsend_str(client->conn.output, "+1\n");
 		return 0;
 	}
@@ -184,9 +193,12 @@ client_input_replicate(struct doveadm_connection *client, const char *const *arg
 	while ((user = replicator_queue_iter_next(iter)) != NULL) {
 		if (!wildcard_match(user->username, usermask))
 			continue;
-		user = replicator_queue_add(queue, user->username, priority);
 		if (full)
 			user->force_full_sync = TRUE;
+		e_debug(client->conn.event, "user %s: doveadm REPLICATE command (priority=%d full=%c)",
+			user->username, priority, full ? 'y' : 'n');
+		replicator_queue_update(queue, user, priority);
+		replicator_queue_add(queue, user);
 		match_count++;
 	}
 	replicator_queue_iter_deinit(&iter);
@@ -205,14 +217,19 @@ client_input_add(struct doveadm_connection *client, const char *const *args)
 
 	/* <usermask> */
 	if (str_array_length(args) != 1) {
-		i_error("%s: ADD: Invalid parameters", client->conn.name);
+		e_error(client->conn.event, "ADD: Invalid parameters");
 		return -1;
 	}
 
 	if (strchr(args[0], '*') == NULL && strchr(args[0], '?') == NULL) {
-		(void)replicator_queue_add(queue, args[0],
-					   REPLICATION_PRIORITY_NONE);
+		struct replicator_user *user =
+			replicator_queue_get(queue, args[0]);
+		e_debug(client->conn.event, "user %s: doveadm ADD command",
+			user->username);
+		replicator_queue_add(queue, user);
 	} else {
+		e_debug(client->conn.event, "doveadm ADD command: Add usermask '%s'",
+			args[0]);
 		replicator_queue_add_auth_users(queue, set->auth_socket_path,
 						args[0], ioloop_time);
 	}
@@ -229,7 +246,7 @@ client_input_remove(struct doveadm_connection *client, const char *const *args)
 
 	/* <username> */
 	if (str_array_length(args) != 1) {
-		i_error("%s: REMOVE: Invalid parameters", client->conn.name);
+		e_error(client->conn.event, "REMOVE: Invalid parameters");
 		return -1;
 	}
 	user = replicator_queue_lookup(queue, args[0]);
@@ -251,15 +268,19 @@ client_input_notify(struct doveadm_connection *client, const char *const *args)
 
 	/* <username> <flags> <state> */
 	if (str_array_length(args) < 3) {
-		i_error("%s: NOTIFY: Invalid parameters", client->conn.name);
+		e_error(client->conn.event, "NOTIFY: Invalid parameters");
 		return -1;
 	}
 
-	user = replicator_queue_add(queue, args[0], REPLICATION_PRIORITY_NONE);
-	if (args[1][0] == 'f')
+	bool full = args[1][0] == 'f';
+	user = replicator_queue_get(queue, args[0]);
+	if (full)
 		user->last_full_sync = ioloop_time;
 	user->last_fast_sync = ioloop_time;
 	user->last_update = ioloop_time;
+	e_debug(client->conn.event, "user %s: doveadm NOTIFY command (full=%c)",
+		user->username, full ? 'y' : 'n');
+	replicator_queue_add(queue, user);
 
 	if (args[2][0] != '\0') {
 		i_free(user->state);
@@ -275,7 +296,7 @@ static int client_input_args(struct connection *conn, const char *const *args)
 	const char *cmd = args[0];
 
 	if (cmd == NULL) {
-		i_error("%s: Empty command", conn->name);
+		e_error(client->conn.event, "Empty command");
 		return 0;
 	}
 	args++;
@@ -292,7 +313,7 @@ static int client_input_args(struct connection *conn, const char *const *args)
 		return client_input_remove(client, args);
 	else if (strcmp(cmd, "NOTIFY") == 0)
 		return client_input_notify(client, args);
-	i_error("%s: Unknown command: %s", conn->name, cmd);
+	e_error(client->conn.event, "Unknown command: %s", cmd);
 	return -1;
 }
 
@@ -314,6 +335,7 @@ void doveadm_connection_create(struct replicator_brain *brain, int fd)
 	client->brain = brain;
 	connection_init_server(doveadm_connections, &client->conn,
 			       "doveadm-client", fd, fd);
+	event_add_category(client->conn.event, &event_category_replication);
 }
 
 static struct connection_settings doveadm_conn_set = {

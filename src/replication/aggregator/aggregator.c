@@ -9,11 +9,22 @@
 #include "replicator-connection.h"
 
 struct replicator_connection *replicator;
+struct event *aggregator_event;
+
+static struct event_category event_category_replication = {
+	.name = "replication"
+};
 
 static void client_connected(struct master_service_connection *conn)
 {
+	const char *name;
+
 	master_service_client_connection_accept(conn);
-	notify_connection_create(conn->fd, conn->fifo);
+	if (conn->remote_port == 0)
+		name = conn->name;
+	else
+		name = net_ipport2str(&conn->remote_ip, conn->remote_port);
+	notify_connection_create(conn->fd, conn->fifo, name);
 }
 
 static void main_preinit(void)
@@ -21,11 +32,13 @@ static void main_preinit(void)
 	struct ip_addr *ips;
 	unsigned int ips_count;
 	const struct aggregator_settings *set;
-	void **sets;
 	int ret;
 
-	sets = master_service_settings_get_others(master_service);
-	set = sets[0];
+	set = master_service_settings_get_root_set(master_service,
+				&aggregator_setting_parser_info);
+
+	aggregator_event = event_create(NULL);
+	event_add_category(aggregator_event, &event_category_replication);
 
 	if (set->replicator_port != 0) {
 		ret = net_gethostbyname(set->replicator_host, &ips, &ips_count);
@@ -69,6 +82,7 @@ int main(int argc, char *argv[])
 
 	notify_connections_destroy_all();
 	replicator_connection_destroy(&replicator);
+	event_unref(&aggregator_event);
 	master_service_deinit(&master_service);
         return 0;
 }

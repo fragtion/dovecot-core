@@ -24,8 +24,6 @@ static struct doveadm_cmd_ver2 *doveadm_commands_ver2[] = {
 	&doveadm_cmd_stats_dump_ver2,
 	&doveadm_cmd_stats_add_ver2,
 	&doveadm_cmd_stats_remove_ver2,
-	&doveadm_cmd_oldstats_dump_ver2,
-	&doveadm_cmd_oldstats_reset_ver2,
 	&doveadm_cmd_penalty_ver2,
 	&doveadm_cmd_kick_ver2,
 	&doveadm_cmd_proxy_kick_ver2,
@@ -115,7 +113,6 @@ void doveadm_cmds_init(void)
 	for (i = 0; i < N_ELEMENTS(doveadm_commands_ver2); i++)
 		doveadm_cmd_register_ver2(doveadm_commands_ver2[i]);
 
-	doveadm_register_director_commands();
 	doveadm_register_instance_commands();
 	doveadm_register_log_commands();
 	doveadm_register_replicator_commands();

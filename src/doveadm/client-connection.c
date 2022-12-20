@@ -39,7 +39,6 @@ static int client_connection_read_settings(struct client_connection *conn)
 	struct master_service_settings_input input;
 	struct master_service_settings_output output;
 	const char *error;
-	void *set;
 
 	i_zero(&input);
 	input.roots = set_roots;
@@ -49,11 +48,11 @@ static int client_connection_read_settings(struct client_connection *conn)
 
 	if (master_service_settings_read(master_service, &input,
 					 &output, &error) < 0) {
-		i_error("Error reading configuration: %s", error);
+		e_error(conn->event, "Error reading configuration: %s", error);
 		return -1;
 	}
-	set = master_service_settings_get_others(master_service)[0];
-	conn->set = settings_dup(&doveadm_setting_parser_info, set, conn->pool);
+	conn->set = master_service_settings_get_root_set_dup(master_service,
+				&doveadm_setting_parser_info, conn->pool);
 	return 0;
 }
 
@@ -95,6 +94,7 @@ void client_connection_destroy(struct client_connection **_conn)
 	if (doveadm_verbose_proctitle)
 		process_title_set("[idling]");
 
+	event_unref(&conn->event);
 	pool_unref(&conn->pool);
 }
 

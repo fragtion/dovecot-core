@@ -124,6 +124,11 @@ struct sql_db_vfuncs {
 	void (*update_stmt)(struct sql_transaction_context *ctx,
 			    struct sql_statement *stmt,
 			    unsigned int *affected_rows);
+
+	/* Returns a schema/keyspace followed by a dot '.' OR an empty string
+	   if none is required (in order remove the requirement for further
+	   checks down the line in format strings et al.) */
+	const char *(*table_prefix)(struct sql_db *db);
 };
 
 struct sql_db {
@@ -194,6 +199,9 @@ struct sql_statement {
 	pool_t pool;
 	const char *query_template;
 	ARRAY_TYPE(const_string) args;
+
+	/* Tell the driver to not log this query with expanded values. */
+	bool no_log_expanded_values;
 };
 
 struct sql_field_map {
@@ -241,8 +249,13 @@ int driver_sqlpool_init_full(const struct sql_settings *set, const struct sql_db
 
 void sql_db_set_state(struct sql_db *db, enum sql_db_state state);
 
+inline static const char *sql_db_table_prefix(struct sql_db *db) {
+	return db->v.table_prefix == NULL ? "" : db->v.table_prefix(db);
+}
+
 void sql_transaction_add_query(struct sql_transaction_context *ctx, pool_t pool,
 			       const char *query, unsigned int *affected_rows);
+const char *sql_statement_get_log_query(struct sql_statement *stmt);
 const char *sql_statement_get_query(struct sql_statement *stmt);
 
 void sql_connection_log_finished(struct sql_db *db);

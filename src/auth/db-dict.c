@@ -5,6 +5,7 @@
 #include "array.h"
 #include "istream.h"
 #include "str.h"
+#include "str-sanitize.h"
 #include "json-parser.h"
 #include "settings.h"
 #include "dict.h"
@@ -104,62 +105,13 @@ static struct dict_connection *dict_conn_find(const char *config_path)
 	return NULL;
 }
 
-static bool
-parse_obsolete_setting(const char *key, const char *value,
-		       struct dict_settings_parser_ctx *ctx,
-		       const char **error_r)
-{
-	const struct db_dict_key *dbkey;
-
-	if (strcmp(key, "password_key") == 0) {
-		/* key passdb { key=<value> format=json }
-		   passdb_objects = passdb */
-		ctx->cur_key = array_append_space(&ctx->conn->set.keys);
-		*ctx->cur_key = default_key_settings;
-		ctx->cur_key->name = "passdb";
-		ctx->cur_key->format = "json";
-		ctx->cur_key->parsed_format = DB_DICT_VALUE_FORMAT_JSON;
-		ctx->cur_key->key = p_strdup(ctx->conn->pool, value);
-
-		dbkey = ctx->cur_key;
-		array_push_back(&ctx->conn->set.parsed_passdb_objects, &dbkey);
-		return TRUE;
-	}
-	if (strcmp(key, "user_key") == 0) {
-		/* key userdb { key=<value> format=json }
-		   userdb_objects = userdb */
-		ctx->cur_key = array_append_space(&ctx->conn->set.keys);
-		*ctx->cur_key = default_key_settings;
-		ctx->cur_key->name = "userdb";
-		ctx->cur_key->format = "json";
-		ctx->cur_key->parsed_format = DB_DICT_VALUE_FORMAT_JSON;
-		ctx->cur_key->key = p_strdup(ctx->conn->pool, value);
-
-		dbkey = ctx->cur_key;
-		array_push_back(&ctx->conn->set.parsed_userdb_objects, &dbkey);
-		return TRUE;
-	}
-	if (strcmp(key, "value_format") == 0) {
-		if (strcmp(value, "json") == 0)
-			return TRUE;
-		*error_r = "Deprecated value_format must be 'json'";
-		return FALSE;
-	}
-	return FALSE;
-}
-
 static const char *parse_setting(const char *key, const char *value,
 				 struct dict_settings_parser_ctx *ctx)
 {
 	struct db_dict_field *field;
-	const char *error = NULL;
 
 	switch (ctx->section) {
 	case DICT_SETTINGS_SECTION_ROOT:
-		if (parse_obsolete_setting(key, value, ctx, &error))
-			return NULL;
-		if (error != NULL)
-			return error;
 		return parse_setting_from_defs(ctx->conn->pool, setting_defs,
 					       &ctx->conn->set, key, value);
 	case DICT_SETTINGS_SECTION_KEY:
@@ -423,7 +375,7 @@ static int db_dict_iter_lookup_key_values(struct db_dict_value_iter *iter)
 		if (ret > 0) {
 			e_debug(authdb_event(iter->auth_request),
 				"Lookup: %s = %s", str_c(path),
-				key->value);
+				str_sanitize(key->value, UINT_MAX));
 		} else if (ret < 0) {
 			e_error(authdb_event(iter->auth_request),
 				"Failed to lookup key %s: %s", str_c(path), error);
@@ -431,7 +383,7 @@ static int db_dict_iter_lookup_key_values(struct db_dict_value_iter *iter)
 		} else if (key->key->default_value != NULL) {
 			e_debug(authdb_event(iter->auth_request),
 				"Lookup: %s not found, using default value %s",
-				str_c(path), key->key->default_value);
+				str_c(path), str_sanitize(key->key->default_value, UINT_MAX));
 			key->value = key->key->default_value;
 		} else {
 			return 0;

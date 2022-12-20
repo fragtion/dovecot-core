@@ -237,13 +237,8 @@ cmd_append_catenate_url(struct client_command_context *cmd, const char *caturl)
 	if (ctx->failed)
 		return -1;
 
-	ret = imap_msgpart_url_parse(cmd->client->user, cmd->client->mailbox,
-				     caturl, &mpurl, &client_error);
-	if (ret < 0) {
-		client_send_box_error(cmd, ctx->box);
-		return -1;
-	}
-	if (ret == 0) {
+	if (imap_msgpart_url_parse(cmd->client->user, cmd->client->mailbox,
+				   caturl, &mpurl, &client_error) < 0) {
 		/* invalid url, abort */
 		client_send_tagline(cmd,
 			t_strdup_printf("NO [BADURL %s] %s.",
@@ -287,6 +282,7 @@ cmd_append_catenate(struct client_command_context *cmd,
 {
 	struct cmd_append_context *ctx = cmd->context;
 	const char *catpart;
+	bool invalid_arg = FALSE;
 
 	*nonsync_r = FALSE;
 
@@ -295,10 +291,12 @@ cmd_append_catenate(struct client_command_context *cmd,
 		const char *caturl;
 
 		if (strcasecmp(catpart, "URL") == 0 ) {
-			/* URL <url> */ 
+			/* URL <url> */
 			args++;
-			if (!imap_arg_get_astring(args, &caturl))
+			if (!imap_arg_get_astring(args, &caturl)) {
+				invalid_arg = TRUE;
 				break;
+			}
 			if (cmd_append_catenate_url(cmd, caturl) < 0) {
 				/* delay failure until we can stop
 				   parsing input */
@@ -307,8 +305,10 @@ cmd_append_catenate(struct client_command_context *cmd,
 		} else if (strcasecmp(catpart, "TEXT") == 0) {
 			/* TEXT <literal> */
 			args++;
-			if (!imap_arg_get_literal_size(args, &ctx->literal_size))
+			if (!imap_arg_get_literal_size(args, &ctx->literal_size)) {
+				invalid_arg = TRUE;
 				break;
+			}
 			if (args->literal8 && !ctx->binary_input &&
 			    !ctx->failed) {
 				client_send_tagline(cmd,
@@ -325,10 +325,11 @@ cmd_append_catenate(struct client_command_context *cmd,
 		args++;
 	}
 
-	if (IMAP_ARG_IS_EOL(args)) {
+	if (!invalid_arg && IMAP_ARG_IS_EOL(args)) {
 		/* ")" */
 		return 0;
 	}
+	ctx->client->input_skip_line = TRUE;
 	if (!ctx->failed)
 		client_send_command_error(cmd, "Invalid arguments.");
 	return -1;
@@ -367,6 +368,10 @@ static bool catenate_args_can_stop(struct cmd_append_context *ctx,
 			return TRUE;
 		}
 		args++;
+		if (args->type == IMAP_ARG_EOL) {
+			/* error - handle it later */
+			return TRUE;
+		}
 		if (args->type == IMAP_ARG_LITERAL_SIZE ||
 		    args->type == IMAP_ARG_LITERAL_SIZE_NONSYNC) {
 			if (args->type == IMAP_ARG_LITERAL_SIZE) {

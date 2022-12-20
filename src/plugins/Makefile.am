@@ -1,7 +1,3 @@
-if BUILD_ZLIB_PLUGIN
-ZLIB = zlib imap-zlib
-endif
-
 if BUILD_SOLR
 FTS_SOLR = fts-solr
 endif
@@ -35,11 +31,11 @@ SUBDIRS = \
 	imap-quota \
 	pop3-migration \
 	replication \
+	mail-compress \
 	mail-crypt \
 	trash \
 	virtual \
 	welcome \
-	$(ZLIB) \
 	$(FTS_SOLR) \
 	$(FTS_FLATCURVE) \
 	$(DICT_LDAP) \

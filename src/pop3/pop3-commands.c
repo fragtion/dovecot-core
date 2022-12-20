@@ -176,7 +176,10 @@ static int cmd_list(struct client *client, const char *args)
 
 static int cmd_last(struct client *client, const char *args ATTR_UNUSED)
 {
-	client_send_line(client, "+OK %u", client->last_seen_pop3_msn);
+	if (client->set->pop3_enable_last)
+		client_send_line(client, "+OK %u", client->last_seen_pop3_msn);
+	else
+		client_send_line(client, "-ERR LAST command not enabled");
 	return 1;
 }
 
@@ -218,7 +221,8 @@ static int client_verify_ordering(struct client *client,
 
 	seq = msgnum_to_seq(client, msgnum);
 	if (seq != mail->seq) {
-		i_error("Message ordering changed unexpectedly "
+		e_error(client->event,
+			"Message ordering changed unexpectedly "
 			"(msg #%u: storage seq %u -> %u)",
 			msgnum+1, seq, mail->seq);
 		return -1;
@@ -622,11 +626,13 @@ pop3_get_uid(struct client *client, struct mail *mail, string_t *str,
 	if ((client->uidl_keymask & UIDL_MD5) != 0) {
 		if (mail_get_special(mail, MAIL_FETCH_HEADER_MD5,
 				     &hdr_md5) < 0) {
-			i_error("UIDL: Header MD5 lookup failed: %s",
+			e_error(client->event,
+				"UIDL: Header MD5 lookup failed: %s",
 				mailbox_get_last_internal_error(mail->box, NULL));
 			return -1;
 		} else if (hdr_md5[0] == '\0') {
-			i_error("UIDL: Header MD5 not found "
+			e_error(client->event,
+				"UIDL: Header MD5 not found "
 				"(pop3_uidl_format=%%m not supported by storage?)");
 			return -1;
 		}
@@ -634,11 +640,13 @@ pop3_get_uid(struct client *client, struct mail *mail, string_t *str,
 	if ((client->uidl_keymask & UIDL_FILE_NAME) != 0) {
 		if (mail_get_special(mail, MAIL_FETCH_STORAGE_ID,
 				     &filename) < 0) {
-			i_error("UIDL: File name lookup failed: %s",
+			e_error(client->event,
+				"UIDL: File name lookup failed: %s",
 				mailbox_get_last_internal_error(mail->box, NULL));
 			return -1;
 		} else if (filename[0] == '\0') {
-			i_error("UIDL: File name not found "
+			e_error(client->event,
+				"UIDL: File name not found "
 				"(pop3_uidl_format=%%f not supported by storage?)");
 			return -1;
 		}
@@ -646,11 +654,13 @@ pop3_get_uid(struct client *client, struct mail *mail, string_t *str,
 	if ((client->uidl_keymask & UIDL_GUID) != 0) {
 		if (mail_get_special(mail, MAIL_FETCH_GUID,
 				     &guid) < 0) {
-			i_error("UIDL: Message GUID lookup failed: %s",
+			e_error(client->event,
+				"UIDL: Message GUID lookup failed: %s",
 				mailbox_get_last_internal_error(mail->box, NULL));
 			return -1;
 		} else if (guid[0] == '\0') {
-			i_error("UIDL: Message GUID not found "
+			e_error(client->event,
+				"UIDL: Message GUID not found "
 				"(pop3_uidl_format=%%g not supported by storage?)");
 			return -1;
 		}
@@ -668,7 +678,8 @@ pop3_get_uid(struct client *client, struct mail *mail, string_t *str,
 
 	if (var_expand(str, client->mail_set->pop3_uidl_format,
 		       tab, &error) <= 0) {
-		i_error("UIDL: Failed to expand pop3_uidl_format=%s: %s",
+		e_error(client->event,
+			"UIDL: Failed to expand pop3_uidl_format=%s: %s",
 			client->mail_set->pop3_uidl_format, error);
 		return -1;
 	}
@@ -921,57 +932,33 @@ static int cmd_uidl(struct client *client, const char *args)
 	return 1;
 }
 
-int client_command_execute(struct client *client,
-			   const char *name, const char *args)
-{
-	/* keep the command uppercased */
-	name = t_str_ucase(name);
+static const struct pop3_command pop3_commands[] = {
+	{ "capa", cmd_capa },
+	{ "dele", cmd_dele },
+	{ "list", cmd_list },
+	{ "last", cmd_last },
+	{ "noop", cmd_noop },
+	{ "quit", cmd_quit },
+	{ "retr", cmd_retr },
+	{ "rset", cmd_rset },
+	{ "stat", cmd_stat },
+	{ "top", cmd_top },
+	{ "uidl", cmd_uidl },
+};
 
+const struct pop3_command *pop3_command_find(const char *name)
+{
+	for (unsigned int i = 0; i < N_ELEMENTS(pop3_commands); i++) {
+		if (strcasecmp(pop3_commands[i].name, name) == 0)
+			return &pop3_commands[i];
+	}
+	return NULL;
+}
+
+int client_command_execute(struct client *client,
+			   const struct pop3_command *cmd, const char *args)
+{
 	while (*args == ' ') args++;
 
-	switch (*name) {
-	case 'C':
-		if (strcmp(name, "CAPA") == 0)
-			return cmd_capa(client, args);
-		break;
-	case 'D':
-		if (strcmp(name, "DELE") == 0)
-			return cmd_dele(client, args);
-		break;
-	case 'L':
-		if (strcmp(name, "LIST") == 0)
-			return cmd_list(client, args);
-		if (strcmp(name, "LAST") == 0 && client->set->pop3_enable_last)
-			return cmd_last(client, args);
-		break;
-	case 'N':
-		if (strcmp(name, "NOOP") == 0)
-			return cmd_noop(client, args);
-		break;
-	case 'Q':
-		if (strcmp(name, "QUIT") == 0)
-			return cmd_quit(client, args);
-		break;
-	case 'R':
-		if (strcmp(name, "RETR") == 0)
-			return cmd_retr(client, args);
-		if (strcmp(name, "RSET") == 0)
-			return cmd_rset(client, args);
-		break;
-	case 'S':
-		if (strcmp(name, "STAT") == 0)
-			return cmd_stat(client, args);
-		break;
-	case 'T':
-		if (strcmp(name, "TOP") == 0)
-			return cmd_top(client, args);
-		break;
-	case 'U':
-		if (strcmp(name, "UIDL") == 0)
-			return cmd_uidl(client, args);
-		break;
-	}
-
-	client_send_line(client, "-ERR Unknown command: %s", name);
-	return -1;
+	return cmd->func(client, args);
 }

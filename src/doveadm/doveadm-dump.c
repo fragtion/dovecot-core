@@ -30,12 +30,12 @@ dump_find_name(const char *name)
 }
 
 static const struct doveadm_cmd_dump *
-dump_find_test(const char *path)
+dump_find_test(struct doveadm_cmd_context *cctx, const char *path)
 {
 	const struct doveadm_cmd_dump *dump;
 
 	array_foreach_elem(&dumps, dump) {
-		if (dump->test != NULL && dump->test(path))
+		if (dump->test != NULL && dump->test(cctx, path))
 			return dump;
 	}
 	return NULL;
@@ -52,7 +52,7 @@ static void cmd_dump(struct doveadm_cmd_context *cctx)
 	(void)doveadm_cmd_param_str(cctx, "type", &type);
 	(void)doveadm_cmd_param_array(cctx, "args", &args);
 
-	dump = type != NULL ? dump_find_name(type) : dump_find_test(path);
+	dump = type != NULL ? dump_find_name(type) : dump_find_test(cctx, path);
 	if (dump == NULL) {
 		if (type != NULL) {
 			print_dump_types();
@@ -65,7 +65,7 @@ static void cmd_dump(struct doveadm_cmd_context *cctx)
 		if (type == NULL)
 			printf("Detected file type: %s\n", dump->name);
 	}
-	dump->cmd(path, args != NULL ? args : &no_args);
+	dump->cmd(cctx, path, args != NULL ? args : &no_args);
 }
 
 struct doveadm_cmd_ver2 doveadm_cmd_dump = {
@@ -80,7 +80,8 @@ DOVEADM_CMD_PARAMS_END
 };
 
 static void
-cmd_dump_multiplex(const char *path, const char *const *args ATTR_UNUSED)
+cmd_dump_multiplex(struct doveadm_cmd_context *cctx,
+		   const char *path, const char *const *args ATTR_UNUSED)
 {
 	const unsigned int channels_count = 256;
 	struct istream *file_input, *channels[channels_count];
@@ -114,7 +115,7 @@ cmd_dump_multiplex(const char *path, const char *const *args ATTR_UNUSED)
 	} while (have_input);
 
 	if (channels[0]->stream_errno != 0)
-		i_error("read() failed: %s", i_stream_get_error(channels[0]));
+		e_error(cctx->event, "read() failed: %s", i_stream_get_error(channels[0]));
 	for (i = 0; i < channels_count; i++)
 		i_stream_unref(&channels[i]);
 }
@@ -131,7 +132,7 @@ static const struct doveadm_cmd_dump *dumps_builtin[] = {
 	&doveadm_cmd_dump_log,
 	&doveadm_cmd_dump_mailboxlog,
 	&doveadm_cmd_dump_thread,
-	&doveadm_cmd_dump_zlib,
+	&doveadm_cmd_dump_imap_compress,
 	&doveadm_cmd_dump_dcrypt_file,
 	&doveadm_cmd_dump_dcrypt_key,
 	&doveadm_cmd_dump_multiplex,

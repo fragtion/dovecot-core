@@ -33,6 +33,7 @@ static const struct log_type_map {
 	[LOG_TYPE_FATAL]   = { EVENT_FILTER_LOG_TYPE_FATAL, "fatal" },
 	[LOG_TYPE_PANIC]   = { EVENT_FILTER_LOG_TYPE_PANIC, "panic" },
 };
+static_assert_array_size(event_filter_log_type_map, LOG_TYPE_COUNT);
 
 struct event_filter_query_internal {
 	struct event_filter_node *expr;
@@ -250,6 +251,9 @@ clone_expr(pool_t pool, struct event_filter_node *old)
 	new->field.value.str = p_strdup(pool, old->field.value.str);
 	new->field.value.intmax = old->field.value.intmax;
 	new->field.value.timeval = old->field.value.timeval;
+	new->ambiguous_unit = old->ambiguous_unit;
+	new->warned_ambiguous_unit = old->warned_ambiguous_unit;
+	new->warned_type_mismatch = old->warned_type_mismatch;
 
 	return new;
 }
@@ -386,6 +390,7 @@ event_filter_export_query_expr(const struct event_filter_query_internal *query,
 		break;
 	case EVENT_FILTER_NODE_TYPE_EVENT_FIELD_EXACT:
 	case EVENT_FILTER_NODE_TYPE_EVENT_FIELD_WILDCARD:
+	case EVENT_FILTER_NODE_TYPE_EVENT_FIELD_NUMERIC_WILDCARD:
 		str_append_c(dest, '"');
 		event_filter_append_escaped(dest, node->field.key);
 		str_append_c(dest, '"');
@@ -535,13 +540,49 @@ event_match_strlist(struct event *event, const struct event_field *wanted_field,
 }
 
 static bool
-event_match_field(struct event *event, const struct event_field *wanted_field,
-		  enum event_filter_node_op op, bool use_strcmp)
+event_filter_handle_numeric_operation(enum event_filter_node_op op,
+				      intmax_t a, intmax_t b)
+{
+	switch (op) {
+	case EVENT_FILTER_OP_CMP_EQ:
+		return a == b;
+	case EVENT_FILTER_OP_CMP_GT:
+		return a > b;
+	case EVENT_FILTER_OP_CMP_LT:
+		return a < b;
+	case EVENT_FILTER_OP_CMP_GE:
+		return a >= b;
+	case EVENT_FILTER_OP_CMP_LE:
+		return a <= b;
+	case EVENT_FILTER_OP_AND:
+	case EVENT_FILTER_OP_OR:
+	case EVENT_FILTER_OP_NOT:
+		i_unreached();
+	}
+	i_unreached();
+}
+
+static bool
+event_match_field(struct event *event, struct event_filter_node *node,
+		  bool use_strcmp, const char *source_filename,
+		  unsigned int source_linenum)
 {
 	const struct event_field *field;
+	struct event_field duration;
 
-	/* wanted_field has the value in all available formats */
-	field = event_find_field_recursive(event, wanted_field->key);
+	const struct event_field *wanted_field = &node->field;
+	if (strcmp(wanted_field->key, "duration") == 0) {
+		uintmax_t duration_value;
+		i_zero(&duration);
+		duration.key = "duration";
+		duration.value_type = EVENT_FIELD_VALUE_TYPE_INTMAX;
+		event_get_last_duration(event, &duration_value);
+		duration.value.intmax = (intmax_t)duration_value;
+		field = &duration;
+	} else {
+		/* wanted_field has the value in all available formats */
+		field = event_find_field_recursive(event, wanted_field->key);
+	}
 	if (field == NULL) {
 		/* field="" matches nonexistent field */
 		return wanted_field->value.str[0] == '\0';
@@ -549,7 +590,7 @@ event_match_field(struct event *event, const struct event_field *wanted_field,
 
 	switch (field->value_type) {
 	case EVENT_FIELD_VALUE_TYPE_STR:
-		if (op != EVENT_FILTER_OP_CMP_EQ) {
+		if (node->op != EVENT_FILTER_OP_CMP_EQ) {
 			/* we only support string equality comparisons */
 			return FALSE;
 		}
@@ -562,37 +603,54 @@ event_match_field(struct event *event, const struct event_field *wanted_field,
 		else
 			return wildcard_match_icase(field->value.str, wanted_field->value.str);
 	case EVENT_FIELD_VALUE_TYPE_INTMAX:
-		if (wanted_field->value.intmax > INT_MIN) {
+		if (node->ambiguous_unit) {
+			if (!node->warned_ambiguous_unit) {
+				const char *name = event->sending_name;
+				/* Use i_warning to prevent event filter recursions. */
+				i_warning("Event filter matches integer field "
+					  "'%s' with value that has an "
+					  "ambiguous unit '%s'. Please use "
+					  "either 'mins' or 'MB' to specify "
+					  "interval or size respectively. "
+					  "(event=%s, source=%s:%u)",
+					  wanted_field->key,
+					  wanted_field->value.str,
+					  name != NULL ? name : "",
+					  source_filename, source_linenum);
+				node->warned_ambiguous_unit = TRUE;
+			}
+			return FALSE;
+		} else if ((wanted_field->value_type != EVENT_FIELD_VALUE_TYPE_INTMAX) &&
+		    (node->type != EVENT_FILTER_NODE_TYPE_EVENT_FIELD_NUMERIC_WILDCARD)) {
+			if (!node->warned_type_mismatch) {
+				const char *name = event->sending_name;
+				/* Use i_warning to prevent event filter recursions. */
+				i_warning("Event filter matches integer field "
+					  "'%s' against non-integer value '%s'. "
+					  "(event=%s, source=%s:%u)",
+					  wanted_field->key,
+					  wanted_field->value.str,
+					  name != NULL ? name : "",
+					  source_filename, source_linenum);
+				node->warned_type_mismatch = TRUE;
+			}
+			return FALSE;
+		} else if (wanted_field->value_type == EVENT_FIELD_VALUE_TYPE_INTMAX) {
 			/* compare against an integer */
-			switch (op) {
-			case EVENT_FILTER_OP_CMP_EQ:
-				return field->value.intmax == wanted_field->value.intmax;
-			case EVENT_FILTER_OP_CMP_GT:
-				return field->value.intmax > wanted_field->value.intmax;
-			case EVENT_FILTER_OP_CMP_LT:
-				return field->value.intmax < wanted_field->value.intmax;
-			case EVENT_FILTER_OP_CMP_GE:
-				return field->value.intmax >= wanted_field->value.intmax;
-			case EVENT_FILTER_OP_CMP_LE:
-				return field->value.intmax <= wanted_field->value.intmax;
-			case EVENT_FILTER_OP_AND:
-			case EVENT_FILTER_OP_OR:
-			case EVENT_FILTER_OP_NOT:
-				i_unreached();
-			}
-			i_unreached();
+			return event_filter_handle_numeric_operation(
+				node->op, field->value.intmax, wanted_field->value.intmax);
+		} else if (node->op != EVENT_FILTER_OP_CMP_EQ) {
+			/* we only support string equality comparisons */
+			return FALSE;
+		} else if (use_strcmp) {
+			/* If the matched value was a number, it was already matched
+			   in the previous branch. So here we have a non-wildcard
+			   string, which can never be a match to a number. */
+			return FALSE;
 		} else {
-			/* compare against an "integer" with wildcards */
-			if (op != EVENT_FILTER_OP_CMP_EQ) {
-				/* we only support string equality comparisons */
-				return FALSE;
-			}
 			char tmp[MAX_INT_STRLEN];
 			i_snprintf(tmp, sizeof(tmp), "%jd", field->value.intmax);
-			if (use_strcmp)
-				return strcasecmp(field->value.str, wanted_field->value.str) == 0;
-			else
-				return wildcard_match_icase(tmp, wanted_field->value.str);
+			return wildcard_match_icase(tmp, wanted_field->value.str);
 		}
 	case EVENT_FIELD_VALUE_TYPE_TIMEVAL:
 		/* there's no point to support matching exact timestamps */
@@ -600,7 +658,7 @@ event_match_field(struct event *event, const struct event_field *wanted_field,
 	case EVENT_FIELD_VALUE_TYPE_STRLIST:
 		/* check if the value is (or is not) on the list,
 		   only string matching makes sense here. */
-		if (op != EVENT_FILTER_OP_CMP_EQ)
+		if (node->op != EVENT_FILTER_OP_CMP_EQ)
 			return FALSE;
 		return event_match_strlist(event, wanted_field, use_strcmp);
 	}
@@ -636,11 +694,10 @@ event_filter_query_match_cmp(struct event_filter_node *node,
 		case EVENT_FILTER_NODE_TYPE_EVENT_CATEGORY:
 			return event_has_category(event, node, log_type);
 		case EVENT_FILTER_NODE_TYPE_EVENT_FIELD_EXACT:
-			return event_match_field(event, &node->field, node->op,
-						 TRUE);
+			return event_match_field(event, node, TRUE, source_filename, source_linenum);
 		case EVENT_FILTER_NODE_TYPE_EVENT_FIELD_WILDCARD:
-			return event_match_field(event, &node->field, node->op,
-						 FALSE);
+		case EVENT_FILTER_NODE_TYPE_EVENT_FIELD_NUMERIC_WILDCARD:
+			return event_match_field(event, node, FALSE, source_filename, source_linenum);
 	}
 
 	i_unreached();
@@ -811,6 +868,7 @@ event_filter_query_update_category(struct event_filter_query_internal *query,
 	case EVENT_FILTER_NODE_TYPE_EVENT_SOURCE_LOCATION:
 	case EVENT_FILTER_NODE_TYPE_EVENT_FIELD_EXACT:
 	case EVENT_FILTER_NODE_TYPE_EVENT_FIELD_WILDCARD:
+	case EVENT_FILTER_NODE_TYPE_EVENT_FIELD_NUMERIC_WILDCARD:
 		break;
 	case EVENT_FILTER_NODE_TYPE_EVENT_CATEGORY:
 		if (node->category.name == NULL)

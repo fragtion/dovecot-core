@@ -20,18 +20,20 @@
 
 static void test_cipher_test_vectors(void)
 {
+	const char *error ATTR_UNUSED;
+
 	static const struct {
 		const char *key;
 		const char *iv;
 		const char *pt;
 		const char *ct;
 	} vectors[] = {
-		{ 
+		{
 			"2b7e151628aed2a6abf7158809cf4f3c",
 			"000102030405060708090a0b0c0d0e0f",
 			"6bc1bee22e409f96e93d7e117393172a",
 			"7649abac8119b246cee98e9b12e9197d"
-		}, { 
+		}, {
 			"2b7e151628aed2a6abf7158809cf4f3c",
 			"7649ABAC8119B246CEE98E9B12E9197D",
 			"ae2d8a571e03ac9c9eb76fac45af8e51",
@@ -69,7 +71,7 @@ static void test_cipher_test_vectors(void)
 
 		if (!dcrypt_ctx_sym_create("AES-128-CBC", DCRYPT_MODE_ENCRYPT,
 					   &ctx, NULL)) {
-			test_assert_failed("dcrypt_ctx_sym_create", 
+			test_assert_failed("dcrypt_ctx_sym_create",
 					   __FILE__, __LINE__-1);
 			continue;
 		}
@@ -79,11 +81,11 @@ static void test_cipher_test_vectors(void)
 		dcrypt_ctx_sym_set_key(ctx, key->data, key->used);
 		dcrypt_ctx_sym_set_iv(ctx, iv->data, iv->used);
 
-		test_assert_idx(dcrypt_ctx_sym_init(ctx, NULL), i);
+		test_assert_idx(dcrypt_ctx_sym_init(ctx, &error), i);
 
 		test_assert_idx(dcrypt_ctx_sym_update(ctx,
-			pt->data, pt->used, res_enc, NULL), i);
-		test_assert_idx(dcrypt_ctx_sym_final(ctx, res_enc, NULL), i);
+			pt->data, pt->used, res_enc, &error), i);
+		test_assert_idx(dcrypt_ctx_sym_final(ctx, res_enc, &error), i);
 
 		test_assert_idx(buffer_cmp(ct, res_enc), i);
 
@@ -101,10 +103,10 @@ static void test_cipher_test_vectors(void)
 		dcrypt_ctx_sym_set_key(ctx, key->data, key->used);
 		dcrypt_ctx_sym_set_iv(ctx, iv->data, iv->used);
 
-		test_assert_idx(dcrypt_ctx_sym_init(ctx, NULL), i);
+		test_assert_idx(dcrypt_ctx_sym_init(ctx, &error), i);
 		test_assert_idx(dcrypt_ctx_sym_update(ctx,
-			res_enc->data, res_enc->used, res_dec, NULL), i);
-		test_assert_idx(dcrypt_ctx_sym_final(ctx, res_dec, NULL), i);
+			res_enc->data, res_enc->used, res_dec, &error), i);
+		test_assert_idx(dcrypt_ctx_sym_final(ctx, res_dec, &error), i);
 
 		test_assert_idx(buffer_cmp(pt, res_dec), i);
 
@@ -193,6 +195,7 @@ static void test_hmac_test_vectors(void)
 {
 	test_begin("test_hmac_test_vectors");
 
+	const char *error ATTR_UNUSED;
 	buffer_t *pt, *ct, *key, *res;
 	pt = t_buffer_create(50);
 	key = t_buffer_create(20);
@@ -206,15 +209,15 @@ static void test_hmac_test_vectors(void)
 		      "2959098b3ef8c122d9635514ced565fe", res);
 
 	struct dcrypt_context_hmac *hctx;
-	if (!dcrypt_ctx_hmac_create("sha256", &hctx, NULL)) {
+	if (!dcrypt_ctx_hmac_create("sha256", &hctx, &error)) {
 		test_assert_failed("dcrypt_ctx_hmac_create",
 				   __FILE__, __LINE__-1);
 	} else {
 		dcrypt_ctx_hmac_set_key(hctx, key->data, key->used);
-		test_assert(dcrypt_ctx_hmac_init(hctx, NULL));
+		test_assert(dcrypt_ctx_hmac_init(hctx, &error));
 		test_assert(dcrypt_ctx_hmac_update(hctx,
 			pt->data, pt->used, NULL));
-		test_assert(dcrypt_ctx_hmac_final(hctx, ct, NULL));
+		test_assert(dcrypt_ctx_hmac_final(hctx, ct, &error));
 		test_assert(buffer_cmp(ct, res));
 		dcrypt_ctx_hmac_destroy(&hctx);
 	}
@@ -227,7 +230,7 @@ static void test_load_v1_keys(void)
 	test_begin("test_load_v1_keys");
 
 	const char *error = NULL;
-	const char *data1 = 
+	const char *data1 =
 		"1\t716\t1\t0567e6bf9579813ae967314423b0fceb14bda24"
 		"749303923de9a9bb9370e0026f995901a57e63113eeb2baf0c"
 		"940e978d00686cbb52bd5014bc318563375876255\t0300E46"
@@ -262,7 +265,7 @@ static void test_load_v1_keys(void)
 		"7c9a1039ea2e4fed73e81dd3ffc3fa22"
 		"ea4a28352939adde7bf8ea858b00fa4f") == 0);
 
-	const char* data2 = 
+	const char* data2 =
 		"1\t716\t0301EB00973C4EFC8FCECA4EA33E941F50B561199A"
 		"5159BCB6C2EED9DD1D62D65E38A254979D89E28F0C28883E71"
 		"EE2AD264CD16B863FA094A8F6F69A56B62E8918040\t7c9a10"
@@ -343,7 +346,7 @@ static void test_load_v1_key(void)
 	struct dcrypt_private_key *pkey = NULL, *pkey2 = NULL;
 	const char *error = NULL;
 
-	test_assert(dcrypt_key_load_private(&pkey, 
+	test_assert(dcrypt_key_load_private(&pkey,
 		"1\t716\t0\t048FD04FD3612B22D32790C592CF21CEF417EFD"
 		"2EA34AE5F688FA5B51BED29E05A308B68DA78E16E90B47A11E"
 		"133BD9A208A2894FD01B0BEE865CE339EA3FB17AC\td0cfaca"
@@ -600,7 +603,7 @@ static void test_gen_and_get_info_rsa_pem(void)
 	struct dcrypt_keypair pair;
 	string_t* buf = str_new(default_pool, 4096);
 
-	ret = dcrypt_keypair_generate(&pair, DCRYPT_KEY_RSA, 1024, NULL, NULL);
+	ret = dcrypt_keypair_generate(&pair, DCRYPT_KEY_RSA, 1024, NULL, &error);
 	test_assert(ret == TRUE);
 
 	/* test public key */
@@ -658,7 +661,8 @@ static void test_get_info_rsa_private_key(void)
 {
 	test_begin("test_get_info_rsa_private_key");
 
-	const char *key = "-----BEGIN RSA PRIVATE KEY-----\n"
+	const char *key =
+"-----BEGIN RSA PRIVATE KEY-----\n"
 "MIICXQIBAAKBgQC89q02I9NezBLQ+otn5XLYE7S+GsKUz59ogr45DA/6MI9jey0W\n"
 "56SeWQ1FJD1vDhAx/TRBMfOmhcIPsBjc5sakYOawPdoiqLjOIlO+iHwnbbmLuMsq\n"
 "ue09vgvZsKjuTr2F5DOFQY43Bq/Nd+4bjHJItdOM58+xwA2I/8vDbtI8jwIDAQAB\n"
@@ -909,6 +913,7 @@ static void test_raw_keys(void)
 
 	test_begin("test_raw_keys");
 
+	const char *error;
 	ARRAY_TYPE(dcrypt_raw_key) priv_key;
 	ARRAY_TYPE(dcrypt_raw_key) pub_key;
 	pool_t pool = pool_datastack_create();
@@ -920,7 +925,7 @@ static void test_raw_keys(void)
 
 	/* generate ECC key */
 	struct dcrypt_keypair pair;
-	i_assert(dcrypt_keypair_generate(&pair, DCRYPT_KEY_EC, 0, "prime256v1", NULL));
+	i_assert(dcrypt_keypair_generate(&pair, DCRYPT_KEY_EC, 0, "prime256v1", &error));
 
 	/* store it */
 	test_assert(dcrypt_key_store_private_raw(pair.priv, pool, &t, &priv_key,
@@ -953,7 +958,7 @@ static void test_raw_keys(void)
 
 	/* Add OID */
 	buffer_t *buf = t_buffer_create(32);
-	test_assert(dcrypt_name2oid(curve, buf, NULL));
+	test_assert(dcrypt_name2oid(curve, buf, &error));
 	item = array_append_space(&static_key);
 	item->parameter = buf->data;
 	item->len = buf->used;
@@ -992,7 +997,7 @@ static void test_raw_keys(void)
 
 	/* Add OID */
 	buf = t_buffer_create(32);
-	test_assert(dcrypt_name2oid(curve, buf, NULL));
+	test_assert(dcrypt_name2oid(curve, buf, &error));
 	item = array_append_space(&static_key);
 	item->parameter = buf->data;
 	item->len = buf->used;
@@ -1029,7 +1034,8 @@ static void test_sign_verify_rsa(void)
 	const char *data = "signed data";
 
 	test_begin("sign and verify (rsa)");
-	const char *key = "-----BEGIN PRIVATE KEY-----\n"
+	const char *key =
+"-----BEGIN PRIVATE KEY-----\n"
 "MIICdwIBADANBgkqhkiG9w0BAQEFAASCAmEwggJdAgEAAoGBALz2rTYj017MEtD6\n"
 "i2flctgTtL4awpTPn2iCvjkMD/owj2N7LRbnpJ5ZDUUkPW8OEDH9NEEx86aFwg+w\n"
 "GNzmxqRg5rA92iKouM4iU76IfCdtuYu4yyq57T2+C9mwqO5OvYXkM4VBjjcGr813\n"
@@ -1076,7 +1082,8 @@ static void test_sign_verify_ecdsa(void)
 	const char *data = "signed data";
 
 	test_begin("sign and verify (ecdsa)");
-	const char *key = "-----BEGIN PRIVATE KEY-----\n"
+	const char *key =
+"-----BEGIN PRIVATE KEY-----\n"
 "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgZ4AMMyJ9XDl5lKM2\n"
 "vusbT1OQ6VzBWBkB3/4syovaKtyhRANCAAQHTR+6L2qMh5fdcMZF+Y1rctBsq8Oy\n"
 "7jZ4uV+MiuaoGNQ5sTxlcv6ETX/XrEDq4S/DUhFKzQ6u9VXYZImvRCT1\n"
@@ -1100,21 +1107,58 @@ static void test_sign_verify_ecdsa(void)
 	test_end();
 }
 
+static void test_sign_verify_x962(void)
+{
+	const char *error = NULL;
+	bool valid;
+	struct dcrypt_private_key *priv_key = NULL;
+	struct dcrypt_public_key *pub_key = NULL;
+
+	buffer_t *signature =
+		buffer_create_dynamic(pool_datastack_create(), 128);
+	const char *data = "signed data";
+
+	test_begin("sign and verify (x9.62)");
+	const char *key =
+"-----BEGIN PRIVATE KEY-----\n"
+"MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgZ4AMMyJ9XDl5lKM2\n"
+"vusbT1OQ6VzBWBkB3/4syovaKtyhRANCAAQHTR+6L2qMh5fdcMZF+Y1rctBsq8Oy\n"
+"7jZ4uV+MiuaoGNQ5sTxlcv6ETX/XrEDq4S/DUhFKzQ6u9VXYZImvRCT1\n"
+"-----END PRIVATE KEY-----";
+
+	test_assert(dcrypt_key_load_private(&priv_key,
+		key, NULL, NULL, &error));
+	if (priv_key == NULL)
+		i_fatal("%s", error);
+	dcrypt_key_convert_private_to_public(priv_key, &pub_key);
+	test_assert(dcrypt_sign(priv_key, "sha256", DCRYPT_SIGNATURE_FORMAT_X962,
+		data, strlen(data), signature, 0, &error));
+	/* verify signature */
+	test_assert(dcrypt_verify(pub_key, "sha256", DCRYPT_SIGNATURE_FORMAT_X962,
+		data, strlen(data), signature->data,
+		signature->used, &valid, 0, &error) && valid);
+
+	dcrypt_key_unref_public(&pub_key);
+	dcrypt_key_unref_private(&priv_key);
+
+	test_end();
+}
+
 static void test_static_verify_ecdsa(void)
 {
 	test_begin("static verify (ecdsa)");
 	const char *input = "hello, world";
 	const char *priv_key_pem =
-	   "-----BEGIN PRIVATE KEY-----\n"
-	   "MGcCAQAwEwYHKoZIzj0CAQYIKoZIzj0DAQcETTBLAgEBBCC25AkD65uhlZXCAdwN\n"
-	   "yLJV2ui8A/CUyqyEMrezvwgMO6EkAyIAAybRUR3MsH0+0PQcDwkrXOJ9aePwzTQV\n"
-	   "DN51+n1JCxbI\n"
-	   "-----END PRIVATE KEY-----";
+"-----BEGIN PRIVATE KEY-----\n"
+"MGcCAQAwEwYHKoZIzj0CAQYIKoZIzj0DAQcETTBLAgEBBCC25AkD65uhlZXCAdwN\n"
+"yLJV2ui8A/CUyqyEMrezvwgMO6EkAyIAAybRUR3MsH0+0PQcDwkrXOJ9aePwzTQV\n"
+"DN51+n1JCxbI\n"
+"-----END PRIVATE KEY-----";
 	const char *pub_key_pem =
-	   "-----BEGIN PUBLIC KEY-----\n"
-	   "MDkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDIgADJtFRHcywfT7Q9BwPCStc4n1p4/DN\n"
-	   "NBUM3nX6fUkLFsg=\n"
-	   "-----END PUBLIC KEY-----";
+"-----BEGIN PUBLIC KEY-----\n"
+"MDkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDIgADJtFRHcywfT7Q9BwPCStc4n1p4/DN\n"
+"NBUM3nX6fUkLFsg=\n"
+"-----END PUBLIC KEY-----";
 
 	const unsigned char sig[] = {
 		0x30,0x45,0x02,0x20,0x2c,0x76,0x20,0x5e,0xfc,0xa6,0x9e,0x16,
@@ -1131,8 +1175,8 @@ static void test_static_verify_ecdsa(void)
 
 	i_zero(&pair);
 	/* static key test */
-	test_assert(dcrypt_key_load_public(&pair.pub, pub_key_pem, NULL));
-	test_assert(dcrypt_key_load_private(&pair.priv, priv_key_pem, NULL, NULL, NULL));
+	test_assert(dcrypt_key_load_public(&pair.pub, pub_key_pem, &error));
+	test_assert(dcrypt_key_load_private(&pair.priv, priv_key_pem, NULL, NULL, &error));
 	/* validate signature */
 	test_assert(dcrypt_verify(pair.pub, "sha256", DCRYPT_SIGNATURE_FORMAT_DSS,
 				  input, strlen(input),
@@ -1156,28 +1200,34 @@ static void test_jwk_keys(void)
 	  "\"d\":\"Po2z9rs86J2Qb_xWprr4idsWNPlgKf3G8-mftnE2ync\"}";
 	/* Acquired using another tool */
 	const char *pem_key =
-	  "-----BEGIN PUBLIC KEY-----\n"
-	  "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEKp0Y4+Wpt+D9t/2XenFIj0LmvaZB\n"
-	  "yLG69yOisek4aMLCMQ8HkGEflJE/DVwI3mCtassKmGtbX18IVHyntz07mg==\n"
-	  "-----END PUBLIC KEY-----";
+"-----BEGIN PUBLIC KEY-----\n"
+"MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEKp0Y4+Wpt+D9t/2XenFIj0LmvaZB\n"
+"yLG69yOisek4aMLCMQ8HkGEflJE/DVwI3mCtassKmGtbX18IVHyntz07mg==\n"
+"-----END PUBLIC KEY-----\n";
 	test_begin("test_jwk_keys");
+	const char *error ATTR_UNUSED;
 	struct dcrypt_keypair pair;
 	buffer_t *pem = t_buffer_create(256);
 	i_zero(&pair);
 
-	test_assert(dcrypt_key_load_public(&pair.pub, jwk_key_json, NULL));
-	test_assert(dcrypt_key_load_private(&pair.priv, jwk_key_json, NULL, NULL, NULL));
+	test_assert(dcrypt_key_load_public(&pair.pub, jwk_key_json, &error));
+	test_assert(dcrypt_key_load_private(&pair.priv, jwk_key_json, NULL, NULL, &error));
 
 	/* test accessors */
 	test_assert_strcmp(dcrypt_key_get_id_public(pair.pub), "123");
 	test_assert(dcrypt_key_get_usage_public(pair.pub) == DCRYPT_KEY_USAGE_SIGN);
 
 	/* make sure we got the right key */
-	test_assert(dcrypt_key_store_public(pair.pub, DCRYPT_FORMAT_PEM, pem, NULL));
+	test_assert(dcrypt_key_store_public(pair.pub, DCRYPT_FORMAT_PEM, pem, &error));
+	const char *pem_result = str_c(pem);
+	if (pem_result[strlen(pem_result)-1] != '\n')
+		str_append_c(pem, '\n');
 	test_assert_strcmp(str_c(pem), pem_key);
 
+	i_assert(pair.priv != NULL);
+
 	str_truncate(pem, 0);
-	test_assert(dcrypt_key_store_private(pair.priv, DCRYPT_FORMAT_JWK, NULL, pem, NULL, NULL, NULL));
+	test_assert(dcrypt_key_store_private(pair.priv, DCRYPT_FORMAT_JWK, NULL, pem, NULL, NULL, &error));
 	test_assert_strcmp(str_c(pem), jwk_key_json);
 
 	dcrypt_keypair_unref(&pair);
@@ -1208,7 +1258,8 @@ static void test_static_verify_rsa(void)
 		0x7f,0xe5,0x66,0x6f,0xcd,0x2b,0x0c,0x02,0x2a,0x12,
 		0x96,0x86,0x66,0x00,0xff,0x12,0x8a,0x79
 	};
-	const char *key = "-----BEGIN PUBLIC KEY-----\n"
+	const char *key =
+"-----BEGIN PUBLIC KEY-----\n"
 "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQC89q02I9NezBLQ+otn5XLYE7S+\n"
 "GsKUz59ogr45DA/6MI9jey0W56SeWQ1FJD1vDhAx/TRBMfOmhcIPsBjc5sakYOaw\n"
 "PdoiqLjOIlO+iHwnbbmLuMsque09vgvZsKjuTr2F5DOFQY43Bq/Nd+4bjHJItdOM\n"
@@ -1300,6 +1351,7 @@ int main(void)
 		test_jwk_keys,
 		test_sign_verify_rsa,
 		test_sign_verify_ecdsa,
+		test_sign_verify_x962,
 		test_static_verify_ecdsa,
 		test_static_verify_rsa,
 		test_static_verify_ecdsa_x962,

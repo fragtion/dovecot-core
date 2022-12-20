@@ -80,7 +80,7 @@ struct imapc_connection_literal {
 
 struct imapc_connection {
 	struct imapc_client *client;
-	char *name;
+	struct event *event;
 	int refcount;
 
 	int fd;
@@ -156,8 +156,7 @@ imapc_login_callback(struct imapc_connection *conn,
 static void
 imapc_auth_ok(struct imapc_connection *conn)
 {
-	if (conn->client->set.debug)
-		i_debug("imapc(%s): Authenticated successfully", conn->name);
+	e_debug(conn->event, "Authenticated successfully");
 
 	if (conn->client->state_change_callback == NULL)
 		return;
@@ -176,7 +175,7 @@ imapc_auth_failed(struct imapc_connection *conn, const struct imapc_command_repl
 		t_strdup_printf("Authentication failed: %s", error);
 	if (reply.state != IMAPC_COMMAND_STATE_DISCONNECTED) {
 		reply.state = IMAPC_COMMAND_STATE_AUTH_FAILED;
-		i_error("imapc(%s): %s", conn->name, reply.text_full);
+		e_error(conn->event, "%s", reply.text_full);
 	}
 	imapc_login_callback(conn, &reply);
 
@@ -196,13 +195,12 @@ imapc_connection_init(struct imapc_client *client,
 	struct imapc_connection *conn;
 
 	conn = i_new(struct imapc_connection, 1);
+	conn->event = event_create(client->event);
 	conn->refcount = 1;
 	conn->client = client;
 	conn->login_callback = login_callback;
 	conn->login_context = login_context;
 	conn->fd = -1;
-	conn->name = i_strdup_printf("%s:%u", client->set.host,
-				     client->set.port);
 	conn->literal.fd = -1;
 	conn->reconnect_ok = (client->set.connect_retry_count>0);
 	i_array_init(&conn->cmd_send_queue, 8);
@@ -210,8 +208,7 @@ imapc_connection_init(struct imapc_client *client,
 	i_array_init(&conn->literal_files, 4);
 	i_array_init(&conn->aborted_cmd_tags, 8);
 
-	if (client->set.debug)
-		i_debug("imapc(%s): Created new connection", conn->name);
+	e_debug(conn->event, "Created new connection");
 
 	imapc_client_ref(client);
 	return conn;
@@ -243,8 +240,8 @@ static void imapc_connection_unref(struct imapc_connection **_conn)
 	array_free(&conn->literal_files);
 	array_free(&conn->aborted_cmd_tags);
 	imapc_client_unref(&conn->client);
+	event_unref(&conn->event);
 	i_free(conn->ips);
-	i_free(conn->name);
 	i_free(conn);
 }
 
@@ -422,7 +419,7 @@ static void imapc_connection_lfiles_free(struct imapc_connection *conn)
 
 	array_foreach_modifiable(&conn->literal_files, lfile) {
 		if (close(lfile->fd) < 0)
-			i_error("imapc: close(literal file) failed: %m");
+			e_error(conn->event, "imapc: close(literal file) failed: %m");
 	}
 	array_clear(&conn->literal_files);
 }
@@ -452,8 +449,7 @@ void imapc_connection_disconnect_full(struct imapc_connection *conn,
 		return;
 	}
 
-	if (conn->client->set.debug)
-		i_debug("imapc(%s): Disconnected", conn->name);
+	e_debug(conn->event, "Disconnected");
 
 	if (conn->dns_lookup != NULL)
 		dns_lookup_abort(&conn->dns_lookup);
@@ -547,7 +543,7 @@ void imapc_connection_try_reconnect(struct imapc_connection *conn,
 {
 	/* Try the next IP address only for connect() problems. */
 	if (conn->prev_connect_idx + 1 < conn->ips_count && connect_error) {
-		i_warning("imapc(%s): %s - trying the next IP", conn->name, errstr);
+		e_warning(conn->event, "%s - trying the next IP", errstr);
 		conn->reconnect_ok = TRUE;
 		imapc_connection_disconnect_full(conn, TRUE);
 		imapc_connection_connect(conn);
@@ -555,11 +551,12 @@ void imapc_connection_try_reconnect(struct imapc_connection *conn,
 	}
 
 	if (!imapc_connection_can_reconnect(conn)) {
-		i_error("imapc(%s): %s - disconnecting", conn->name, errstr);
+		e_error(conn->event, "%s - disconnecting", errstr);
 		imapc_connection_disconnect(conn);
 	} else {
 		conn->reconnecting = TRUE;
-		i_warning("imapc(%s): %s - reconnecting (delay %u ms)", conn->name, errstr, delay_msecs);
+		e_warning(conn->event, "%s - reconnecting (delay %u ms)",
+			  errstr, delay_msecs);
 		if (delay_msecs == 0)
 			imapc_connection_reconnect(conn);
 		else {
@@ -578,8 +575,8 @@ imapc_connection_input_error(struct imapc_connection *conn,
 	va_list va;
 
 	va_start(va, fmt);
-	i_error("imapc(%s): Server sent invalid input: %s",
-		conn->name, t_strdup_vprintf(fmt, va));
+	e_error(conn->event, "Server sent invalid input: %s",
+		t_strdup_vprintf(fmt, va));
 	imapc_connection_disconnect(conn);
 	va_end(va);
 }
@@ -645,8 +642,8 @@ static int imapc_connection_read_literal(struct imapc_connection *conn)
 		size = conn->literal.bytes_left;
 	if (size > 0) {
 		if (write_full(conn->literal.fd, data, size) < 0) {
-			i_error("imapc(%s): write(%s) failed: %m",
-				conn->name, conn->literal.temp_path);
+			e_error(conn->event, "write(%s) failed: %m",
+				conn->literal.temp_path);
 			imapc_connection_disconnect(conn);
 			return -1;
 		}
@@ -692,7 +689,7 @@ imapc_connection_read_line_more(struct imapc_connection *conn,
 		if (parser_error != IMAP_PARSE_ERROR_BAD_SYNTAX)
 			imapc_connection_input_error(conn, "Error parsing input: %s", err_msg);
 		else
-			i_error("Error parsing input: %s", err_msg);
+			e_error(conn->event, "Error parsing input: %s", err_msg);
 		return -1;
 	}
 
@@ -742,10 +739,7 @@ imapc_connection_parse_capability(struct imapc_connection *conn,
 	const char *const *tmp;
 	unsigned int i;
 
-	if (conn->client->set.debug) {
-		i_debug("imapc(%s): Server capabilities: %s",
-			conn->name, value);
-	}
+	e_debug(conn->event, "Server capabilities: %s", value);
 
 	conn->capabilities = 0;
 	if (conn->capabilities_list != NULL)
@@ -995,14 +989,11 @@ static void imapc_connection_authenticate(struct imapc_connection *conn)
 	const struct dsasl_client_mech *sasl_mech = NULL;
 	const char *error;
 
-	if (conn->client->set.debug) {
-		if (set->master_user == NULL) {
-			i_debug("imapc(%s): Authenticating as %s",
-				conn->name, set->username);
-		} else {
-			i_debug("imapc(%s): Authenticating as %s for user %s",
-				conn->name, set->master_user, set->username);
-		}
+	if (set->master_user == NULL) {
+		e_debug(conn->event, "Authenticating as %s", set->username);
+	} else {
+		e_debug(conn->event, "Authenticating as %s for user %s",
+			set->master_user, set->username);
 	}
 
 	if (set->sasl_mechanisms != NULL && set->sasl_mechanisms[0] != '\0') {
@@ -1064,8 +1055,9 @@ static void imapc_connection_authenticate(struct imapc_connection *conn)
 
 		if (dsasl_client_output(conn->sasl_client, &sasl_output,
 					&sasl_output_len, &error) < 0) {
-			i_error("imapc(%s): Failed to create initial SASL reply: %s",
-				conn->name, error);
+			e_error(conn->event,
+				"Failed to create initial SASL reply: %s",
+				error);
 			imapc_connection_disconnect(conn);
 			return;
 		}
@@ -1134,9 +1126,8 @@ static void imapc_connection_starttls(struct imapc_connection *conn)
 	if (conn->client->set.ssl_mode == IMAPC_CLIENT_SSL_MODE_STARTTLS &&
 	    conn->ssl_iostream == NULL) {
 		if ((conn->capabilities & IMAPC_CAPABILITY_STARTTLS) == 0) {
-			i_error("imapc(%s): Requested STARTTLS, "
-				"but server doesn't support it",
-				conn->name);
+			e_error(conn->event, "Requested STARTTLS, "
+				"but server doesn't support it");
 			imapc_connection_disconnect(conn);
 			return;
 		}
@@ -1492,8 +1483,8 @@ static int imapc_connection_input_tagged(struct imapc_connection *conn)
 		conn->select_waiting_reply = FALSE;
 
 	if (reply.state == IMAPC_COMMAND_STATE_BAD) {
-		i_error("imapc(%s): Command '%s' failed with BAD: %u %s",
-			conn->name, imapc_command_get_readable(cmd),
+		e_error(conn->event, "Command '%s' failed with BAD: %u %s",
+			imapc_command_get_readable(cmd),
 			conn->cur_tag, reply.text_full);
 		imapc_connection_disconnect(conn);
 	}
@@ -1626,17 +1617,11 @@ static int imapc_connection_ssl_handshaked(const char **error_r, void *context)
 
 	if (ssl_iostream_check_cert_validity(conn->ssl_iostream,
 					     conn->client->set.host, &error) == 0) {
-		if (conn->client->set.debug) {
-			i_debug("imapc(%s): SSL handshake successful",
-				conn->name);
-		}
+		e_debug(conn->event, "SSL handshake successful");
 		return 0;
 	} else if (conn->client->set.ssl_set.allow_invalid_cert) {
-		if (conn->client->set.debug) {
-			i_debug("imapc(%s): SSL handshake successful, "
-				"ignoring invalid certificate: %s",
-				conn->name, error);
-		}
+		e_debug(conn->event, "SSL handshake successful, "
+			"ignoring invalid certificate: %s", error);
 		return 0;
 	} else {
 		*error_r = error;
@@ -1649,12 +1634,11 @@ static int imapc_connection_ssl_init(struct imapc_connection *conn)
 	const char *error;
 
 	if (conn->client->ssl_ctx == NULL) {
-		i_error("imapc(%s): No SSL context", conn->name);
+		e_error(conn->event, "No SSL context");
 		return -1;
 	}
 
-	if (conn->client->set.debug)
-		i_debug("imapc(%s): Starting SSL handshake", conn->name);
+	e_debug(conn->event, "Starting SSL handshake");
 
 	if (conn->raw_input != conn->input) {
 		/* recreate rawlog after STARTTLS */
@@ -1670,11 +1654,11 @@ static int imapc_connection_ssl_init(struct imapc_connection *conn)
 	if (io_stream_create_ssl_client(conn->client->ssl_ctx,
 					conn->client->set.host,
 					&conn->client->set.ssl_set,
-					conn->client->event,
+					conn->event,
 					&conn->input, &conn->output,
 					&conn->ssl_iostream, &error) < 0) {
-		i_error("imapc(%s): Couldn't initialize SSL client: %s",
-			conn->name, error);
+		e_error(conn->event, "Couldn't initialize SSL client: %s",
+			error);
 		return -1;
 	}
 	conn->io = io_add_istream(conn->input, imapc_connection_input, conn);
@@ -1682,7 +1666,7 @@ static int imapc_connection_ssl_init(struct imapc_connection *conn)
 					    imapc_connection_ssl_handshaked,
 					    conn);
 	if (ssl_iostream_handshake(conn->ssl_iostream) < 0) {
-		i_error("imapc(%s): SSL handshake failed: %s", conn->name,
+		e_error(conn->event, "SSL handshake failed: %s",
 			ssl_iostream_get_last_error(conn->ssl_iostream));
 		return -1;
 	}
@@ -1715,7 +1699,7 @@ static int imapc_connection_connected(struct imapc_connection *conn)
 	}
 	if (net_getsockname(conn->fd, &local_ip, &local_port) < 0)
 		local_port = 0;
-	i_info("imapc(%s): Connected to %s:%u (local %s:%u)", conn->name,
+	e_info(conn->event, "Connected to %s:%u (local %s:%u)",
 	       net_ip2addr(ip), conn->client->set.port,
 	       net_ip2addr(&local_ip), local_port);
 	conn->io = io_add(conn->fd, IO_READ, imapc_connection_input, conn);
@@ -1800,7 +1784,7 @@ static void imapc_connection_connect_next_ip(struct imapc_connection *conn)
 		/* failed to connect to one of the IPs immediately
 		   (e.g. IPv6 address without connectivity). try all IPs
 		   before failing completely. */
-		i_error("net_connect_ip(%s:%u) failed: %m",
+		e_error(conn->event, "net_connect_ip(%s:%u) failed: %m",
 			net_ip2addr(ip), conn->client->set.port);
 		if (conn->prev_connect_idx+1 == conn->ips_count) {
 			imapc_connection_try_reconnect(conn, "No more IP address(es) to try",
@@ -1832,10 +1816,8 @@ static void imapc_connection_connect_next_ip(struct imapc_connection *conn)
 			       imapc_connection_timeout, conn);
 	conn->to_output = timeout_add(conn->client->set.max_idle_time*1000,
 				      imapc_connection_reset_idle, conn);
-	if (conn->client->set.debug) {
-		i_debug("imapc(%s): Connecting to %s:%u", conn->name,
-			net_ip2addr(ip), conn->client->set.port);
-	}
+	e_debug(conn->event, "Connecting to %s:%u", net_ip2addr(ip),
+		conn->client->set.port);
 }
 
 static void
@@ -1845,8 +1827,8 @@ imapc_connection_dns_callback(const struct dns_lookup_result *result,
 	conn->dns_lookup = NULL;
 
 	if (result->ret != 0) {
-		i_error("imapc(%s): dns_lookup(%s) failed: %s",
-			conn->name, conn->client->set.host, result->error);
+		e_error(conn->event, "dns_lookup(%s) failed: %s",
+			conn->client->set.host, result->error);
 		imapc_connection_set_disconnected(conn);
 		return;
 	}
@@ -1884,18 +1866,16 @@ void imapc_connection_connect(struct imapc_connection *conn)
 	imapc_connection_input_reset(conn);
 	conn->last_connect = ioloop_timeval;
 
-	if (conn->client->set.debug) {
-		i_debug("imapc(%s): Looking up IP address "
-			"(reconnect_ok=%s, last_connect=%ld)", conn->name,
-			(conn->reconnect_ok ? "true" : "false"),
-			(long)conn->last_connect.tv_sec);
-	}
+	e_debug(conn->event, "Looking up IP address "
+		"(reconnect_ok=%s, last_connect=%ld)",
+		(conn->reconnect_ok ? "true" : "false"),
+		(long)conn->last_connect.tv_sec);
 
 	i_zero(&dns_set);
 	dns_set.dns_client_socket_path =
 		conn->client->set.dns_client_socket_path;
 	dns_set.timeout_msecs = conn->client->set.connect_timeout_msecs;
-	dns_set.event_parent = conn->client->event;
+	dns_set.event_parent = conn->event;
 
 	imapc_connection_set_state(conn, IMAPC_CONNECTION_STATE_CONNECTING);
 	if (conn->ips_count > 0) {
@@ -1908,8 +1888,8 @@ void imapc_connection_connect(struct imapc_connection *conn)
 		ret = net_gethostbyname(conn->client->set.host,
 					&ips, &ips_count);
 		if (ret != 0) {
-			i_error("imapc(%s): net_gethostbyname(%s) failed: %s",
-				conn->name, conn->client->set.host,
+			e_error(conn->event, "net_gethostbyname(%s) failed: %s",
+				conn->client->set.host,
 				net_gethosterror(ret));
 			imapc_connection_set_disconnected(conn);
 			return;
@@ -2089,7 +2069,7 @@ static int imapc_command_try_send_stream(struct imapc_connection *conn,
 		i_assert(stream->input->v_offset < stream->size);
 		return 0;
 	case OSTREAM_SEND_ISTREAM_RESULT_ERROR_INPUT:
-		i_error("imapc: read(%s) failed: %s",
+		e_error(conn->event, "read(%s) failed: %s",
 			i_stream_get_name(stream->input),
 			i_stream_get_error(stream->input));
 		return -1;
@@ -2515,4 +2495,9 @@ void imapc_connection_idle(struct imapc_connection *conn)
 	cmd = imapc_connection_cmd(conn, imapc_connection_idle_callback, conn);
 	cmd->idle = TRUE;
 	imapc_command_send(cmd, "IDLE");
+}
+
+struct event *imapc_connection_get_event(struct imapc_connection *conn)
+{
+	return conn->event;
 }

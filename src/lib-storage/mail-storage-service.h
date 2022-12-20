@@ -68,10 +68,9 @@ struct mail_storage_service_input {
 	bool no_userdb_lookup:1;
 	/* Enable auth_debug=yes for this lookup */
 	bool debug:1;
-	/* Connection is secure (SSL or just trusted) */
-	bool conn_secured:1;
-	/* Connection is secured using SSL specifically */
-	bool conn_ssl_secured:1;
+	/* The end client connection (not just the previous hop proxy
+	   connection) is using TLS. */
+	bool end_client_tls_secured:1;
 };
 
 extern struct module *mail_storage_service_modules;
@@ -87,9 +86,7 @@ void mail_storage_service_set_auth_conn(struct mail_storage_service_ctx *ctx,
 					struct auth_master_connection *conn);
 int mail_storage_service_read_settings(struct mail_storage_service_ctx *ctx,
 				       const struct mail_storage_service_input *input,
-				       pool_t pool,
-				       const struct setting_parser_info **user_info_r,
-				       const struct setting_parser_context **parser_r,
+				       struct setting_parser_context **parser_r,
 				       const char **error_r) ATTR_NULL(2);
 /* Read settings and initialize context to use them. Do nothing if service is
    already initialized. This is mainly necessary when calling _get_auth_conn()
@@ -152,9 +149,10 @@ void mail_storage_service_io_activate_user(struct mail_storage_service_user *use
    log prefix. */
 void mail_storage_service_io_deactivate_user(struct mail_storage_service_user *user);
 
-/* Return the settings pointed to by set_root parameter in _init().
-   The settings contain all the changes done by userdb lookups. */
-void **mail_storage_service_user_get_set(struct mail_storage_service_user *user);
+/* Return settings struct for the given root. The settings contain all the
+   changes done by userdb lookups. */
+void *mail_storage_service_user_get_set(struct mail_storage_service_user *user,
+					const struct setting_parser_info *root);
 const struct mail_storage_settings *
 mail_storage_service_user_get_mail_set(struct mail_storage_service_user *user);
 const struct mail_storage_service_input *
@@ -169,6 +167,11 @@ pool_t mail_storage_service_user_get_pool(struct mail_storage_service_user *user
 const char *
 mail_storage_service_user_get_log_prefix(struct mail_storage_service_user *user);
 
+/* Return all service settings roots. This includes the roots given to
+   mail_storage_service_init() as well as all dynamically created
+   mail_storage_classes. */
+const struct setting_parser_info *const *
+mail_storage_service_get_set_roots(struct mail_storage_service_ctx *ctx);
 const char *
 mail_storage_service_get_log_prefix(struct mail_storage_service_ctx *ctx);
 const struct var_expand_table *
@@ -176,8 +179,6 @@ mail_storage_service_get_var_expand_table(struct mail_storage_service_ctx *ctx,
 					  struct mail_storage_service_input *input);
 const char *mail_storage_service_fields_var_expand(const char *data,
 						   const char *const *fields);
-/* Return the settings pointed to by set_root parameter in _init() */
-void *mail_storage_service_get_settings(struct master_service *service);
 /* Updates settings for storage service user, forwards return value of settings_parse_keyvalue() */
 int mail_storage_service_user_set_setting(struct mail_storage_service_user *user,
 					  const char *key,

@@ -12,9 +12,7 @@
 #include "iostream-temp.h"
 #include "iostream-ssl.h"
 #include "iostream-ssl-test.h"
-#ifdef HAVE_OPENSSL
 #include "iostream-openssl.h"
-#endif
 #include "connection.h"
 #include "test-common.h"
 #include "test-subprocess.h"
@@ -328,6 +326,8 @@ client_handle_download_request(struct client_request *creq,
 	} else {
 		http_server_response_set_payload(resp, fstream);
 		http_server_response_submit(resp);
+		/* seeking the payload stream shouldn't affect lib-http */
+		i_stream_seek(fstream, 1);
 	}
 	i_stream_unref(&fstream);
 }
@@ -548,6 +548,8 @@ static void client_request_finish_payload_in(struct client_request *creq)
 	} else {
 		http_server_response_set_payload(resp, payload_input);
 		http_server_response_submit(resp);
+		/* seeking the payload stream shouldn't affect lib-http */
+		i_stream_seek(payload_input, 1);
 	}
 
 	i_stream_unref(&payload_input);
@@ -756,6 +758,8 @@ client_handle_request(void *context,
 	const char *path = hreq->target.url->path, *p;
 	struct client *client = (struct client *)context;
 	struct client_request *creq;
+
+	i_assert(hreq->target.url->have_ssl == tset.ssl);
 
 	if (debug) {
 		i_debug("test server: request method=`%s' path=`%s'",
@@ -1426,6 +1430,10 @@ test_client_echo_nonblocking(struct test_client_request *tcreq ATTR_UNUSED,
 	http_client_request_set_payload(hreq, fstream,
 					tset.request_100_continue);
 	http_client_request_submit(hreq);
+	if (fstream->seekable) {
+		/* seeking the payload stream shouldn't affect lib-http */
+		i_stream_seek(fstream, 1);
+	}
 }
 
 static void
@@ -2302,7 +2310,6 @@ static void test_echo_client_shared(void)
 	test_end();
 }
 
-#ifdef HAVE_OPENSSL
 static void test_echo_ssl(void)
 {
 	test_begin("http payload echo (ssl)");
@@ -2332,7 +2339,6 @@ static void test_echo_ssl(void)
 	test_run_parallel(test_client_echo);
 	test_end();
 }
-#endif
 
 static void test_echo_client_blocking(void)
 {
@@ -2382,9 +2388,7 @@ static void (*const test_functions[])(void) = {
 	test_download_client_partial,
 	test_download_client_nested_ioloop,
 	test_echo_client_shared,
-#ifdef HAVE_OPENSSL
 	test_echo_ssl,
-#endif
 	test_echo_client_blocking,
 	NULL
 };
@@ -2395,17 +2399,13 @@ static void (*const test_functions[])(void) = {
 
 static void main_init(void)
 {
-#ifdef HAVE_OPENSSL
 	ssl_iostream_openssl_init();
-#endif
 }
 
 static void main_deinit(void)
 {
 	ssl_iostream_context_cache_free();
-#ifdef HAVE_OPENSSL
 	ssl_iostream_openssl_deinit();
-#endif
 }
 
 int main(int argc, char *argv[])

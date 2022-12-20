@@ -9,9 +9,7 @@
 #include "http-client.h"
 #include "dns-lookup.h"
 #include "iostream-ssl.h"
-#ifdef HAVE_OPENSSL
 #include "iostream-openssl.h"
-#endif
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -32,7 +30,7 @@ static void payload_input(struct http_test_request *req)
 
 	/* read payload */
 	while ((ret=i_stream_read_more(req->payload, &data, &size)) > 0) {
-		i_info("DEBUG: got data (size=%d)", (int)size); 
+		i_info("DEBUG: got data (size=%d)", (int)size);
 		if (req->write_output)
 			if (write_full(1, data, size) < 0)
 				i_error("REQUEST PAYLOAD WRITE ERROR: %m");
@@ -360,9 +358,7 @@ int main(int argc, char *argv[])
 	const char *error;
 
 	lib_init();
-#ifdef HAVE_OPENSSL
 	ssl_iostream_openssl_init();
-#endif
 	ioloop = io_loop_create();
 	io_loop_set_running(ioloop);
 
@@ -465,8 +461,6 @@ int main(int argc, char *argv[])
 
 	io_loop_destroy(&ioloop);
 	ssl_iostream_context_cache_free();
-#ifdef HAVE_OPENSSL
 	ssl_iostream_openssl_deinit();
-#endif
 	lib_deinit();
 }

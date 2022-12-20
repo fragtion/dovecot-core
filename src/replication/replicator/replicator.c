@@ -25,8 +25,11 @@ static struct timeout *to_dump;
 
 static void client_connected(struct master_service_connection *conn)
 {
+	const char *type;
+
 	master_service_client_connection_accept(conn);
-	if (strcmp(conn->name, "replicator-doveadm") == 0)
+	type = master_service_connection_get_type(conn);
+	if (strcmp(type, "doveadm") == 0)
 		doveadm_connection_create(brain, conn->fd);
 	else
 		(void)notify_connection_create(conn->fd, queue);
@@ -54,11 +57,9 @@ replicator_dump_timeout(void *context ATTR_UNUSED)
 
 static void main_init(void)
 {
-	void **sets;
-
 	service_set = master_service_settings_get(master_service);
-	sets = master_service_settings_get_others(master_service);
-	set = sets[0];
+	set = master_service_settings_get_root_set(master_service,
+				&replicator_setting_parser_info);
 
 	queue = replicator_queue_init(set->replication_full_sync_interval,
 				      REPLICATOR_FAILURE_RESYNC_INTERVAL_SECS);

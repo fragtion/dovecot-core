@@ -22,16 +22,6 @@
 
 HASH_TABLE_TYPE(pid_process) service_pids;
 
-void service_error(struct service *service, const char *format, ...)
-{
-	va_list args;
-
-	va_start(args, format);
-	i_error("service(%s): %s", service->set->name,
-		t_strdup_vprintf(format, args));
-	va_end(args);
-}
-
 static struct service_listener *
 service_create_file_listener(struct service *service,
 			     enum service_listener_type type,
@@ -197,8 +187,9 @@ static int service_get_groups(const char *groups, pool_t pool,
 }
 
 static struct service *
-service_create(pool_t pool, const struct service_settings *set,
-	       struct service_list *service_list, const char **error_r)
+service_create_real(pool_t pool, struct event *event,
+		    const struct service_settings *set,
+	            struct service_list *service_list, const char **error_r)
 {
 	struct file_listener_settings *const *unix_listeners;
 	struct file_listener_settings *const *fifo_listeners;
@@ -209,6 +200,7 @@ service_create(pool_t pool, const struct service_settings *set,
 
 	service = p_new(pool, struct service, 1);
 	service->list = service_list;
+	service->event = event;
 	service->set = set;
 	service->throttle_msecs = SERVICE_STARTUP_FAILURE_THROTTLE_MIN_MSECS;
 
@@ -362,6 +354,22 @@ service_create(pool_t pool, const struct service_settings *set,
 					   t_strcut(service->executable, ' '));
 		return NULL;
 	}
+
+	return service;
+}
+
+static struct service *
+service_create(pool_t pool, const struct service_settings *set,
+	       struct service_list *service_list, const char **error_r)
+{
+	struct event *event = event_create(service_list->event);
+	event_set_append_log_prefix(event, t_strdup_printf(
+		"service(%s): ", set->name));
+
+	struct service *service = service_create_real(
+		pool, event, set, service_list, error_r);
+	if (service == NULL)
+		event_unref(&event);
 	return service;
 }
 
@@ -412,7 +420,8 @@ static bool service_want(struct service_settings *set)
 
 static int
 services_create_real(const struct master_settings *set, pool_t pool,
-		     struct service_list **services_r, const char **error_r)
+		     struct event *event, struct service_list **services_r,
+		     const char **error_r)
 {
 	struct service_list *service_list;
 	struct service *service;
@@ -423,6 +432,7 @@ services_create_real(const struct master_settings *set, pool_t pool,
 	service_list = p_new(pool, struct service_list, 1);
 	service_list->refcount = 1;
 	service_list->pool = pool;
+	service_list->event = event;
 	service_list->service_set = master_service_settings_get(master_service);
 	service_list->set_pool = master_service_settings_detach(master_service);
 	service_list->set = set;
@@ -492,10 +502,10 @@ services_create_real(const struct master_settings *set, pool_t pool,
 int services_create(const struct master_settings *set,
 		    struct service_list **services_r, const char **error_r)
 {
-	pool_t pool;
-
-	pool = pool_alloconly_create("services pool", 32768);
-	if (services_create_real(set, pool, services_r, error_r) < 0) {
+	pool_t pool = pool_alloconly_create("services pool", 32768);
+	struct event *event = event_create(NULL);
+	if (services_create_real(set, pool, event, services_r, error_r) < 0) {
+		event_unref(&event);
 		pool_unref(&pool);
 		return -1;
 	}
@@ -518,16 +528,16 @@ unsigned int service_signal(struct service *service, int signo,
 			*uninitialized_count_r += 1;
 			continue;
 		}
-		    
+
 		if (kill(process->pid, signo) == 0)
 			count++;
 		else if (errno != ESRCH) {
-			service_error(service, "kill(%s, %d) failed: %m",
-				      dec2str(process->pid), signo);
+			e_error(service->event, "kill(%s, %d) failed: %m",
+				dec2str(process->pid), signo);
 		}
 	}
 	if (count > 0 && signo != SIGUSR1) {
-		i_warning("Sent %s to %u %s processes",
+		e_warning(service->event, "Sent %s to %u %s processes",
 			  signo == SIGTERM ? "SIGTERM" : "SIGKILL",
 			  count, service->set->name);
 	}
@@ -563,7 +573,7 @@ void service_login_notify(struct service *service, bool all_processes_full)
 	state = all_processes_full ? MASTER_LOGIN_STATE_FULL :
 		MASTER_LOGIN_STATE_NONFULL;
 	if (lseek(service->login_notify_fd, state, SEEK_SET) < 0)
-		service_error(service, "lseek(notify fd) failed: %m");
+		e_error(service->event, "lseek(notify fd) failed: %m");
 
 	/* but don't send signal to processes too often */
 	diff = ioloop_time - service->last_login_notify_time;
@@ -626,7 +636,7 @@ static void services_kill_timeout(struct service_list *service_list)
 			str_printfa(str, " (%u processes still uninitialized)",
 				    uninitialized_count);
 		}
-		i_warning("%s", str_c(str));
+		e_warning(service_list->event, "%s", str_c(str));
 	}
 }
 
@@ -667,10 +677,12 @@ void service_list_unref(struct service_list *service_list)
 	array_foreach_elem(&service_list->services, service) {
 		array_foreach_elem(&service->listeners, listener)
 			i_close_fd(&listener->fd);
+		event_unref(&service->event);
 	}
 	i_close_fd(&service_list->master_fd);
 
 	timeout_remove(&service_list->to_kill);
+	event_unref(&service_list->event);
 	pool_unref(&service_list->set_pool);
 	pool_unref(&service_list->pool);
 }

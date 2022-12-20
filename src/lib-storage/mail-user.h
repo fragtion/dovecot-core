@@ -22,8 +22,7 @@ struct mail_user_connection_data {
 	struct ip_addr *local_ip, *remote_ip;
 	in_port_t local_port, remote_port;
 
-	bool secured:1;
-	bool ssl_secured:1;
+	bool end_client_tls_secured:1;
 };
 
 struct mail_user {
@@ -59,7 +58,8 @@ struct mail_user {
 	   This could be set by plugins that need to fail the initialization. */
 	const char *error;
 
-	const struct setting_parser_info *set_info;
+	struct setting_parser_context *unexpanded_set_parser;
+	struct setting_parser_context *set_parser;
 	const struct mail_user_settings *unexpanded_set;
 	struct mail_user_settings *set;
 	struct mail_namespace *namespaces;
@@ -129,13 +129,11 @@ extern const struct var_expand_func_table *mail_user_var_expand_func_table;
 
 struct mail_user *mail_user_alloc(struct event *parent_event,
 				  const char *username,
-				  const struct setting_parser_info *set_info,
-				  const struct mail_user_settings *set);
+				  struct setting_parser_context *unexpanded_set_parser);
 struct mail_user *
 mail_user_alloc_nodup_set(struct event *parent_event,
 			  const char *username,
-			  const struct setting_parser_info *set_info,
-			  const struct mail_user_settings *set);
+			  struct setting_parser_context *set_parser);
 /* Returns -1 if settings were invalid. */
 int mail_user_init(struct mail_user *user, const char **error_r);
 
@@ -157,6 +155,11 @@ void mail_user_set_vars(struct mail_user *user, const char *service,
 /* Return %variable expansion table for the user. */
 const struct var_expand_table *
 mail_user_var_expand_table(struct mail_user *user);
+/* Expand %variables for the user. The settings values may be allocated from
+   user->pool. Returns the same as settings_var_expand_with_funcs(). */
+int mail_user_var_expand(struct mail_user *user,
+			 const struct setting_parser_info *info, void *set,
+			 const char **error_r);
 
 /* Specify the user's home directory. This should be called also when it's
    known that the user doesn't have a home directory to avoid the internal

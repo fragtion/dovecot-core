@@ -8,7 +8,8 @@
 #include "str.h"
 #include "strescape.h"
 #include "hash.h"
-#include "replicator-queue.h"
+#include "replicator-queue-private.h"
+#include "replicator-settings.h"
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -22,59 +23,67 @@ struct replicator_sync_lookup {
 	bool wait_for_next_push;
 };
 
-struct replicator_queue {
-	struct priorityq *user_queue;
-	/* username => struct replicator_user* */
-	HASH_TABLE(char *, struct replicator_user *) user_hash;
-
-	ARRAY(struct replicator_sync_lookup) sync_lookups;
-
-	unsigned int full_sync_interval;
-	unsigned int failure_resync_interval;
-
-	void (*change_callback)(void *context);
-	void *change_context;
-};
-
 struct replicator_queue_iter {
 	struct replicator_queue *queue;
 	struct hash_iterate_context *iter;
 };
 
+static unsigned int replicator_full_sync_interval = 0;
+static unsigned int replicator_failure_resync_interval = 0;
+
+static time_t replicator_user_next_sync_time(const struct replicator_user *user)
+{
+	/* The idea is that the higher the priority, the more likely it will
+	   be prioritized over low priority syncs. However, to avoid permanent
+	   starvation of lower priority users, the priority boost is only
+	   temporary.
+
+	   The REPLICATION_PRIORITY_*_SECS macros effectively specify how long
+	   lower priority requests are allowed to be waiting. */
+#define REPLICATION_PRIORITY_LOW_SECS (60*15)
+#define REPLICATION_PRIORITY_HIGH_SECS (60*30)
+#define REPLICATION_PRIORITY_SYNC_SECS (60*45)
+	/* When priority != none, user needs to be replicated ASAP.
+	   The question is just whether the queue is already busy and other
+	   users need to be synced even more faster. */
+	if (user->last_fast_sync == 0) {
+		/* User has never been synced yet. These will be replicated
+		   first. Still, try to replicate higher priority users faster
+		   than lower priority users. */
+		if (user->priority != REPLICATION_PRIORITY_NONE)
+			return REPLICATION_PRIORITY_SYNC - user->priority;
+	}
+	switch (user->priority) {
+	case REPLICATION_PRIORITY_NONE:
+		break;
+	case REPLICATION_PRIORITY_LOW:
+		i_assert(user->last_update >= REPLICATION_PRIORITY_LOW_SECS);
+		return user->last_update - REPLICATION_PRIORITY_LOW_SECS;
+	case REPLICATION_PRIORITY_HIGH:
+		i_assert(user->last_update >= REPLICATION_PRIORITY_HIGH_SECS);
+		return user->last_update - REPLICATION_PRIORITY_HIGH_SECS;
+	case REPLICATION_PRIORITY_SYNC:
+		i_assert(user->last_update >= REPLICATION_PRIORITY_HIGH_SECS);
+		return user->last_update - REPLICATION_PRIORITY_SYNC_SECS;
+	}
+	if (user->last_sync_failed) {
+		/* failures need to be retried at specific intervals */
+		return user->last_fast_sync +
+			replicator_failure_resync_interval;
+	}
+	/* full resyncs should be done at configured intervals */
+	return user->last_full_sync + replicator_full_sync_interval;
+}
+
 static int user_priority_cmp(const void *p1, const void *p2)
 {
 	const struct replicator_user *user1 = p1, *user2 = p2;
-
-	if (user1->priority > user2->priority)
+	time_t next_sync1 = replicator_user_next_sync_time(user1);
+	time_t next_sync2 = replicator_user_next_sync_time(user2);
+	if (next_sync1 < next_sync2)
 		return -1;
-	if (user1->priority < user2->priority)
+	if (next_sync1 > next_sync2)
 		return 1;
-
-	if (user1->priority != REPLICATION_PRIORITY_NONE) {
-		/* there is something to replicate */
-		if (user1->last_fast_sync < user2->last_fast_sync)
-			return -1;
-		if (user1->last_fast_sync > user2->last_fast_sync)
-			return 1;
-	} else if (user1->last_sync_failed != user2->last_sync_failed) {
-		/* resync failures first */
-		if (user1->last_sync_failed)
-			return -1;
-		else
-			return 1;
-	} else if (user1->last_sync_failed) {
-		/* both have failed. resync failures with fast-sync timestamp */
-		if (user1->last_fast_sync < user2->last_fast_sync)
-			return -1;
-		if (user1->last_fast_sync > user2->last_fast_sync)
-			return 1;
-	} else {
-		/* nothing to replicate, but do still periodic full syncs */
-		if (user1->last_full_sync < user2->last_full_sync)
-			return -1;
-		if (user1->last_full_sync > user2->last_full_sync)
-			return 1;
-	}
 	return 0;
 }
 
@@ -84,6 +93,15 @@ replicator_queue_init(unsigned int full_sync_interval,
 {
 	struct replicator_queue *queue;
 
+	/* priorityq callback needs to access these */
+	i_assert(replicator_full_sync_interval == 0 ||
+		 replicator_full_sync_interval == full_sync_interval);
+	replicator_full_sync_interval = full_sync_interval;
+	i_assert(replicator_failure_resync_interval == 0 ||
+		 replicator_failure_resync_interval == failure_resync_interval);
+	replicator_full_sync_interval = full_sync_interval;
+	replicator_failure_resync_interval = failure_resync_interval;
+
 	queue = i_new(struct replicator_queue, 1);
 	queue->full_sync_interval = full_sync_interval;
 	queue->failure_resync_interval = failure_resync_interval;
@@ -91,6 +109,8 @@ replicator_queue_init(unsigned int full_sync_interval,
 	hash_table_create(&queue->user_hash, default_pool, 1024,
 			  str_hash, strcmp);
 	i_array_init(&queue->sync_lookups, 32);
+	queue->event = event_create(NULL);
+	event_add_category(queue->event, &event_category_replication);
 	return queue;
 }
 
@@ -114,6 +134,7 @@ void replicator_queue_deinit(struct replicator_queue **_queue)
 	hash_table_destroy(&queue->user_hash);
 	i_assert(array_count(&queue->sync_lookups) == 0);
 	array_free(&queue->sync_lookups);
+	event_unref(&queue->event);
 	i_free(queue);
 }
 
@@ -152,56 +173,64 @@ replicator_queue_lookup(struct replicator_queue *queue, const char *username)
 	return hash_table_lookup(queue->user_hash, username);
 }
 
-static struct replicator_user *
-replicator_queue_add_int(struct replicator_queue *queue, const char *username,
-			 enum replication_priority priority)
+struct replicator_user *
+replicator_queue_get(struct replicator_queue *queue, const char *username)
 {
 	struct replicator_user *user;
 
 	user = replicator_queue_lookup(queue, username);
 	if (user == NULL) {
+		e_debug(queue->event, "user %s: User not found from queue - adding", username);
 		user = i_new(struct replicator_user, 1);
 		user->refcount = 1;
 		user->username = i_strdup(username);
+		user->last_update = ioloop_time;
 		hash_table_insert(queue->user_hash, user->username, user);
-	} else {
-		if (user->priority > priority) {
-			/* user already has a higher priority than this */
-			return user;
-		}
 		if (!user->popped)
-			priorityq_remove(queue->user_queue, &user->item);
+			priorityq_add(queue->user_queue, &user->item);
 	}
+	return user;
+}
+
+void replicator_queue_update(struct replicator_queue *queue,
+			     struct replicator_user *user,
+			     enum replication_priority priority)
+{
+	if (user->priority >= priority) {
+		/* user already has at least this high priority */
+		e_debug(queue->event, "user %s: Ignoring priority %u update, "
+			"since user already has priority=%u",
+			user->username, priority, user->priority);
+		return;
+	}
+	e_debug(queue->event, "user %s: Updating priority %u -> %u",
+		user->username, user->priority, priority);
 	user->priority = priority;
 	user->last_update = ioloop_time;
+}
 
-	if (!user->popped)
+void replicator_queue_add(struct replicator_queue *queue,
+			  struct replicator_user *user)
+{
+	if (!user->popped) {
+		priorityq_remove(queue->user_queue, &user->item);
 		priorityq_add(queue->user_queue, &user->item);
-	return user;
-}
-
-struct replicator_user *
-replicator_queue_add(struct replicator_queue *queue, const char *username,
-		     enum replication_priority priority)
-{
-	struct replicator_user *user;
-
-	user = replicator_queue_add_int(queue, username, priority);
-	if (queue->change_callback != NULL)
+	}
+	if (queue->change_callback != NULL) {
+		e_debug(queue->event, "user %s: Queue changed - calling callback",
+			user->username);
 		queue->change_callback(queue->change_context);
-	return user;
+	}
 }
 
-void replicator_queue_add_sync(struct replicator_queue *queue,
-			       const char *username,
-			       replicator_sync_callback_t *callback,
-			       void *context)
+void replicator_queue_add_sync_callback(struct replicator_queue *queue,
+					struct replicator_user *user,
+					replicator_sync_callback_t *callback,
+					void *context)
 {
-	struct replicator_user *user;
 	struct replicator_sync_lookup *lookup;
 
-	user = replicator_queue_add_int(queue, username,
-					REPLICATION_PRIORITY_SYNC);
+	i_assert(user->priority == REPLICATION_PRIORITY_SYNC);
 
 	lookup = array_append_space(&queue->sync_lookups);
 	lookup->user = user;
@@ -209,8 +238,7 @@ void replicator_queue_add_sync(struct replicator_queue *queue,
 	lookup->context = context;
 	lookup->wait_for_next_push = user->popped;
 
-	if (queue->change_callback != NULL)
-		queue->change_callback(queue->change_context);
+	replicator_queue_add(queue, user);
 }
 
 void replicator_queue_remove(struct replicator_queue *queue,
@@ -219,40 +247,39 @@ void replicator_queue_remove(struct replicator_queue *queue,
 	struct replicator_user *user = *_user;
 
 	*_user = NULL;
+	e_debug(queue->event, "user %s: Removing user from queue", user->username);
 	if (!user->popped)
 		priorityq_remove(queue->user_queue, &user->item);
 	hash_table_remove(queue->user_hash, user->username);
-	replicator_user_unref(&user);
 
-	if (queue->change_callback != NULL)
+	if (queue->change_callback != NULL) {
+		e_debug(queue->event, "user %s: Queue changed - calling callback",
+			user->username);
 		queue->change_callback(queue->change_context);
+	}
+	replicator_user_unref(&user);
 }
 
-bool replicator_queue_want_sync_now(struct replicator_queue *queue,
-				    struct replicator_user *user,
+unsigned int replicator_queue_count(struct replicator_queue *queue)
+{
+	return priorityq_count(queue->user_queue);
+}
+
+bool replicator_queue_want_sync_now(struct replicator_user *user,
 				    unsigned int *next_secs_r)
 {
-	time_t next_sync;
-
-	if (user->priority != REPLICATION_PRIORITY_NONE)
+	time_t next_sync = replicator_user_next_sync_time(user);
+	if (next_sync <= ioloop_time) {
+		*next_secs_r = 0;
 		return TRUE;
-
-	if (user->last_sync_failed) {
-		next_sync = user->last_fast_sync +
-			queue->failure_resync_interval;
-	} else {
-		next_sync = user->last_full_sync + queue->full_sync_interval;
 	}
-	if (next_sync <= ioloop_time)
-		return TRUE;
-
 	*next_secs_r = next_sync - ioloop_time;
 	return FALSE;
 }
 
 struct replicator_user *
-replicator_queue_pop(struct replicator_queue *queue,
-		     unsigned int *next_secs_r)
+replicator_queue_peek(struct replicator_queue *queue,
+		      unsigned int *next_secs_r)
 {
 	struct priorityq_item *item;
 	struct replicator_user *user;
@@ -264,12 +291,25 @@ replicator_queue_pop(struct replicator_queue *queue,
 		return NULL;
 	}
 	user = (struct replicator_user *)item;
-	if (!replicator_queue_want_sync_now(queue, user, next_secs_r)) {
+	(void)replicator_queue_want_sync_now(user, next_secs_r);
+	return user;
+}
+
+struct replicator_user *
+replicator_queue_pop(struct replicator_queue *queue,
+		     unsigned int *next_secs_r)
+{
+	struct replicator_user *user;
+
+	user = replicator_queue_peek(queue, next_secs_r);
+	if (*next_secs_r > 0) {
 		/* we don't want to sync the user yet */
 		return NULL;
 	}
-	priorityq_remove(queue->user_queue, &user->item);
-	user->popped = TRUE;
+	if (user != NULL) {
+		priorityq_remove(queue->user_queue, &user->item);
+		user->popped = TRUE;
+	}
 	return user;
 }
 
@@ -298,6 +338,8 @@ replicator_queue_handle_sync_lookups(struct replicator_queue *queue,
 			array_delete(&queue->sync_lookups, i, 1);
 		}
 	}
+
+	e_debug(queue->event, "user %s: Handled sync lookups", user->username);
 
 	array_foreach_modifiable(&callbacks, lookups)
 		lookups->callback(success, lookups->context);
@@ -341,7 +383,7 @@ replicator_queue_import_line(struct replicator_queue *queue, const char *line)
 	tmp_user.priority = priority;
 	tmp_user.last_sync_failed = args[5][0] != '0';
 
-	if (str_array_length(args) >= 8) { 
+	if (str_array_length(args) >= 8) {
 		if (str_to_time(args[7], &tmp_user.last_successful_sync) < 0)
 			return -1;
 	} else {
@@ -361,9 +403,10 @@ replicator_queue_import_line(struct replicator_queue *queue, const char *line)
 			if (user->priority > tmp_user.priority)
 				return 0;
 		}
+	} else {
+		user = replicator_queue_get(queue, username);
 	}
-	user = replicator_queue_add(queue, username,
-				    tmp_user.priority);
+	user->priority = tmp_user.priority;
 	user->last_update = tmp_user.last_update;
 	user->last_fast_sync = tmp_user.last_fast_sync;
 	user->last_full_sync = tmp_user.last_full_sync;
@@ -371,6 +414,7 @@ replicator_queue_import_line(struct replicator_queue *queue, const char *line)
 	user->last_sync_failed = tmp_user.last_sync_failed;
 	i_free(user->state);
 	user->state = i_strdup(state);
+	replicator_queue_add(queue, user);
 	return 0;
 }
 
@@ -380,11 +424,13 @@ int replicator_queue_import(struct replicator_queue *queue, const char *path)
 	const char *line;
 	int fd, ret = 0;
 
+	e_debug(queue->event, "Importing queue from %s", path);
+
 	fd = open(path, O_RDONLY);
 	if (fd == -1) {
 		if (errno == ENOENT)
 			return 0;
-		i_error("open(%s) failed: %m", path);
+		e_error(queue->event, "open(%s) failed: %m", path);
 		return -1;
 	}
 
@@ -394,13 +440,13 @@ int replicator_queue_import(struct replicator_queue *queue, const char *path)
 			ret = replicator_queue_import_line(queue, line);
 		} T_END;
 		if (ret < 0) {
-			i_error("Corrupted replicator record in %s: %s",
-				path, line);
+			e_error(queue->event,
+				"Corrupted replicator record in %s: %s", path, line);
 			break;
 		}
 	}
 	if (input->stream_errno != 0) {
-		i_error("read(%s) failed: %s", path, i_stream_get_error(input));
+		e_error(queue->event, "read(%s) failed: %s", path, i_stream_get_error(input));
 		ret = -1;
 	}
 	i_stream_destroy(&input);
@@ -431,7 +477,7 @@ int replicator_queue_export(struct replicator_queue *queue, const char *path)
 
 	fd = creat(path, 0600);
 	if (fd == -1) {
-		i_error("creat(%s) failed: %m", path);
+		e_error(queue->event, "creat(%s) failed: %m", path);
 		return -1;
 	}
 	output = o_stream_create_fd_file_autoclose(&fd, 0);
@@ -447,7 +493,7 @@ int replicator_queue_export(struct replicator_queue *queue, const char *path)
 	}
 	replicator_queue_iter_deinit(&iter);
 	if (o_stream_finish(output) < 0) {
-		i_error("write(%s) failed: %s", path, o_stream_get_error(output));
+		e_error(queue->event, "write(%s) failed: %s", path, o_stream_get_error(output));
 		ret = -1;
 	}
 	o_stream_destroy(&output);

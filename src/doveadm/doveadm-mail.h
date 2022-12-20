@@ -9,10 +9,12 @@
 #include "mail-storage.h"
 #include "mail-storage-service.h"
 
+struct auth_proxy_settings;
 struct mailbox;
 struct mailbox_list;
 struct mail_storage;
 struct mail_user;
+struct doveadm_client;
 struct doveadm_mail_cmd_context;
 
 struct doveadm_mail_cmd_vfuncs {
@@ -92,10 +94,6 @@ struct doveadm_mail_cmd_context {
 	bool proxying:1;
 	/* We're handling only a single user */
 	bool iterate_single_user:1;
-	/* We're going through all users (not set for wildcard usernames) */
-	bool iterate_all_users:1;
-	/* Add username header to all replies */
-	bool add_username_header:1;
 };
 
 struct doveadm_mail_cmd {
@@ -127,7 +125,22 @@ int doveadm_mail_single_user(struct doveadm_mail_cmd_context *ctx,
 			     const char **error_r);
 int doveadm_mail_server_user(struct doveadm_mail_cmd_context *ctx,
 			     const char **error_r);
-void doveadm_mail_server_flush(void);
+struct doveadm_server *doveadm_server_get(const char *name);
+void doveadm_mail_server_handle(struct doveadm_server *server,
+				struct doveadm_client *conn,
+				struct doveadm_mail_cmd_context *cmd_ctx,
+				const char *username, bool print_username);
+void doveadm_mail_server_flush(struct doveadm_mail_cmd_context *ctx);
+
+int doveadm_cmd_pass_lookup(struct doveadm_mail_cmd_context *ctx,
+			    const char *const *extra_fields, pool_t pool,
+			    const char *const **fields_r,
+			    const char **auth_socket_path_r);
+int doveadm_cmd_pass_reply_parse(struct doveadm_mail_cmd_context *ctx,
+				 const char *auth_socket_path,
+				 const char *const *fields,
+				 struct auth_proxy_settings *proxy_set,
+				 bool *nologin_r, const char **error_r);
 
 /* Request input stream to be read (from stdin). This must be called from
    the command's init() function. */

@@ -44,6 +44,7 @@ struct service_listener {
 
 struct service {
 	struct service_list *list;
+	struct event *event;
 
 	enum service_type type;
 
@@ -137,6 +138,7 @@ struct service_list {
 	int refcount;
 	struct timeout *to_kill;
 	unsigned int fork_counter;
+	struct event *event;
 
 	const struct master_settings *set;
 	const struct master_service_settings *service_set;
@@ -201,9 +203,6 @@ service_lookup(struct service_list *service_list, const char *name);
 /* Find service by type */
 struct service *
 service_lookup_type(struct service_list *service_list, enum service_type type);
-
-void service_error(struct service *service, const char *format, ...)
-	ATTR_FORMAT(2, 3);
 
 void service_pids_init(void);
 void service_pids_deinit(void);

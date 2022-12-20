@@ -31,6 +31,7 @@
 #include "lib.h"
 #include "ioloop.h"
 #include "str.h"
+#include "settings-parser.h"
 #include "imap-arg.h"
 #include "imap-match.h"
 #include "imap-utf7.h"
@@ -94,9 +95,8 @@ static int imapc_list_init(struct mailbox_list *_list, const char **error_r)
 {
 	struct imapc_mailbox_list *list = (struct imapc_mailbox_list *)_list;
 
-	list->set = mail_user_set_get_driver_settings(_list->ns->user->set_info,
-						      _list->ns->user_set,
-						      IMAPC_STORAGE_NAME);
+	list->set = settings_parser_get_root_set(_list->ns->user->set_parser,
+						 imapc_get_setting_parser_info());
 	if (imapc_storage_client_create(_list->ns, list->set, _list->mail_set,
 					&list->client, error_r) < 0)
 		return -1;
@@ -415,6 +415,7 @@ imapc_list_get_vname(struct mailbox_list *_list, const char *storage_name)
 
 static struct mailbox_list *imapc_list_get_fs(struct imapc_mailbox_list *list)
 {
+	struct event *event = list->list.ns->user->event;
 	struct mailbox_list_settings list_set;
 	const char *error, *dir;
 
@@ -437,7 +438,8 @@ static struct mailbox_list *imapc_list_get_fs(struct imapc_mailbox_list *list)
 		if (mailbox_list_create(list_set.layout, list->list.ns,
 					&list_set, MAILBOX_LIST_FLAG_SECONDARY,
 					&list->index_list, &error) < 0) {
-			i_error("imapc: Couldn't create %s mailbox list: %s",
+			e_error(event,
+				"imapc: Couldn't create %s mailbox list: %s",
 				list_set.layout, error);
 			list->index_list_failed = TRUE;
 		}
@@ -752,7 +754,9 @@ imapc_list_iter_next(struct mailbox_list_iterate_context *_ctx)
 		if (node == NULL)
 			return mailbox_list_iter_default_next(_ctx);
 	} while ((node->flags & MAILBOX_MATCHED) == 0 ||
-		 imapc_list_is_ns_root(ctx, node));
+		 (imapc_list_is_ns_root(ctx, node) &&
+		  (strcasecmp(vname, "INBOX") != 0 ||
+		   (ctx->info.ns->flags & NAMESPACE_FLAG_INBOX_ANY) == 0)));
 
 	if (ctx->info.ns->prefix_len > 0 &&
 	    strcasecmp(vname, "INBOX") != 0 &&

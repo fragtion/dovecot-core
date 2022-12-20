@@ -11,6 +11,7 @@
 #include "message-parser.h"
 #include "mail-user.h"
 #include "fts-parser.h"
+#include "fts-api.h"
 
 #define SCRIPT_USER_CONTEXT(obj) \
 	MODULE_CONTEXT(obj, fts_parser_script_user_module)
@@ -30,6 +31,7 @@ struct fts_parser_script_user {
 
 struct script_fts_parser {
 	struct fts_parser parser;
+	struct event *event;
 
 	int fd;
 	char *path;
@@ -42,7 +44,8 @@ struct script_fts_parser {
 static MODULE_CONTEXT_DEFINE_INIT(fts_parser_script_user_module,
 				  &mail_user_module_register);
 
-static int script_connect(struct mail_user *user, const char **path_r)
+static int
+script_connect(struct mail_user *user, const char **path_r, struct event *event)
 {
 	const char *path;
 	int fd;
@@ -55,14 +58,15 @@ static int script_connect(struct mail_user *user, const char **path_r)
 		path = t_strconcat(user->set->base_dir, "/", path, NULL);
 	fd = net_connect_unix_with_retries(path, 1000);
 	if (fd == -1)
-		i_error("net_connect_unix(%s) failed: %m", path);
+		e_error(event, "net_connect_unix(%s) failed: %m", path);
 	else
 		net_set_nonblock(fd, FALSE);
 	*path_r = path;
 	return fd;
 }
 
-static int script_contents_read(struct mail_user *user)
+static int
+script_contents_read(struct mail_user *user, struct event *event)
 {
 	struct fts_parser_script_user *suser = SCRIPT_USER_CONTEXT(user);
 	const char *path, *cmd, *line;
@@ -73,13 +77,13 @@ static int script_contents_read(struct mail_user *user)
 	int fd, ret = 0;
 	i_assert(suser != NULL);
 
-	fd = script_connect(user, &path);
+	fd = script_connect(user, &path, event);
 	if (fd == -1)
 		return -1;
 
 	cmd = t_strdup_printf(SCRIPT_HANDSHAKE"\n");
 	if (write_full(fd, cmd, strlen(cmd)) < 0) {
-		i_error("write(%s) failed: %m", path);
+		e_error(event, "write(%s) failed: %m", path);
 		i_close_fd(&fd);
 		return -1;
 	}
@@ -92,7 +96,7 @@ static int script_contents_read(struct mail_user *user)
 			break;
 		}
 		if (args[0][0] == '\0' || args[1] == NULL) {
-			i_error("parser script sent invalid input: %s", line);
+			e_error(event, "parser script sent invalid input: %s", line);
 			continue;
 		}
 
@@ -101,23 +105,24 @@ static int script_contents_read(struct mail_user *user)
 		content->extensions = (const void *)(args+1);
 	}
 	if (input->stream_errno != 0) {
-		i_error("parser script read(%s) failed: %s", path,
+		e_error(event, "parser script read(%s) failed: %s", path,
 			i_stream_get_error(input));
 		ret = -1;
 	} else if (!eof_seen) {
 		if (input->v_offset == 0)
-			i_error("parser script didn't send any data");
+			e_error(event, "parser script didn't send any data");
 		else
-			i_error("parser script didn't send empty EOF line");
+			e_error(event, "parser script didn't send empty EOF line");
 	}
 	i_stream_destroy(&input);
 	return ret;
 }
 
-static bool script_support_content(struct mail_user *user,
-				   const char **content_type,
+static bool script_support_content(struct fts_parser_context *parser_context,
 				   const char *filename)
 {
+	struct mail_user *user = parser_context->user;
+	struct event *event = parser_context->event;
 	struct fts_parser_script_user *suser = SCRIPT_USER_CONTEXT(user);
 	const struct content *content;
 	const char *extension;
@@ -128,11 +133,11 @@ static bool script_support_content(struct mail_user *user,
 		MODULE_CONTEXT_SET(user, fts_parser_script_user_module, suser);
 	}
 	if (array_count(&suser->content) == 0) {
-		if (script_contents_read(user) < 0)
+		if (script_contents_read(user, event) < 0)
 			return FALSE;
 	}
 
-	if (strcmp(*content_type, "application/octet-stream") == 0) {
+	if (strcmp(parser_context->content_type, "application/octet-stream") == 0) {
 		if (filename == NULL)
 			return FALSE;
 		extension = strrchr(filename, '.');
@@ -143,13 +148,13 @@ static bool script_support_content(struct mail_user *user,
 		array_foreach(&suser->content, content) {
 			if (content->extensions != NULL &&
 			    str_array_icase_find(content->extensions, extension)) {
-				*content_type = content->content_type;
+				parser_context->content_type = content->content_type;
 				return TRUE;
 			}
 		}
 	} else {
 		array_foreach(&suser->content, content) {
-			if (strcmp(content->content_type, *content_type) == 0)
+			if (strcmp(content->content_type, parser_context->content_type) == 0)
 				return TRUE;
 		}
 	}
@@ -200,26 +205,29 @@ static void parse_content_disposition(const char *content_disposition,
 static struct fts_parser *
 fts_parser_script_try_init(struct fts_parser_context *parser_context)
 {
+	struct event *event = parser_context->user->event;
 	struct script_fts_parser *parser;
 	const char *filename, *path, *cmd;
 	int fd;
 
 	parse_content_disposition(parser_context->content_disposition, &filename);
-	if (!script_support_content(parser_context->user, &parser_context->content_type, filename))
+	if (!script_support_content(parser_context, filename))
 		return NULL;
 
-	fd = script_connect(parser_context->user, &path);
+	fd = script_connect(parser_context->user, &path, parser_context->event);
 	if (fd == -1)
 		return NULL;
 	cmd = t_strdup_printf(SCRIPT_HANDSHAKE"%s\n\n", parser_context->content_type);
 	if (write_full(fd, cmd, strlen(cmd)) < 0) {
-		i_error("write(%s) failed: %m", path);
+		e_error(event, "write(%s) failed: %m", path);
 		i_close_fd(&fd);
 		return NULL;
 	}
 
 	parser = i_new(struct script_fts_parser, 1);
 	parser->parser.v = fts_parser_script;
+	parser->event = event_create(event);
+	event_add_category(parser->event, &event_category_fts);
 	parser->path = i_strdup(path);
 	parser->fd = fd;
 	return &parser->parser;
@@ -235,20 +243,20 @@ static void fts_parser_script_more(struct fts_parser *_parser,
 		/* first we'll send everything to the script */
 		if (!parser->failed &&
 		    write_full(parser->fd, block->data, block->size) < 0) {
-			i_error("write(%s) failed: %m", parser->path);
+			e_error(parser->event, "write(%s) failed: %m", parser->path);
 			parser->failed = TRUE;
 		}
 		block->size = 0;
 	} else {
 		if (!parser->shutdown) {
 			if (shutdown(parser->fd, SHUT_WR) < 0)
-				i_error("shutdown(%s) failed: %m", parser->path);
+				e_error(parser->event, "shutdown(%s) failed: %m", parser->path);
 			parser->shutdown = TRUE;
 		}
 		/* read the result from the script */
 		ret = read(parser->fd, parser->outbuf, sizeof(parser->outbuf));
 		if (ret < 0)
-			i_error("read(%s) failed: %m", parser->path);
+			e_error(parser->event, "read(%s) failed: %m", parser->path);
 		else {
 			block->data = parser->outbuf;
 			block->size = ret;
@@ -263,7 +271,9 @@ static int fts_parser_script_deinit(struct fts_parser *_parser,
 	int ret = parser->failed ? -1 : 1;
 
 	if (close(parser->fd) < 0)
-		i_error("close(%s) failed: %m", parser->path);
+		e_error(parser->event, "close(%s) failed: %m", parser->path);
+
+	event_unref(&parser->event);
 	i_free(parser->path);
 	i_free(parser);
 	return ret;

@@ -2,13 +2,16 @@
 
 #include "lib.h"
 #include "str.h"
+#include "str-parse.h"
 #include "settings-parser.h"
 #include "config-parser-private.h"
 #include "old-set-parser.h"
+#include "event-filter.h"
 #include "istream.h"
 #include "base64.h"
 #include <stdio.h>
 
+#define LOG_DEBUG_KEY "log_debug"
 #define config_apply_line (void)config_apply_line
 
 struct socket_set {
@@ -18,12 +21,14 @@ struct socket_set {
 
 struct old_set_parser {
 	const char *base_dir;
+	const char *post_log_debug;
 	/* 1 when in auth {} section, >1 when inside auth { .. { .. } } */
 	unsigned int auth_section;
 	/* 1 when in socket listen {}, >1 when inside more of its sections */
 	unsigned int socket_listen_section;
-	bool seen_auth_section;
 	struct socket_set socket_set;
+	bool seen_auth_section:1;
+	bool post_auth_debug:1;
 };
 
 static const struct config_filter any_filter = {
@@ -289,14 +294,36 @@ old_settings_handle_root(struct config_parser_context *ctx,
 		return TRUE;
 	}
 	if (strcmp(key, "auth_debug") == 0) {
-		obsolete(ctx, "%s will be removed in a future version, consider using log_debug = \"category=auth\" instead", key);
+		const char *error ATTR_UNUSED;
+		bool auth_debug;
+		if (str_parse_get_bool(value, &auth_debug, &error) == 0 &&
+		    auth_debug)
+			ctx->old->post_auth_debug = auth_debug;
+		obsolete(ctx, "%s will be removed in a future version%s",
+			 key, ctx->old->post_auth_debug ?
+				", consider using log_debug = \"category=auth\" instead" : "");
 		return TRUE;
+	}
+	if (strcmp(key, LOG_DEBUG_KEY) == 0) {
+		ctx->old->post_log_debug = p_strdup(ctx->pool, value);
+		return FALSE;
 	}
 	if (strcmp(key, "login_access_sockets") == 0) {
 		if (value != NULL && *value != '\0')
 			i_fatal("%s is no longer supported", key);
 		else
 			obsolete(ctx, "%s is no longer supported", key);
+		return TRUE;
+	}
+	if (strcmp(key, "disable_plaintext_auth") == 0) {
+		const char *error;
+		bool b;
+		if (str_parse_get_bool(value, &b, &error) < 0)
+			i_fatal("%s has bad value '%s': %s", key, value, error);
+		obsolete(ctx, "%s = %s has been replaced with auth_allow_cleartext = %s",
+			 key, value, b ? "no" : "yes");
+		config_parser_apply_line(ctx, CONFIG_LINE_TYPE_KEYVALUE,
+					 "auth_allow_cleartext", b ? "no" : "yes");
 		return TRUE;
 	}
 	if (ctx->old->auth_section == 1) {
@@ -306,6 +333,30 @@ old_settings_handle_root(struct config_parser_context *ctx,
 					 key, value);
 		return TRUE;
 	}
+	if (strcmp(key, "imapc_features") == 0) {
+		char **args = p_strsplit_spaces(
+			pool_datastack_create(), value, " ");
+		for (char **arg = args; *arg != NULL; arg++) {
+			if (strcmp(*arg, "rfc822.size") == 0 ||
+			    strcmp(*arg, "fetch-headers") == 0 ||
+			    strcmp(*arg, "search") == 0 ||
+			    strcmp(*arg, "modseq") == 0 ||
+			    strcmp(*arg, "delay-login") == 0 ||
+			    strcmp(*arg, "fetch-bodystructure") == 0 ||
+			    strcmp(*arg, "acl") == 0) {
+				obsolete(ctx,
+					 "The imapc feature '%s' is no longer necessary, "
+					 "it is enabled by default.",
+					 *arg);
+				*arg = "";
+			}
+		}
+		value = t_strarray_join((void *)args, " ");
+		config_parser_apply_line(ctx, CONFIG_LINE_TYPE_KEYVALUE, key,
+					 value);
+		return TRUE;
+	}
+
 	return FALSE;
 }
 
@@ -663,14 +714,6 @@ old_settings_handle_path(struct config_parser_context *ctx,
 	char end;
 	int index;
 	if (sscanf(str_c(ctx->str), "plugin/%d%c]", &index, &end) == 2 && end == '/') {
-		if (strcmp(key, "imap_zlib_compress_level") == 0) {
-			obsolete(ctx, "%s has been replaced by imap_compress_deflate_level", key);
-			config_apply_line(ctx, key, t_strdup_printf(
-				"plugin/%d/imap_compress_deflate_level=%s",
-				index, value), NULL);
-			return TRUE;
-		}
-
 		if (strcmp(key, "push_notification_backend") == 0) {
 			obsolete(ctx, "%s has been replaced by push_notification_driver", key);
 			config_apply_line(ctx, key, t_strdup_printf(
@@ -678,6 +721,26 @@ old_settings_handle_path(struct config_parser_context *ctx,
 				index, value), NULL);
 			return TRUE;
 		}
+
+		if (strcmp(key, "zlib_save") == 0) {
+			obsolete(ctx, "%s has been replaced by mail_compress_save", key);
+			config_apply_line(ctx, key, t_strdup_printf(
+				"plugin/%d/mail_compress_save=%s",
+				index, value), NULL);
+			return TRUE;
+		}
+		if (strcmp(key, "zlib_save_level") == 0) {
+			obsolete(ctx, "%s has been replaced by mail_compress_save_level", key);
+			config_apply_line(ctx, key, t_strdup_printf(
+				"plugin/%d/mail_compress_save_level=%s",
+				index, value), NULL);
+			return TRUE;
+		}
+	}
+	if (strcmp(key, "imap_zlib_compress_level") == 0 ||
+	    strcmp(key, "imap_compress_deflate_level") == 0) {
+		obsolete(ctx, "%s has been removed, the default compression level is now used unconditionally", key);
+		return TRUE;
 	}
 	return FALSE;
 }
@@ -748,6 +811,48 @@ bool old_settings_handle(struct config_parser_context *ctx,
 		break;
 	}
 	return FALSE;
+}
+
+static void old_settings_handle_post_log_debug(struct config_parser_context *ctx)
+{
+	static const char *category_auth = "category=auth";
+	const char *error ATTR_UNUSED;
+	const char *prev = ctx->old->post_log_debug;
+
+	if (!ctx->old->post_auth_debug)
+		return;
+
+	if (prev == NULL || *prev == '\0') {
+		config_parser_apply_line(ctx, CONFIG_LINE_TYPE_KEYVALUE,
+					 LOG_DEBUG_KEY, category_auth);
+		return;
+	}
+
+	struct event_filter *filter = event_filter_create();
+	if (event_filter_parse(prev, filter, &error) != 0) {
+		/* ignore, it will be handled later when actually
+		   parsing/applying the configuration */
+		event_filter_unref(&filter);
+		return;
+	}
+
+	struct event_filter *auth_filter = event_filter_create();
+	if (event_filter_parse(category_auth, auth_filter, &error) != 0)
+		i_unreached();
+
+	string_t *merged = t_str_new(128);
+	event_filter_merge(auth_filter, filter);
+	event_filter_export(filter, merged);
+	event_filter_unref(&auth_filter);
+	event_filter_unref(&filter);
+
+	config_parser_apply_line(ctx, CONFIG_LINE_TYPE_KEYVALUE,
+				 LOG_DEBUG_KEY, str_c(merged));
+}
+
+void old_settings_handle_post(struct config_parser_context *ctx)
+{
+	old_settings_handle_post_log_debug(ctx);
 }
 
 void old_settings_init(struct config_parser_context *ctx)

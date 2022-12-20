@@ -101,7 +101,7 @@ http_client_request_result_event(struct http_client_request *req)
 }
 
 static struct http_client_request *
-http_client_request_new(struct http_client *client, const char *method, 
+http_client_request_new(struct http_client *client, const char *method,
 			http_client_request_callback_t *callback, void *context)
 {
 	static unsigned int id_counter = 0;
@@ -542,7 +542,8 @@ void http_client_request_set_date(struct http_client_request *req, time_t date)
 	req->date = date;
 }
 
-void http_client_request_set_payload(struct http_client_request *req,
+static void
+http_client_request_set_payload_real(struct http_client_request *req,
 				     struct istream *input, bool sync)
 {
 	int ret;
@@ -557,7 +558,7 @@ void http_client_request_set_payload(struct http_client_request *req,
 	req->payload_input = input;
 	if ((ret = i_stream_get_size(input, TRUE, &req->payload_size)) <= 0) {
 		if (ret < 0) {
-			i_error("i_stream_get_size(%s) failed: %s",
+			e_error(req->event, "i_stream_get_size(%s) failed: %s",
 				i_stream_get_name(input),
 				i_stream_get_error(input));
 		}
@@ -573,6 +574,14 @@ void http_client_request_set_payload(struct http_client_request *req,
 	 */
 	if ((req->payload_chunked || req->payload_size > 0) && sync)
 		req->payload_sync = TRUE;
+}
+
+void http_client_request_set_payload(struct http_client_request *req,
+				     struct istream *input, bool sync)
+{
+	input = i_stream_create_limit(input, UOFF_T_MAX);
+	http_client_request_set_payload_real(req, input, sync);
+	i_stream_unref(&input);
 }
 
 void http_client_request_set_payload_data(struct http_client_request *req,
@@ -591,7 +600,7 @@ void http_client_request_set_payload_data(struct http_client_request *req,
 	memcpy(payload_data, data, size);
 	input = i_stream_create_from_data(payload_data, size);
 
-	http_client_request_set_payload(req, input, FALSE);
+	http_client_request_set_payload_real(req, input, FALSE);
 	i_stream_unref(&input);
 }
 
@@ -1109,7 +1118,7 @@ http_client_request_continue_payload(struct http_client_request **_req,
 		req->payload_input = NULL;
 		if (req->state == HTTP_REQUEST_STATE_PAYLOAD_OUT)
 			(void)http_client_request_finish_payload_out(req);
-	} else { 
+	} else {
 		req->payload_input = i_stream_create_from_data(data, size);
 		i_stream_set_name(req->payload_input, "<HTTP request payload>");
 	}

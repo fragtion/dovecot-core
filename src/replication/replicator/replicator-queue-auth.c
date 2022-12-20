@@ -2,7 +2,7 @@
 
 #include "lib.h"
 #include "auth-master.h"
-#include "replicator-queue.h"
+#include "replicator-queue-private.h"
 
 #define REPLICATOR_AUTH_SERVICE_NAME "replicator"
 
@@ -16,6 +16,9 @@ void replicator_queue_add_auth_users(struct replicator_queue *queue,
 	struct replicator_user *user;
 	const char *username;
 
+	e_debug(queue->event, "Add users from userdb with usermask '%s'",
+		usermask);
+
 	auth_conn = auth_master_init(auth_socket_path,
 				     AUTH_MASTER_FLAG_NO_IDLE_TIMEOUT);
 
@@ -26,11 +29,13 @@ void replicator_queue_add_auth_users(struct replicator_queue *queue,
 	   full syncs for everyone whose state can't be found */
 	ctx = auth_master_user_list_init(auth_conn, usermask, &user_info);
 	while ((username = auth_master_user_list_next(ctx)) != NULL) {
-		user = replicator_queue_add(queue, username,
-					    REPLICATION_PRIORITY_NONE);
+		user = replicator_queue_get(queue, username);
+		replicator_queue_update(queue, user, REPLICATION_PRIORITY_NONE);
+		replicator_queue_add(queue, user);
 		user->last_update = last_update;
 	}
 	if (auth_master_user_list_deinit(&ctx) < 0)
-		i_error("listing users failed, can't replicate existing data");
+		e_error(queue->event,
+			"listing users failed, can't replicate existing data");
 	auth_master_deinit(&auth_conn);
 }

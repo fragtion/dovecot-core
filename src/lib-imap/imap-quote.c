@@ -95,17 +95,22 @@ static void remove_newlines_and_append(string_t *dest, const char *src)
 	size_t src_len;
 	string_t *src_nolf;
 	src_len = strlen(src);
-	src_nolf = t_str_new(src_len + 1);
+	src_nolf = t_str_new(src_len);
 	for (size_t i = 0; i < src_len; ++i) {
 		if (src[i] != '\r' && src[i] != '\n') {
+			/* other than CRs and LFS just copy */
 			str_append_c(src_nolf, src[i]);
 		} else if (src[i+1] != ' ' &&
 			   src[i+1] != '\t' &&
 			   src[i+1] != '\r' &&
 			   src[i+1] != '\n' &&
 			   src[i+1] != '\0') {
-			/* ensure whitespace between lines if new line doesn't start with whitespace */
+			/* CRs and LFs followed by a non-whitespace
+			   are replaced themselves with a space */
 			str_append_c(src_nolf, ' ');
+		} else {
+			/* CRs and LFs followed by a whitespace
+			   OR at the end of the string are discarded */
 		}
 	}
 	imap_append_nstring(dest, str_c(src_nolf));

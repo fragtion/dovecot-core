@@ -34,7 +34,7 @@ static void cmd_helo_reply(struct submission_client *subm_client,
 		if ((backend_caps & SMTP_CAPABILITY_8BITMIME) != 0)
 			smtp_server_reply_ehlo_add(reply, "8BITMIME");
 
-		if (client->secured ||
+		if (client->connection_secured ||
 			strcmp(client->ssl_set->ssl, "required") != 0) {
 			const struct auth_mech_desc *mechs;
 			unsigned int count, i;
@@ -80,7 +80,9 @@ static void cmd_helo_reply(struct submission_client *subm_client,
 			smtp_server_reply_ehlo_add(reply, "SIZE");
 		}
 
-		if (client_is_tls_enabled(client) && !client->tls)
+		if (client_is_tls_enabled(client) &&
+		    !client->connection_tls_secured &&
+		    !client->haproxy_terminated_tls)
 			smtp_server_reply_ehlo_add(reply, "STARTTLS");
 		if (!exotic_backend ||
 		    (backend_caps & SMTP_CAPABILITY_PIPELINING) != 0)

@@ -1,6 +1,8 @@
 #ifndef SETTINGS_PARSER_H
 #define SETTINGS_PARSER_H
 
+#include "str-parse.h"
+
 struct var_expand_table;
 struct var_expand_func_table;
 
@@ -112,19 +114,9 @@ struct setting_parser_info {
 	bool (*check_func)(void *set, pool_t pool, const char **error_r);
 	bool (*expand_check_func)(void *set, pool_t pool, const char **error_r);
 	const struct setting_parser_info *const *dependencies;
-	struct dynamic_settings_parser *dynamic_parsers;
 
 };
 ARRAY_DEFINE_TYPE(setting_parser_info, struct setting_parser_info);
-
-/* name=NULL-terminated list of parsers. These follow the static settings.
-   After this list follows the actual settings. */
-struct dynamic_settings_parser {
-	const char *name;
-	const struct setting_parser_info *info;
-	size_t struct_offset;
-};
-ARRAY_DEFINE_TYPE(dynamic_settings_parser, struct dynamic_settings_parser);
 
 enum settings_parser_flags {
 	SETTINGS_PARSER_FLAG_IGNORE_UNKNOWN_KEYS	= 0x01,
@@ -140,13 +132,20 @@ struct setting_parser_context *
 settings_parser_init_list(pool_t set_pool,
 			  const struct setting_parser_info *const *roots,
 			  unsigned int count, enum settings_parser_flags flags);
-void settings_parser_deinit(struct setting_parser_context **ctx);
+void settings_parser_ref(struct setting_parser_context *ctx);
+void settings_parser_unref(struct setting_parser_context **ctx);
 
 /* Return pointer to root setting structure. */
 void *settings_parser_get(struct setting_parser_context *ctx);
-/* If there are multiple roots, return a NULL-terminated list to all of
-   their settings. */
-void **settings_parser_get_list(const struct setting_parser_context *ctx);
+/* Returns settings for a specific root. The root is expected to exist, and it
+   must be the same pointer as given to settings_parser_init*(). If it doesn't,
+   the function panics. */
+void *settings_parser_get_root_set(const struct setting_parser_context *ctx,
+				   const struct setting_parser_info *root);
+/* Combine settings_parser_get_root_set() and settings_dup(). */
+void *settings_parser_get_root_set_dup(const struct setting_parser_context *ctx,
+				       const struct setting_parser_info *root,
+				       pool_t pool);
 /* Like settings_parser_get(), but return change struct. */
 void *settings_parser_get_changes(struct setting_parser_context *ctx);
 /* Returns the setting parser's roots (same as given to init()). */
@@ -223,11 +222,6 @@ int settings_var_expand_with_funcs(const struct setting_parser_info *info,
 				   const struct var_expand_table *table,
 				   const struct var_expand_func_table *func_table,
 				   void *func_context, const char **error_r);
-/* Go through all the settings and return the first one that has an unexpanded
-   setting containing the given %key. */
-bool settings_vars_have_key(const struct setting_parser_info *info, void *set,
-			    char var_key, const char *long_var_key,
-			    const char **key_r, const char **value_r);
 /* Duplicate the entire settings structure. */
 void *settings_dup(const struct setting_parser_info *info,
 		   const void *set, pool_t pool);
@@ -239,21 +233,6 @@ void *settings_dup_with_pointers(const struct setting_parser_info *info,
 struct setting_parser_context *
 settings_parser_dup(const struct setting_parser_context *old_ctx,
 		    pool_t new_pool);
-
-/* parsers is a name=NULL -terminated list. The parsers are appended as
-   dynamic_settings_list structures to their parent. All must have the same
-   parent. The new structures are allocated from the given pool. */
-void settings_parser_info_update(pool_t pool,
-				 struct setting_parser_info *parent,
-				 const struct dynamic_settings_parser *parsers);
-void settings_parser_dyn_update(pool_t pool,
-				const struct setting_parser_info *const **roots,
-				const struct dynamic_settings_parser *dyn_parsers);
-
-/* Return pointer to beginning of settings for given name, or NULL if there is
-   no such registered name. */
-const void *settings_find_dynamic(const struct setting_parser_info *info,
-				  const void *base_set, const char *name);
 
 /* Copy changed settings from src to dest. If conflict_key_r is not NULL and
    both src and dest have changed the same setting, return -1 and set the
@@ -268,18 +247,6 @@ int settings_parser_apply_changes(struct setting_parser_context *dest,
 
 /* Return section name escaped */
 const char *settings_section_escape(const char *name);
-/* Parse time interval string, return as seconds. */
-int settings_get_time(const char *str, unsigned int *secs_r,
-		      const char **error_r);
-/* Parse time interval string, return as milliseconds. */
-int settings_get_time_msecs(const char *str, unsigned int *msecs_r,
-			    const char **error_r);
-/* Parse size string, return as bytes. */
-int settings_get_size(const char *str, uoff_t *bytes_r,
-		      const char **error_r);
-/* Parse boolean string, return as boolean */
-int settings_get_bool(const char *value, bool *result_r,
-		      const char **error_r);
 
 void set_config_binary(bool value);
 bool is_config_binary(void);

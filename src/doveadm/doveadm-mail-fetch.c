@@ -312,7 +312,8 @@ static int fetch_text_utf8(struct fetch_cmd_context *ctx)
 
 	doveadm_print_stream("", 0);
 	if (input->stream_errno != 0) {
-		i_error("read(%s) failed: %s", i_stream_get_name(input),
+		e_error(ctx->ctx.cctx->event,
+			"read(%s) failed: %s", i_stream_get_name(input),
 			i_stream_get_error(input));
 		return -1;
 	}
@@ -359,9 +360,8 @@ static int fetch_date_sent(struct fetch_cmd_context *ctx)
 		return -1;
 
 	chr = tz < 0 ? '-' : '+';
-	if (tz < 0) tz = -tz;
-	doveadm_print(t_strdup_printf("%s (%c%02u%02u)", unixdate2str(t),
-				      chr, tz/60, tz%60));
+	doveadm_print(t_strdup_printf("%s (%c%02u%02u)",
+		unixdate2tzstr(t, tz), chr, abs(tz) / 60, abs(tz) % 60));
 	return 0;
 }
 
@@ -586,7 +586,8 @@ static int cmd_fetch_mail(struct fetch_cmd_context *ctx)
 	array_foreach(&ctx->fields, field) {
 		ctx->cur_field = field;
 		if (field->print(ctx) < 0) {
-			i_error("fetch(%s) failed for box=%s uid=%u: %s",
+			e_error(ctx->ctx.cctx->event,
+				"fetch(%s) failed for box=%s uid=%u: %s",
 				field->name, mailbox_get_vname(mail->box),
 				mail->uid,
 				ctx->print_error != NULL ? ctx->print_error :

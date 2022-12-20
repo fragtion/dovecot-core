@@ -657,6 +657,13 @@ void smtp_client_connection_send_xclient(struct smtp_client_connection *conn)
 						   "SESSION", xclient->session);
 	}
 
+	/* CLIENT-TRANSPORT */
+	if (xclient->client_transport != NULL &&
+	    str_array_icase_find(xclient_args, "CLIENT-TRANSPORT")) {
+		smtp_client_connection_xclient_add(conn, str, offset,
+			"CLIENT-TRANSPORT", xclient->client_transport);
+	}
+
 	/* TTL */
 	if (xclient->ttl_plus_1 > 0 &&
 	    str_array_icase_find(xclient_args, "TTL")) {
@@ -2203,6 +2210,7 @@ smtp_client_connection_do_create(struct smtp_client *client, const char *name,
 				smtp_protocol_name(conn->protocol)));
 	event_add_str(conn_event, "protocol",
 		      smtp_protocol_name(conn->protocol));
+	event_add_category(conn_event, &event_category_smtp_client);
 	event_set_forced_debug(conn_event, (set != NULL && set->debug));
 
 	conn->conn.event_parent = conn_event;

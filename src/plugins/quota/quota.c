@@ -15,7 +15,7 @@
 #include "quota-fs.h"
 #include "llist.h"
 #include "program-client.h"
-#include "settings-parser.h"
+#include "str-parse.h"
 
 #include <sys/wait.h>
 
@@ -316,8 +316,8 @@ int quota_user_read_settings(struct mail_user *user,
 						       "quota_max_mail_size");
 	if (max_size != NULL) {
 		const char *error = NULL;
-		if (settings_get_size(max_size, &quota_set->max_mail_size,
-					&error) < 0) {
+		if (str_parse_get_size(max_size, &quota_set->max_mail_size,
+				       &error) < 0) {
 			*error_r = t_strdup_printf("quota_max_mail_size: %s",
 					error);
 			return -1;
@@ -1325,6 +1325,14 @@ static int quota_get_mail_size(struct quota_transaction_context *ctx,
 		return mail_get_physical_size(mail, size_r);
 }
 
+static void quota_alloc_with_size(struct quota_transaction_context *ctx,
+				  uoff_t size)
+{
+	ctx->bytes_used += size;
+	ctx->bytes_ceil = ctx->bytes_ceil2;
+	ctx->count_used++;
+}
+
 enum quota_alloc_result quota_try_alloc(struct quota_transaction_context *ctx,
 					struct mail *mail, const char **error_r)
 {
@@ -1365,7 +1373,7 @@ enum quota_alloc_result quota_try_alloc(struct quota_transaction_context *ctx,
 	   quota_alloc() or quota_free_bytes() was already used within the same
 	   transaction, but that doesn't normally happen. */
 	ctx->auto_updating = FALSE;
-	quota_alloc(ctx, mail);
+	quota_alloc_with_size(ctx, size);
 	return QUOTA_ALLOC_RESULT_OK;
 }
 
@@ -1448,15 +1456,13 @@ static enum quota_alloc_result quota_default_test_alloc(
 
 void quota_alloc(struct quota_transaction_context *ctx, struct mail *mail)
 {
-	uoff_t size;
+	uoff_t size = 0;
 
 	if (!ctx->auto_updating) {
-		if (quota_get_mail_size(ctx, mail, &size) == 0)
-			ctx->bytes_used += size;
+		(void)quota_get_mail_size(ctx, mail, &size);
 	}
 
-	ctx->bytes_ceil = ctx->bytes_ceil2;
-	ctx->count_used++;
+	quota_alloc_with_size(ctx, size);
 }
 
 void quota_free_bytes(struct quota_transaction_context *ctx,

@@ -15,6 +15,35 @@
 
 ARRAY_DEFINE_TYPE(getopt_option_array, struct option);
 
+static struct event_category event_category_doveadm = {
+	.name = "doveadm",
+};
+
+struct doveadm_cmd_context*
+doveadm_cmd_context_create(enum doveadm_client_type conn_type, bool forced_debug)
+{
+	pool_t pool = pool_alloconly_create("doveadm cmd", 256);
+	struct event *event = event_create(NULL);
+	event_set_append_log_prefix(event, "doveadm: ");
+	event_set_forced_debug(event, forced_debug);
+	event_add_category(event, &event_category_doveadm);
+
+	struct doveadm_cmd_context *cctx = p_new(pool, struct doveadm_cmd_context, 1);
+	cctx->pool = pool;
+	cctx->event = event;
+	cctx->conn_type = conn_type;
+	return cctx;
+}
+
+void doveadm_cmd_context_unref(struct doveadm_cmd_context **_cctx)
+{
+	struct doveadm_cmd_context *cctx = *_cctx;
+	*_cctx = NULL;
+
+	event_unref(&cctx->event);
+	pool_unref(&cctx->pool);
+}
+
 static const struct doveadm_cmd_param *
 doveadm_cmd_param_get(const struct doveadm_cmd_context *cctx,
 		      const char *name)
@@ -302,19 +331,21 @@ doveadm_cmd_process_options(int argc, const char *const argv[],
 				if (opt->name == param->name &&
 				    doveadm_fill_param(
 					param, optarg, pool, &error) < 0) {
-					i_error("Invalid parameter: %s",
-						error);
+					e_error(cctx->event,
+						"Invalid parameter: %s", error);
 					doveadm_cmd_params_clean(pargv);
 					return -1;
 				}
 			}
 			break;
 		case '?':
-			i_error("Unexpected or incomplete option: -%c", optopt);
+			e_error(cctx->event,
+				"Unexpected or incomplete option: -%c", optopt);
 			doveadm_cmd_params_clean(pargv);
 			return -1;
 		case ':':
-			i_error("Option not followed by argument: -%c", optopt);
+			e_error(cctx->event,
+				"Option not followed by argument: -%c", optopt);
 			doveadm_cmd_params_clean(pargv);
 			return -1;
 		default:
@@ -327,8 +358,8 @@ doveadm_cmd_process_options(int argc, const char *const argv[],
 				    doveadm_fill_param(
 					array_idx_modifiable(pargv, i),
 					optarg, pool, &error) < 0) {
-					i_error("Invalid parameter: %s",
-						error);
+					e_error(cctx->event,
+						"Invalid parameter: %s", error);
 					doveadm_cmd_params_clean(pargv);
 					return -1;
 				}
@@ -377,7 +408,7 @@ int doveadm_cmdline_run(int argc, const char *const argv[],
 
 			const char *error;
 			if (doveadm_fill_param(ptr, argv[optind], pool, &error) < 0) {
-				i_error("Invalid parameter: %s",
+				e_error(cctx->event, "Invalid parameter: %s",
 					t_strarray_join(argv + optind, " "));
 				doveadm_cmd_params_clean(&pargv);
 				return -1;
@@ -386,7 +417,7 @@ int doveadm_cmdline_run(int argc, const char *const argv[],
 			break;
 		}
 		if (!found) {
-			i_error("Extraneous arguments found: %s",
+			e_error(cctx->event, "Extraneous arguments found: %s",
 				t_strarray_join(argv + optind, " "));
 			doveadm_cmd_params_clean(&pargv);
 			return -1;
@@ -399,7 +430,13 @@ int doveadm_cmdline_run(int argc, const char *const argv[],
 	cctx->argv = array_get_modifiable(&pargv, &pargc);
 	cctx->argc = pargc;
 
-	cctx->cmd->cmd(cctx);
+	if (cctx->cmd->name != NULL) {
+		const char * prefix = t_strdup_printf("cmd %s: ", cctx->cmd->name);
+		event_set_append_log_prefix(cctx->event, prefix);
+		cctx->cmd->cmd(cctx);
+		event_drop_parent_log_prefixes(cctx->event, 1);
+	} else
+		cctx->cmd->cmd(cctx);
 
 	doveadm_cmd_params_clean(&pargv);
 	return 0;
@@ -446,13 +483,13 @@ doveadm_cmd_param_tostring(const struct doveadm_cmd_param *argv)
 
 void doveadm_cmd_params_dump(const struct doveadm_cmd_context *cctx)
 {
-	i_debug("%s()", __func__);
+	e_debug(cctx->event, "%s()", __func__);
 	i_assert(cctx != NULL);
 	i_assert(cctx->argv != NULL);
 	const struct doveadm_cmd_param *argv = cctx->argv;
 	for (int index = 0; index < cctx->argc; index++, argv++) T_BEGIN {
 		const char *value = doveadm_cmd_param_tostring(argv);
-		i_debug("    %c%c%c%c %02x/%02x -%c %s: %s",
+		e_debug(cctx->event, "    %c%c%c%c %02x/%02x -%c %s: %s",
 			*value != '\0' ? 'S': '-',
 			argv->type == CMD_PARAM_ARRAY ? 'A': '-',
 			(argv->flags & CMD_PARAM_FLAG_POSITIONAL) != 0 ? 'P': '-',

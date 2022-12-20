@@ -192,7 +192,7 @@ static void test_cache_reset(void)
 	mail_crypt_key_cache_destroy(&muser->key_cache);
 
 	test_assert(mail_crypt_user_get_private_key(test_ctx->user, NULL,
-					    	    &pair.priv, &error) > 0);
+						    &pair.priv, &error) > 0);
 	if (error != NULL)
 		i_error("mail_crypt_user_get_private_key() failed: %s", error);
 	error = NULL;
@@ -363,8 +363,9 @@ static void test_setup(void)
 	struct dcrypt_settings set = {
 		.module_dir = top_builddir "/src/lib-dcrypt/.libs"
 	};
-	if (!dcrypt_initialize(NULL, &set, NULL)) {
-		i_info("No functional dcrypt backend found - skipping tests");
+	const char *error;
+	if (!dcrypt_initialize(NULL, &set, &error)) {
+		i_info("No functional dcrypt backend found - skipping tests: %s", error);
 		test_exit(0);
 	}
 	test_ctx = test_mail_storage_init();

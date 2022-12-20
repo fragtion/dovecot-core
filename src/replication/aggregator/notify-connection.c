@@ -11,6 +11,7 @@
 #include "replication-common.h"
 #include "replicator-connection.h"
 #include "notify-connection.h"
+#include "aggregator-settings.h"
 
 #define MAX_INBUF_SIZE 8192
 
@@ -19,6 +20,7 @@
 
 struct notify_connection {
 	struct notify_connection *prev, *next;
+	struct event *event;
 	int refcount;
 
 	int fd;
@@ -44,12 +46,15 @@ void notify_connection_sync_callback(bool success, void *context)
 {
 	struct notify_connection *conn = context;
 
+	e_debug(conn->event, "Sending %s result",
+		success ? "success" : "failure");
 	o_stream_nsend_str(conn->output, success ? "+\n" : "-\n");
 	notify_connection_unref(conn);
 }
 
 static int
-notify_input_line(struct notify_connection *conn, const char *line)
+notify_input_line(struct notify_connection *conn, const char *line,
+		  const char **error_r)
 {
 	const char *const *args;
 	enum replication_priority priority;
@@ -57,13 +62,18 @@ notify_input_line(struct notify_connection *conn, const char *line)
 	/* <username> \t <priority> */
 	args = t_strsplit_tabescaped(line);
 	if (str_array_length(args) < 2) {
-		i_error("Client sent invalid input");
+		*error_r = "Client sent invalid input";
 		return -1;
 	}
 	if (replication_priority_parse(args[1], &priority) < 0) {
-		i_error("Client sent invalid priority: %s", args[1]);
+		*error_r = t_strdup_printf(
+			"Client sent invalid priority: %s", args[1]);
 		return -1;
 	}
+
+	e_debug(conn->event, "Received priority %s request for %s",
+		args[1], args[0]);
+
 	if (priority != REPLICATION_PRIORITY_SYNC)
 		replicator_connection_notify(replicator, args[0], priority);
 	else {
@@ -77,11 +87,12 @@ static void notify_input(struct notify_connection *conn)
 {
 	const char *line;
 	int ret;
+	const char *error;
 
 	switch (i_stream_read(conn->input)) {
 	case -2:
 		/* buffer full */
-		i_error("Client sent too long line");
+		e_error(conn->event, "Client sent too long line");
 		(void)notify_input_error(conn);
 		return;
 	case -1:
@@ -92,7 +103,9 @@ static void notify_input(struct notify_connection *conn)
 
 	while ((line = i_stream_next_line(conn->input)) != NULL) {
 		T_BEGIN {
-			ret = notify_input_line(conn, line);
+			ret = notify_input_line(conn, line, &error);
+			if (ret < 0)
+				e_error(conn->event, "%s", error);
 		} T_END;
 		if (ret < 0) {
 			if (!notify_input_error(conn))
@@ -101,7 +114,7 @@ static void notify_input(struct notify_connection *conn)
 	}
 }
 
-void notify_connection_create(int fd, bool fifo)
+void notify_connection_create(int fd, bool fifo, const char *name)
 {
 	struct notify_connection *conn;
 
@@ -110,6 +123,10 @@ void notify_connection_create(int fd, bool fifo)
 	conn->fd = fd;
 	conn->io = io_add(fd, IO_READ, notify_input, conn);
 	conn->input = i_stream_create_fd(fd, MAX_INBUF_SIZE);
+	i_stream_set_name(conn->input, name);
+	conn->event = event_create(NULL);
+	event_set_append_log_prefix(conn->event,
+		t_strdup_printf("notify(%s): ", name));
 	if (!fifo) {
 		conn->output = o_stream_create_fd(fd, SIZE_MAX);
 		o_stream_set_no_error_handling(conn->output, TRUE);
@@ -126,12 +143,15 @@ static void notify_connection_unref(struct notify_connection *conn)
 
 	i_stream_destroy(&conn->input);
 	o_stream_destroy(&conn->output);
+	event_unref(&conn->event);
 	i_free(conn);
 }
 
 static void notify_connection_destroy(struct notify_connection *conn)
 {
 	i_assert(conn->fd != -1);
+
+	e_debug(conn->event, "Disconnected");
 
 	if (!CONNECTION_IS_FIFO(conn))
 		master_service_client_connection_destroyed(master_service);

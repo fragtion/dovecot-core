@@ -181,8 +181,9 @@ doveadm_cmd_server_post(struct client_connection_tcp *conn,
 				   t_strdup_printf("\n-%s\n", str));
 	} else {
 		o_stream_nsend_str(conn->output, "\n-\n");
-		i_error("BUG: Command '%s' returned unknown error code %d",
-			cctx->cmd->name, doveadm_exit_code);
+		e_error(cctx->event,
+			"BUG: Command returned unknown error code %d",
+			doveadm_exit_code);
 	}
 }
 
@@ -206,7 +207,8 @@ static int doveadm_cmd_handle(struct client_connection_tcp *conn,
 	const struct doveadm_cmd_ver2 *cmd_ver2;
 
 	if ((cmd_ver2 = doveadm_cmdline_find_with_args(cmd_name, &argc, &argv)) == NULL) {
-		i_error("doveadm: Client sent unknown command: %s", cmd_name);
+		e_error(cctx->event,
+			"doveadm: Client sent unknown command: %s", cmd_name);
 		return -1;
 	}
 	cctx->cmd = cmd_ver2;
@@ -267,7 +269,7 @@ static bool client_handle_command_ctx(struct client_connection_tcp *conn,
 	unsigned int argc = str_array_length(args);
 
 	if (argc < 3) {
-		i_error("doveadm client: No command given");
+		e_error(cctx->event, "doveadm client: No command given");
 		return FALSE;
 	}
 	doveadm_exit_code = 0;
@@ -291,7 +293,8 @@ static bool client_handle_command_ctx(struct client_connection_tcp *conn,
 			args++; argc--;
 			break;
 		default:
-			i_error("doveadm client: Unknown flag: %c", *flags);
+			e_error(cctx->event,
+				"doveadm client: Unknown flag: %c", *flags);
 			return FALSE;
 		}
 	}
@@ -304,7 +307,8 @@ static bool client_handle_command_ctx(struct client_connection_tcp *conn,
 	}
 
 	if (!doveadm_client_is_allowed_command(conn->conn.set, cmd_name)) {
-		i_error("doveadm client isn't allowed to use command: %s",
+		e_error(cctx->event,
+			"doveadm client isn't allowed to use command: %s",
 			cmd_name);
 		return FALSE;
 	}
@@ -328,19 +332,16 @@ static bool client_handle_command_ctx(struct client_connection_tcp *conn,
 static bool client_handle_command(struct client_connection_tcp *conn,
 				  const char *const *args)
 {
-	struct doveadm_cmd_context cctx;
-
-	i_zero(&cctx);
-	cctx.pool = pool_alloconly_create("doveadm cmd", 256);
-	cctx.conn_type = conn->conn.type;
-	cctx.input = conn->input;
-	cctx.output = conn->output;
-	cctx.local_ip = conn->conn.local_ip;
-	cctx.remote_ip = conn->conn.remote_ip;
-	cctx.local_port = conn->conn.local_port;
-	cctx.remote_port = conn->conn.remote_port;
-	bool ret = client_handle_command_ctx(conn, &cctx, args);
-	pool_unref(&cctx.pool);
+	struct doveadm_cmd_context *cctx = doveadm_cmd_context_create(
+		conn->conn.type, doveadm_verbose || doveadm_debug);
+	cctx->input = conn->input;
+	cctx->output = conn->output;
+	cctx->local_ip = conn->conn.local_ip;
+	cctx->remote_ip = conn->conn.remote_ip;
+	cctx->local_port = conn->conn.local_port;
+	cctx->remote_port = conn->conn.remote_port;
+	bool ret = client_handle_command_ctx(conn, cctx, args);
+	doveadm_cmd_context_unref(&cctx);
 	return ret;
 }
 
@@ -360,8 +361,8 @@ client_connection_tcp_authenticate(struct client_connection_tcp *conn)
 	}
 
 	if (*set->doveadm_password == '\0') {
-		i_error("doveadm_password not set, "
-			"remote authentication disabled");
+		e_error(conn->conn.event,
+			"doveadm_password not set, remote authentication disabled");
 		return -1;
 	}
 
@@ -376,13 +377,16 @@ client_connection_tcp_authenticate(struct client_connection_tcp *conn)
 	/* FIXME: some day we should probably let auth process do this and
 	   support all kinds of authentication */
 	if (!str_begins(line, "PLAIN\t", &args)) {
-		i_error("doveadm client attempted non-PLAIN authentication: %s", line);
+		e_error(conn->conn.event,
+			"doveadm client attempted non-PLAIN authentication: %s",
+			line);
 		return -1;
 	}
 
 	plain = t_buffer_create(128);
 	if (base64_decode(args, strlen(args), plain) < 0) {
-		i_error("doveadm client sent invalid base64 auth PLAIN data");
+		e_error(conn->conn.event,
+			"doveadm client sent invalid base64 auth PLAIN data");
 		return -1;
 	}
 	data = plain->data;
@@ -390,14 +394,16 @@ client_connection_tcp_authenticate(struct client_connection_tcp *conn)
 
 	if (size < 10 || data[0] != '\0' ||
 	    memcmp(data+1, "doveadm", 7) != 0 || data[8] != '\0') {
-		i_error("doveadm client didn't authenticate as 'doveadm'");
+		e_error(conn->conn.event
+			, "doveadm client didn't authenticate as 'doveadm'");
 		return -1;
 	}
 	pass = t_strndup(data + 9, size - 9);
 	if (strlen(pass) != strlen(set->doveadm_password) ||
 	    !mem_equals_timing_safe(pass, set->doveadm_password,
 				    strlen(pass))) {
-		i_error("doveadm client authenticated with wrong password");
+		e_error(conn->conn.event,
+			"doveadm client authenticated with wrong password");
 		return -1;
 	}
 	return 1;
@@ -413,7 +419,8 @@ static void client_log_disconnect_error(struct client_connection_tcp *conn)
 		error = conn->input->stream_errno == 0 ? "EOF" :
 			strerror(conn->input->stream_errno);
 	}
-	i_error("doveadm client disconnected before handshake: %s", error);
+	e_error(conn->conn.event,
+		"doveadm client disconnected before handshake: %s", error);
 }
 
 static void
@@ -434,7 +441,8 @@ client_connection_tcp_input(struct client_connection_tcp *conn)
 		if (!version_string_verify_full(line, "doveadm-server",
 				DOVEADM_SERVER_PROTOCOL_VERSION_MAJOR,
 				&conn->minor_version)) {
-			i_error("doveadm client not compatible with this server "
+			e_error(conn->conn.event,
+				"doveadm client not compatible with this server "
 				"(mixed old and new binaries?)");
 			client_connection_tcp_destroy(&conn);
 			return;
@@ -498,11 +506,11 @@ client_connection_tcp_init_ssl(struct client_connection_tcp *conn)
 	if (master_service_ssl_init(master_service,
 				    &conn->input, &conn->output,
 				    &conn->ssl_iostream, &error) < 0) {
-		i_error("SSL init failed: %s", error);
+		e_error(conn->conn.event, "SSL init failed: %s", error);
 		return -1;
 	}
 	if (ssl_iostream_handshake(conn->ssl_iostream) < 0) {
-		i_error("SSL handshake failed: %s",
+		e_error(conn->conn.event, "SSL handshake failed: %s",
 			ssl_iostream_get_last_error(conn->ssl_iostream));
 		return -1;
 	}
@@ -565,6 +573,8 @@ client_connection_tcp_create(int fd, int listen_fd, bool ssl)
 
 	pool = pool_alloconly_create("doveadm client", 1024*16);
 	conn = p_new(pool, struct client_connection_tcp, 1);
+	conn->conn.event = event_create(NULL);
+	event_set_append_log_prefix(conn->conn.event, "tcp: ");
 	conn->fd = fd;
 
 	if (client_connection_init(&conn->conn,

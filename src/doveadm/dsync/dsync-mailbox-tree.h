@@ -17,10 +17,6 @@ enum dsync_mailbox_trees_sync_type {
 };
 
 enum dsync_mailbox_trees_sync_flags {
-	/* Enable debugging */
-	DSYNC_MAILBOX_TREES_SYNC_FLAG_DEBUG		= 0x01,
-	/* Show ourself as "master brain" in the debug output */
-	DSYNC_MAILBOX_TREES_SYNC_FLAG_MASTER_BRAIN	= 0x02,
 	/* Disable mailbox renaming logic. This is just a kludge that should
 	   be removed once the renaming logic has no more bugs.. */
 	DSYNC_MAILBOX_TREES_SYNC_FLAG_NO_RENAMES	= 0x04
@@ -150,6 +146,7 @@ int dsync_mailbox_tree_fill(struct dsync_mailbox_tree *tree,
 			    struct mail_namespace *ns, const char *box_name,
 			    const guid_128_t box_guid,
 			    const char *const *exclude_mailboxes,
+			    struct event *event,
 			    enum mail_error *error_r);
 
 /* Return all known deleted mailboxes and directories. */
@@ -193,7 +190,8 @@ struct dsync_mailbox_tree_sync_ctx *
 dsync_mailbox_trees_sync_init(struct dsync_mailbox_tree *local_tree,
 			      struct dsync_mailbox_tree *remote_tree,
 			      enum dsync_mailbox_trees_sync_type sync_type,
-			      enum dsync_mailbox_trees_sync_flags sync_flags);
+			      enum dsync_mailbox_trees_sync_flags sync_flags,
+			      struct event *parent_event);
 const struct dsync_mailbox_tree_sync_change *
 dsync_mailbox_trees_sync_next(struct dsync_mailbox_tree_sync_ctx *ctx);
 int dsync_mailbox_trees_sync_deinit(struct dsync_mailbox_tree_sync_ctx **ctx);

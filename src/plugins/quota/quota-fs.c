@@ -25,7 +25,14 @@
 #endif
 
 #ifdef HAVE_RQUOTA
+#  ifdef HAVE_STRICT_BOOL
+#    pragma clang diagnostic push
+#    pragma clang diagnostic ignored "-Wstrict-bool"
+#  endif
 #  include "rquota.h"
+#  ifdef HAVE_STRICT_BOOL
+#    pragma clang diagnostic pop
+#  endif
 #  define RQUOTA_GETQUOTA_TIMEOUT_SECS 10
 #endif
 
@@ -397,7 +404,7 @@ do_rquota_user(struct fs_quota_root *root,
 		host, path, dec2str(root->uid));
 
 	/* clnt_create() polls for a while to establish a connection */
-	cl = clnt_create(host, RQUOTAPROG, RQUOTAVERS, "udp");
+	cl = clnt_create((char *)host, RQUOTAPROG, RQUOTAVERS, "udp");
 	if (cl == NULL) {
 		*error_r = t_strdup_printf(
 			"could not contact RPC service on %s", host);

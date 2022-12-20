@@ -138,13 +138,24 @@ login_request_finished(const struct login_server_request *request,
 	const char *const *fields;
 	const char *service = NULL;
 	unsigned int count, i;
+	const char *error;
 
-	auth_user_fields_parse(extra_fields, pool_datastack_create(), &reply);
+	if (auth_user_fields_parse(extra_fields, pool_datastack_create(),
+			       	   &reply, &error) < 0) {
+		e_error(request->conn->event,
+			"Invalid settings in userdb: %s", error);
+		if (write(request->fd, msg, strlen(msg)) < 0) {
+			/* ignored */
+		}
+		net_disconnect(request->fd);
+		return;
+	}
 
 	/* check peer credentials if possible */
 	if (reply.uid != (uid_t)-1 && net_getunixcred(request->fd, &cred) == 0 &&
 		reply.uid != cred.uid) {
-		i_error("Peer's credentials (uid=%ld) do not match "
+		e_error(request->conn->event,
+			"Peer's credentials (uid=%ld) do not match "
 			"the user that logged in (uid=%ld).",
 			(long)cred.uid, (long)reply.uid);
 		if (write(request->fd, msg, strlen(msg)) < 0) {
@@ -161,7 +172,8 @@ login_request_finished(const struct login_server_request *request,
 	}
 
 	if (service == NULL) {
-		i_error("Auth did not yield required client_service field (BUG).");
+		e_error(request->conn->event,
+			"Auth did not yield required client_service field (BUG).");
 		if (write(request->fd, msg, strlen(msg)) < 0) {
 			/* ignored */
 		}
@@ -204,7 +216,6 @@ int main(int argc, char *argv[])
 	struct login_server_settings login_set;
 	struct master_service_settings_input input;
 	struct master_service_settings_output output;
-	void **sets;
 	enum master_service_flags service_flags = 0;
 	const char *error = NULL, *username = NULL;
 	const char *auth_socket_path = "auth-master";
@@ -249,8 +260,9 @@ int main(int argc, char *argv[])
 						&error) < 0)
 		i_fatal("Error reading configuration: %s", error);
 
-	sets = master_service_settings_get_others(master_service);
-	imap_urlauth_settings = sets[0];
+	imap_urlauth_settings = 
+		master_service_settings_get_root_set(master_service,
+			&imap_urlauth_setting_parser_info);
 
 	if (imap_urlauth_settings->verbose_proctitle)
 		verbose_proctitle = TRUE;

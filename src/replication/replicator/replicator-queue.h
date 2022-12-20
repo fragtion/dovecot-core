@@ -46,19 +46,33 @@ bool replicator_user_unref(struct replicator_user **user);
 /* Lookup an existing user */
 struct replicator_user *
 replicator_queue_lookup(struct replicator_queue *queue, const char *username);
-/* Add a user to queue and return it. If the user already exists, it's updated
-   only if the new priority is higher. */
+/* Lookup or create a user and return it. Afterwards replicator_queue_add()
+   must be called to add/move the user to the proper place in the queue. */
 struct replicator_user *
-replicator_queue_add(struct replicator_queue *queue, const char *username,
-		     enum replication_priority priority);
-void replicator_queue_add_sync(struct replicator_queue *queue,
-			       const char *username,
-			       replicator_sync_callback_t *callback,
-			       void *context);
+replicator_queue_get(struct replicator_queue *queue, const char *username);
+/* Update user's priority if it's currently lower. */
+void replicator_queue_update(struct replicator_queue *queue,
+			     struct replicator_user *user,
+			     enum replication_priority priority);
+void replicator_queue_add(struct replicator_queue *queue,
+			  struct replicator_user *user);
+/* Call the callback when user with SYNC priority has finished syncing. */
+void replicator_queue_add_sync_callback(struct replicator_queue *queue,
+					struct replicator_user *user,
+					replicator_sync_callback_t *callback,
+					void *context);
 /* Remove user from replication queue and free it. */
 void replicator_queue_remove(struct replicator_queue *queue,
 			     struct replicator_user **user);
+/* Return the number of users in the queue. */
+unsigned int replicator_queue_count(struct replicator_queue *queue);
 
+/* Return the next user from replication queue and how many seconds from now
+   the returned user should be synced (0 = immediately). Returns NULL only if
+   there are no users in the queue. */
+struct replicator_user *
+replicator_queue_peek(struct replicator_queue *queue,
+		      unsigned int *next_secs_r);
 /* Return the next user from replication queue, and remove it from the queue.
    If there's nothing to be replicated currently, returns NULL and sets
    next_secs_r to when there should be more work to do. */
@@ -74,8 +88,7 @@ int replicator_queue_export(struct replicator_queue *queue, const char *path);
 
 /* Returns TRUE if user replication can be started now, FALSE if not. When
    returning FALSE, next_secs_r is set to user's next replication time. */
-bool replicator_queue_want_sync_now(struct replicator_queue *queue,
-				    struct replicator_user *user,
+bool replicator_queue_want_sync_now(struct replicator_user *user,
 				    unsigned int *next_secs_r);
 /* Iterate through all users in the queue. */
 struct replicator_queue_iter *

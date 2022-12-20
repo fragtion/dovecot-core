@@ -13,7 +13,6 @@ AM_CPPFLAGS = \
 	-DMODULEDIR=\""$(moduledir)"\"
 
 liblogin_la_SOURCES = \
-	access-lookup.c \
 	client-common.c \
 	client-common-auth.c \
 	login-proxy.c \
@@ -23,7 +22,6 @@ liblogin_la_SOURCES = \
 	sasl-server.c
 
 headers = \
-	access-lookup.h \
 	client-common.h \
 	login-common.h \
 	login-proxy.h \
@@ -35,7 +33,7 @@ pkginc_libdir=$(pkgincludedir)
 pkginc_lib_HEADERS = $(headers)
 
 pkglib_LTLIBRARIES = libdovecot-login.la
-libdovecot_login_la_SOURCES = 
+libdovecot_login_la_SOURCES =
 libdovecot_login_la_LIBADD = liblogin.la ../lib-dovecot/libdovecot.la $(SSL_LIBS)
 libdovecot_login_la_DEPENDENCIES = liblogin.la
 libdovecot_login_la_LDFLAGS = -export-dynamic

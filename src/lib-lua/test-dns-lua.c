@@ -118,7 +118,7 @@ static void test_dns_server_listen(int *fd_listenp)
 		return;
 	}
 	net_set_nonblock(fd_client, TRUE);
- 
+
 	const char *handshake = "VERSION\tdns\t1\t0\n";
 	if (write_full(fd_client, handshake, strlen(handshake)) < 0) {
 		i_error("write(dns-client) failed: %m");
@@ -141,6 +141,10 @@ static void test_dns_lua(void)
 "  assert(#arr == 2)\n"
 "  assert(arr[1] == '127.0.0.1')\n"
 "  assert(arr[2] == '127.0.0.2')\n"
+"  local arr, error, errno = client:lookup('invalid..name')\n"
+"  assert(arr == nil)\n"
+"  assert(errno == -4)\n"
+"  assert(error == \"Unknown host\")\n"
 "end\n";
 	test_begin("dns lua lookup");
 

@@ -2,6 +2,7 @@
 
 #include "lib.h"
 #include "net.h"
+#include "passdb.h"
 #include "str.h"
 #include "istream.h"
 #include "ioloop.h"
@@ -12,6 +13,7 @@
 #include "http-client.h"
 #include "json-parser.h"
 #include "master-service.h"
+#include "master-service-settings.h"
 #include "master-service-ssl-settings.h"
 #include "auth-request.h"
 #include "auth-penalty.h"
@@ -162,7 +164,8 @@ void auth_policy_open_and_close_to_key(const char *fromkey, const char *tokey, s
 void auth_policy_init(void)
 {
 	const struct master_service_ssl_settings *master_ssl_set =
-		master_service_ssl_settings_get(master_service);
+		master_service_settings_get_root_set(master_service,
+			&master_service_ssl_setting_parser_info);
 	struct ssl_iostream_settings ssl_set;
 	i_zero(&ssl_set);
 
@@ -226,7 +229,8 @@ void auth_policy_init(void)
 	auth_policy_json_template = i_strdup(str_c(template));
 
 	if (global_auth_settings->policy_log_only)
-		i_warning("auth-policy: Currently in log-only mode. Ignoring "
+		e_warning(auth_event,
+			  "auth-policy: Currently in log-only mode. Ignoring "
 			  "tarpit and disconnect instructions from policy server");
 }
 
@@ -367,7 +371,7 @@ void auth_policy_parse_response(struct policy_lookup_ctx *context)
 			"Policy response %d", context->result);
 	}
 
-	if (context->request->policy_refusal == TRUE && context->set->verbose == TRUE) {
+	if (context->request->policy_refusal) {
 		e_info(context->event, "Authentication failure due to policy server refusal%s%s",
 		       (context->message!=NULL?": ":""),
 		       (context->message!=NULL?context->message:""));
@@ -461,11 +465,39 @@ const char *auth_policy_escape_function(const char *string,
 }
 
 static
+const char* auth_policy_fail_type(struct auth_request *request)
+{
+	if (request->policy_refusal)
+		return "policy";
+	/* wait until it's finished */
+	if (request->state != AUTH_REQUEST_STATE_FINISHED)
+		return "";
+	switch (request->passdb_result) {
+	case PASSDB_RESULT_OK:
+	case PASSDB_RESULT_NEXT:
+		return "";
+	case PASSDB_RESULT_SCHEME_NOT_AVAILABLE:
+	case PASSDB_RESULT_INTERNAL_FAILURE:
+		return "internal";
+	case PASSDB_RESULT_PASSWORD_MISMATCH:
+		return "credentials";
+	case PASSDB_RESULT_PASS_EXPIRED:
+		return "expired";
+	case PASSDB_RESULT_USER_DISABLED:
+		return "disabled";
+	case PASSDB_RESULT_USER_UNKNOWN:
+		return "account";
+	}
+	i_unreached();
+}
+
+
+static
 const struct var_expand_table *policy_get_var_expand_table(struct auth_request *auth_request,
 	const char *hashed_password, const char *requested_username)
 {
 	struct var_expand_table *table;
-	unsigned int count = 2;
+	unsigned int count = 3;
 
 	table = auth_request_get_var_expand_table_full(auth_request,
 		auth_request->fields.user, auth_policy_escape_function, &count);
@@ -475,6 +507,9 @@ const struct var_expand_table *policy_get_var_expand_table(struct auth_request *
 	table[1].key = '\0';
 	table[1].long_key = "requested_username";
 	table[1].value = requested_username;
+	table[2].key = '\0';
+	table[2].long_key = "fail_type";
+	table[2].value = auth_policy_fail_type(auth_request);
 	if (table[0].value != NULL)
 		table[0].value = auth_policy_escape_function(table[0].value, auth_request);
 	if (table[1].value != NULL)
@@ -540,7 +575,7 @@ void auth_policy_create_json(struct policy_lookup_ctx *context,
 		str_append(context->json, context->request->policy_refusal ? "true" : "false");
 	}
 	str_append(context->json, ",\"tls\":");
-	if (context->request->fields.secured == AUTH_REQUEST_SECURED_TLS)
+	if (context->request->fields.conn_secured == AUTH_REQUEST_CONN_SECURED_TLS)
 		str_append(context->json, "true");
 	else
 		str_append(context->json, "false");

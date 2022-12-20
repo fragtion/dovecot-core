@@ -77,7 +77,8 @@ static void client_parse_backend_capabilities(struct client *client)
 		enum smtp_capability cap = smtp_capability_find_by_name(*str);
 
 		if (cap == SMTP_CAPABILITY_NONE) {
-			i_warning("Unknown SMTP capability in submission_backend_capabilities: "
+			e_warning(client->event,
+				  "Unknown SMTP capability in submission_backend_capabilities: "
 				  "%s", *str);
 			continue;
 		}
@@ -175,7 +176,8 @@ static void client_init_urlauth(struct client *client)
 }
 
 struct client *
-client_create(int fd_in, int fd_out, struct mail_user *user,
+client_create(int fd_in, int fd_out, struct event *event,
+	      struct mail_user *user,
 	      struct mail_storage_service_user *service_user,
 	      const struct submission_settings *set, const char *helo,
 	      const struct smtp_proxy_data *proxy_data,
@@ -197,6 +199,8 @@ client_create(int fd_in, int fd_out, struct mail_user *user,
 	client = p_new(pool, struct client, 1);
 	client->pool = pool;
 	client->v = submission_client_vfuncs;
+	client->event = event;
+	event_ref(client->event);
 	client->user = user;
 	client->service_user = service_user;
 	client->set = set;
@@ -214,6 +218,7 @@ client_create(int fd_in, int fd_out, struct mail_user *user,
 	smtp_set.rawlog_dir = set->rawlog_dir;
 	smtp_set.no_greeting = no_greeting;
 	smtp_set.debug = user->mail_debug;
+	smtp_set.event_parent = event;
 
 	if ((workarounds & SUBMISSION_WORKAROUND_WHITESPACE_BEFORE_PATH) != 0) {
 		smtp_set.workarounds |=
@@ -233,7 +238,8 @@ client_create(int fd_in, int fd_out, struct mail_user *user,
 		FALSE, &smtp_set, &smtp_callbacks, client);
 	smtp_server_connection_set_proxy_data(client->conn, proxy_data);
 	smtp_server_connection_login(client->conn, client->user->username, helo,
-				     pdata, pdata_len, user->conn.ssl_secured);
+				     pdata, pdata_len,
+				     user->conn.end_client_tls_secured);
 
 	client_create_backend_default(client, set);
 
@@ -326,6 +332,7 @@ client_default_destroy(struct client *client)
 
 	client_state_reset(client);
 
+	event_unref(&client->event);
 	pool_unref(&client->pool);
 
 	master_service_client_connection_destroyed(master_service);
@@ -411,7 +418,8 @@ static const char *client_stats(struct client *client)
 	if (var_expand_with_funcs(str, client->set->submission_logout_format,
 				  tab, mail_user_var_expand_func_table,
 				  client->user, &error) <= 0) {
-		i_error("Failed to expand submission_logout_format=%s: %s",
+		e_error(client->event,
+			"Failed to expand submission_logout_format=%s: %s",
 			client->set->submission_logout_format, error);
 	}
 	return str_c(str);
@@ -436,7 +444,8 @@ static void client_connection_disconnect(void *context, const char *reason)
 		log_reason = "Connection closed";
 	else
 		log_reason = t_str_oneline(reason);
-	i_info("Disconnected: %s %s", log_reason, client_stats(client));
+	e_info(client->event, "Disconnected: %s %s",
+	       log_reason, client_stats(client));
 }
 
 static void client_connection_free(void *context)

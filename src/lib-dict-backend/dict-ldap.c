@@ -23,6 +23,7 @@ struct ldap_dict;
 
 struct dict_ldap_op {
 	struct ldap_dict *dict;
+	struct event *event;
 	const struct dict_ldap_map *map;
 	pool_t pool;
 	unsigned long txid;
@@ -40,6 +41,7 @@ struct ldap_dict {
 	enum ldap_scope scope;
 
 	pool_t pool;
+	struct event *event;
 
 	struct ldap_client *client;
 
@@ -165,6 +167,7 @@ int dict_ldap_connect(struct ldap_dict *dict, const char **error_r)
 	set.debug = dict->set->debug;
 	set.require_ssl = dict->set->require_ssl;
 	set.start_tls = dict->set->start_tls;
+	set.event_parent = dict->event;
 	return ldap_client_init(&set, &dict->client, error_r);
 }
 
@@ -237,16 +240,19 @@ int ldap_dict_init(struct dict *dict_driver, const char *uri,
 	pool_t pool = pool_alloconly_create("ldap dict", 2048);
 	struct ldap_dict *dict = p_new(pool, struct ldap_dict, 1);
 	dict->pool = pool;
+	dict->event = event_create(dict_driver->event);
 	dict->dict = *dict_driver;
 	dict->uri = p_strdup(pool, uri);
 	dict->set = dict_ldap_settings_read(pool, uri, error_r);
 
 	if (dict->set == NULL) {
+		event_unref(&dict->event);
 		pool_unref(&pool);
 		return -1;
 	}
 
 	if (dict_ldap_connect(dict, error_r) < 0) {
+		event_unref(&dict->event);
 		pool_unref(&pool);
 		return -1;
 	}
@@ -262,6 +268,7 @@ void ldap_dict_deinit(struct dict *dict)
 	struct ldap_dict *ctx = (struct ldap_dict *)dict;
 
 	ldap_client_deinit(&ctx->client);
+	event_unref(&dict->event);
 	pool_unref(&ctx->pool);
 }
 
@@ -322,23 +329,26 @@ ldap_dict_lookup_callback(struct ldap_result *result, struct dict_ldap_op *op)
 		iter = ldap_search_iterator_init(result);
 		entry = ldap_search_iterator_next(iter);
 		if (entry != NULL) {
-			if (op->dict->set->debug > 0)
-				i_debug("ldap_dict_lookup_callback got dn %s", ldap_entry_dn(entry));
+			e_debug(op->event, "ldap_dict_lookup_callback got dn %s",
+				ldap_entry_dn(entry));
 			/* try extract value */
-			const char *const *values = ldap_entry_get_attribute(entry, op->map->value_attribute);
+			const char *const *values = ldap_entry_get_attribute(
+				entry, op->map->value_attribute);
 			if (values != NULL) {
 				const char **new_values;
 
-				if (op->dict->set->debug > 0)
-					i_debug("ldap_dict_lookup_callback got attribute %s", op->map->value_attribute);
+				e_debug(op->event,
+					"ldap_dict_lookup_callback got attribute %s",
+					op->map->value_attribute);
 				op->res.ret = 1;
 				new_values = p_new(op->pool, const char *, 2);
 				new_values[0] = p_strdup(op->pool, values[0]);
 				op->res.values = new_values;
 				op->res.value = op->res.values[0];
 			} else {
-				if (op->dict->set->debug > 0)
-					i_debug("ldap_dict_lookup_callback dit not get attribute %s", op->map->value_attribute);
+				e_debug(op->event,
+					"ldap_dict_lookup_callback dit not get attribute %s",
+					op->map->value_attribute);
 				op->res.value = NULL;
 			}
 		}
@@ -351,6 +361,8 @@ ldap_dict_lookup_callback(struct ldap_result *result, struct dict_ldap_op *op)
 		io_loop_set_current(op->dict->dict.ioloop);
 		io_loop_stop(op->dict->dict.ioloop);
 	}
+
+	event_unref(&op->event);
 	pool_unref(&pool);
 }
 
@@ -437,6 +449,9 @@ void ldap_dict_lookup_async(struct dict *dict,
 	op->callback_ctx = context;
 	op->txid = ctx->last_txid++;
 
+	op->event = event_create(op->dict->dict.event);
+	event_set_forced_debug(op->event, op->dict->set->debug > 0);
+
 	/* key needs to be transformed into something else */
 	ARRAY_TYPE(const_string) values;
 	const char *attributes[2] = {0, 0};
@@ -453,6 +468,7 @@ void ldap_dict_lookup_async(struct dict *dict,
 		if (!ldap_dict_build_query(set, map, &values, strncmp(key, DICT_PATH_PRIVATE, strlen(DICT_PATH_PRIVATE))==0, query, &error)) {
 			op->res.error = error;
 			callback(&op->res, context);
+			event_unref(&op->event);
 			pool_unref(&oppool);
 			return;
 		}
@@ -464,6 +480,7 @@ void ldap_dict_lookup_async(struct dict *dict,
 	} else {
 		op->res.error = "no such key";
 		callback(&op->res, context);
+		event_unref(&op->event);
 		pool_unref(&oppool);
 	}
 }

@@ -10,8 +10,8 @@
 
 #define AUTH_FAILED_MSG "Authentication failed."
 #define AUTH_TEMP_FAILED_MSG "Temporary authentication failure."
-#define AUTH_PLAINTEXT_DISABLED_MSG \
-	"Plaintext authentication disallowed on non-secure (SSL/TLS) connections."
+#define AUTH_CLEARTEXT_DISABLED_MSG \
+	"Cleartext authentication disallowed on non-secure (SSL/TLS) connections."
 
 #define LOGIN_DEFAULT_SOCKET "login"
 #define LOGIN_TOKEN_DEFAULT_SOCKET "tokenlogin"
@@ -64,7 +64,6 @@ extern void **global_other_settings;
 
 extern const struct ip_addr *login_source_ips;
 extern unsigned int login_source_ips_idx, login_source_ips_count;
-extern struct event *event_auth;
 
 
 void login_refresh_proctitle(void);

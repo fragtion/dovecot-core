@@ -49,7 +49,7 @@ enum master_service_flags {
 	MASTER_SERVICE_FLAG_HAVE_STARTTLS	= 0x2000,
 };
 
-struct master_service_connection_proxy {
+struct master_service_connection_haproxy {
 	/* only set if ssl is TRUE */
 	const char *hostname;
 	const char *cert_common_name;
@@ -67,6 +67,9 @@ struct master_service_connection {
 	int listen_fd;
 	/* listener name as in configuration file, or "" if unnamed. */
 	const char *name;
+	/* listener type as in configuration file, or "" if no type is
+	   specified */
+	const char *type;
 
 	/* Original client/server IP/port. Both of these may have been changed
 	   by the haproxy protocol. */
@@ -78,10 +81,10 @@ struct master_service_connection {
 	in_port_t real_remote_port, real_local_port;
 
 	/* filled if connection is proxied */
-	struct master_service_connection_proxy proxy;
+	struct master_service_connection_haproxy haproxy;
 
 	/* This is a connection proxied wit HAproxy (or similar) */
-	bool proxied:1;
+	bool haproxied:1;
 
 	/* This is a FIFO fd. Only a single "connection" is ever received from
 	   a FIFO after the first writer sends something to it. */
@@ -209,6 +212,9 @@ unsigned int master_service_get_socket_count(struct master_service *service);
 /* Returns the name of the listener socket, or "" if none is specified. */
 const char *master_service_get_socket_name(struct master_service *service,
 					   int listen_fd);
+/* Returns the type of the listener socket, or "" if none is specified. */
+const char *
+master_service_get_socket_type(struct master_service *service, int listen_fd);
 
 /* Returns configuration file path. */
 const char *master_service_get_config_path(struct master_service *service);
@@ -261,6 +267,13 @@ void master_service_client_connection_accept(struct master_service_connection *c
 void master_service_client_connection_created(struct master_service *service);
 /* Call whenever a client connection is destroyed. */
 void master_service_client_connection_destroyed(struct master_service *service);
+/* Returns the listener type for this connection. If the type is unassigned, the
+   connection name is parsed for a "-suffix" which is returned instead to easily
+   implement backwards compatibility for custom listeners that are still
+   configured without an explicit type. */
+const char *
+master_service_connection_get_type(
+	const struct master_service_connection *conn);
 
 /* Deinitialize the service. */
 void master_service_deinit(struct master_service **service);

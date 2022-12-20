@@ -24,16 +24,16 @@ static void auth_server_send_new_request(struct auth_client_connection *conn,
 
 	if ((info->flags & AUTH_REQUEST_FLAG_SUPPORT_FINAL_RESP) != 0)
 		str_append(str, "\tfinal-resp-ok");
-	if ((info->flags & AUTH_REQUEST_FLAG_SECURED) != 0) {
+	if ((info->flags & AUTH_REQUEST_FLAG_CONN_SECURED) != 0) {
 		str_append(str, "\tsecured");
-		if ((info->flags & AUTH_REQUEST_FLAG_TRANSPORT_SECURITY_TLS) != 0) {
+		if ((info->flags & AUTH_REQUEST_FLAG_CONN_SECURED_TLS) != 0) {
 			str_append(str, "=tls");
 			event_add_str(request->event, "transport", "TLS");
 		} else {
-			event_add_str(request->event, "transport", "trusted");
+			event_add_str(request->event, "transport", "secured");
 		}
 	} else {
-		i_assert((info->flags & AUTH_REQUEST_FLAG_TRANSPORT_SECURITY_TLS) == 0);
+		i_assert((info->flags & AUTH_REQUEST_FLAG_CONN_SECURED_TLS) == 0);
 		event_add_str(request->event, "transport", "insecure");
 	}
 	if ((info->flags & AUTH_REQUEST_FLAG_NO_PENALTY) != 0)
@@ -69,6 +69,11 @@ static void auth_server_send_new_request(struct auth_client_connection *conn,
 	if (info->remote_port != 0) {
 		str_printfa(str, "\trport=%u", info->remote_port);
 		event_add_int(request->event, "remote_port", info->remote_port);
+	}
+	if (info->ssl_ja3_hash != 0) {
+		str_append(str, "\tssl_ja3_hash=");
+		str_append_tabescaped(str,info->ssl_ja3_hash);
+		event_add_str(request->event, "ssl_ja3_hash", info->ssl_ja3_hash);
 	}
 	if (info->real_local_ip.family != 0) {
 		event_add_str(request->event, "real_local_ip",

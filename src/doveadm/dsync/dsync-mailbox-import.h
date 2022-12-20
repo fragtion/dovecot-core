@@ -7,7 +7,6 @@ enum dsync_mailbox_import_flags {
 	DSYNC_MAILBOX_IMPORT_FLAG_MASTER_BRAIN		= 0x01,
 	DSYNC_MAILBOX_IMPORT_FLAG_WANT_MAIL_REQUESTS	= 0x02,
 	DSYNC_MAILBOX_IMPORT_FLAG_REVERT_LOCAL_CHANGES	= 0x04,
-	DSYNC_MAILBOX_IMPORT_FLAG_DEBUG			= 0x08,
 	DSYNC_MAILBOX_IMPORT_FLAG_MAILS_HAVE_GUIDS	= 0x10,
 	DSYNC_MAILBOX_IMPORT_FLAG_MAILS_USE_GUID128	= 0x20,
 	DSYNC_MAILBOX_IMPORT_FLAG_NO_NOTIFY		= 0x40,
@@ -39,7 +38,8 @@ dsync_mailbox_import_init(struct mailbox *box,
 			  unsigned int commit_msgs_interval,
 			  enum dsync_mailbox_import_flags flags,
 			  unsigned int hdr_hash_version,
-			  const char *const *hashed_headers);
+			  const char *const *hashed_headers,
+			  struct event *event);
 int dsync_mailbox_import_attribute(struct dsync_mailbox_importer *importer,
 				   const struct dsync_mailbox_attribute *attr);
 int dsync_mailbox_import_change(struct dsync_mailbox_importer *importer,

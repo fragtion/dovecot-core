@@ -16,9 +16,11 @@ static const struct exit_code_str {
 	{ EX_NOPERM, "NOPERM" },
 	{ EX_PROTOCOL, "PROTOCOL" },
 	{ EX_DATAERR, "DATAERR" },
+	{ DOVEADM_EX_CHANGED, "CHANGED" },
 	{ DOVEADM_EX_NOREPLICATE, "NOREPLICATE" },
 	{ DOVEADM_EX_REFERRAL, "REFERRAL" },
-	{ DOVEADM_EX_NOTFOUND, "NOTFOUND" }
+	{ DOVEADM_EX_NOTFOUND, "NOTFOUND" },
+	{ DOVEADM_EX_EXPIRED, "EXPIRED" },
 };
 
 const char *doveadm_exit_code_to_str(int code)

@@ -11,7 +11,13 @@
 
 /* <settings checks> */
 static struct file_listener_settings imap_login_unix_listeners_array[] = {
-	{ "srv.imap-login/%{pid}", 0600, "", "" },
+	{
+		.path = "srv.imap-login/%{pid}",
+		.type = "admin",
+		.mode = 0600,
+		.user = "",
+		.group = "",
+	},
 };
 static struct file_listener_settings *imap_login_unix_listeners[] = {
 	&imap_login_unix_listeners_array[0],
@@ -21,8 +27,17 @@ static buffer_t imap_login_unix_listeners_buf = {
 };
 
 static struct inet_listener_settings imap_login_inet_listeners_array[] = {
-	{ .name = "imap", .address = "", .port = 143 },
-	{ .name = "imaps", .address = "", .port = 993, .ssl = TRUE }
+	{
+		.name = "imap",
+		.address = "",
+		.port = 143,
+	},
+	{
+		.name = "imaps",
+		.address = "",
+		.port = 993,
+		.ssl = TRUE,
+	},
 };
 static struct inet_listener_settings *imap_login_inet_listeners[] = {
 	&imap_login_inet_listeners_array[0],

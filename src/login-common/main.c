@@ -15,7 +15,6 @@
 #include "master-interface.h"
 #include "iostream-ssl.h"
 #include "client-common.h"
-#include "access-lookup.h"
 #include "master-admin-client.h"
 #include "anvil-client.h"
 #include "auth-client.h"
@@ -28,7 +27,6 @@
 
 #define AUTH_CLIENT_IDLE_TIMEOUT_MSECS (1000*60)
 
-struct event *event_auth;
 static struct event_category event_category_auth = {
 	.name = "auth",
 };
@@ -189,6 +187,10 @@ client_connected(struct master_service_connection *conn)
 		}
 	}
 	client_init(client, other_sets);
+	client->event_auth = event_create(client->event);
+	event_add_category(client->event_auth, &event_category_auth);
+	event_set_min_log_level(client->event_auth, set->auth_verbose ?
+					LOG_TYPE_INFO : LOG_TYPE_WARNING);
 
 	timeout_remove(&auth_client_to);
 }
@@ -415,10 +417,6 @@ static void main_init(const char *login_socket)
 	/* make sure we can't fork() */
 	restrict_process_count(1);
 
-	event_auth = event_create(NULL);
-	event_set_forced_debug(event_auth, global_login_settings->auth_debug);
-	event_add_category(event_auth, &event_category_auth);
-
 	i_array_init(&global_alt_usernames, 4);
 	master_service_set_avail_overflow_callback(master_service,
 						   client_destroy_oldest);
@@ -458,7 +456,6 @@ static void main_deinit(void)
 	client_common_deinit();
 	dsasl_clients_deinit();
 	login_settings_deinit();
-	event_unref(&event_auth);
 }
 
 int login_binary_run(struct login_binary *binary,

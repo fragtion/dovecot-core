@@ -8,9 +8,9 @@
 #include "ostream.h"
 #include "str.h"
 #include "strescape.h"
+#include "str-parse.h"
 #include "safe-memset.h"
 #include "time-util.h"
-#include "settings-parser.h"
 #include "login-proxy.h"
 #include "auth-client.h"
 #include "dsasl-client.h"
@@ -171,7 +171,7 @@ static bool client_auth_parse_args(const struct client *client, bool success,
 		} else if (strcmp(key, "reason") == 0)
 			reply_r->reason = value;
 		else if (strcmp(key, "proxy_host_immediate_failure_after") == 0) {
-			if (settings_get_time(value,
+			if (str_parse_get_interval(value,
 				&reply_r->proxy_host_immediate_failure_after_secs,
 				&error) < 0) {
 				e_error(client->event,
@@ -207,7 +207,8 @@ static bool client_auth_parse_args(const struct client *client, bool success,
 		} else if (str_begins_with(key, "forward_")) {
 			/* these are passed to upstream */
 		} else
-			e_debug(event_auth, "Ignoring unknown passdb extra field: %s", key);
+			e_debug(client->event_auth,
+				"Ignoring unknown passdb extra field: %s", key);
 	}
 	if (reply_r->proxy.port == 0) {
 		if ((reply_r->proxy.ssl_flags & AUTH_PROXY_SSL_FLAG_YES) != 0 &&
@@ -512,7 +513,7 @@ proxy_try_redirect(struct client *client, const char *destination,
 	}
 	if (net_str2hostport(destination,
 			     login_proxy_get_port(client->login_proxy),
-			     &host, &port) < 0) {
+			     &host, &port) < 0 || host[0] == '\0') {
 		*error_r = t_strdup_printf(
 			"Failed to parse host:port '%s'", destination);
 		return FALSE;
@@ -1008,14 +1009,13 @@ client_auth_begin_common(struct client *client, const char *mech_name,
 			 enum sasl_server_auth_flags auth_flags,
 			 const char *init_resp)
 {
-	if (!client->secured && strcmp(client->ssl_set->ssl, "required") == 0) {
-		if (client->set->auth_verbose) {
-			e_info(client->event, "Login failed: "
-			       "SSL required for authentication");
-		}
+	if (!client->connection_secured &&
+	    strcmp(client->ssl_set->ssl, "required") == 0) {
+		e_info(client->event_auth, "Login failed: "
+			"SSL required for authentication");
 		client->auth_attempts++;
 		client_auth_result(client, CLIENT_AUTH_RESULT_SSL_REQUIRED, NULL,
-			"Authentication not allowed until SSL/TLS is enabled.");
+			"Authentication disallowed on non-secure (SSL/TLS) connections.");
 		return 1;
 	}
 
@@ -1060,27 +1060,27 @@ bool client_check_plaintext_auth(struct client *client, bool pass_sent)
 {
 	bool ssl_required = (strcmp(client->ssl_set->ssl, "required") == 0);
 
-	if (client->secured || (!client->set->disable_plaintext_auth &&
-				!ssl_required))
+	i_assert(!ssl_required || !client->set->auth_allow_cleartext);
+
+	if (client->set->auth_allow_cleartext ||
+	    client->connection_secured)
 		return TRUE;
 
-	if (client->set->auth_verbose) {
-		e_info(client->event, "Login failed: "
-		       "Plaintext authentication disabled");
-	}
+	e_info(client->event_auth, "Login failed: "
+		"Cleartext authentication disabled");
 	if (pass_sent) {
 		client_notify_status(client, TRUE,
-			 "Plaintext authentication not allowed "
+			 "cleartext authentication not allowed "
 			 "without SSL/TLS, but your client did it anyway. "
 			 "If anyone was listening, the password was exposed.");
 	}
 
 	if (ssl_required) {
 		client_auth_result(client, CLIENT_AUTH_RESULT_SSL_REQUIRED, NULL,
-			   AUTH_PLAINTEXT_DISABLED_MSG);
+			   AUTH_CLEARTEXT_DISABLED_MSG);
 	} else {
 		client_auth_result(client, CLIENT_AUTH_RESULT_MECH_SSL_REQUIRED, NULL,
-			   AUTH_PLAINTEXT_DISABLED_MSG);
+			   AUTH_CLEARTEXT_DISABLED_MSG);
 	}
 	client->auth_attempts++;
 	return FALSE;

@@ -13,6 +13,10 @@
 
 extern struct acl_backend_vfuncs acl_backend_vfile;
 
+struct event_category event_category_acl = {
+	.name = "acl",
+};
+
 const char *const all_mailbox_rights[] = {
 	MAIL_ACL_LOOKUP,
 	MAIL_ACL_READ,
@@ -54,6 +58,9 @@ acl_backend_init(const char *data, struct mailbox_list *list,
 		i_fatal("Unknown ACL backend: %s", t_strcut(data, ':'));
 
 	backend = acl_backend_vfile.alloc();
+	backend->event = event_create(user->event);
+	event_add_category(backend->event, &event_category_acl);
+
 	backend->debug = user->mail_debug;
 	backend->v = acl_backend_vfile;
 	backend->list = list;
@@ -68,7 +75,7 @@ acl_backend_init(const char *data, struct mailbox_list *list,
 			p_new(backend->pool, const char *, group_count);
 		for (i = 0; i < group_count; i++) {
 			backend->groups[i] = p_strdup(backend->pool, groups[i]);
-			e_debug(user->event, "acl: group added: %s", groups[i]);
+			e_debug(backend->event, "acl: group added: %s", groups[i]);
 		}
 		i_qsort(backend->groups, group_count, sizeof(const char *),
 			i_strcmp_p);
@@ -97,6 +104,7 @@ void acl_backend_deinit(struct acl_backend **_backend)
 	if (backend->default_aclobj != NULL)
 		acl_object_deinit(&backend->default_aclobj);
 	acl_cache_deinit(&backend->cache);
+	event_unref(&backend->event);
 	backend->v.deinit(backend);
 }
 

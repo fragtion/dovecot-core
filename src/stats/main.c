@@ -18,30 +18,13 @@ time_t stats_startup_time;
 
 static const struct stats_settings *stats_settings;
 
-static bool client_is_writer(const char *path)
-{
-	const char *name, *suffix;
-
-	name = strrchr(path, '/');
-	if (name == NULL)
-		name = path;
-	else
-		name++;
-
-	suffix = strrchr(name, '-');
-	if (suffix == NULL)
-		suffix = name;
-	else
-		suffix++;
-
-	return strcmp(suffix, "writer") == 0;
-}
-
 static void client_connected(struct master_service_connection *conn)
 {
-	if (strcmp(conn->name, "http") == 0)
+	const char *type = master_service_connection_get_type(conn);
+
+	if (strcmp(type, "http") == 0)
 		client_http_create(conn);
-	else if (client_is_writer(conn->name))
+	else if (strcmp(type, "writer") == 0)
 		client_writer_create(conn->fd);
 	else
 		client_reader_create(conn->fd);
@@ -61,8 +44,8 @@ static void main_preinit(void)
 
 static void main_init(void)
 {
-	void **sets = master_service_settings_get_others(master_service);
-	stats_settings = sets[0];
+	stats_settings = master_service_settings_get_root_set(master_service,
+				&stats_setting_parser_info);
 
 	stats_startup_time = ioloop_time;
 	stats_metrics = stats_metrics_init(stats_settings);

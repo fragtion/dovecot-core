@@ -581,6 +581,306 @@ static void test_event_filter_named_separate_from_str(void)
 	test_end();
 }
 
+static void test_event_filter_duration(void)
+{
+	struct event_filter *filter;
+	const char *error;
+	const struct failure_context failure_ctx = {
+		.type = LOG_TYPE_DEBUG
+	};
+
+	test_begin("event filter: event duration");
+
+	/* we check that we can actually match duration field */
+	filter = event_filter_create();
+	test_assert(event_filter_parse("duration < 1000", filter, &error) == 0);
+
+	struct event *e = event_create(NULL);
+	test_assert(event_filter_match(filter, e, &failure_ctx));
+
+	event_filter_unref(&filter);
+	event_unref(&e);
+	test_end();
+}
+
+static void test_event_filter_numbers(void)
+{
+	struct event_filter *filter;
+	const char *error;
+	const struct failure_context failure_ctx = {
+		.type = LOG_TYPE_DEBUG
+	};
+
+	test_begin("event filter: event numeric matching");
+
+	/* we check that we can actually match duration field */
+	filter = event_filter_create();
+	test_assert(event_filter_parse("number > 0", filter, &error) == 0);
+
+	struct event *e = event_create(NULL);
+	event_add_int(e, "number", 1);
+	test_assert(event_filter_match(filter, e, &failure_ctx));
+	event_add_int(e, "number", 0);
+	test_assert(!event_filter_match(filter, e, &failure_ctx));
+	event_add_int(e, "number", -1);
+	test_assert(!event_filter_match(filter, e, &failure_ctx));
+	event_filter_unref(&filter);
+
+	filter = event_filter_create();
+	test_assert(event_filter_parse("number < 0", filter, &error) == 0);
+	event_add_int(e, "number", 1);
+	test_assert(!event_filter_match(filter, e, &failure_ctx));
+	event_add_int(e, "number", 0);
+	test_assert(!event_filter_match(filter, e, &failure_ctx));
+	event_add_int(e, "number", -1);
+	test_assert(event_filter_match(filter, e, &failure_ctx));
+	event_filter_unref(&filter);
+
+	event_add_int(e, "number", 0);
+
+	filter = event_filter_create();
+	test_assert(event_filter_parse("number > *", filter, &error) == 0);
+	test_assert(!event_filter_match(filter, e, &failure_ctx));
+	event_filter_unref(&filter);
+
+	filter = event_filter_create();
+	test_assert(event_filter_parse("number=0", filter, &error) == 0);
+	test_assert(event_filter_match(filter, e, &failure_ctx));
+	event_filter_unref(&filter);
+
+	filter = event_filter_create();
+	test_assert(event_filter_parse("number=*", filter, &error) == 0);
+	test_assert(event_filter_match(filter, e, &failure_ctx));
+	event_filter_unref(&filter);
+
+	filter = event_filter_create();
+	test_assert(event_filter_parse("number=fish", filter, &error) == 0);
+	test_expect_error_string("Event filter matches integer field 'number' "
+				 "against non-integer value 'fish'");
+	test_assert(!event_filter_match(filter, e, &failure_ctx));
+	test_expect_no_more_errors();
+	event_filter_unref(&filter);
+
+	event_unref(&e);
+	test_end();
+}
+
+static void test_event_filter_size_values(void)
+{
+	const char *error;
+	const struct failure_context failure_ctx = {
+		.type = LOG_TYPE_DEBUG,
+	};
+
+	test_begin("event filter: sizes with different size units");
+
+	const struct {
+		const char *filter;
+		intmax_t value;
+		bool match;
+	} test_cases[] = {
+		/* Make sure negative values do not interfere with the
+		   existing event filtering. */
+		{ "field = -1", -1, TRUE },
+
+		{ "field = 1", 1, TRUE },
+		{ "field = 1b", 1, TRUE },
+		{ "field = 1B", 1, TRUE },
+		{ "field < 1B", 1, FALSE },
+		{ "field > 1B", 1, FALSE },
+
+		{ "field = 1k", 1024, TRUE },
+		{ "field = 1KB", 1024, TRUE },
+		{ "field = 1Kb", 1024, TRUE },
+		{ "field = 1kB", 1024, TRUE },
+		{ "field = 1kb", 1024, TRUE },
+		{ "field = 1KIB", 1024, TRUE },
+		{ "field = 1KiB", 1024, TRUE },
+		{ "field >= 1KB", 1024, TRUE },
+		{ "field <= 1KB", 1024, TRUE },
+		{ "field > 1B", 1024, TRUE },
+		{ "field > 1000", 1024, TRUE },
+		{ "field < 1KB", 1024, FALSE },
+		{ "field > 1KB", 1024, FALSE },
+
+		{ "field = 1MB", 1024 * 1024, TRUE },
+		{ "field >= 1MB", 1024 * 1024, TRUE },
+		{ "field <= 1MB", 1024 * 1024, TRUE },
+		{ "field > 1KB", 1024 * 1024, TRUE },
+		{ "field > 1000000", 1024 * 1024, TRUE },
+		{ "field < 1MB", 1024 * 1024, FALSE },
+		{ "field > 1MB", 1024 * 1024, FALSE },
+
+		{ "field = 1g", 1024 * 1024 * 1024, TRUE },
+		{ "field = 1GB", 1024 * 1024 * 1024, TRUE },
+		{ "field >= 1GB", 1024 * 1024 * 1024, TRUE },
+		{ "field <= 1GB", 1024 * 1024 * 1024, TRUE },
+		{ "field < 1TB", 1024 * 1024 * 1024, TRUE },
+		{ "field > 1000000000", 1024 * 1024 * 1024, TRUE },
+		{ "field < 1GB", 1024 * 1024 * 1024, FALSE },
+		{ "field > 1GB", 1024 * 1024 * 1024, FALSE },
+
+		{ "field = 1t", 1024ULL * 1024 * 1024 * 1024, TRUE },
+		{ "field = 1TB", 1024ULL * 1024 * 1024 * 1024, TRUE },
+		{ "field >= 1TB", 1024ULL * 1024 * 1024 * 1024, TRUE },
+		{ "field <= 1TB", 1024ULL * 1024 * 1024 * 1024, TRUE },
+		{ "field > 1GB", 1024ULL * 1024 * 1024 * 1024, TRUE },
+		{ "field > 1000000000000", 1024ULL * 1024 * 1024 * 1024, TRUE },
+		{ "field < 1TB", 1024ULL * 1024 * 1024 * 1024, FALSE },
+		{ "field > 1TB", 1024ULL * 1024 * 1024 * 1024, FALSE },
+	};
+
+	struct event_filter *filter;
+	struct event *e;
+
+	for (unsigned int i = 0; i < N_ELEMENTS(test_cases); i++) {
+		e = event_create(NULL);
+		filter = event_filter_create();
+
+		event_add_int(e, "field", test_cases[i].value);
+		test_assert_idx(event_filter_parse(test_cases[i].filter, filter,
+						   &error) == 0, i);
+		bool result = event_filter_match(filter, e, &failure_ctx);
+		test_assert_idx(result == test_cases[i].match, i);
+
+		event_filter_unref(&filter);
+		event_unref(&e);
+	}
+
+	test_end();
+}
+
+static void test_event_filter_interval_values(void)
+{
+	const char *error;
+	const struct failure_context failure_ctx = {
+		.type = LOG_TYPE_DEBUG,
+	};
+
+	test_begin("event filter: sizes with different interval units");
+
+	const struct {
+		const char *filter;
+		intmax_t value;
+		bool match;
+	} test_cases[] = {
+		/* Make sure negative values do not interfere with the
+		   existing event filtering. */
+		{ "field = -1", -1, TRUE },
+
+		{ "field = 1milliseconds", 1000, TRUE },
+		{ "field = 1millisecs", 1000, TRUE },
+		{ "field = 1mseconds", 1000, TRUE },
+		{ "field = 1msecs", 1000, TRUE },
+		{ "field = 1ms", 1000, TRUE },
+		{ "field = 1000", 1000, TRUE },
+		{ "field >= 1msecs", 1000, TRUE },
+		{ "field <= 1msecs", 1000, TRUE },
+		{ "field > 1", 1000, TRUE },
+		{ "field > 1msecs", 1000, FALSE },
+		{ "field < 1msecs", 1000, FALSE },
+
+		{ "field = 1seconds", 1000 * 1000, TRUE },
+		{ "field = 1secs", 1000 * 1000, TRUE },
+		{ "field = 1s", 1000 * 1000, TRUE },
+		{ "field = 1000000", 1000 * 1000, TRUE },
+		{ "field >= 1secs", 1000 * 1000, TRUE },
+		{ "field <= 1secs", 1000 * 1000, TRUE },
+		{ "field > 1msecs", 1000 * 1000, TRUE },
+		{ "field > 1secs", 1000 * 1000, FALSE },
+		{ "field < 1secs", 1000 * 1000, FALSE },
+
+		{ "field = 1minutes", 60 * 1000 * 1000, TRUE },
+		{ "field = 1mins", 60 * 1000 * 1000, TRUE },
+		{ "field = 60000000", 60 * 1000 * 1000, TRUE },
+		{ "field >= 1mins", 60 * 1000 * 1000, TRUE },
+		{ "field <= 1mins", 60 * 1000 * 1000, TRUE },
+		{ "field > 1secs", 60 * 1000 * 1000, TRUE },
+		{ "field > 1mins", 60 * 1000 * 1000, FALSE },
+		{ "field < 1mins", 60 * 1000 * 1000, FALSE },
+
+		{ "field = 1hours", 60L * 60 * 1000 * 1000, TRUE },
+		{ "field = 1h", 60L * 60 * 1000 * 1000, TRUE },
+		{ "field = 3600000000", 60L * 60 * 1000 * 1000, TRUE },
+		{ "field >= 1hours", 60L * 60 * 1000 * 1000, TRUE },
+		{ "field <= 1hours", 60L * 60 * 1000 * 1000, TRUE },
+		{ "field > 1mins", 60L * 60 * 1000 * 1000, TRUE },
+		{ "field > 1hours", 60L * 60 * 1000 * 1000, FALSE },
+		{ "field < 1hours", 60L * 60 * 1000 * 1000, FALSE },
+
+		{ "field = 1days", 24L * 60 * 60 * 1000 * 1000, TRUE },
+		{ "field = 1d", 24L * 60 * 60 * 1000 * 1000, TRUE },
+		{ "field = 86400000000", 24L * 60 * 60 * 1000 * 1000, TRUE },
+		{ "field >= 1days", 24L * 60 * 60 * 1000 * 1000, TRUE },
+		{ "field <= 1days", 24L * 60 * 60 * 1000 * 1000, TRUE },
+		{ "field > 1hours", 24L * 60 * 60 * 1000 * 1000, TRUE },
+		{ "field > 1days", 24L * 60 * 60 * 1000 * 1000, FALSE },
+		{ "field < 1days", 24L * 60 * 60 * 1000 * 1000, FALSE },
+
+		{ "field = 1weeks", 7L * 24 * 60 * 60 * 1000 * 1000, TRUE },
+		{ "field = 1w", 7L * 24 * 60 * 60 * 1000 * 1000, TRUE },
+		{ "field = 604800000000", 7L * 24 * 60 * 60 * 1000 * 1000, TRUE },
+		{ "field >= 1weeks", 7L * 24 * 60 * 60 * 1000 * 1000, TRUE },
+		{ "field <= 1weeks", 7L * 24 * 60 * 60 * 1000 * 1000, TRUE },
+		{ "field > 1days", 7L * 24 * 60 * 60 * 1000 * 1000, TRUE },
+		{ "field > 1weeks", 7L * 24 * 60 * 60 * 1000 * 1000, FALSE },
+		{ "field < 1weeks", 7L * 24 * 60 * 60 * 1000 * 1000, FALSE },
+	};
+
+	struct event_filter *filter;
+	struct event *e;
+
+	for (unsigned int i = 0; i < N_ELEMENTS(test_cases); i++) {
+		e = event_create(NULL);
+		filter = event_filter_create();
+
+		event_add_int(e, "field", test_cases[i].value);
+		test_assert_idx(event_filter_parse(test_cases[i].filter, filter,
+						   &error) == 0, i);
+		bool result = event_filter_match(filter, e, &failure_ctx);
+		test_assert_idx(result == test_cases[i].match, i);
+
+		event_filter_unref(&filter);
+		event_unref(&e);
+	}
+
+	test_end();
+}
+
+static void test_event_filter_ambiguous_units(void)
+{
+	const char *error;
+	const struct failure_context failure_ctx = {
+		.type = LOG_TYPE_DEBUG,
+	};
+
+	test_begin("event filter: ambiguous units");
+
+	struct event_filter *filter = event_filter_create();
+
+	/* Make sure an ambiguous unit creates a warning. */
+	struct event *e_int = event_create(NULL);
+	event_add_int(e_int, "field", 1000);
+	test_assert(event_filter_parse("field = 1m", filter, &error) == 0);
+	test_expect_error_string("Event filter matches integer field 'field' "
+				 "with value that has an ambiguous unit '1m'. "
+				 "Please use either 'mins' or 'MB' to specify "
+				 "interval or size respectively.");
+	test_assert(!event_filter_match(filter, e_int, &failure_ctx));
+	test_expect_no_more_errors();
+	event_unref(&e_int);
+
+	/* String values should not be considered for ambiguous units. */
+	struct event *e_str = event_create(NULL);
+	event_add_str(e_str, "field", "1m");
+	test_assert(event_filter_parse("field = 1m", filter, &error) == 0);
+	test_assert(event_filter_match(filter, e_str, &failure_ctx));
+	event_unref(&e_str);
+
+	event_filter_unref(&filter);
+	test_end();
+}
+
 void test_event_filter(void)
 {
 	test_event_filter_override_parent_fields();
@@ -595,4 +895,9 @@ void test_event_filter(void)
 	test_event_filter_named_and_str();
 	test_event_filter_named_or_str();
 	test_event_filter_named_separate_from_str();
+	test_event_filter_duration();
+	test_event_filter_numbers();
+	test_event_filter_size_values();
+	test_event_filter_interval_values();
+	test_event_filter_ambiguous_units();
 }

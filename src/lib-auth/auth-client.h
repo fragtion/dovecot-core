@@ -8,7 +8,12 @@ struct auth_client;
 struct auth_client_request;
 
 enum auth_request_flags {
-	AUTH_REQUEST_FLAG_SECURED		= 0x01,
+	/* Connection from the previous hop (client, proxy, haproxy) is
+	   considered secured. Either because TLS is used, or because the
+	   connection is otherwise considered not to need TLS. Note that this
+	   doesn't necessarily mean that the client connection behind the
+	   previous hop is secured. */
+	AUTH_REQUEST_FLAG_CONN_SECURED		= 0x01,
 	AUTH_REQUEST_FLAG_VALID_CLIENT_CERT	= 0x02,
 	/* Skip penalty checks for this request */
 	AUTH_REQUEST_FLAG_NO_PENALTY		= 0x04,
@@ -16,8 +21,8 @@ enum auth_request_flags {
 	AUTH_REQUEST_FLAG_SUPPORT_FINAL_RESP	= 0x08,
 	/* Enable auth_debug=yes logging for this request */
 	AUTH_REQUEST_FLAG_DEBUG			= 0x10,
-	/* If TLS was used */
-	AUTH_REQUEST_FLAG_TRANSPORT_SECURITY_TLS = 0x20,
+	/* Connection from the previous hop is secured by TLS. */
+	AUTH_REQUEST_FLAG_CONN_SECURED_TLS	= 0x20,
 };
 
 enum auth_request_status {
@@ -52,6 +57,7 @@ struct auth_request_info {
 	const char *ssl_cipher;
 	const char *ssl_pfs;
 	const char *ssl_protocol;
+	const char *ssl_ja3_hash;
 
 	enum auth_request_flags flags;
 

@@ -32,16 +32,17 @@ static const struct setting_define login_setting_defines[] = {
 	DEF(UINT, login_proxy_max_reconnects),
 	DEF(TIME, login_proxy_max_disconnect_delay),
 	DEF(STR, login_proxy_rawlog_dir),
-	DEF(STR, director_username_hash),
 	DEF(STR, login_auth_socket_path),
 
 	DEF(BOOL, auth_ssl_require_client_cert),
 	DEF(BOOL, auth_ssl_username_from_cert),
 
-	DEF(BOOL, disable_plaintext_auth),
+	DEF(BOOL, auth_allow_cleartext),
 	DEF(BOOL, auth_verbose),
 	DEF(BOOL, auth_debug),
 	DEF(BOOL, verbose_proctitle),
+
+	DEF(ENUM, ssl),
 
 	DEF(UINT, mail_max_userip_connections),
 
@@ -61,16 +62,17 @@ static const struct login_settings login_default_settings = {
 	.login_proxy_max_reconnects = 3,
 	.login_proxy_max_disconnect_delay = 0,
 	.login_proxy_rawlog_dir = "",
-	.director_username_hash = "%Lu",
 	.login_auth_socket_path = "",
 
 	.auth_ssl_require_client_cert = FALSE,
 	.auth_ssl_username_from_cert = FALSE,
 
-	.disable_plaintext_auth = TRUE,
+	.auth_allow_cleartext = FALSE,
 	.auth_verbose = FALSE,
 	.auth_debug = FALSE,
 	.verbose_proctitle = FALSE,
+
+	.ssl = "yes:no:required",
 
 	.mail_max_userip_connections = 10
 };
@@ -99,17 +101,18 @@ static struct master_service_settings_cache *set_cache;
 
 /* <settings checks> */
 static bool login_settings_check(void *_set, pool_t pool,
-				 const char **error_r ATTR_UNUSED)
+				 const char **error_r)
 {
 	struct login_settings *set = _set;
 
 	set->log_format_elements_split =
 		p_strsplit(pool, set->login_log_format_elements, " ");
 
-	if (set->auth_debug_passwords)
-		set->auth_debug = TRUE;
-	if (set->auth_debug)
-		set->auth_verbose = TRUE;
+	if (strcmp(set->ssl, "required") == 0 && set->auth_allow_cleartext) {
+		*error_r = "auth_allow_cleartext=yes has no effect with ssl=required";
+		return FALSE;
+	}
+
 	return TRUE;
 }
 /* </settings checks> */
@@ -139,11 +142,12 @@ login_set_var_expand_table(const struct master_service_settings_input *input)
 
 static void *
 login_setting_dup(pool_t pool, const struct setting_parser_info *info,
-		  const void *src_set)
+		  const struct setting_parser_context *parser)
 {
 	const char *error;
-	void *dest;
+	void *src_set, *dest;
 
+	src_set = settings_parser_get_root_set(parser, info);
 	dest = settings_dup(info, src_set, pool);
 	if (!settings_check(info, pool, dest, &error)) {
 		const char *name = info->module_name;
@@ -165,8 +169,7 @@ login_settings_read(pool_t pool,
 {
 	struct master_service_settings_input input;
 	const char *error;
-	const struct setting_parser_context *parser;
-	void *const *cache_sets;
+	struct setting_parser_context *parser;
 	void **sets;
 	unsigned int i, count;
 
@@ -195,16 +198,14 @@ login_settings_read(pool_t pool,
 			master_service_settings_cache_init_filter(set_cache);
 	}
 
-	if (master_service_settings_cache_read(set_cache, &input, NULL,
+	if (master_service_settings_cache_read(set_cache, &input,
 					       &parser, &error) < 0)
 		i_fatal("Error reading configuration: %s", error);
 
-	cache_sets = master_service_settings_parser_get_others(master_service, parser);
 	for (count = 0; input.roots[count] != NULL; count++) ;
-	i_assert(cache_sets[count] == NULL);
 	sets = p_new(pool, void *, count + 1);
 	for (i = 0; i < count; i++)
-		sets[i] = login_setting_dup(pool, input.roots[i], cache_sets[i]);
+		sets[i] = login_setting_dup(pool, input.roots[i], parser);
 
 	if (settings_var_expand(&login_setting_parser_info, sets[0], pool,
 				login_set_var_expand_table(&input), &error) <= 0)
@@ -212,10 +213,10 @@ login_settings_read(pool_t pool,
 
 	*ssl_set_r =
 		login_setting_dup(pool, &master_service_ssl_setting_parser_info,
-				  settings_parser_get_list(parser)[1]);
+				  parser);
 	*ssl_server_set_r =
 		login_setting_dup(pool, &master_service_ssl_server_setting_parser_info,
-				  settings_parser_get_list(parser)[2]);
+				  parser);
 	*other_settings_r = sets + 1;
 	return sets[0];
 }

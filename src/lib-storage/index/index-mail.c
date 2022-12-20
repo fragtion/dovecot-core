@@ -26,7 +26,7 @@
 #define BODY_SNIPPET_ALGO_V1 "1"
 #define BODY_SNIPPET_MAX_CHARS 200
 
-struct mail_cache_field global_cache_fields[MAIL_INDEX_CACHE_FIELD_COUNT] = {
+static struct mail_cache_field global_cache_fields[] = {
 	{ .name = "flags",
 	  .type = MAIL_CACHE_FIELD_BITMASK,
 	  .field_size = sizeof(uint32_t) },
@@ -68,11 +68,17 @@ struct mail_cache_field global_cache_fields[MAIL_INDEX_CACHE_FIELD_COUNT] = {
 	   index-status.c when adding more fields. those fields should probably
 	   just be moved here to the same struct. */
 };
+static_assert_array_size(global_cache_fields, MAIL_INDEX_CACHE_FIELD_COUNT);
 
 static void index_mail_init_data(struct index_mail *mail);
 static int index_mail_parse_body(struct index_mail *mail,
 				 enum index_cache_field field);
 static int index_mail_write_body_snippet(struct index_mail *mail);
+
+struct mail_cache_field *index_mail_global_cache_fields_dup(void)
+{
+	return i_memdup(global_cache_fields, sizeof(global_cache_fields));
+}
 
 int index_mail_cache_lookup_field(struct index_mail *mail, buffer_t *buf,
 				  unsigned int field_idx)
@@ -89,8 +95,9 @@ int index_mail_cache_lookup_field(struct index_mail *mail, buffer_t *buf,
 	if (_mail->lookup_abort == MAIL_LOOKUP_ABORT_NOT_IN_CACHE_START_CACHING &&
 	    mail_cache_field_get_decision(_mail->box->cache, field_idx) ==
 	    MAIL_CACHE_DECISION_NO) {
+		bool rejected ATTR_UNUSED;
 		mail_cache_decision_add(_mail->transaction->cache_view,
-					_mail->seq, field_idx);
+					_mail->seq, field_idx, &rejected);
 	}
 
 	return ret;
@@ -2204,7 +2211,8 @@ bool index_mail_prefetch(struct mail *_mail)
 		else
 			len = MAIL_READ_HDR_BLOCK_SIZE;
 		if (posix_fadvise(fd, 0, len, POSIX_FADV_WILLNEED) < 0) {
-			i_error("posix_fadvise(%s) failed: %m",
+			e_error(mail_event(_mail),
+				"posix_fadvise(%s) failed: %m",
 				i_stream_get_name(mail->data.stream));
 		}
 		mail->data.prefetch_sent = TRUE;

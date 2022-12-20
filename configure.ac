@@ -95,13 +95,6 @@ AS_HELP_STRING([--with-libunwind], [Build with libunwind support (auto)]),
   TEST_WITH(libunwind, $withval),
   want_libunwind=auto)
 
-# Berkeley DB support is more or less broken. Disabled for now.
-#AC_ARG_WITH(db,
-#AS_HELP_STRING([--with-db], [Build with Berkeley DB support]),
-#  TEST_WITH(db, $withval),
-#  want_db=no)
-want_db=no
-
 AC_ARG_WITH(cdb,
 AS_HELP_STRING([--with-cdb], [Build with CDB support]),
   TEST_WITH(cdb, $withval),
@@ -164,11 +157,6 @@ AS_HELP_STRING([--with-sodium], [Build with libsodium support (enables argon2, d
   TEST_WITH(sodium, $withval),
   want_sodium=auto)
 
-AC_ARG_WITH(zlib,
-AS_HELP_STRING([--with-zlib], [Build with zlib compression support (auto)]),
-  TEST_WITH(zlib, $withval),
-  want_zlib=auto)
-
 AC_ARG_WITH(bzlib,
 AS_HELP_STRING([--with-bzlib], [Build with bzlib compression support (auto)]),
   TEST_WITH(bzlib, $withval),
@@ -226,8 +214,6 @@ DOVECOT_WANT_SYSTEMD
 dovecot_moduledir="$libdir/dovecot"
 DC_DOVECOT_MODULEDIR
 
-DOVECOT_CHECK_PYTHON_VENV
-
 AC_ARG_WITH(docs,
 AS_HELP_STRING([--with-docs], [Install documentation (default)]),
 	if test x$withval = xno; then
@@ -248,13 +234,14 @@ AC_PROG_CPP
 AC_PROG_CXX # lucene plugin needs this
 AC_CHECK_TOOL([FLEX],[flex],[:])
 AC_CHECK_TOOL([BISON],[bison],[:])
+AM_MISSING_PROG([WGET], [wget])
+
 AS_IF([test "$BISON" = ":" && test ! -e "$srcdir/src/lib/event-filter-parser.h"],
   AC_MSG_ERROR([Bison is required when building from git])
 ])
 AS_IF([test "$FLEX" = ":" && test ! -e "$srcdir/src/lib/event-filter-lexer.c"],
   AC_MSG_ERROR([flex is required when building from git])
 ])
-AC_HEADER_STDC
 AC_C_INLINE
 LT_INIT
 AM_ICONV
@@ -486,7 +473,6 @@ DOVECOT_WANT_PAM
 DOVECOT_WANT_BSDAUTH
 DOVECOT_WANT_GSSAPI
 DOVECOT_WANT_LDAP
-DOVECOT_WANT_DB
 DOVECOT_WANT_CDB
 DOVECOT_WANT_PGSQL
 DOVECOT_WANT_MYSQL
@@ -658,14 +644,12 @@ dnl **
 
 COMPRESS_LIBS=
 
-DOVECOT_WANT_ZLIB
+DOVECOT_ZLIB
 DOVECOT_WANT_BZLIB
 DOVECOT_WANT_LZ4
 DOVECOT_WANT_ZSTD
 
 AC_SUBST(COMPRESS_LIBS)
-
-AM_CONDITIONAL(BUILD_ZLIB_PLUGIN, test "$have_compress_lib" = "yes")
 
 DOVECOT_RPCGEN
 DOVECOT_QUOTA
@@ -707,7 +691,7 @@ dnl **
 dnl IDLE doesn't really belong to banner. It's there just to make Blackberries
 dnl happy, because otherwise BIS server disables push email.
 capability_banner="IMAP4rev1 SASL-IR LOGIN-REFERRALS ID ENABLE IDLE"
-capability="$capability_banner SORT SORT=DISPLAY THREAD=REFERENCES THREAD=REFS THREAD=ORDEREDSUBJECT MULTIAPPEND URL-PARTIAL CATENATE UNSELECT CHILDREN NAMESPACE UIDPLUS LIST-EXTENDED I18NLEVEL=1 CONDSTORE QRESYNC ESEARCH ESORT SEARCHRES WITHIN CONTEXT=SEARCH LIST-STATUS BINARY MOVE SNIPPET=FUZZY PREVIEW=FUZZY PREVIEW STATUS=SIZE SAVEDATE"
+capability="$capability_banner SORT SORT=DISPLAY THREAD=REFERENCES THREAD=REFS THREAD=ORDEREDSUBJECT MULTIAPPEND URL-PARTIAL CATENATE UNSELECT CHILDREN NAMESPACE UIDPLUS LIST-EXTENDED I18NLEVEL=1 CONDSTORE QRESYNC ESEARCH ESORT SEARCHRES WITHIN CONTEXT=SEARCH LIST-STATUS BINARY MOVE SNIPPET=FUZZY PREVIEW=FUZZY PREVIEW STATUS=SIZE SAVEDATE COMPRESS=DEFLATE"
 AC_DEFINE_UNQUOTED(CAPABILITY_STRING, "$capability", [IMAP capabilities])
 AC_DEFINE_UNQUOTED(CAPABILITY_BANNER_STRING, "$capability_banner", [IMAP capabilities advertised in banner])
 
@@ -804,7 +788,6 @@ src/lda/Makefile
 src/log/Makefile
 src/lmtp/Makefile
 src/dict/Makefile
-src/director/Makefile
 src/dns/Makefile
 src/indexer/Makefile
 src/imap/Makefile
@@ -845,8 +828,7 @@ src/plugins/replication/Makefile
 src/plugins/trash/Makefile
 src/plugins/virtual/Makefile
 src/plugins/welcome/Makefile
-src/plugins/zlib/Makefile
-src/plugins/imap-zlib/Makefile
+src/plugins/mail-compress/Makefile
 src/plugins/mail-crypt/Makefile
 src/plugins/var-expand-crypt/Makefile
 src/plugins/apparmor/Makefile

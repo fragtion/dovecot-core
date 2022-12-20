@@ -76,7 +76,6 @@ doveadm_server_DEPENDENCIES = \
 doveadm_common_cmds = \
 	doveadm-auth.c \
 	doveadm-dict.c \
-	doveadm-director.c \
 	doveadm-fs.c \
 	doveadm-indexer.c \
 	doveadm-instance.c \
@@ -88,7 +87,6 @@ doveadm_common_cmds = \
 	doveadm-replicator.c \
 	doveadm-sis.c \
 	doveadm-stats.c \
-	doveadm-oldstats.c \
 	doveadm-who.c
 
 doveadm_common_mail_cmds = \
@@ -125,7 +123,7 @@ doveadm_common_dump_cmds = \
 	doveadm-dump-thread.c \
 	doveadm-dump-dcrypt-file.c \
 	doveadm-dump-dcrypt-key.c \
-	doveadm-zlib.c
+	doveadm-compress.c
 
 common = \
 	$(doveadm_common_cmds) \

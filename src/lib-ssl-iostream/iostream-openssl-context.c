@@ -1,6 +1,8 @@
 /* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
+#include "str.h"
+#include "hex-binary.h"
 #include "safe-memset.h"
 #include "iostream-openssl.h"
 #include "dovecot-openssl-common.h"
@@ -13,9 +15,10 @@
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <arpa/inet.h>
 
-#if !defined(OPENSSL_NO_ECDH) && OPENSSL_VERSION_NUMBER >= 0x10000000L
-#  define HAVE_ECDH
+#ifndef HAVE_EVP_PKEY_get0_DH
+#  define EVP_PKEY_get0_DH(x) ((x)->pkey.dh)
 #endif
 
 struct ssl_iostream_password_context {
@@ -26,6 +29,7 @@ struct ssl_iostream_password_context {
 static bool ssl_global_initialized = FALSE;
 int dovecot_ssl_extdata_index;
 
+#ifdef HAVE_SSL_CTX_set_tmp_rsa_callback
 static RSA *ssl_gen_rsa_key(SSL *ssl ATTR_UNUSED,
 			    int is_export ATTR_UNUSED, int keylength)
 {
@@ -44,7 +48,9 @@ static RSA *ssl_gen_rsa_key(SSL *ssl ATTR_UNUSED,
 		RSA_free(rsa);
 	return NULL;
 }
+#endif
 
+#ifdef HAVE_SSL_CTX_set_tmp_dh_callback
 static DH *ssl_tmp_dh_callback(SSL *ssl,
 			       int is_export ATTR_UNUSED, int keylength ATTR_UNUSED)
 {
@@ -55,6 +61,7 @@ static DH *ssl_tmp_dh_callback(SSL *ssl,
 		"but no DH parameters provided. Set ssl_dh=</path/to/dh.pem");
 	return NULL;
 }
+#endif
 
 static int
 pem_password_callback(char *buf, int size, int rwflag ATTR_UNUSED,
@@ -116,11 +123,11 @@ int openssl_iostream_load_key(const struct ssl_iostream_cert *set,
 
 static
 int openssl_iostream_load_dh(const struct ssl_iostream_settings *set,
-			     DH **dh_r, const char **error_r)
+			     EVP_PKEY **pkey_r, const char **error_r)
 {
-	DH *dh;
 	BIO *bio;
 	char *dhvalue;
+	EVP_PKEY *pkey = NULL;
 
 	dhvalue = t_strdup_noconst(set->dh);
 	bio = BIO_new_mem_buf(dhvalue, strlen(dhvalue));
@@ -131,16 +138,27 @@ int openssl_iostream_load_dh(const struct ssl_iostream_settings *set,
 		return -1;
 	}
 
-	dh = NULL;
+#ifdef HAVE_PEM_read_bio_Parameters
+	if ((pkey = PEM_read_bio_Parameters(bio, &pkey)) == NULL) {
+		*error_r = t_strdup_printf("Couldn't parse DH parameters: %s",
+					   openssl_iostream_error());
+	}
+#else
+	DH *dh = NULL;
 	dh = PEM_read_bio_DHparams(bio, &dh, NULL, NULL);
 
 	if (dh == NULL) {
 		*error_r = t_strdup_printf("Couldn't parse DH parameters: %s",
 					   openssl_iostream_error());
+	} else {
+		pkey = EVP_PKEY_new();
+		EVP_PKEY_set1_DH(pkey, dh);
+		DH_free(dh);
 	}
+#endif
 	BIO_free(bio);
-	*dh_r = dh;
-	return dh == NULL ? -1 : 0;
+	*pkey_r = pkey;
+	return pkey == NULL ? -1 : 0;
 }
 
 static int
@@ -168,20 +186,28 @@ ssl_iostream_ctx_use_dh(struct ssl_iostream_context *ctx,
 			const struct ssl_iostream_settings *set,
 			const char **error_r)
 {
-	DH *dh;
+	EVP_PKEY *pkey_dh;
 	int ret = 0;
 	if (*set->dh == '\0') {
 		return 0;
 	}
-	if (openssl_iostream_load_dh(set, &dh, error_r) < 0)
+	if (openssl_iostream_load_dh(set, &pkey_dh, error_r) < 0)
 		return -1;
-	if (SSL_CTX_set_tmp_dh(ctx->ssl_ctx, dh) == 0) {
+#ifdef HAVE_SSL_CTX_set0_tmp_dh_pkey
+	if (SSL_CTX_set0_tmp_dh_pkey(ctx->ssl_ctx, pkey_dh) == 0)
+#else
+	DH *dh = EVP_PKEY_get0_DH(pkey_dh);
+	if (SSL_CTX_set_tmp_dh(ctx->ssl_ctx, dh) == 0)
+#endif
+	{
 		 *error_r = t_strdup_printf(
 			"Can't load DH parameters (ssl_dh setting): %s",
 			openssl_iostream_key_load_error());
 		ret = -1;
 	}
-	DH_free(dh);
+#ifndef HAVE_SSL_CTX_set0_tmp_dh_pkey
+	EVP_PKEY_free(pkey_dh);
+#endif
 	return ret;
 }
 
@@ -205,9 +231,7 @@ static int ssl_ctx_use_certificate_chain(SSL_CTX *ctx, const char *cert)
 		ret = 0;
 
 	if (ret != 0) {
-#ifdef HAVE_SSL_CTX_SET_CURRENT_CERT
 		SSL_CTX_select_current_cert(ctx, x);
-#endif
 		/* If we could set up our certificate, now proceed to
 		 * the CA certificates.
 		 */
@@ -234,9 +258,7 @@ static int ssl_ctx_use_certificate_chain(SSL_CTX *ctx, const char *cert)
 end:
 	if (x != NULL) X509_free(x);
 	BIO_free(in);
-#ifdef HAVE_SSL_CTX_SET_CURRENT_CERT
 	SSL_CTX_set_current_cert(ctx, SSL_CERT_SET_FIRST);
-#endif
 	return ret;
 }
 
@@ -349,6 +371,169 @@ static int ssl_servername_callback(SSL *ssl, int *al ATTR_UNUSED,
 	return SSL_TLSEXT_ERR_OK;
 }
 
+#ifdef HAVE_SSL_client_hello_get0_ciphers
+
+static const int ssl_ja3_grease[] = {
+	0x0a0a,
+	0x1a1a,
+	0x2a2a,
+	0x3a3a,
+	0x4a4a,
+	0x5a5a,
+	0x6a6a,
+	0x7a7a,
+	0x8a8a,
+	0x9a9a,
+	0xaaaa,
+	0xbaba,
+	0xcaca,
+	0xdada,
+	0xeaea,
+	0xfafa,
+};
+
+static bool
+ssl_ja3_is_ext_greased(int id)
+{
+	for (size_t i = 0; i < N_ELEMENTS(ssl_ja3_grease); ++i)
+		if (id == ssl_ja3_grease[i])
+			return TRUE;
+	return FALSE;
+}
+
+static const int ssl_ja3_nid_list[] = {
+	NID_sect163k1,        /* sect163k1 (1) */
+	NID_sect163r1,        /* sect163r1 (2) */
+	NID_sect163r2,        /* sect163r2 (3) */
+	NID_sect193r1,        /* sect193r1 (4) */
+	NID_sect193r2,        /* sect193r2 (5) */
+	NID_sect233k1,        /* sect233k1 (6) */
+	NID_sect233r1,        /* sect233r1 (7) */
+	NID_sect239k1,        /* sect239k1 (8) */
+	NID_sect283k1,        /* sect283k1 (9) */
+	NID_sect283r1,        /* sect283r1 (10) */
+	NID_sect409k1,        /* sect409k1 (11) */
+	NID_sect409r1,        /* sect409r1 (12) */
+	NID_sect571k1,        /* sect571k1 (13) */
+	NID_sect571r1,        /* sect571r1 (14) */
+	NID_secp160k1,        /* secp160k1 (15) */
+	NID_secp160r1,        /* secp160r1 (16) */
+	NID_secp160r2,        /* secp160r2 (17) */
+	NID_secp192k1,        /* secp192k1 (18) */
+	NID_X9_62_prime192v1, /* secp192r1 (19) */
+	NID_secp224k1,        /* secp224k1 (20) */
+	NID_secp224r1,        /* secp224r1 (21) */
+	NID_secp256k1,        /* secp256k1 (22) */
+	NID_X9_62_prime256v1, /* secp256r1 (23) */
+	NID_secp384r1,        /* secp384r1 (24) */
+	NID_secp521r1,        /* secp521r1 (25) */
+	NID_brainpoolP256r1,  /* brainpoolP256r1 (26) */
+	NID_brainpoolP384r1,  /* brainpoolP384r1 (27) */
+	NID_brainpoolP512r1,  /* brainpool512r1 (28) */
+	NID_X25519,           /* X25519 (29) */
+	NID_X448,             /* X448 (30) */
+};
+
+static int ssl_ja3_nid_to_cid(int nid)
+{
+	for (size_t i = 0; i < N_ELEMENTS(ssl_ja3_nid_list); i++)
+		if (nid == ssl_ja3_nid_list[i])
+			return ((int)i)+1;
+
+	if (nid == NID_ffdhe2048)
+		return 0x100;
+	else if (nid == NID_ffdhe3072)
+		return 0x101;
+	else if (nid == NID_ffdhe4096)
+		return 0x102;
+	else if (nid == NID_ffdhe6144)
+		return 0x103;
+	else if (nid == NID_ffdhe8192)
+	        return 0x104;
+	return nid;
+}
+
+static int ssl_clienthello_callback(SSL *ssl, int *al ATTR_UNUSED,
+				    void *context ATTR_UNUSED)
+{
+	struct ssl_iostream *ssl_io =
+		SSL_get_ex_data(ssl, dovecot_ssl_extdata_index);
+
+	int ver = SSL_version(ssl)-1;
+	const unsigned char *ciphers = NULL;
+	size_t nciphers = 0;
+	string_t *ja3 = str_new(ssl_io->ctx->pool, 64);
+
+	str_printfa(ja3, "%d,", ver);
+	nciphers = SSL_client_hello_get0_ciphers(ssl, &ciphers);
+
+	for (size_t i = 0; i < nciphers; i += 2) {
+		if (i > 0)
+			str_append_c(ja3, '-');
+		uint16_t cipher = be16_to_cpu_unaligned(&ciphers[i]);
+		str_printfa(ja3, "%u", cipher);
+	}
+	str_append_c(ja3, ',');
+
+	int *exts = NULL;
+	size_t nexts = 0;
+	if (SSL_client_hello_get1_extensions_present(ssl, &exts, &nexts) == 1) {
+		bool first = TRUE;
+		for (size_t i = 0; i < nexts; i++) {
+			if (ssl_ja3_is_ext_greased(exts[i]))
+				continue;
+			if (first)
+				first = FALSE;
+			else
+				str_append_c(ja3, '-');
+			str_printfa(ja3, "%d", exts[i]);
+		}
+		OPENSSL_free(exts);
+	}
+	str_append_c(ja3, ',');
+
+	const unsigned char *ext = NULL;
+	size_t extlen;
+
+	/* Process extension 10 - groups */
+	if (SSL_client_hello_get0_ext(ssl, 10, &ext, &extlen) == 1 &&
+	    extlen > 0) {
+		bool first = TRUE;
+		unsigned short veclen = be16_to_cpu_unaligned(ext);
+		if (veclen+2 == extlen) {
+			for (size_t i = 2; i < extlen; i+=2) {
+				uint16_t group = be16_to_cpu_unaligned(&ext[i]);
+				if (ssl_ja3_is_ext_greased(group))
+					continue;
+				if (first)
+					first = FALSE;
+				else
+					str_append_c(ja3, '-');
+				str_printfa(ja3, "%u", ssl_ja3_nid_to_cid(group));
+			}
+		}
+	}
+	str_append_c(ja3, ',');
+
+	/* Process extension 11 - ec point formats */
+	ext = NULL;
+	if (SSL_client_hello_get0_ext(ssl, 11, &ext, &extlen) == 1 &&
+	    extlen > 0 && extlen == ext[0]+1) {
+		for (size_t i = 1; i < extlen; i++) {
+			if (i > 1)
+				str_append_c(ja3, '-');
+			str_printfa(ja3, "%u", ext[i]);
+		}
+	}
+
+	/* Store ja3 string */
+	ssl_io->ja3_str = str_c(ja3);
+
+	return SSL_CLIENT_HELLO_SUCCESS;
+}
+
+#endif
+
 static int
 ssl_iostream_context_load_ca(struct ssl_iostream_context *ctx,
 			     const struct ssl_iostream_settings *set,
@@ -412,7 +597,7 @@ ssl_iostream_context_set(struct ssl_iostream_context *ctx,
 			set->curve_list);
 		return -1;
 	}
-#ifdef HAVE_SSL_CTX_SET_CIPHERSUITES
+#ifdef HAVE_SSL_CTX_set_ciphersuites
 	if (set->ciphersuites != NULL &&
 	    SSL_CTX_set_ciphersuites(ctx->ssl_ctx, set->ciphersuites) == 0) {
 		*error_r = t_strdup_printf("Can't set ciphersuites to '%s': %s",
@@ -434,7 +619,7 @@ ssl_iostream_context_set(struct ssl_iostream_context *ctx,
 					set->min_protocol);
 			return -1;
 		}
-#ifdef HAVE_SSL_CTX_SET_MIN_PROTO_VERSION
+#ifdef HAVE_SSL_CTX_SET_min_proto_version
 		SSL_CTX_set_min_proto_version(ctx->ssl_ctx, min_protocol);
 #else
 		SSL_CTX_set_options(ctx->ssl_ctx, opts);
@@ -465,7 +650,7 @@ ssl_iostream_context_set(struct ssl_iostream_context *ctx,
 			return -1;
 	}
 
-	if (set->dh != NULL) {
+	if (set->dh != NULL && *set->dh != '\0') {
 		if (ssl_iostream_ctx_use_dh(ctx, set, error_r) < 0)
 			return -1;
 	}
@@ -491,72 +676,32 @@ ssl_iostream_context_set(struct ssl_iostream_context *ctx,
 			if (set->verbose)
 				i_debug("OpenSSL library doesn't support SNI");
 		}
-	}
-	return 0;
-}
-
-#if defined(HAVE_ECDH) && !defined(SSL_CTX_set_ecdh_auto)
-static int
-ssl_proxy_ctx_get_pkey_ec_curve_name(const struct ssl_iostream_settings *set,
-				     int *nid_r, const char **error_r)
-{
-	int nid = 0;
-	EVP_PKEY *pkey;
-	EC_KEY *eckey;
-	const EC_GROUP *ecgrp;
-
-	if (set->cert.key != NULL) {
-		if (openssl_iostream_load_key(&set->cert, "ssl_key", &pkey, error_r) < 0)
-			return -1;
-
-		if ((eckey = EVP_PKEY_get1_EC_KEY(pkey)) != NULL &&
-		    (ecgrp = EC_KEY_get0_group(eckey)) != NULL)
-			nid = EC_GROUP_get_curve_name(ecgrp);
-		else {
-			/* clear errors added by the above calls */
-			openssl_iostream_clear_errors();
-		}
-		EVP_PKEY_free(pkey);
-	}
-	if (nid == 0 && set->alt_cert.key != NULL) {
-		if (openssl_iostream_load_key(&set->alt_cert, "ssl_alt_key", &pkey, error_r) < 0)
-			return -1;
-
-		if ((eckey = EVP_PKEY_get1_EC_KEY(pkey)) != NULL &&
-		    (ecgrp = EC_KEY_get0_group(eckey)) != NULL)
-			nid = EC_GROUP_get_curve_name(ecgrp);
-		else {
-			/* clear errors added by the above calls */
-			openssl_iostream_clear_errors();
-		}
-		EVP_PKEY_free(pkey);
-	}
-
-	*nid_r = nid;
-	return 0;
-}
+#ifdef HAVE_SSL_client_hello_get0_ciphers
+		SSL_CTX_set_client_hello_cb(ctx->ssl_ctx, ssl_clienthello_callback, ctx);
 #endif
+	}
+	return 0;
+}
 
 static int
 ssl_proxy_ctx_set_crypto_params(SSL_CTX *ssl_ctx,
-				const struct ssl_iostream_settings *set,
+				const struct ssl_iostream_settings *set ATTR_UNUSED,
 				const char **error_r ATTR_UNUSED)
 {
-#if defined(HAVE_ECDH) && !defined(SSL_CTX_set_ecdh_auto)
-	EC_KEY *ecdh;
-	int nid;
-	const char *curve_name;
-#endif
+#ifdef HAVE_SSL_CTX_set_tmp_rsa_callback
 	if (SSL_CTX_need_tmp_RSA(ssl_ctx) != 0)
 		SSL_CTX_set_tmp_rsa_callback(ssl_ctx, ssl_gen_rsa_key);
+#endif
+#ifdef HAVE_SSL_CTX_set_tmp_dh_callback
 	if (set->dh == NULL || *set->dh == '\0')
 		SSL_CTX_set_tmp_dh_callback(ssl_ctx, ssl_tmp_dh_callback);
-#ifdef HAVE_ECDH
+#endif
+#ifndef OPENSSL_NO_ECDH
 	/* In the non-recommended situation where ECDH cipher suites are being
 	   used instead of ECDHE, do not reuse the same ECDH key pair for
 	   different sessions. This option improves forward secrecy. */
 	SSL_CTX_set_options(ssl_ctx, SSL_OP_SINGLE_ECDH_USE);
-#ifdef SSL_CTX_set_ecdh_auto
+#  ifdef HAVE_SSL_CTX_set_ecdh_auto
 	/* OpenSSL >= 1.0.2 automatically handles ECDH temporary key parameter
 	   selection. The return value of this function changes is changed to
 	   bool in OpenSSL 1.1 and is int in OpenSSL 1.0.2+ */
@@ -564,33 +709,7 @@ ssl_proxy_ctx_set_crypto_params(SSL_CTX *ssl_ctx,
 		/* shouldn't happen */
 		i_unreached();
 	}
-#else
-	/* For OpenSSL < 1.0.2, ECDH temporary key parameter selection must be
-	   performed manually. Attempt to select the same curve as that used
-	   in the server's private EC key file. Otherwise fall back to the
-	   NIST P-384 (secp384r1) curve to be compliant with RFC 6460 when
-	   AES-256 TLS cipher suites are in use. This fall back option does
-	   however make Dovecot non-compliant with RFC 6460 which requires
-	   curve NIST P-256 (prime256v1) be used when AES-128 TLS cipher
-	   suites are in use. At least the non-compliance is in the form of
-	   providing too much security rather than too little. */
-	if (ssl_proxy_ctx_get_pkey_ec_curve_name(set, &nid, error_r) < 0)
-		return -1;
-	ecdh = EC_KEY_new_by_curve_name(nid);
-	if (ecdh == NULL) {
-		/* Fall back option */
-		nid = NID_secp384r1;
-		ecdh = EC_KEY_new_by_curve_name(nid);
-	}
-	if ((curve_name = OBJ_nid2sn(nid)) != NULL && set->verbose) {
-		i_debug("SSL: elliptic curve %s will be used for ECDH and"
-			" ECDHE key exchanges", curve_name);
-	}
-	if (ecdh != NULL) {
-		SSL_CTX_set_tmp_ecdh(ssl_ctx, ecdh);
-		EC_KEY_free(ecdh);
-	}
-#endif
+#  endif
 #endif
 #ifdef SSL_OP_SINGLE_DH_USE
 	/* Improves forward secrecy with DH parameters, especially if the

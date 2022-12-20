@@ -176,15 +176,14 @@ imap_urlauth_fetch_local(struct imap_urlauth_fetch *ufetch, const char *url,
 	struct imap_urlauth_fetch_reply reply;
 	struct imap_msgpart_open_result mpresult;
 	const char *error, *errormsg = NULL, *bpstruct = NULL;
-	bool debug = ufetch->uctx->user->mail_debug, success;
 	enum mail_error error_code;
 	struct imap_msgpart_url *mpurl = NULL;
 	int ret;
 
-	success = TRUE;
+	bool success = TRUE;
+	struct event *event = ufetch->uctx->user->event;
 
-	if (debug)
-		i_debug("Fetching local URLAUTH %s", url);
+	e_debug(event, "Fetching local URLAUTH %s", url);
 
 	if (url_flags == 0)
 		url_flags = IMAP_URLAUTH_FETCH_FLAG_BODY;
@@ -199,10 +198,10 @@ imap_urlauth_fetch_local(struct imap_urlauth_fetch *ufetch, const char *url,
 	}
 	if (ret <= 0) {
 		if (ret == 0) {
-			errormsg = t_strdup_printf("Failed to fetch URLAUTH \"%s\": %s",
-						   url, error);
-			if (debug)
-				i_debug("%s", errormsg);
+			errormsg = t_strdup_printf(
+				"Failed to fetch URLAUTH \"%s\": %s",
+				url, error);
+			e_debug(event, "%s", errormsg);
 		}
 		success = FALSE;
 	}
@@ -215,10 +214,10 @@ imap_urlauth_fetch_local(struct imap_urlauth_fetch *ufetch, const char *url,
 		ret = imap_msgpart_url_get_bodypartstructure(mpurl, &bpstruct, &error);
 		if (ret <= 0) {
 			if (ret == 0) {
-				errormsg = t_strdup_printf
-					("Failed to read URLAUTH \"%s\": %s",	url, error);
-				if (debug)
-					i_debug("%s", errormsg);
+				errormsg = t_strdup_printf(
+					"Failed to read URLAUTH \"%s\": %s",
+					url, error);
+				e_debug(event, "%s", errormsg);
 			}
 			success = FALSE;
 		}
@@ -231,22 +230,25 @@ imap_urlauth_fetch_local(struct imap_urlauth_fetch *ufetch, const char *url,
 		ret = imap_msgpart_url_read_part(mpurl, &mpresult, &error);
 		if (ret <= 0) {
 			if (ret == 0) {
-				errormsg = t_strdup_printf
-					("Failed to read URLAUTH \"%s\": %s",	url, error);
-				if (debug)
-					i_debug("%s", errormsg);
+				errormsg = t_strdup_printf(
+					"Failed to read URLAUTH \"%s\": %s",
+					url, error);
+				e_debug(event, "%s", errormsg);
 			}
 			success = FALSE;
 		}
 	}
 
-	if (debug && success) {
+	if (success) {
 		if (bpstruct != NULL)
-			i_debug("Fetched URLAUTH yielded BODYPARTSTRUCTURE (%s)", bpstruct);
+			e_debug(event,
+				"Fetched URLAUTH yielded BODYPARTSTRUCTURE (%s)",
+			bpstruct);
 		if (mpresult.size == 0 || mpresult.input == NULL)
-			i_debug("Fetched URLAUTH yielded empty result");
+			e_debug(event, "Fetched URLAUTH yielded empty result");
 		else {
-			i_debug("Fetched URLAUTH yielded %"PRIuUOFF_T" bytes "
+			e_debug(event,
+				"Fetched URLAUTH yielded %"PRIuUOFF_T" bytes "
 				"of %smessage data", mpresult.size,
 				(mpresult.binary_decoded_input_has_nuls ? "binary " : ""));
 		}
@@ -333,7 +335,7 @@ imap_urlauth_fetch_request_callback(struct imap_urlauth_fetch_reply *reply,
 		ufetch->waiting_service = TRUE;
 		ufetch->pending_requests++;
 	}
-	
+
 	imap_urlauth_fetch_unref(&ufetch);
 	return ret;
 }
@@ -481,7 +483,7 @@ static bool imap_urlauth_fetch_do_continue(struct imap_urlauth_fetch *ufetch)
 		if (ret < 0) {
 			imap_urlauth_fetch_fail(ufetch);
 			return FALSE;
-		} 
+		}
 
 		if (ret == 0) {
 			ufetch->waiting_service = TRUE;
@@ -505,7 +507,7 @@ static bool imap_urlauth_fetch_do_continue(struct imap_urlauth_fetch *ufetch)
 			       &ufetch->local_urls_tail, url);
 		i_free(url->url);
 		i_free(url);
-		if (ufetch->waiting_local) 
+		if (ufetch->waiting_local)
 			return TRUE;
 		url = url_next;
 	}

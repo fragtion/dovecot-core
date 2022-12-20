@@ -8,7 +8,12 @@
 
 /* <settings checks> */
 static struct file_listener_settings dict_unix_listeners_array[] = {
-	{ "dict", 0660, "", "$default_internal_group" }
+	{
+		.path = "dict",
+		.mode = 0660,
+		.user = "",
+		.group = "$default_internal_group",
+	},
 };
 static struct file_listener_settings *dict_unix_listeners[] = {
 	&dict_unix_listeners_array[0]
@@ -18,7 +23,12 @@ static buffer_t dict_unix_listeners_buf = {
 };
 
 static struct file_listener_settings dict_async_unix_listeners_array[] = {
-	{ "dict-async", 0660, "", "$default_internal_group" }
+	{
+		.path = "dict-async",
+		.mode = 0660,
+		.user = "",
+		.group = "$default_internal_group",
+	},
 };
 static struct file_listener_settings *dict_async_unix_listeners[] = {
 	&dict_async_unix_listeners_array[0]
@@ -112,8 +122,6 @@ struct service_settings dict_expire_service_settings = {
 static const struct setting_define dict_setting_defines[] = {
 	DEF(STR, base_dir),
 	DEF(BOOL, verbose_proctitle),
-
-	DEF(STR, dict_db_config),
 	{ .type = SET_STRLIST, .key = "dict",
 	  .offset = offsetof(struct dict_server_settings, dicts) },
 
@@ -123,8 +131,6 @@ static const struct setting_define dict_setting_defines[] = {
 const struct dict_server_settings dict_default_settings = {
 	.base_dir = PKG_RUNDIR,
 	.verbose_proctitle = FALSE,
-
-	.dict_db_config = "",
 	.dicts = ARRAY_INIT
 };
 

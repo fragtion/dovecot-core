@@ -101,15 +101,9 @@ static void main_preinit(void)
 static void main_init(void)
 {
 	struct module_dir_load_settings mod_set;
-	void **sets;
 
-	sets = master_service_settings_get_others(master_service);
-	dict_settings = sets[0];
-
-	if (*dict_settings->dict_db_config != '\0') {
-		/* for berkeley db library */
-		env_put("DB_CONFIG", dict_settings->dict_db_config);
-	}
+	dict_settings = master_service_settings_get_root_set(master_service,
+				&dict_setting_parser_info);
 
 	i_zero(&mod_set);
 	mod_set.abi_version = DOVECOT_ABI_VERSION;

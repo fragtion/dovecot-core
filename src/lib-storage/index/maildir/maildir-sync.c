@@ -289,6 +289,7 @@ static void maildir_sync_deinit(struct maildir_sync_context *ctx)
 static int maildir_fix_duplicate(struct maildir_sync_context *ctx,
 				 const char *dir, const char *fname2)
 {
+	struct event *event = ctx->mbox->box.event;
 	const char *fname1, *path1, *path2;
 	const char *new_fname;
 	struct stat st1, st2;
@@ -324,14 +325,14 @@ static int maildir_fix_duplicate(struct maildir_sync_context *ctx,
 			   unlink() the other (uidlist lock prevents this from
 			   happening) */
 			if (i_unlink(path2) == 0)
-				i_warning("Unlinked a duplicate: %s", path2);
+				e_warning(event, "Unlinked a duplicate: %s", path2);
 		}
 		return 0;
 	}
 
 	new_fname = maildir_filename_generate();
 	/* preserve S= and W= sizes if they're available.
-	   (S=size is required for zlib plugin to work) */
+	   (S=size is required for mail-compress plugin to work) */
 	if (maildir_filename_get_size(fname2, MAILDIR_EXTRA_FILE_SIZE, &size)) {
 		new_fname = t_strdup_printf("%s,%c=%"PRIuUOFF_T,
 			new_fname, MAILDIR_EXTRA_FILE_SIZE, size);
@@ -342,7 +343,6 @@ static int maildir_fix_duplicate(struct maildir_sync_context *ctx,
 	}
 	return 0;
 }
-
 
 static int
 maildir_stat(struct maildir_mailbox *mbox, const char *path, struct stat *st_r)
@@ -369,6 +369,7 @@ static int
 maildir_scan_dir(struct maildir_sync_context *ctx, bool final,
 		 enum maildir_scan_why why)
 {
+	struct event *event = ctx->mbox->box.event;
 	const char *path;
 	DIR *dirp;
 	struct dirent *dp;
@@ -482,7 +483,8 @@ maildir_scan_dir(struct maildir_sync_context *ctx, bool final,
 	}
 	time_diff = time(NULL) - start_time;
 	if (time_diff >= MAILDIR_SYNC_TIME_WARN_SECS) {
-		i_warning("Maildir: Scanning %s took %u seconds "
+		e_warning(event,
+			  "Scanning %s took %u seconds "
 			  "(%u readdir()s, %u rename()s to cur/, why=0x%x)",
 			  path, time_diff, readdir_count, move_count, why);
 	}

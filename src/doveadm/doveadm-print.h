@@ -11,6 +11,9 @@
 
 enum doveadm_print_header_flags {
 	DOVEADM_PRINT_HEADER_FLAG_RIGHT_JUSTIFY 	= 0x01,
+	/* Sticky headers work only on the doveadm client side. Trying to use
+	   them via doveadm proxy won't work correctly. Practically this
+	   restricts their usage only to the username. */
 	DOVEADM_PRINT_HEADER_FLAG_STICKY	 	= 0x02,
 	DOVEADM_PRINT_HEADER_FLAG_HIDE_TITLE	 	= 0x04,
 	DOVEADM_PRINT_HEADER_FLAG_EXPAND	 	= 0x08,
@@ -38,7 +41,6 @@ void doveadm_print_stream(const void *value, size_t size);
 int doveadm_print_istream(struct istream *input);
 void doveadm_print_sticky(const char *key, const char *value);
 void doveadm_print_flush(void);
-void doveadm_print_unstick_headers(void);
 
 void doveadm_print_init(const char *name);
 void doveadm_print_deinit(void);

@@ -14,9 +14,10 @@
 #include "client.h"
 #include "pop3-proxy.h"
 
-static const char *pop3_proxy_state_names[POP3_PROXY_STATE_COUNT] = {
+static const char *pop3_proxy_state_names[] = {
 	"banner", "starttls", "xclient", "login1", "login2"
 };
+static_assert_array_size(pop3_proxy_state_names, POP3_PROXY_STATE_COUNT);
 
 static int proxy_send_login(struct pop3_client *client, struct ostream *output)
 {
@@ -38,11 +39,14 @@ static int proxy_send_login(struct pop3_client *client, struct ostream *output)
                         }
 		}
 
-		str_printfa(str, "XCLIENT ADDR=%s PORT=%u SESSION=%s TTL=%u",
+		str_printfa(str, "XCLIENT ADDR=%s PORT=%u SESSION=%s TTL=%u "
+			    "CLIENT-TRANSPORT=%s",
 			    net_ip2addr(&client->common.ip),
 			    client->common.remote_port,
 			    client_get_session_id(&client->common),
-			    client->common.proxy_ttl - 1);
+			    client->common.proxy_ttl - 1,
+			    client->common.end_client_tls_secured ?
+			    CLIENT_TRANSPORT_TLS : CLIENT_TRANSPORT_INSECURE);
 		if (str_len(fwd) > 0) {
 			str_append(str, " FORWARD=");
 			base64_encode(str_data(fwd), str_len(fwd), str);

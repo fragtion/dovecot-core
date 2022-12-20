@@ -9,12 +9,12 @@
 #include "execv-const.h"
 #include "str.h"
 #include "strescape.h"
+#include "str-parse.h"
 #include "var-expand.h"
 #include "settings-parser.h"
 
 #include <stdio.h>
 #include <unistd.h>
-#include <ctype.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -42,6 +42,7 @@ struct setting_link {
 
 struct setting_parser_context {
 	pool_t set_pool, parser_pool;
+	int refcount;
         enum settings_parser_flags flags;
 	bool str_vars_are_expanded;
 
@@ -204,6 +205,7 @@ settings_parser_init_list(pool_t set_pool,
 	parser_pool = pool_alloconly_create(MEMPOOL_GROWING"settings parser",
 					    1024);
 	ctx = p_new(parser_pool, struct setting_parser_context, 1);
+	ctx->refcount = 1;
 	ctx->set_pool = set_pool;
 	ctx->parser_pool = parser_pool;
 	ctx->flags = flags;
@@ -235,11 +237,21 @@ settings_parser_init_list(pool_t set_pool,
 	return ctx;
 }
 
-void settings_parser_deinit(struct setting_parser_context **_ctx)
+void settings_parser_ref(struct setting_parser_context *ctx)
+{
+	i_assert(ctx->refcount > 0);
+	ctx->refcount++;
+}
+
+void settings_parser_unref(struct setting_parser_context **_ctx)
 {
 	struct setting_parser_context *ctx = *_ctx;
 
 	*_ctx = NULL;
+
+	i_assert(ctx->refcount > 0);
+	if (--ctx->refcount > 0)
+		return;
 	hash_table_destroy(&ctx->links);
 	pool_unref(&ctx->set_pool);
 	pool_unref(&ctx->parser_pool);
@@ -252,15 +264,21 @@ void *settings_parser_get(struct setting_parser_context *ctx)
 	return ctx->roots[0].set_struct;
 }
 
-void **settings_parser_get_list(const struct setting_parser_context *ctx)
+void *settings_parser_get_root_set(const struct setting_parser_context *ctx,
+				   const struct setting_parser_info *root)
 {
-	unsigned int i;
-	void **sets;
+	for (unsigned int i = 0; i < ctx->root_count; i++) {
+		if (ctx->roots[i].info == root)
+			return ctx->roots[i].set_struct;
+	}
+	i_panic("Couldn't find settings for root %s", root->module_name);
+}
 
-	sets = t_new(void *, ctx->root_count + 1);
-	for (i = 0; i < ctx->root_count; i++)
-		sets[i] = ctx->roots[i].set_struct;
-	return sets;
+void *settings_parser_get_root_set_dup(const struct setting_parser_context *ctx,
+				       const struct setting_parser_info *root,
+				       pool_t pool)
+{
+	return settings_dup(root, settings_parser_get_root_set(ctx, root), pool);
 }
 
 void *settings_parser_get_changes(struct setting_parser_context *ctx)
@@ -299,29 +317,11 @@ setting_define_find(const struct setting_parser_info *info, const char *key)
 	return NULL;
 }
 
-int settings_get_bool(const char *value, bool *result_r,
-		      const char **error_r)
-{
-	/* FIXME: eventually we'd want to support only yes/no */
-	if (strcasecmp(value, "yes") == 0 ||
-	    strcasecmp(value, "y") == 0 || strcmp(value, "1") == 0)
-		*result_r = TRUE;
-	else if (strcasecmp(value, "no") == 0)
-		*result_r = FALSE;
-	else {
-		*error_r = t_strdup_printf("Invalid boolean value: %s (use yes or no)",
-					   value);
-		return -1;
-	}
-
-	return 0;
-}
-
 static int
 get_bool(struct setting_parser_context *ctx, const char *value, bool *result_r)
 {
 	int ret;
-	if ((ret = settings_get_bool(value, result_r, &ctx->error)) < 0)
+	if ((ret = str_parse_get_bool(value, result_r, &ctx->error)) < 0)
 		ctx->error = p_strdup(ctx->parser_pool, ctx->error);
 	return ret;
 }
@@ -354,148 +354,6 @@ get_octal(struct setting_parser_context *ctx, const char *value,
 		return -1;
 	}
 	*result_r = (unsigned int)octal;
-	return 0;
-}
-
-static int settings_get_time_full(const char *str, unsigned int *interval_r,
-				  bool milliseconds, const char **error_r)
-{
-	uintmax_t num, multiply = milliseconds ? 1000 : 1;
-	const char *p;
-
-	if (str_parse_uintmax(str, &num, &p) < 0) {
-		*error_r = t_strconcat("Invalid time interval: ", str, NULL);
-		return -1;
-	}
-	while (*p == ' ') p++;
-	if (*p == '\0' && num != 0) {
-		*error_r = t_strdup_printf("Time interval '%s' is missing units "
-			"(add e.g. 's' for seconds)", str);
-		return -1;
-	}
-	switch (i_toupper(*p)) {
-	case 'S':
-		multiply *= 1;
-		if (str_begins_icase_with("secs", p) ||
-		    str_begins_icase_with("seconds", p))
-			p = "";
-		break;
-	case 'M':
-		multiply *= 60;
-		if (str_begins_icase_with("mins", p) ||
-		    str_begins_icase_with("minutes", p))
-			p = "";
-		else if (str_begins_icase_with("msecs", p) ||
-			 str_begins_icase_with("mseconds", p) ||
-			 str_begins_icase_with("millisecs", p) ||
-			 str_begins_icase_with("milliseconds", p)) {
-			if (milliseconds || (num % 1000) == 0) {
-				if (!milliseconds) {
-					/* allow ms also for seconds, as long
-					   as it's divisible by seconds */
-					num /= 1000;
-				}
-				multiply = 1;
-				p = "";
-				break;
-			}
-			*error_r = t_strdup_printf(
-				"Milliseconds not supported for this setting: %s", str);
-			return -1;
-		}
-		break;
-	case 'H':
-		multiply *= 60*60;
-		if (str_begins_icase_with("hours", p))
-			p = "";
-		break;
-	case 'D':
-		multiply *= 60*60*24;
-		if (str_begins_icase_with("days", p))
-			p = "";
-		break;
-	case 'W':
-		multiply *= 60*60*24*7;
-		if (str_begins_icase_with("weeks", p))
-			p = "";
-		break;
-	}
-
-	if (*p != '\0') {
-		*error_r = t_strconcat("Invalid time interval: ", str, NULL);
-		return -1;
-	}
-	if (num > UINT_MAX / multiply) {
-		*error_r = t_strconcat("Time interval is too large: ",
-				       str, NULL);
-		return -1;
-	}
-	*interval_r = num * multiply;
-	return 0;
-}
-
-int settings_get_time(const char *str, unsigned int *secs_r,
-		      const char **error_r)
-{
-	return settings_get_time_full(str, secs_r, FALSE, error_r);
-}
-
-int settings_get_time_msecs(const char *str, unsigned int *msecs_r,
-			    const char **error_r)
-{
-	return settings_get_time_full(str, msecs_r, TRUE, error_r);
-}
-
-int settings_get_size(const char *str, uoff_t *bytes_r,
-		      const char **error_r)
-{
-	uintmax_t num, multiply = 1;
-	const char *p;
-
-	if (str_parse_uintmax(str, &num, &p) < 0) {
-		*error_r = t_strconcat("Invalid size: ", str, NULL);
-		return -1;
-	}
-	while (*p == ' ') p++;
-	switch (i_toupper(*p)) {
-	case 'B':
-		multiply = 1;
-		p += 1;
-		break;
-	case 'K':
-		multiply = 1024;
-		p += 1;
-		break;
-	case 'M':
-		multiply = 1024*1024;
-		p += 1;
-		break;
-	case 'G':
-		multiply = 1024*1024*1024;
-		p += 1;
-		break;
-	case 'T':
-		multiply = 1024ULL*1024*1024*1024;
-		p += 1;
-		break;
-	}
-
-	if (multiply > 1) {
-		/* Allow: k, ki, kiB */
-		if (i_toupper(*p) == 'I')
-			p++;
-		if (i_toupper(*p) == 'B')
-			p++;
-	}
-	if (*p != '\0') {
-		*error_r = t_strconcat("Invalid size: ", str, NULL);
-		return -1;
-	}
-	if (num > (UOFF_T_MAX) / multiply) {
-		*error_r = t_strconcat("Size is too large: ", str, NULL);
-		return -1;
-	}
-	*bytes_r = num * multiply;
 	return 0;
 }
 
@@ -673,19 +531,19 @@ settings_parse(struct setting_parser_context *ctx, struct setting_link *link,
 			return -1;
 		break;
 	case SET_TIME:
-		if (settings_get_time(value, (unsigned int *)ptr, &error) < 0) {
+		if (str_parse_get_interval(value, (unsigned int *)ptr, &error) < 0) {
 			ctx->error = p_strdup(ctx->parser_pool, error);
 			return -1;
 		}
 		break;
 	case SET_TIME_MSECS:
-		if (settings_get_time_msecs(value, (unsigned int *)ptr, &error) < 0) {
+		if (str_parse_get_interval_msecs(value, (unsigned int *)ptr, &error) < 0) {
 			ctx->error = p_strdup(ctx->parser_pool, error);
 			return -1;
 		}
 		break;
 	case SET_SIZE:
-		if (settings_get_size(value, (uoff_t *)ptr, &error) < 0) {
+		if (str_parse_get_size(value, (uoff_t *)ptr, &error) < 0) {
 			ctx->error = p_strdup(ctx->parser_pool, error);
 			return -1;
 		}
@@ -1174,26 +1032,6 @@ int settings_parse_exec(struct setting_parser_context *ctx,
 	return ret;
 }
 
-static bool
-settings_check_dynamic(const struct setting_parser_info *info, pool_t pool,
-		       void *set, const char **error_r)
-{
-	unsigned int i;
-
-	if (info->dynamic_parsers == NULL)
-		return TRUE;
-
-	for (i = 0; info->dynamic_parsers[i].name != NULL; i++) {
-		struct dynamic_settings_parser *dyn = &info->dynamic_parsers[i];
-
-		if (!settings_check(dyn->info, pool,
-				    PTR_OFFSET(set, dyn->struct_offset),
-				    error_r))
-			return FALSE;
-	}
-	return TRUE;
-}
-
 bool settings_check(const struct setting_parser_info *info, pool_t pool,
 		    void *set, const char **error_r)
 {
@@ -1226,7 +1064,7 @@ bool settings_check(const struct setting_parser_info *info, pool_t pool,
 				return FALSE;
 		}
 	}
-	return settings_check_dynamic(info, pool, set, error_r);
+	return TRUE;
 }
 
 bool settings_parser_check(struct setting_parser_context *ctx, pool_t pool,
@@ -1364,18 +1202,6 @@ settings_var_expand_info(const struct setting_parser_info *info, void *set,
 		if (!info->expand_check_func(set, pool, error_r))
 			return -1;
 	}
-	if (info->dynamic_parsers != NULL) {
-		for (i = 0; info->dynamic_parsers[i].name != NULL; i++) {
-			struct dynamic_settings_parser *dyn = &info->dynamic_parsers[i];
-			const struct setting_parser_info *dinfo = dyn->info;
-			void *dset = PTR_OFFSET(set, dyn->struct_offset);
-
-			if (dinfo->expand_check_func != NULL) {
-				if (!dinfo->expand_check_func(dset, pool, error_r))
-					return -1;
-			}
-		}
-	}
 
 	return final_ret;
 }
@@ -1418,70 +1244,6 @@ void settings_parse_var_skip(struct setting_parser_context *ctx)
 					       NULL, NULL, NULL, NULL, NULL,
 					       &error);
 	}
-}
-
-bool settings_vars_have_key(const struct setting_parser_info *info, void *set,
-			    char var_key, const char *long_var_key,
-			    const char **key_r, const char **value_r)
-{
-	const struct setting_define *def;
-	const void *value;
-	void *const *children;
-	unsigned int i, count;
-
-	for (def = info->defines; def->key != NULL; def++) {
-		value = CONST_PTR_OFFSET(set, def->offset);
-		switch (def->type) {
-		case SET_BOOL:
-		case SET_UINT:
-		case SET_UINT_OCT:
-		case SET_TIME:
-		case SET_TIME_MSECS:
-		case SET_SIZE:
-		case SET_IN_PORT:
-		case SET_STR:
-		case SET_ENUM:
-		case SET_STRLIST:
-		case SET_ALIAS:
-			break;
-		case SET_STR_VARS: {
-			const char *const *val = value;
-
-			if (*val == NULL)
-				break;
-
-			if (**val == SETTING_STRVAR_UNEXPANDED[0]) {
-				if (var_has_key(*val + 1, var_key,
-						long_var_key)) {
-					*key_r = def->key;
-					*value_r = *val + 1;
-					return TRUE;
-				}
-			} else {
-				i_assert(**val == SETTING_STRVAR_EXPANDED[0]);
-			}
-			break;
-		}
-		case SET_DEFLIST:
-		case SET_DEFLIST_UNIQUE: {
-			const ARRAY_TYPE(void_array) *val = value;
-
-			if (!array_is_created(val))
-				break;
-
-			children = array_get(val, &count);
-			for (i = 0; i < count; i++) {
-				if (settings_vars_have_key(def->list_info,
-							   children[i], var_key,
-							   long_var_key,
-							   key_r, value_r))
-					return TRUE;
-			}
-			break;
-		}
-		}
-	}
-	return FALSE;
 }
 
 static void settings_set_parent(const struct setting_parser_info *info,
@@ -1695,175 +1457,6 @@ settings_changes_dup(const struct setting_parser_info *info,
 	return dest_set;
 }
 
-static void
-info_update_real(pool_t pool, struct setting_parser_info *parent,
-		 const struct dynamic_settings_parser *parsers)
-{
-	/* @UNSAFE */
-	ARRAY(struct setting_define) defines;
-	ARRAY_TYPE(dynamic_settings_parser) dynamic_parsers;
-	struct dynamic_settings_parser new_parser;
-	const struct setting_define *cur_defines;
-	struct setting_define *new_defines, new_define;
-	void *parent_defaults;
-	unsigned int i, j;
-	size_t offset, new_struct_size;
-
-	t_array_init(&defines, 128);
-	/* add existing defines */
-	for (j = 0; parent->defines[j].key != NULL; j++)
-		array_push_back(&defines, &parent->defines[j]);
-	new_struct_size = MEM_ALIGN(parent->struct_size);
-
-	/* add new dynamic defines */
-	for (i = 0; parsers[i].name != NULL; i++) {
-		i_assert(parsers[i].info->parent == parent);
-		cur_defines = parsers[i].info->defines;
-		for (j = 0; cur_defines[j].key != NULL; j++) {
-			new_define = cur_defines[j];
-			new_define.offset += new_struct_size;
-			array_push_back(&defines, &new_define);
-		}
-		new_struct_size += MEM_ALIGN(parsers[i].info->struct_size);
-	}
-	new_defines = p_new(pool, struct setting_define,
-			    array_count(&defines) + 1);
-	memcpy(new_defines, array_front(&defines),
-	       sizeof(*parent->defines) * array_count(&defines));
-	parent->defines = new_defines;
-
-	/* update defaults */
-	parent_defaults = p_malloc(pool, new_struct_size);
-	memcpy(parent_defaults, parent->defaults, parent->struct_size);
-	offset = MEM_ALIGN(parent->struct_size);
-	for (i = 0; parsers[i].name != NULL; i++) {
-		memcpy(PTR_OFFSET(parent_defaults, offset),
-		       parsers[i].info->defaults, parsers[i].info->struct_size);
-		offset += MEM_ALIGN(parsers[i].info->struct_size);
-	}
-	parent->defaults = parent_defaults;
-
-	/* update dynamic parsers list */
-	t_array_init(&dynamic_parsers, 32);
-	if (parent->dynamic_parsers != NULL) {
-		for (i = 0; parent->dynamic_parsers[i].name != NULL; i++) {
-			array_push_back(&dynamic_parsers,
-					&parent->dynamic_parsers[i]);
-		}
-	}
-	offset = MEM_ALIGN(parent->struct_size);
-	for (i = 0; parsers[i].name != NULL; i++) {
-		new_parser = parsers[i];
-		new_parser.name = p_strdup(pool, new_parser.name);
-		new_parser.struct_offset = offset;
-		array_push_back(&dynamic_parsers, &new_parser);
-		offset += MEM_ALIGN(parsers[i].info->struct_size);
-	}
-	parent->dynamic_parsers =
-		p_new(pool, struct dynamic_settings_parser,
-		      array_count(&dynamic_parsers) + 1);
-	memcpy(parent->dynamic_parsers, array_front(&dynamic_parsers),
-	       sizeof(*parent->dynamic_parsers) *
-	       array_count(&dynamic_parsers));
-	parent->struct_size = new_struct_size;
-}
-
-void settings_parser_info_update(pool_t pool,
-				 struct setting_parser_info *parent,
-				 const struct dynamic_settings_parser *parsers)
-{
-	if (parsers[0].name != NULL) T_BEGIN {
-		info_update_real(pool, parent, parsers);
-	} T_END;
-}
-
-static void
-settings_parser_update_children_parent(struct setting_parser_info *parent,
-				       pool_t pool)
-{
-	struct setting_define *new_defs;
-	struct setting_parser_info *new_info;
-	unsigned int i, count;
-
-	for (count = 0; parent->defines[count].key != NULL; count++) ;
-
-	new_defs = p_new(pool, struct setting_define, count + 1);
-	memcpy(new_defs, parent->defines, sizeof(*new_defs) * count);
-	parent->defines = new_defs;
-
-	for (i = 0; i < count; i++) {
-		if (new_defs[i].list_info == NULL ||
-		    new_defs[i].list_info->parent == NULL)
-			continue;
-
-		new_info = p_new(pool, struct setting_parser_info, 1);
-		*new_info = *new_defs[i].list_info;
-		new_info->parent = parent;
-		new_defs[i].list_info = new_info;
-	}
-}
-
-void settings_parser_dyn_update(pool_t pool,
-				const struct setting_parser_info *const **_roots,
-				const struct dynamic_settings_parser *dyn_parsers)
-{
-	const struct setting_parser_info *const *roots = *_roots;
-	const struct setting_parser_info *old_parent, **new_roots;
-	struct setting_parser_info *new_parent, *new_info;
-	struct dynamic_settings_parser *new_dyn_parsers;
-	unsigned int i, count;
-
-	/* settings_parser_info_update() modifies the parent structure.
-	   since we may be using the same structure later, we want it to be
-	   in its original state, so we'll have to copy all structures. */
-	old_parent = dyn_parsers[0].info->parent;
-	new_parent = p_new(pool, struct setting_parser_info, 1);
-	*new_parent = *old_parent;
-	settings_parser_update_children_parent(new_parent, pool);
-
-	/* update root */
-	for (count = 0; roots[count] != NULL; count++) ;
-	new_roots = p_new(pool, const struct setting_parser_info *, count + 1);
-	for (i = 0; i < count; i++) {
-		if (roots[i] == old_parent)
-			new_roots[i] = new_parent;
-		else
-			new_roots[i] = roots[i];
-	}
-	*_roots = new_roots;
-
-	/* update parent in dyn_parsers */
-	for (count = 0; dyn_parsers[count].name != NULL; count++) ;
-	new_dyn_parsers = p_new(pool, struct dynamic_settings_parser, count + 1);
-	for (i = 0; i < count; i++) {
-		new_dyn_parsers[i] = dyn_parsers[i];
-
-		new_info = p_new(pool, struct setting_parser_info, 1);
-		*new_info = *dyn_parsers[i].info;
-		new_info->parent = new_parent;
-		new_dyn_parsers[i].info = new_info;
-	}
-
-	settings_parser_info_update(pool, new_parent, new_dyn_parsers);
-}
-
-const void *settings_find_dynamic(const struct setting_parser_info *info,
-				  const void *base_set, const char *name)
-{
-	unsigned int i;
-
-	if (info->dynamic_parsers == NULL)
-		return NULL;
-
-	for (i = 0; info->dynamic_parsers[i].name != NULL; i++) {
-		if (strcmp(info->dynamic_parsers[i].name, name) == 0) {
-			return CONST_PTR_OFFSET(base_set,
-				info->dynamic_parsers[i].struct_offset);
-		}
-	}
-	return NULL;
-}
-
 static struct setting_link *
 settings_link_get_new(struct setting_parser_context *new_ctx,
 		      HASH_TABLE_TYPE(setting_link) links,
@@ -1930,6 +1523,7 @@ settings_parser_dup(const struct setting_parser_context *old_ctx,
 	parser_pool = pool_alloconly_create(MEMPOOL_GROWING"dup settings parser",
 					    1024);
 	new_ctx = p_new(parser_pool, struct setting_parser_context, 1);
+	new_ctx->refcount = 1;
 	new_ctx->set_pool = new_pool;
 	new_ctx->parser_pool = parser_pool;
 	new_ctx->flags = old_ctx->flags;

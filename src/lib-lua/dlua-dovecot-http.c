@@ -10,6 +10,7 @@
 #include "istream.h"
 #include "iostream-ssl.h"
 #include "master-service.h"
+#include "master-service-settings.h"
 #include "master-service-ssl-settings.h"
 
 #define DLUA_DOVECOT_HTTP "http"
@@ -429,8 +430,10 @@ static int parse_client_settings(lua_State *L, struct http_client_settings *set,
 {
 	struct http_url *parsed_url;
 	const char *proxy_url;
-
-	set->dns_client_socket_path = "dns-client";
+	const struct master_service_settings *master_set =
+		master_service_settings_get(master_service);
+	/* need to figure out socket dir */
+	set->dns_client_socket_path = t_strconcat(master_set->base_dir, "/dns-client", NULL);
 	CLIENT_SETTING_STR(user_agent);
 	CLIENT_SETTING_STR(rawlog_dir);
 	CLIENT_SETTING_UINT(max_idle_time_msecs);
@@ -487,7 +490,8 @@ static int dlua_http_client_new(lua_State *L)
 		luaL_error(L, "Invalid HTTP client setting: %s", error);
 
 	const struct master_service_ssl_settings *master_ssl_set =
-		master_service_ssl_settings_get(master_service);
+		master_service_settings_get_root_set(master_service,
+			&master_service_ssl_setting_parser_info);
 	master_service_ssl_client_settings_to_iostream_set(master_ssl_set,
 		pool_datastack_create(), &ssl_set);
 	http_set.ssl = &ssl_set;

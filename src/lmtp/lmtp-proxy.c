@@ -18,6 +18,7 @@
 #include "smtp-dovecot.h"
 #include "auth-proxy.h"
 #include "auth-master.h"
+#include "master-service-settings.h"
 #include "master-service-ssl-settings.h"
 #include "mail-storage-service.h"
 #include "lda-settings.h"
@@ -125,6 +126,12 @@ lmtp_proxy_init(struct client *client,
 					      &lmtp_set.proxy_data);
 	lmtp_set.proxy_data.source_ip = client->remote_ip;
 	lmtp_set.proxy_data.source_port = client->remote_port;
+	bool end_client_tls_secured =
+		client->end_client_tls_secured_set ?
+		client->end_client_tls_secured :
+		smtp_server_connection_is_ssl_secured(client->conn);
+	lmtp_set.proxy_data.client_transport = end_client_tls_secured ?
+		CLIENT_TRANSPORT_TLS : CLIENT_TRANSPORT_INSECURE;
 	/* This initial session_id is used only locally by lib-smtp. Each LMTP
 	   proxy connection gets a more specific updated session_id. */
 	lmtp_set.proxy_data.session = trans->id;
@@ -200,7 +207,8 @@ lmtp_proxy_connection_init_ssl(struct lmtp_proxy_connection *conn,
 		return;
 	}
 
-	master_ssl_set = master_service_ssl_settings_get(master_service);
+	master_ssl_set = master_service_settings_get_root_set(master_service,
+			&master_service_ssl_setting_parser_info);
 	master_service_ssl_client_settings_to_iostream_set(
 		master_ssl_set, pool_datastack_create(), ssl_set_r);
 	if ((conn->set.set.ssl_flags & AUTH_PROXY_SSL_FLAG_ANY_CERT) != 0)
@@ -670,7 +678,6 @@ lmtp_proxy_rcpt_redirect_relookup(struct lmtp_proxy_recipient *lprcpt,
 {
 	struct lmtp_recipient *lrcpt = lprcpt->rcpt;
 	struct smtp_server_recipient *rcpt = lrcpt->rcpt;
-	const struct ip_addr *ip = &set->set.host_ip;
 	in_port_t port = set->set.port;
 	struct auth_master_connection *auth_conn;
 	struct auth_user_info info;
@@ -685,7 +692,7 @@ lmtp_proxy_rcpt_redirect_relookup(struct lmtp_proxy_recipient *lprcpt,
 	lmtp_proxy_rcpt_get_redirect_path(lprcpt, hosts_attempted);
 	const char *const extra_fields[] = {
 		t_strdup_printf("proxy_redirect_host_next=%s:%u",
-				net_ip2addr(ip), port),
+				set->set.host, port),
 		str_c(hosts_attempted),
 		t_strdup_printf("destuser=%s", str_tabescape(destuser)),
 		t_strdup_printf("proxy_timeout=%u", lprcpt->conn->set.set.timeout_msecs),
@@ -734,6 +741,7 @@ lmtp_proxy_rcpt_redirect_relookup(struct lmtp_proxy_recipient *lprcpt,
 	} else {
 		lmtp_proxy_rcpt_redirect_finish(lprcpt, set);
 	}
+	pool_unref(&auth_pool);
 }
 
 static void

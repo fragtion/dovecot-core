@@ -170,7 +170,6 @@ static void
 doveadm_http_server_command_execute(struct client_request_http *req)
 {
 	struct client_connection_http *conn = req->conn;
-	struct doveadm_cmd_context cctx;
 	struct istream *is;
 	const char *user;
 	struct ioloop *ioloop, *prev_ioloop;
@@ -194,47 +193,52 @@ doveadm_http_server_command_execute(struct client_request_http *req)
 	}
 
 	prev_ioloop = current_ioloop;
-	i_zero(&cctx);
-	cctx.pool = pool_alloconly_create("doveadm cmd", 256);
-	cctx.conn_type = conn->conn.type;
-	cctx.input = req->input;
-	cctx.output = req->output;
+
+	struct doveadm_cmd_context *cctx = doveadm_cmd_context_create(
+		conn->conn.type, doveadm_verbose || doveadm_debug);
+
+	cctx->input = req->input;
+	cctx->output = req->output;
 
 	// create iostream
 	doveadm_print_ostream = iostream_temp_create("/tmp/doveadm.", 0);
-	cctx.cmd = req->cmd;
+	cctx->cmd = req->cmd;
 
-	if ((cctx.cmd->flags & CMD_FLAG_NO_PRINT) == 0)
+	if ((cctx->cmd->flags & CMD_FLAG_NO_PRINT) == 0)
 		doveadm_print_init(DOVEADM_PRINT_TYPE_JSON);
 
 	/* then call it */
 	doveadm_cmd_params_null_terminate_arrays(&req->pargv);
-	cctx.argv = array_get(&req->pargv, (unsigned int*)&cctx.argc);
+	cctx->argv = array_get(&req->pargv, (unsigned int*)&cctx->argc);
 	ioloop = io_loop_create();
 	doveadm_exit_code = 0;
 
-	cctx.local_ip = conn->conn.local_ip;
-	cctx.local_port = conn->conn.local_port;
-	cctx.remote_ip = conn->conn.remote_ip;
-	cctx.remote_port = conn->conn.remote_port;
+	cctx->local_ip = conn->conn.local_ip;
+	cctx->local_port = conn->conn.local_port;
+	cctx->remote_ip = conn->conn.remote_ip;
+	cctx->remote_port = conn->conn.remote_port;
 
-	if (doveadm_cmd_param_str(&cctx, "user", &user))
-		i_info("Executing command '%s' as '%s'", cctx.cmd->name, user);
+	client_connection_set_proctitle(&conn->conn, cctx->cmd->name);
+	event_set_append_log_prefix(cctx->event, t_strdup_printf(
+		"cmd %s: ", cctx->cmd->name));
+
+	if (doveadm_cmd_param_str(cctx, "user", &user))
+		e_info(cctx->event, "Executing command as '%s'", user);
 	else
-		i_info("Executing command '%s'", cctx.cmd->name);
-	client_connection_set_proctitle(&conn->conn, cctx.cmd->name);
-	cctx.cmd->cmd(&cctx);
+		e_info(cctx->event, "Executing command");
+	cctx->cmd->cmd(cctx);
+
+	event_drop_parent_log_prefixes(cctx->event, 1);
 	client_connection_set_proctitle(&conn->conn, "");
 
 	o_stream_switch_ioloop_to(req->output, prev_ioloop);
 	io_loop_destroy(&ioloop);
 
-	if ((cctx.cmd->flags & CMD_FLAG_NO_PRINT) == 0)
+	if ((cctx->cmd->flags & CMD_FLAG_NO_PRINT) == 0)
 		doveadm_print_deinit();
 	if (o_stream_finish(doveadm_print_ostream) < 0) {
-		i_info("Error writing output in command %s: %s",
-		       req->cmd->name,
-		       o_stream_get_error(req->output));
+		e_info(cctx->event, "Error writing output in command %s: %s",
+		       req->cmd->name, o_stream_get_error(req->output));
 		doveadm_exit_code = EX_TEMPFAIL;
 	}
 
@@ -245,18 +249,21 @@ doveadm_http_server_command_execute(struct client_request_http *req)
 	else
 		o_stream_nsend_str(req->output,",");
 
-	if (cctx.referral != NULL) {
-		i_error("Command requested referral: %s", cctx.referral);
+	if (cctx->referral != NULL) {
+		e_error(cctx->event,
+			"Command requested referral: %s", cctx->referral);
 		doveadm_http_server_json_error(req, "internalError");
 	} else if (doveadm_exit_code != 0) {
-		if (doveadm_exit_code == 0 || doveadm_exit_code == EX_TEMPFAIL)
-			i_error("Command %s failed", req->cmd->name);
+		if (doveadm_exit_code == 0 || doveadm_exit_code == EX_TEMPFAIL) {
+			e_error(cctx->event,
+				"Command %s failed", req->cmd->name);
+		}
 		doveadm_http_server_json_error(req, "exitCode");
 	} else {
 		doveadm_http_server_json_success(req, is);
 	}
 	i_stream_unref(&is);
-	pool_unref(&cctx.pool);
+	doveadm_cmd_context_unref(&cctx);
 }
 
 static int
@@ -506,7 +513,17 @@ request_json_parse_param_value(struct client_request_http *req)
 	req->cmd_param->value_set = TRUE;
 	switch(req->cmd_param->type) {
 	case CMD_PARAM_BOOL:
-		req->cmd_param->value.v_bool = (strcmp(value, "true") == 0);
+		if (strcmp(value, "true") == 0) {
+			req->cmd_param->value.v_bool = TRUE;
+		} else if (strcmp(value, "false") == 0) {
+			req->cmd_param->value.v_bool = FALSE;
+		} else {
+			http_server_request_fail_text(http_sreq,
+				400, "Bad Request",
+				"Parameter `%s' must be `true' or `false', not `%s'",
+				req->cmd_param->name, value);
+			return -1;
+		}
 		break;
 	case CMD_PARAM_INT64:
 		if (str_to_int64(value, &req->cmd_param->value.v_int64) != 0) {
@@ -578,7 +595,8 @@ request_json_parse_param_istream(struct client_request_http *req)
 	}
 
 	if (v_input->stream_errno != 0) {
-		i_error("read(%s) failed: %s",
+		e_error(req->conn->conn.event,
+			"read(%s) failed: %s",
 			i_stream_get_name(v_input),
 			i_stream_get_error(v_input));
 		req->method_err = 400;
@@ -735,7 +753,8 @@ doveadm_http_server_read_request_v1(struct client_request_http *req)
 	if (req->input->stream_errno != 0) {
 		http_server_request_fail_close(http_sreq,
 			400, "Client disconnected");
-		i_info("read(%s) failed: %s",
+		e_info(req->conn->conn.event,
+			"read(%s) failed: %s",
 		       i_stream_get_name(req->input),
 		       i_stream_get_error(req->input));
 		return;
@@ -901,7 +920,8 @@ static void doveadm_http_server_send_response(struct client_request_http *req)
 
 	if (req->output != NULL) {
 		if (o_stream_finish(req->output) == -1) {
-			i_info("error writing output: %s",
+			e_info(req->conn->conn.event,
+			       "error writing output: %s",
 			       o_stream_get_error(req->output));
 			o_stream_destroy(&req->output);
 			http_server_request_fail(http_sreq,
@@ -948,7 +968,7 @@ doveadm_http_server_request_destroy(struct client_request_http *req)
 		if (agent == NULL) agent = "";
 
 		url = http_url_create(http_req->target.url);
-		i_info("doveadm: %s %s %s \"%s %s "
+		e_info(conn->conn.event, "doveadm: %s %s %s \"%s %s "
 		       "HTTP/%d.%d\" %d %"PRIuUOFF_T" \"%s\" \"%s\"",
 		       net_ip2addr(&conn->conn.remote_ip), "-", "-",
 		       http_req->method, http_req->target.url->path,
@@ -983,7 +1003,8 @@ doveadm_http_server_auth_basic(struct client_request_http *req,
 	char *value;
 
 	if (*set->doveadm_password == '\0') {
-		i_error("Invalid authentication attempt to HTTP API: "
+		e_error(conn->conn.event,
+			"Invalid authentication attempt to HTTP API: "
 			"Basic authentication scheme not enabled");
 		return FALSE;
 	}
@@ -995,7 +1016,8 @@ doveadm_http_server_auth_basic(struct client_request_http *req,
 	if (creds->data != NULL && strcmp(creds->data, str_c(b64_value)) == 0)
 		return TRUE;
 
-	i_error("Invalid authentication attempt to HTTP API "
+	e_error(conn->conn.event,
+		"Invalid authentication attempt to HTTP API "
 		"(using Basic authentication scheme)");
 	return FALSE;
 }
@@ -1009,7 +1031,8 @@ doveadm_http_server_auth_api_key(struct client_request_http *req,
 	string_t *b64_value;
 
 	if (*set->doveadm_api_key == '\0') {
-		i_error("Invalid authentication attempt to HTTP API: "
+		e_error(conn->conn.event,
+			"Invalid authentication attempt to HTTP API: "
 			"X-Dovecot-API authentication scheme not enabled");
 		return FALSE;
 	}
@@ -1020,7 +1043,8 @@ doveadm_http_server_auth_api_key(struct client_request_http *req,
 	if (creds->data != NULL && strcmp(creds->data, str_c(b64_value)) == 0)
 		return TRUE;
 
-	i_error("Invalid authentication attempt to HTTP API "
+	e_error(conn->conn.event,
+		"Invalid authentication attempt to HTTP API "
 		"(using X-Dovecot-API authentication scheme)");
 	return FALSE;
 }
@@ -1036,7 +1060,8 @@ doveadm_http_server_auth_verify(struct client_request_http *req,
 	if (strcasecmp(creds->scheme, "X-Dovecot-API") == 0)
 		return doveadm_http_server_auth_api_key(req, creds);
 
-	i_error("Unsupported authentication scheme to HTTP API: %s",
+	e_error(req->conn->conn.event,
+		"Unsupported authentication scheme to HTTP API: %s",
 		str_sanitize(creds->scheme, 128));
 	return FALSE;
 }
@@ -1054,7 +1079,8 @@ doveadm_http_server_authorize_request(struct client_request_http *req)
 		*conn->conn.set->doveadm_password == '\0') {
 		http_server_request_fail(http_sreq,
 			500, "Internal Server Error");
-		i_error("No authentication defined in configuration. "
+		e_error(conn->conn.event,
+			"No authentication defined in configuration. "
 			"Add API key or password");
 		return FALSE;
 	}
@@ -1183,6 +1209,8 @@ client_connection_http_create(int fd, bool ssl)
 
 	pool = pool_alloconly_create("doveadm client", 1024);
 	conn = p_new(pool, struct client_connection_http, 1);
+	conn->conn.event = event_create(NULL);
+	event_set_append_log_prefix(conn->conn.event, "http: ");
 
 	if (client_connection_init(&conn->conn,
 		DOVEADM_CONNECTION_TYPE_HTTP, pool, fd) < 0) {

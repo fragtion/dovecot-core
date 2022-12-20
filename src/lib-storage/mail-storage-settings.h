@@ -4,13 +4,12 @@
 #include "file-lock.h"
 #include "fsync-mode.h"
 
-#define MAIL_STORAGE_SET_DRIVER_NAME "MAIL"
-
 struct mail_user;
 struct mail_namespace;
 struct mail_storage;
 struct message_address;
 struct smtp_address;
+struct setting_parser_context;
 
 struct mail_storage_settings {
 	const char *mail_location;
@@ -28,6 +27,8 @@ struct mail_storage_settings {
 	unsigned int mail_cache_min_mail_count;
 	unsigned int mail_cache_unaccessed_field_drop;
 	uoff_t mail_cache_record_max_size;
+	unsigned int mail_cache_max_header_name_length;
+	unsigned int mail_cache_max_headers_count;
 	uoff_t mail_cache_max_size;
 	uoff_t mail_cache_purge_min_size;
 	unsigned int mail_cache_purge_delete_percentage;
@@ -68,6 +69,7 @@ struct mail_storage_settings {
 
 	enum file_lock_method parsed_lock_method;
 	enum fsync_mode parsed_fsync_mode;
+	const char *unexpanded_mail_location;
 
 	const char *const *parsed_mail_attachment_content_type_filter;
 	bool parsed_mail_attachment_exclude_inlined;
@@ -93,6 +95,7 @@ struct mail_namespace_settings {
 
 	ARRAY(struct mailbox_settings *) mailboxes;
 	struct mail_user_settings *user_set;
+	const char *unexpanded_location;
 };
 
 /* <settings checks> */
@@ -151,19 +154,8 @@ extern const struct mailbox_settings mailbox_default_settings;
 
 struct ssl_iostream_settings;
 
-const void *
-mail_user_set_get_driver_settings(const struct setting_parser_info *info,
-				  const struct mail_user_settings *set,
-				  const char *driver);
-
 const struct mail_storage_settings *
 mail_user_set_get_storage_set(struct mail_user *user);
-/* Get storage-specific settings, which may be namespace-specific. */
-const void *mail_namespace_get_driver_settings(struct mail_namespace *ns,
-					       struct mail_storage *storage);
-
-const struct dynamic_settings_parser *
-mail_storage_get_dynamic_parsers(pool_t pool);
 
 bool mail_user_set_get_postmaster_address(const struct mail_user_settings *set,
 					  const struct message_address **address_r,

@@ -1,6 +1,6 @@
 extra_dist_extra =
 
-SUBDIRS = man example-config
+SUBDIRS = . example-config
 DOCDIRS = example-config
 
 docfiles = \
@@ -11,61 +11,47 @@ docfiles = \
 	solr-schema-7.7.0.xml \
 	solr-config-7.7.0.xml
 
+DOCS_URL=https://doc.dovecot.org/assets/3.0/docs.txz
+MAN_URL=https://doc.dovecot.org/assets/3.0/man.txz
+
+AM_V_Q = $(am__v_Q_$(V))
+am__v_Q_ = $(am__v_Q_$(AM_DEFAULT_VERBOSITY))
+am__v_Q_0 = -q
+am__v_Q_1 =
+
 if INSTALL_DOCS
-if HAVE_VENV
+SUBDIRS += man
+DOCDIRS += html
+endif
+
 extra_dist_extra += html
-documentation_sources = documentation-main
 
-# extracting the documentation tarball from github yields the
-# "documentation-main" directory
-$(documentation_sources)/requirements.txt:
-	$(AM_V_GEN)wget -O - \
-		https://github.com/dovecot/documentation/archive/refs/heads/main.tar.gz | \
-	  gunzip | $(am__untar)
+html-dl:
+	$(AM_V_at)$(WGET) -nv -O- $(DOCS_URL) | xz -d | $(am__untar)
 
-venv: $(documentation_sources)/requirements.txt
-	$(AM_V_GEN)$(PYTHON) -m venv venv && \
-		venv/bin/pip install -r "$(documentation_sources)/requirements.txt"
+man-dl:
+	$(AM_V_at)$(WGET) -nv -O- $(MAN_URL) | xz -d | $(am__untar)
 
-html: venv
-	$(AM_V_GEN)venv/bin/python -msphinx -b html $(documentation_sources)/source html
+all-local: html
 
-else # if HAVE_VENV
-
-html:
-	if [ ! -e html/index.html ]; then echo "Building html documentation needs python installed"; fi
-
-endif # if HAVE_VENV
-
-# hack to build pages only if they're missing
-all-local:
-	if [ ! -e html/index.html ]; then $(MAKE) html; fi
-
-# explicit hook for make dist
-# remove all the build artifacts before packaging
-dist-hook: html
-	-rm -rf $(distdir)/html/.buildinfo
-	-rm -rf $(distdir)/html/.doctrees
-	-rm -rf $(distdir)/html/_sources
-	-rm -rf $(distdir)/html/objects.inv
+html-local:
+	$(AM_V_at)if [ ! -e html/index.html ]; then \
+		$(MAKE) html-dl; \
+	fi
+	$(AM_V_at)if [ ! -e man/dovecot.1 ]; then \
+		$(MAKE) man-dl; \
+	fi
 
 install-data-local:
-	if [ ! -e html/index.html ]; then $(MAKE) html; fi
-	cp -nrf html "$(DESTDIR)$(docdir)"
+	$(MKDIR_P) $(DESTDIR)$(docdir); \
+	for dir in $(DOCDIRS); do \
+	  cp -nrf $$dir $(DESTDIR)$(docdir); \
+	done
 
 uninstall-local:
-	-rm -rf "$(DESTDIR)$(docdir)/html"
-
-clean-local:
-	-rm -rf venv
-	-rm -rf $(documentation_sources)
-
-distclean-local: clean-local
-	-rm -rf html
-
-maintainer-clean: distclean-local
-
-endif # if INSTALL_DOCS
+	-for dir in $(DOCDIRS); do \
+	  rm -rf $(DESTDIR)$(docdir)/$$dir; \
+	done
 
 doc_DATA = $(docfiles)
 

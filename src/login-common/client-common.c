@@ -1,10 +1,12 @@
 /* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
 
 #include "login-common.h"
+#include "hex-binary.h"
 #include "array.h"
 #include "hostpid.h"
 #include "llist.h"
 #include "istream.h"
+#include "md5.h"
 #include "ostream.h"
 #include "iostream.h"
 #include "iostream-ssl.h"
@@ -214,17 +216,38 @@ client_alloc(int fd, pool_t pool,
 	event_add_str(client->event, "service", login_binary->protocol);
 	event_set_log_message_callback(client->event, client_log_msg_callback,
 				       client);
-	client->trusted = client_is_trusted(client);
+	client->connection_trusted = client_is_trusted(client);
 
-	if (conn->proxied) {
-		client->proxied_ssl = conn->proxy.ssl;
-		client->secured = conn->proxy.ssl || client->trusted;
-		client->ssl_secured = conn->proxy.ssl;
-		client->local_name = conn->proxy.hostname;
-		client->client_cert_common_name = conn->proxy.cert_common_name;
-	} else {
-		client->secured = client->trusted ||
-			net_ip_compare(&conn->real_remote_ip, &conn->real_local_ip);
+	if (conn->haproxied) {
+		/* haproxy connections are always coming from
+		   haproxy_trusted_networks, so we consider them secured.
+		   However, ssl=required implies that the client connection is
+		   expected to be secured either via TLS or because the client
+		   is coming from localhost.  */
+		client->connection_secured = conn->haproxy.ssl ||
+			net_ip_compare(&conn->remote_ip, &conn->local_ip) ||
+			strcmp(client->ssl_set->ssl, "required") != 0;
+		/* Assume that the connection is also TLS secured if client
+		   terminated TLS connections on haproxy. If haproxy isn't
+		   running on localhost, the haproxy-Dovecot connection isn't
+		   TLS secured. However, that's most likely an intentional
+		   configuration and we should just consider the connection
+		   TLS secured anyway. */
+		client->connection_tls_secured = conn->haproxy.ssl;
+		client->haproxy_terminated_tls = conn->haproxy.ssl;
+		/* Start by assuming this is the end client connection.
+		   Later on this can be overwritten. */
+		client->end_client_tls_secured = conn->haproxy.ssl;
+		client->local_name = conn->haproxy.hostname;
+		client->client_cert_common_name = conn->haproxy.cert_common_name;
+	} else if (net_ip_compare(&conn->real_remote_ip, &conn->real_local_ip)) {
+		/* localhost connections are always secured */
+		client->connection_secured = TRUE;
+	} else if (client->connection_trusted &&
+		   strcmp(client->ssl_set->ssl, "required") != 0) {
+		/* Connections from login_trusted_networks are assumed to be
+		   secured, except if ssl=required. */
+		client->connection_secured = TRUE;
 	}
 	client->proxy_ttl = LOGIN_PROXY_TTL;
 
@@ -423,6 +446,7 @@ bool client_unref(struct client **_client)
 		o_stream_unref(&client->output);
 		pool_unref(&client->preproxy_pool);
 		event_unref(&client->event);
+		event_unref(&client->event_auth);
 		pool_unref(&client->pool);
 		return FALSE;
 	}
@@ -449,6 +473,7 @@ bool client_unref(struct client **_client)
 	o_stream_unref(&client->output);
 	i_close_fd(&client->fd);
 	event_unref(&client->event);
+	event_unref(&client->event_auth);
 
 	i_free(client->proxy_user);
 	i_free(client->proxy_master_user);
@@ -587,11 +612,12 @@ int client_init_ssl(struct client *client)
 	ssl_iostream_set_sni_callback(client->ssl_iostream,
 				      client_sni_callback, client);
 
-	client->tls = TRUE;
-	client->secured = TRUE;
-	client->ssl_secured = TRUE;
+	client->connection_tls_secured = TRUE;
+	client->connection_secured = TRUE;
+	if (!client->end_client_tls_secured_set)
+		client->end_client_tls_secured = TRUE;
 
-	if (client->starttls) {
+	if (client->connection_used_starttls) {
 		io_remove(&client->io);
 		if (!client_does_custom_io(client)) {
 			client->io = io_add_istream(client->input,
@@ -603,7 +629,7 @@ int client_init_ssl(struct client *client)
 
 static void client_start_tls(struct client *client)
 {
-	client->starttls = TRUE;
+	client->connection_used_starttls = TRUE;
 	if (client_init_ssl(client) < 0) {
 		client_notify_disconnect(client,
 			CLIENT_DISCONNECT_INTERNAL_ERROR,
@@ -634,7 +660,7 @@ static int client_output_starttls(struct client *client)
 
 void client_cmd_starttls(struct client *client)
 {
-	if (client->tls) {
+	if (client->connection_tls_secured) {
 		client->v.notify_starttls(client, FALSE, "TLS is already active.");
 		return;
 	}
@@ -679,7 +705,7 @@ int client_get_plaintext_fd(struct client *client, int *fd_r, bool *close_fd_r)
 {
 	int fds[2];
 
-	if (!client->tls) {
+	if (client->ssl_iostream == NULL) {
 		/* Plaintext connection - We can send the fd directly to
 		   the post-login process without any proxying. */
 		*fd_r = client->fd;
@@ -798,7 +824,7 @@ const char *client_get_session_id(struct client *client)
 
 /* increment index if new proper login variables are added
  * make sure the aliases stay in the current order */
-#define VAR_EXPAND_ALIAS_INDEX_START 27
+#define VAR_EXPAND_ALIAS_INDEX_START 28
 
 static struct var_expand_table login_var_expand_empty_tab[] = {
 	{ 'u', NULL, "user" },
@@ -829,6 +855,7 @@ static struct var_expand_table login_var_expand_empty_tab[] = {
 	{ '\0', NULL, "auth_domain" },
 	{ '\0', NULL, "listener" },
 	{ '\0', NULL, "local_name" },
+	{ '\0', NULL, "ssl_ja3" },
 
 	/* aliases: */
 	{ '\0', NULL, "local_ip" },
@@ -885,12 +912,12 @@ get_var_expand_table(struct client *client)
 		dec2str(client->local_port);
 	tab[VAR_EXPAND_ALIAS_INDEX_START + 3].value = tab[10].value =
 		dec2str(client->remote_port);
-	if (!client->tls) {
-		tab[11].value = client->secured ? "secured" : NULL;
-		tab[12].value = "";
-	} else if (client->proxied_ssl) {
+	if (client->haproxy_terminated_tls) {
 		tab[11].value = "TLS";
 		tab[12].value = "(proxied)";
+	} else if (!client->connection_tls_secured) {
+		tab[11].value = client->connection_secured ? "secured" : NULL;
+		tab[12].value = "";
 	} else if (client->ssl_iostream != NULL) {
 		const char *ssl_state =
 			ssl_iostream_is_handshaked(client->ssl_iostream) ?
@@ -902,6 +929,8 @@ get_var_expand_table(struct client *client)
 			t_strdup_printf("%s: %s", ssl_state, ssl_error);
 		tab[12].value =
 			ssl_iostream_get_security_string(client->ssl_iostream);
+		tab[27].value =
+			ssl_iostream_get_ja3(client->ssl_iostream);
 	} else {
 		tab[11].value = "TLS";
 		tab[12].value = "";
@@ -978,11 +1007,35 @@ client_var_expand_func_passdb(const char *data, void *context,
 	return 1;
 }
 
+static int client_var_expand_func_ssl_ja3_hash(const char *data ATTR_UNUSED,
+					       void *context,
+					       const char **value_r,
+					       const char **error_r ATTR_UNUSED)
+{
+	struct client *client = context;
+
+	if (client->ssl_iostream == NULL) {
+		*value_r = NULL;
+		return 1;
+	}
+
+	unsigned char hash[MD5_RESULTLEN];
+	const char *ja3 = ssl_iostream_get_ja3(client->ssl_iostream);
+	if (ja3 == NULL) {
+		*value_r = NULL;
+	} else {
+		md5_get_digest(ja3, strlen(ja3), hash);
+		*value_r = binary_to_hex(hash, sizeof(hash));
+	}
+	return 1;
+}
+
 static const char *
 client_get_log_str(struct client *client, const char *msg)
 {
 	static const struct var_expand_func_table func_table[] = {
 		{ "passdb", client_var_expand_func_passdb },
+		{ "ssl_ja3_hash", client_var_expand_func_ssl_ja3_hash },
 		{ NULL, NULL }
 	};
 	static bool expand_error_logged = FALSE;
@@ -1128,7 +1181,7 @@ const char *client_get_extra_disconnect_reason(struct client *client)
 	case CLIENT_AUTH_FAIL_CODE_MECH_INVALID:
 		return "(tried to use unsupported auth mechanism)";
 	case CLIENT_AUTH_FAIL_CODE_MECH_SSL_REQUIRED:
-		return "(tried to use disallowed plaintext auth)";
+		return "(tried to use disallowed cleartext auth)";
 	default:
 		break;
 	}

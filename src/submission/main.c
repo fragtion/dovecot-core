@@ -47,6 +47,10 @@ static struct login_server *login_server = NULL;
 submission_client_created_func_t *hook_client_created = NULL;
 bool submission_debug = FALSE;
 
+struct event_category event_category_submission = {
+	.name = "submission",
+};
+
 submission_client_created_func_t *
 submission_client_created_hook_set(submission_client_created_func_t *new_hook)
 {
@@ -99,8 +103,8 @@ static void submission_die(void)
 }
 
 static void
-send_error(int fd_out, const char *hostname, const char *error_code,
-	   const char *error_msg)
+send_error(int fd_out, struct event *event, const char *hostname,
+	   const char *error_code, const char *error_msg)
 {
 	const char *msg;
 
@@ -109,7 +113,7 @@ send_error(int fd_out, const char *hostname, const char *error_code,
 		error_code, error_msg, hostname);
 	if (write(fd_out, msg, strlen(msg)) < 0) {
 		if (errno != EAGAIN && errno != EPIPE && errno != ECONNRESET)
-			i_error("write(client) failed: %m");
+			e_error(event, "write(client) failed: %m");
 	}
 }
 
@@ -145,48 +149,62 @@ client_create_from_input(const struct mail_storage_service_input *input,
 			 int fd_in, int fd_out, const buffer_t *input_buf,
 			 const char **error_r)
 {
+	struct mail_storage_service_input service_input;
 	struct mail_storage_service_user *user;
 	struct mail_user *mail_user;
 	struct submission_settings *set;
 	bool no_greeting = HAS_ALL_BITS(login_flags,
 					LOGIN_REQUEST_FLAG_IMPLICIT);
-	const char *errstr;
+	struct event *event;
 	const char *helo = NULL;
 	struct smtp_proxy_data proxy_data;
 	const unsigned char *data;
 	size_t data_len;
 
-	if (mail_storage_service_lookup_next(storage_service, input,
+	event = event_create(NULL);
+	event_add_category(event, &event_category_submission);
+	event_add_fields(event, (const struct event_add_field []){
+		{ .key = "user", .value = input->username },
+		{ .key = NULL }
+	});
+	if (input->local_ip.family != 0)
+		event_add_str(event, "local_ip", net_ip2addr(&input->local_ip));
+	if (input->local_port != 0)
+		event_add_int(event, "local_port", input->local_port);
+	if (input->remote_ip.family != 0)
+		event_add_str(event, "remote_ip", net_ip2addr(&input->remote_ip));
+	if (input->remote_port != 0)
+		event_add_int(event, "remote_port", input->remote_port);
+
+	service_input = *input;
+	service_input.event_parent = event;
+	if (mail_storage_service_lookup_next(storage_service, &service_input,
 					     &user, &mail_user, error_r) <= 0) {
-		send_error(fd_out, my_hostname,
+		send_error(fd_out, event, my_hostname,
 			"4.7.0", MAIL_ERRSTR_CRITICAL_MSG);
+		event_unref(&event);
 		return -1;
 	}
+	/* Add the session only after creating the user, because
+	   input->session_id may be NULL */
+	event_add_str(event, "session", mail_user->session_id);
+
 	restrict_access_allow_coredumps(TRUE);
 
-	set = mail_storage_service_user_get_set(user)[1];
+	set = settings_parser_get_root_set(mail_user->set_parser,
+			&submission_setting_parser_info);
 	if (set->verbose_proctitle)
 		verbose_proctitle = TRUE;
-
-	if (settings_var_expand(&submission_setting_parser_info, set,
-				mail_user->pool, mail_user_var_expand_table(mail_user),
-				&errstr) <= 0) {
-		*error_r = t_strdup_printf("Failed to expand settings: %s", errstr);
-		send_error(fd_out, set->hostname,
-			"4.3.5", MAIL_ERRSTR_CRITICAL_MSG);
-		mail_user_deinit(&mail_user);
-		mail_storage_service_user_unref(&user);
-		return -1;
-	}
 
 	if (set->submission_relay_host == NULL ||
 		*set->submission_relay_host == '\0') {
 		*error_r = "No relay host configured for submission proxy "
 			"(submission_relay_host is unset)";
-		send_error(fd_out, set->hostname,
-			"4.3.5", MAIL_ERRSTR_CRITICAL_MSG);
+		send_error(fd_out, event, set->hostname,
+			   "4.3.5", MAIL_ERRSTR_CRITICAL_MSG);
 		mail_user_deinit(&mail_user);
 		mail_storage_service_user_unref(&user);
+		event_unref(&event);
 		return -1;
 	}
 
@@ -209,9 +227,10 @@ client_create_from_input(const struct mail_storage_service_input *input,
 		 */
 	}
 
-	(void)client_create(fd_in, fd_out, mail_user,
+	(void)client_create(fd_in, fd_out, event, mail_user,
 			    user, set, helo, &proxy_data, data, data_len,
 			    no_greeting);
+	event_unref(&event);
 	return 0;
 }
 
@@ -260,10 +279,8 @@ login_request_finished(const struct login_server_request *request,
 	input.username = username;
 	input.userdb_fields = extra_fields;
 	input.session_id = request->session_id;
-	if ((flags & LOGIN_REQUEST_FLAG_CONN_SECURED) != 0)
-		input.conn_secured = TRUE;
-	if ((flags & LOGIN_REQUEST_FLAG_CONN_SSL_SECURED) != 0)
-		input.conn_ssl_secured = TRUE;
+	if ((flags & LOGIN_REQUEST_FLAG_END_CLIENT_SECURED_TLS) != 0)
+		input.end_client_tls_secured = TRUE;
 
 	buffer_create_from_const_data(&input_buf, request->data,
 				      request->auth_req.data_size);
