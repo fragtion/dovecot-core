@@ -13,6 +13,9 @@
 #  include <sys/utsname.h>
 #endif
 
+/* Limit the allowed characters that an IMAP ID parameter might have. */
+#define IMAP_ID_KEY_ACCEPT_CHARS "abcdefghijklmnopqrstuvwxyz0123456789_-"
+
 static struct utsname utsname_result;
 static bool utsname_set = FALSE;
 
@@ -118,52 +121,26 @@ const char *imap_id_reply_generate(const char *settings)
 	return ret;
 }
 
-void imap_id_log_reply_append(string_t *reply, const char *key,
-			      const char *value)
+void
+imap_id_add_log_entry(struct imap_id_log_entry *log_entry, const char *key,
+		      const char *value)
 {
-	if (str_len(reply) > 0)
-		str_append(reply, ", ");
-	str_append(reply, str_sanitize(key, IMAP_ID_KEY_MAX_LEN));
-	str_append_c(reply, '=');
-	str_append(reply, value == NULL ? "NIL" : str_sanitize(value, 80));
-}
+	if (str_len(log_entry->reply) > 0)
+		str_append(log_entry->reply, ", ");
+	str_append(log_entry->reply, key);
+	str_append_c(log_entry->reply, '=');
+	str_append(log_entry->reply, value == NULL ? "NIL" : value);
 
-const char *imap_id_args_get_log_reply(const struct imap_arg *args,
-				       const char *settings)
-{
-	const char *const *keys, *key, *value;
-	string_t *reply;
-	bool log_all;
-
-	if (settings == NULL || *settings == '\0')
-		return NULL;
-	if (!imap_arg_get_list(args, &args))
-		return NULL;
-
-	log_all = strcmp(settings, "*") == 0;
-	reply = t_str_new(256);
-	keys = t_strsplit_spaces(settings, " ");
-	while (!IMAP_ARG_IS_EOL(&args[0]) &&
-	       !IMAP_ARG_IS_EOL(&args[1])) {
-		if (!imap_arg_get_string(args, &key)) {
-			/* broken input */
-			args += 2;
-			continue;
-		}
-		args++;
-		if (strlen(key) > 30) {
-			/* broken: ID spec requires fields to be max. 30
-			   octets */
-			args++;
-			continue;
-		}
-
-		if (log_all || str_array_icase_find(keys, key)) {
-			if (!imap_arg_get_nstring(args, &value))
-				value = "";
-			imap_id_log_reply_append(reply, key, value);
-		}
-		args++;
+	const char *l_key = t_str_lcase(key);
+	const char *prefixed_key;
+	const char *val_str = value == NULL ? "NIL" : value;
+	if (strspn(l_key, IMAP_ID_KEY_ACCEPT_CHARS) == strlen(l_key)) {
+		prefixed_key = t_strconcat("id_param_", l_key, NULL);
+		event_add_str(log_entry->event, prefixed_key, val_str);
+	} else {
+		prefixed_key = t_strdup_printf("id_invalid%u",
+					       ++log_entry->invalid_key_id_counter);
+		const char *key_val = t_strconcat(key, " ", val_str, NULL);
+		event_add_str(log_entry->event, prefixed_key, key_val);
 	}
-	return str_len(reply) == 0 ? NULL : str_c(reply);
 }

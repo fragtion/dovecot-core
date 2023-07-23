@@ -12,6 +12,7 @@
 #include <ctype.h>
 
 #include "lib.h"
+#include "strescape.h"
 #include "str-parse.h"
 #include "wildcard-match.h"
 #include "lib-event-private.h"
@@ -56,20 +57,22 @@ static struct event_filter_node *key_value(struct event_filter_parser_state *sta
 	node = p_new(state->pool, struct event_filter_node, 1);
 	node->type = type;
 	node->op = op;
-	node->warned_type_mismatch = FALSE;
-	node->ambiguous_unit = FALSE;
 
 	switch (type) {
 	case EVENT_FILTER_NODE_TYPE_LOGIC:
 		i_unreached();
-	case EVENT_FILTER_NODE_TYPE_EVENT_NAME_WILDCARD:
-		node->str = p_strdup(state->pool, b);
-		if (wildcard_is_literal(node->str))
+	case EVENT_FILTER_NODE_TYPE_EVENT_NAME_WILDCARD: {
+		if (wildcard_is_escaped_literal(b)) {
 			node->type = EVENT_FILTER_NODE_TYPE_EVENT_NAME_EXACT;
+			node->str = str_unescape(p_strdup(state->pool, b));
+		} else {
+			node->str = p_strdup(state->pool, b);
+		}
 		break;
+	}
 	case EVENT_FILTER_NODE_TYPE_EVENT_SOURCE_LOCATION: {
 		const char *colon = strrchr(b, ':');
-		const char *file;
+		char *file;
 		uintmax_t line;
 
 		/* split "filename:line-number", but also handle "filename" */
@@ -85,19 +88,20 @@ static struct event_filter_node *key_value(struct event_filter_parser_state *sta
 			line = 0;
 		}
 
-		node->str = file;
+		node->str = str_unescape(file);
 		node->intmax = line;
 		break;
 	}
 	case EVENT_FILTER_NODE_TYPE_EVENT_CATEGORY:
 		if (!event_filter_category_to_log_type(b, &node->category.log_type)) {
-			node->category.name = p_strdup(state->pool, b);
+			node->category.name = str_unescape(p_strdup(state->pool, b));
 			node->category.ptr = event_category_find_registered(b);
 		}
 		break;
-	case EVENT_FILTER_NODE_TYPE_EVENT_FIELD_WILDCARD:
+	case EVENT_FILTER_NODE_TYPE_EVENT_FIELD_WILDCARD: {
+		char *b_duped = p_strdup(state->pool, b);
 		node->field.key = p_strdup(state->pool, a);
-		node->field.value.str = p_strdup(state->pool, b);
+		node->field.value.str = b_duped;
 		node->field.value_type = EVENT_FIELD_VALUE_TYPE_STR;
 
 		/* Filter currently supports only comparing strings
@@ -105,6 +109,11 @@ static struct event_filter_node *key_value(struct event_filter_parser_state *sta
 		if (str_to_intmax(b, &node->field.value.intmax) == 0) {
 			/* Leave a hint that this is in fact a valid number. */
 			node->field.value_type = EVENT_FIELD_VALUE_TYPE_INTMAX;
+			node->type = EVENT_FILTER_NODE_TYPE_EVENT_FIELD_EXACT;
+		} else if (net_parse_range(b, &node->field.value.ip,
+					   &node->field.value.ip_bits) == 0) {
+			/* Leave a hint that this is in fact a valid IP. */
+			node->field.value_type = EVENT_FIELD_VALUE_TYPE_IP;
 			node->type = EVENT_FILTER_NODE_TYPE_EVENT_FIELD_EXACT;
 		} else {
 			/* This field contains no valid number.
@@ -144,13 +153,16 @@ static struct event_filter_node *key_value(struct event_filter_parser_state *sta
 				break;
 			}
 
-			if (wildcard_is_literal(node->field.value.str))
+			if (wildcard_is_escaped_literal(b)) {
 				node->type = EVENT_FILTER_NODE_TYPE_EVENT_FIELD_EXACT;
-			else if (strspn(b, "0123456789*?") == strlen(b))
+				str_unescape(b_duped);
+			} else if (strspn(b, "0123456789*?") == strlen(b)) {
 				node->type = EVENT_FILTER_NODE_TYPE_EVENT_FIELD_NUMERIC_WILDCARD;
+			}
 		}
 
 		break;
+	}
 	case EVENT_FILTER_NODE_TYPE_EVENT_NAME_EXACT:
 	case EVENT_FILTER_NODE_TYPE_EVENT_FIELD_EXACT:
 	case EVENT_FILTER_NODE_TYPE_EVENT_FIELD_NUMERIC_WILDCARD:
@@ -215,13 +227,15 @@ key_value : key op value	{
 					$$ = key_value(state, $1, $3, $2);
 					if ($$ == NULL) {
 						yyerror(state, state->error);
+						/* avoid compiler warning about yynerrs being set, but not used */
+						(void)yynerrs;
 						YYERROR;
 					}
 				}
 	  ;
 
 key : TOKEN			{ $$ = $1; }
-    | STRING			{ $$ = $1; }
+    | STRING			{ $$ = str_unescape(t_strdup_noconst($1)); }
     ;
 
 value : TOKEN			{ $$ = $1; }

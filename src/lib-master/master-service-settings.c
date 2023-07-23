@@ -4,10 +4,10 @@
 #include "array.h"
 #include "event-filter.h"
 #include "path-util.h"
-#include "istream.h"
+#include "mmap-util.h"
+#include "fdpass.h"
 #include "write-full.h"
 #include "str.h"
-#include "strescape.h"
 #include "syslog-util.h"
 #include "eacces-error.h"
 #include "env-util.h"
@@ -27,7 +27,7 @@
 #define DOVECOT_CONFIG_SOCKET_PATH PKG_RUNDIR"/config"
 
 #define CONFIG_READ_TIMEOUT_SECS 10
-#define CONFIG_HANDSHAKE "VERSION\tconfig\t2\t0\n"
+#define CONFIG_HANDSHAKE "VERSION\tconfig\t3\t0\n"
 
 #undef DEF
 #define DEF(type, name) \
@@ -208,37 +208,17 @@ master_service_exec_config(struct master_service *service,
 	if (input->use_sysexits)
 		env_put("USE_SYSEXITS", "1");
 
+	if (input->service != NULL)
+		env_put("DOVECONF_SERVICE", input->service);
+
 	t_array_init(&conf_argv, 11 + (service->argc + 1) + 1);
 	strarr_push(&conf_argv, DOVECOT_CONFIG_BIN_PATH);
-	if (input->service != NULL) {
-		strarr_push(&conf_argv, "-f");
-		strarr_push(&conf_argv,
-			    t_strconcat("service=", input->service, NULL));
-	}
 	strarr_push(&conf_argv, "-c");
 	strarr_push(&conf_argv, service->config_path);
-	if (input->module != NULL) {
-		strarr_push(&conf_argv, "-m");
-		strarr_push(&conf_argv, input->module);
-	}
-	if (input->extra_modules != NULL) {
-		for (unsigned int i = 0; input->extra_modules[i] != NULL; i++) {
-			strarr_push(&conf_argv, "-m");
-			strarr_push(&conf_argv, input->extra_modules[i]);
-		}
-	}
-	if ((service->flags & MASTER_SERVICE_FLAG_DISABLE_SSL_SET) == 0 &&
-	    (input->module != NULL || input->extra_modules != NULL)) {
-		strarr_push(&conf_argv, "-m");
-		if (service->want_ssl_server)
-			strarr_push(&conf_argv, "ssl-server");
-		else
-			strarr_push(&conf_argv, "ssl");
-	}
-	if (input->parse_full_config)
-		strarr_push(&conf_argv, "-p");
 
-	strarr_push(&conf_argv, "-e");
+	if (input->disable_check_settings)
+		strarr_push(&conf_argv, "-E");
+	strarr_push(&conf_argv, "-F");
 	strarr_push(&conf_argv, binary_path);
 	array_append(&conf_argv, (const char *const *)service->argv + 1,
 		     service->argc);
@@ -300,122 +280,93 @@ master_service_open_config(struct master_service *service,
 {
 	struct stat st;
 	const char *path;
-	int fd;
+	int fd = -1;
 
 	*path_r = path = input->config_path != NULL ? input->config_path :
 		master_service_get_config_path(service);
 
-	if (service->config_fd != -1 && input->config_path == NULL &&
-	    !service->config_path_changed_with_param) {
-		/* use the already opened config socket */
-		fd = service->config_fd;
-		service->config_fd = -1;
-		return fd;
-	}
-
 	if (!service->config_path_from_master &&
 	    !service->config_path_changed_with_param &&
+	    !input->always_exec &&
 	    input->config_path == NULL) {
 		/* first try to connect to the default config socket.
 		   configuration may contain secrets, so in default config
 		   this fails because the socket is 0600. it's useful for
 		   developers though. :) */
 		fd = net_connect_unix(DOVECOT_CONFIG_SOCKET_PATH);
-		if (fd >= 0) {
+		if (fd >= 0)
 			*path_r = DOVECOT_CONFIG_SOCKET_PATH;
-			net_set_nonblock(fd, FALSE);
-			return fd;
+		else {
+			/* fallback to executing doveconf */
 		}
-		/* fallback to executing doveconf */
 	}
 
-	if (stat(path, &st) < 0) {
-		*error_r = errno == EACCES ? eacces_error_get("stat", path) :
-			t_strdup_printf("stat(%s) failed: %m", path);
-		config_error_update_path_source(service, input, error_r);
-		return -1;
-	}
+	if (fd == -1) {
+		if (stat(path, &st) < 0) {
+			*error_r = errno == EACCES ?
+				eacces_error_get("stat", path) :
+				t_strdup_printf("stat(%s) failed: %m", path);
+			config_error_update_path_source(service, input, error_r);
+			return -1;
+		}
 
-	if (!S_ISSOCK(st.st_mode) && !S_ISFIFO(st.st_mode)) {
-		/* it's not an UNIX socket, don't even try to connect */
-		fd = -1;
-		errno = ENOTSOCK;
-	} else {
-		fd = net_connect_unix_with_retries(path, 1000);
+		if (!S_ISSOCK(st.st_mode) && !S_ISFIFO(st.st_mode)) {
+			/* it's not an UNIX socket, don't even try to connect */
+			fd = -1;
+			errno = ENOTSOCK;
+		} else {
+			fd = net_connect_unix_with_retries(path, 1000);
+		}
+		if (fd < 0) {
+			*error_r = t_strdup_printf(
+				"net_connect_unix(%s) failed: %m", path);
+			config_exec_fallback(service, input, error_r);
+			return -1;
+		}
 	}
-	if (fd < 0) {
-		*error_r = t_strdup_printf("net_connect_unix(%s) failed: %m",
-					   path);
+	net_set_nonblock(fd, FALSE);
+	string_t *str = t_str_new(128);
+	str_append(str, CONFIG_HANDSHAKE"REQ");
+	if (input->reload_config)
+		str_append(str, "\treload");
+	if (input->disable_check_settings)
+		str_append(str, "\tdisable-check-settings");
+	str_append_c(str, '\n');
+	alarm(CONFIG_READ_TIMEOUT_SECS);
+	int ret = write_full(fd, str_data(str), str_len(str));
+	if (ret < 0)
+		*error_r = t_strdup_printf("write_full(%s) failed: %m", path);
+
+	int config_fd = -1;
+	if (ret == 0) {
+		/* read the config fd as reply */
+		char buf[1024];
+		ret = fd_read(fd, buf, sizeof(buf)-1, &config_fd);
+		if (ret < 0)
+			*error_r = t_strdup_printf("fd_read() failed: %m");
+		else if (ret > 0 && buf[0] == '+' && buf[1] == '\n')
+			; /* success */
+		else if (ret > 0 && buf[0] == '-') {
+			buf[ret] = '\0';
+			*error_r = t_strdup_printf("Failed to read config: %s",
+						   t_strcut(buf+1, '\n'));
+			i_close_fd(&config_fd);
+		} else {
+			buf[ret] = '\0';
+			*error_r = t_strdup_printf(
+				"Failed to read config: Unexpected reply '%s'",
+				t_strcut(buf, '\n'));
+			i_close_fd(&config_fd);
+		}
+	}
+	alarm(0);
+	i_close_fd(&fd);
+
+	if (config_fd == -1) {
 		config_exec_fallback(service, input, error_r);
 		return -1;
 	}
-	net_set_nonblock(fd, FALSE);
-	return fd;
-}
-
-static void
-config_build_request(struct master_service *service, string_t *str,
-		     const struct master_service_settings_input *input)
-{
-	str_append(str, "REQ");
-	if (input->module != NULL)
-		str_printfa(str, "\tmodule=%s", input->module);
-	if (input->extra_modules != NULL) {
-		for (unsigned int i = 0; input->extra_modules[i] != NULL; i++)
-			str_printfa(str, "\tmodule=%s", input->extra_modules[i]);
-	}
-	if ((service->flags & MASTER_SERVICE_FLAG_DISABLE_SSL_SET) == 0 &&
-	    (input->module != NULL || input->extra_modules != NULL)) {
-		str_printfa(str, "\tmodule=%s",
-			    service->want_ssl_server ? "ssl-server" : "ssl");
-	}
-	if (input->no_ssl_ca)
-		str_append(str, "\texclude=ssl_ca\texclude=ssl_verify_client_cert");
-	if (input->service != NULL)
-		str_printfa(str, "\tservice=%s", input->service);
-	if (input->username != NULL)
-		str_printfa(str, "\tuser=%s", input->username);
-	if (input->local_ip.family != 0)
-		str_printfa(str, "\tlip=%s", net_ip2addr(&input->local_ip));
-	if (input->remote_ip.family != 0)
-		str_printfa(str, "\trip=%s", net_ip2addr(&input->remote_ip));
-	if (input->local_name != NULL)
-		str_printfa(str, "\tlname=%s", input->local_name);
-	str_append_c(str, '\n');
-}
-
-static int
-config_send_request(struct master_service *service,
-		    const struct master_service_settings_input *input,
-		    int fd, const char *path, const char **error_r)
-{
-	int ret;
-
-	T_BEGIN {
-		string_t *str;
-
-		str = t_str_new(128);
-		str_append(str, CONFIG_HANDSHAKE);
-		config_build_request(service, str, input);
-		ret = write_full(fd, str_data(str), str_len(str));
-	} T_END;
-	if (ret < 0) {
-		*error_r = t_strdup_printf("write_full(%s) failed: %m", path);
-		return -1;
-	}
-	return 0;
-}
-
-static int
-config_send_filters_request(int fd, const char *path, const char **error_r)
-{
-	int ret;
-	ret = write_full(fd, CONFIG_HANDSHAKE"FILTERS\n", strlen(CONFIG_HANDSHAKE"FILTERS\n"));
-	if (ret < 0) {
-		*error_r = t_strdup_printf("write_full(%s) failed: %m", path);
-		return -1;
-	}
-	return 0;
+	return config_fd;
 }
 
 static int
@@ -440,125 +391,155 @@ master_service_apply_config_overrides(struct master_service *service,
 	return 0;
 }
 
-static int
-config_read_reply_header(struct istream *istream, const char *path, pool_t pool,
-			 const struct master_service_settings_input *input,
-			 struct master_service_settings_output *output_r,
-			 const char **error_r)
+static void
+filter_string_parse_protocol(const char *filter_string,
+			     ARRAY_TYPE(const_string) *protocols)
 {
-	const char *line;
-	ssize_t ret;
+	const char *p = strstr(filter_string, "protocol=\"");
+	if (p == NULL)
+		return;
+	const char *p2 = strchr(p + 10, '"');
+	if (p2 == NULL)
+		return;
+	const char *protocol = t_strdup_until(p + 10, p2);
+	if (p - filter_string > 4 && strcmp(p - 4, "NOT ") == 0)
+		protocol = t_strconcat("!", protocol, NULL);
+	array_push_back(protocols, &protocol);
+}
 
-	while ((ret = i_stream_read(istream)) > 0) {
-		line = i_stream_next_line(istream);
-		if (line != NULL)
-			break;
+static int
+master_service_settings_read_mmap(struct setting_parser_context *parser,
+				  struct event *event,
+				  const unsigned char *mmap_base,
+				  size_t mmap_size,
+				  struct master_service_settings_output *output_r,
+				  const char **error_r)
+{
+	/*
+	   DOVECOT-CONFIG <TAB> 1.0 <LF>
+
+	   <64bit big-endian global settings blob size>
+	   [ key <NUL> value <NUL>, ... ]
+
+	   <64bit big-endian filter settings blob size>
+	   filter_string <NUL>
+	   [ key <NUL> value <NUL>, ... ]
+
+	   ... more filters ...
+
+	   Settings are read until the blob size is reached. There is no
+	   padding/alignment. The mmaped data comes from a trusted source
+	   (if we can't trust the config, what can we trust?), so for
+	   performance and simplicity we trust the mmaped data to be properly
+	   NUL-terminated. If it's not, it can cause a segfault. */
+	ARRAY_TYPE(const_string) protocols;
+
+	t_array_init(&protocols, 8);
+	const struct failure_context failure_ctx = {
+		.type = LOG_TYPE_DEBUG,
+	};
+
+	const char *magic_prefix = "DOVECOT-CONFIG\t";
+	const unsigned int magic_prefix_len = strlen(magic_prefix);
+	const unsigned char *eol = memchr(mmap_base, '\n', mmap_size);
+	if (mmap_size < magic_prefix_len ||
+	    memcmp(magic_prefix, mmap_base, magic_prefix_len) != 0 ||
+	    eol == NULL) {
+		*error_r = "File header doesn't begin with DOVECOT-CONFIG line";
+		return -1;
 	}
-	if (ret <= 0) {
-		if (ret == 0)
-			return 1;
-		*error_r = istream->stream_errno != 0 ?
-			t_strdup_printf("read(%s) failed: %s", path,
-					i_stream_get_error(istream)) :
-			t_strdup_printf("read(%s) failed: EOF", path);
+	if (mmap_base[magic_prefix_len] != '1' ||
+	    mmap_base[magic_prefix_len+1] != '.') {
+		*error_r = t_strdup_printf(
+			"Unsupported config file version '%s'",
+			t_strdup_until(mmap_base + magic_prefix_len, eol));
 		return -1;
 	}
 
-	T_BEGIN {
-		const char *value, *const *arg = t_strsplit_tabescaped(line);
-		ARRAY_TYPE(const_string) services;
-
-		p_array_init(&services, pool, 8);
-		for (; *arg != NULL; arg++) {
-			if (strcmp(*arg, "service-uses-local") == 0)
-				output_r->service_uses_local = TRUE;
-			else if (strcmp(*arg, "service-uses-remote") == 0)
-				output_r->service_uses_remote = TRUE;
-			if (strcmp(*arg, "used-local") == 0)
-				output_r->used_local = TRUE;
-			else if (strcmp(*arg, "used-remote") == 0)
-				output_r->used_remote = TRUE;
-			else if (str_begins(*arg, "service=", &value)) {
-				const char *name = p_strdup(pool, value);
-				array_push_back(&services, &name);
-			 }
+	size_t start_offset = eol - mmap_base + 1;
+	uoff_t offset = start_offset;
+	do {
+		/* <blob size> */
+		uint64_t blob_size;
+		if (offset + sizeof(blob_size) > mmap_size) {
+			*error_r = t_strdup_printf(
+				"Config file size too small "
+				"(offset=%zu, file_size=%zu)", offset, mmap_size);
+			return -1;
 		}
-		if (input->service == NULL) {
-			array_append_zero(&services);
-			output_r->specific_services = array_front(&services);
+		blob_size = be64_to_cpu_unaligned(mmap_base + offset);
+		if (offset + blob_size > mmap_size) {
+			*error_r = t_strdup_printf(
+				"Settings blob points outside file "
+				"(offset=%zu, blob_size=%"PRIu64", file_size=%zu)",
+				offset, blob_size, mmap_size);
+			return -1;
 		}
-	} T_END;
-	return 0;
-}
+		size_t end_offset = offset + blob_size;
+		offset += sizeof(blob_size);
 
-void master_service_config_socket_try_open(struct master_service *service)
-{
-	struct master_service_settings_input input;
-	const char *path, *error;
-	int fd;
-
-	/* we'll get here before command line parameters have been parsed,
-	   so -O, -c and -i parameters haven't been handled yet at this point.
-	   this means we could end up opening config socket connection
-	   unnecessarily, but this isn't a problem. we'll just have to
-	   ignore it later on. (unfortunately there isn't a master_service_*()
-	   call where this function would be better called.) */
-	if (getenv("DOVECONF_ENV") != NULL ||
-	    (service->flags & MASTER_SERVICE_FLAG_NO_CONFIG_SETTINGS) != 0)
-		return;
-
-	i_zero(&input);
-	input.never_exec = TRUE;
-	fd = master_service_open_config(service, &input, &path, &error);
-	if (fd != -1)
-		service->config_fd = fd;
-}
-
-int master_service_settings_get_filters(struct master_service *service,
-					const char *const **filters,
-					const char **error_r)
-{
-	struct master_service_settings_input input;
-	int fd;
-	bool retry = TRUE;
-	const char *path = NULL;
-	ARRAY_TYPE(const_string) filters_tmp;
-	t_array_init(&filters_tmp, 8);
-	i_zero(&input);
-
-	if (getenv("DOVECONF_ENV") == NULL &&
-	    (service->flags & MASTER_SERVICE_FLAG_NO_CONFIG_SETTINGS) == 0) {
-		retry = service->config_fd != -1;
-		for (;;) {
-			fd = master_service_open_config(service, &input, &path, error_r);
-			if (fd == -1) {
+		/* <filter> */
+		if (offset > start_offset + sizeof(blob_size)) {
+			const char *filter_string =
+				(const char *)mmap_base + offset;
+			offset += strlen(filter_string) + 1;
+			if (offset > end_offset) {
+				*error_r = t_strdup_printf(
+					"Filter points outside blob "
+					"(offset=%zu, end_offset=%zu, file_size=%zu)",
+					offset, end_offset, mmap_size);
 				return -1;
 			}
-			if (config_send_filters_request(fd, path, error_r) == 0)
-				break;
 
-			i_close_fd(&fd);
-			if (!retry)
+			struct event_filter *filter = event_filter_create();
+			const char *error;
+			filter_string_parse_protocol(filter_string, &protocols);
+			if (event_filter_parse(filter_string, filter, &error) < 0) {
+				*error_r = t_strdup_printf(
+					"Received invalid filter '%s': %s",
+					filter_string, error);
+				event_filter_unref(&filter);
 				return -1;
-			retry = FALSE;
-		}
-		service->config_fd = fd;
-		struct istream *is = i_stream_create_fd(fd, SIZE_MAX);
-		const char *line;
-		/* try read response */
-		while((line = i_stream_read_next_line(is)) != NULL) {
-			if (*line == '\0')
-				break;
-			if (str_begins(line, "FILTER\t", &line)) {
-				line = t_strdup(line);
-				array_push_back(&filters_tmp, &line);
+			}
+			bool match = filter_string[0] == '\0' ||
+				event_filter_match(filter, event,
+						   &failure_ctx);
+			event_filter_unref(&filter);
+			if (!match) {
+				/* Filter didn't match. Jump to the next one. */
+				offset = end_offset;
+				continue;
 			}
 		}
-		i_stream_unref(&is);
+
+		/* list of settings: key, value, ... */
+		while (offset < end_offset) {
+			const char *key = (const char *)mmap_base + offset;
+			offset += strlen(key)+1;
+			const char *value = (const char *)mmap_base + offset;
+			offset += strlen(value)+1;
+			if (offset > end_offset) {
+				*error_r = t_strdup_printf(
+					"Settings key/value points outside blob "
+					"(offset=%zu, end_offset=%zu, file_size=%zu)",
+					offset, end_offset, mmap_size);
+				return -1;
+			}
+			int ret;
+			T_BEGIN {
+				ret = settings_parse_keyvalue(parser, key, value);
+				if (ret < 0)
+					*error_r = t_strdup(settings_parser_get_error(parser));
+			} T_END_PASS_STR_IF(ret < 0, error_r);
+			if (ret < 0)
+				return -1;
+		}
+	} while (offset < mmap_size);
+
+	if (array_count(&protocols) > 0) {
+		array_append_zero(&protocols);
+		output_r->specific_services = array_front(&protocols);
 	}
-
-	array_append_zero(&filters_tmp);
-	*filters = array_front(&filters_tmp);
 	return 0;
 }
 
@@ -570,38 +551,51 @@ int master_service_settings_read(struct master_service *service,
 	ARRAY(const struct setting_parser_info *) all_roots;
 	const struct setting_parser_info *tmp_root;
 	struct setting_parser_context *parser;
-	struct istream *istream;
-	const char *path = NULL, *error;
+	const char *path = NULL, *value, *error;
 	unsigned int i;
 	int ret, fd = -1;
-	time_t now, timeout;
-	bool use_environment, retry;
 
 	i_zero(output_r);
+	output_r->config_fd = -1;
 
-	if (getenv("DOVECONF_ENV") == NULL &&
-	    (service->flags & MASTER_SERVICE_FLAG_NO_CONFIG_SETTINGS) == 0) {
-		retry = service->config_fd != -1;
-		for (;;) {
-			fd = master_service_open_config(service, input,
-							&path, error_r);
-			if (fd == -1) {
-				if (errno == EACCES)
-					output_r->permission_denied = TRUE;
-				return -1;
-			}
-
-			if (config_send_request(service, input, fd,
-						path, error_r) == 0)
-				break;
-			i_close_fd(&fd);
-			if (!retry) {
-				config_exec_fallback(service, input, error_r);
-				return -1;
-			}
-			/* config process died, retry connecting */
-			retry = FALSE;
+	if (service->config_mmap_base != NULL && !input->reload_config) {
+		/* config was already read once */
+	} else if ((value = getenv(DOVECOT_CONFIG_FD_ENV)) != NULL) {
+		/* doveconf -F parameter already executed us back.
+		   The configuration is in DOVECOT_CONFIG_FD. */
+		if (str_to_int(value, &fd) < 0 || fd < 0)
+			i_fatal("Invalid "DOVECOT_CONFIG_FD_ENV": %s", value);
+		path = t_strdup_printf("<"DOVECOT_CONFIG_FD_ENV" %d>", fd);
+	} else if ((service->flags & MASTER_SERVICE_FLAG_NO_CONFIG_SETTINGS) == 0) {
+		/* Open config via socket if possible. If it doesn't work,
+		   execute doveconf -F. */
+		fd = master_service_open_config(service, input, &path, error_r);
+		if (fd == -1) {
+			if (errno == EACCES)
+				output_r->permission_denied = TRUE;
+			return -1;
 		}
+	}
+	if (fd != -1) {
+		if (service->config_mmap_base != NULL) {
+			i_assert(input->reload_config);
+			if (munmap(service->config_mmap_base,
+				   service->config_mmap_size) < 0)
+				i_error("munmap(<config>) failed: %m");
+		}
+
+		service->config_mmap_base =
+			mmap_ro_file(fd, &service->config_mmap_size);
+		if (service->config_mmap_base == MAP_FAILED)
+			i_fatal("Failed to read config: mmap(%s) failed: %m", path);
+		if (service->config_mmap_size == 0)
+			i_fatal("Failed to read config: %s file size is empty", path);
+
+		if (input->return_config_fd)
+			output_r->config_fd = fd;
+		else
+			i_close_fd(&fd);
+		env_remove(DOVECOT_CONFIG_FD_ENV);
 	}
 
 	if (service->set_pool != NULL) {
@@ -612,6 +606,14 @@ int master_service_settings_read(struct master_service *service,
 		service->set_pool =
 			pool_alloconly_create("master service settings", 16384);
 	}
+
+	/* Create event for matching config filters */
+	struct event *event = event_create(NULL);
+	event_add_str(event, "protocol", input->service);
+	event_add_str(event, "user", input->username);
+	event_add_str(event, "local_name", input->local_name);
+	event_add_ip(event, "local_ip", &input->local_ip);
+	event_add_ip(event, "remote_ip", &input->remote_ip);
 
 	p_array_init(&all_roots, service->set_pool, 8);
 	tmp_root = &master_service_setting_parser_info;
@@ -631,61 +633,24 @@ int master_service_settings_read(struct master_service *service,
 			array_front(&all_roots), array_count(&all_roots),
 			SETTINGS_PARSER_FLAG_IGNORE_UNKNOWN_KEYS);
 
-	if (fd != -1) {
-		istream = i_stream_create_fd(fd, SIZE_MAX);
-		now = time(NULL);
-		timeout = now + CONFIG_READ_TIMEOUT_SECS;
-		do {
-			alarm(timeout - now);
-			ret = config_read_reply_header(istream, path,
-						       service->set_pool, input,
-						       output_r, error_r);
-			if (ret == 0) {
-				ret = settings_parse_stream_read(parser,
-								 istream);
-				if (ret < 0)
-					*error_r = t_strdup(
-						settings_parser_get_error(parser));
+	/* config_mmap_base is NULL only if
+	   MASTER_SERVICE_FLAG_NO_CONFIG_SETTINGS is used */
+	if (service->config_mmap_base != NULL) {
+		ret = master_service_settings_read_mmap(parser, event,
+			service->config_mmap_base, service->config_mmap_size,
+			output_r, error_r);
+
+		if (ret < 0) {
+			if (getenv(DOVECOT_CONFIG_FD_ENV) != NULL) {
+				i_fatal("Failed to parse config from fd %d: %s",
+					fd, *error_r);
 			}
-			alarm(0);
-			if (ret <= 0)
-				break;
-
-			/* most likely timed out, but just in case some other
-			   signal was delivered early check if we need to
-			   continue */
-			now = time(NULL);
-		} while (now < timeout);
-		i_stream_unref(&istream);
-
-		if (ret != 0) {
-			if (ret > 0) {
-				*error_r = t_strdup_printf(
-					"Timeout reading config from %s", path);
-			}
-			i_close_fd(&fd);
-			config_exec_fallback(service, input, error_r);
 			settings_parser_unref(&parser);
-			return -1;
-		}
-
-		if ((service->flags & MASTER_SERVICE_FLAG_KEEP_CONFIG_OPEN) != 0 &&
-		    service->config_fd == -1 && input->config_path == NULL)
-			service->config_fd = fd;
-		else
-			i_close_fd(&fd);
-		use_environment = FALSE;
-	} else {
-		use_environment = TRUE;
-	}
-
-	if (use_environment || service->keep_environment) {
-		if (settings_parse_environ(parser) < 0) {
-			*error_r = t_strdup(settings_parser_get_error(parser));
-			settings_parser_unref(&parser);
+			event_unref(&event);
 			return -1;
 		}
 	}
+	event_unref(&event);
 
 	if (array_is_created(&service->config_overrides)) {
 		if (master_service_apply_config_overrides(service, parser,
@@ -695,10 +660,12 @@ int master_service_settings_read(struct master_service *service,
 		}
 	}
 
-	if (!settings_parser_check(parser, service->set_pool, &error)) {
-		*error_r = t_strdup_printf("Invalid settings: %s", error);
-		settings_parser_unref(&parser);
-		return -1;
+	if (!input->disable_check_settings) {
+		if (!settings_parser_check(parser, service->set_pool, &error)) {
+			*error_r = t_strdup_printf("Invalid settings: %s", error);
+			settings_parser_unref(&parser);
+			return -1;
+		}
 	}
 
 	service->set = settings_parser_get_root_set(parser,
@@ -737,7 +704,6 @@ int master_service_settings_read_simple(struct master_service *service,
 
 	i_zero(&input);
 	input.roots = roots;
-	input.module = service->name;
 	return master_service_settings_read(service, &input, &output, error_r);
 }
 

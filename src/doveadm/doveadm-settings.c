@@ -16,6 +16,7 @@ ARRAY_TYPE(doveadm_setting_root) doveadm_setting_roots;
 bool doveadm_verbose_proctitle;
 
 static pool_t doveadm_settings_pool = NULL;
+static int global_config_fd = -1;
 
 static bool doveadm_settings_check(void *_set, pool_t pool, const char **error_r);
 
@@ -242,31 +243,28 @@ void doveadm_read_settings(void)
 	const struct doveadm_settings *set;
 	struct doveadm_setting_root *root;
 	ARRAY(const struct setting_parser_info *) set_roots;
-	ARRAY_TYPE(const_string) module_names;
 	const char *error;
 
 	t_array_init(&set_roots, N_ELEMENTS(default_set_roots) +
 		     array_count(&doveadm_setting_roots) + 1);
 	array_append(&set_roots, default_set_roots,
 		     N_ELEMENTS(default_set_roots));
-	t_array_init(&module_names, 4);
-	array_foreach_modifiable(&doveadm_setting_roots, root) {
-		array_push_back(&module_names, &root->info->module_name);
+	array_foreach_modifiable(&doveadm_setting_roots, root)
 		array_push_back(&set_roots, &root->info);
-	}
-	array_append_zero(&module_names);
 	array_append_zero(&set_roots);
 
 	i_zero(&input);
 	input.roots = array_front(&set_roots);
-	input.module = "doveadm";
-	input.extra_modules = array_front(&module_names);
 	input.service = "doveadm";
 	input.preserve_user = TRUE;
 	input.preserve_home = TRUE;
+	input.return_config_fd = TRUE; /* for doveadm exec */
 	if (master_service_settings_read(master_service, &input,
 					 &output, &error) < 0)
 		i_fatal("Error reading configuration: %s", error);
+	i_assert(global_config_fd == -1);
+	global_config_fd = output.config_fd;
+	fd_close_on_exec(output.config_fd, TRUE);
 
 	doveadm_settings_pool = pool_alloconly_create("doveadm settings", 1024);
 	service_set = master_service_settings_get_root_set_dup(master_service,
@@ -287,6 +285,12 @@ void doveadm_read_settings(void)
 		root->settings = master_service_settings_get_root_set_dup(
 			master_service, root->info, doveadm_settings_pool);
 	}
+}
+
+int doveadm_settings_get_config_fd(void)
+{
+	i_assert(global_config_fd != -1);
+	return global_config_fd;
 }
 
 void doveadm_setting_roots_add(const struct setting_parser_info *info)

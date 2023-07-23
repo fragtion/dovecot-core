@@ -61,6 +61,7 @@ struct metric_field {
 enum metric_value_type {
 	METRIC_VALUE_TYPE_STR,
 	METRIC_VALUE_TYPE_INT,
+	METRIC_VALUE_TYPE_IP,
 	METRIC_VALUE_TYPE_BUCKET_INDEX,
 };
 
@@ -68,6 +69,7 @@ struct metric_value {
 	enum metric_value_type type;
 	unsigned char hash[SHA1_RESULTLEN];
 	intmax_t intmax;
+	struct ip_addr ip;
 };
 
 struct metric {
@@ -89,6 +91,7 @@ struct metric {
 	   This is a display name and does not guarantee uniqueness.
 	*/
 	const char *sub_name;
+	size_t sub_name_used_size;
 
 	/* Timing for how long the event existed */
 	struct stats_dist *duration_stats;

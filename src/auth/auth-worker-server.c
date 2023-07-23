@@ -192,15 +192,11 @@ static void auth_worker_send_reply(struct auth_worker_server *server,
 static void
 reply_append_extra_fields(string_t *str, struct auth_request *request)
 {
-	if (!auth_fields_is_empty(request->fields.extra_fields)) {
-		str_append_c(str, '\t');
-		/* export only the fields changed by this lookup, so the
-		   changed-flag gets preserved correctly on the master side as
-		   well. */
-		auth_fields_append(request->fields.extra_fields, str,
-				   AUTH_FIELD_FLAG_CHANGED,
-				   AUTH_FIELD_FLAG_CHANGED);
-	}
+	/* export only the fields changed by this lookup, so the changed-flag
+	   gets preserved correctly on the master side as well. */
+	auth_fields_append(request->fields.extra_fields, str,
+			   AUTH_FIELD_FLAG_CHANGED, AUTH_FIELD_FLAG_CHANGED,
+			   TRUE);
 	if (request->fields.userdb_reply != NULL &&
 	    auth_fields_is_empty(request->fields.userdb_reply)) {
 		/* all userdb_* fields had NULL values. we'll still
@@ -309,7 +305,7 @@ auth_worker_handle_passw(struct auth_worker_command *cmd,
 	const char *password;
 	const char *crypted, *scheme, *error;
 	unsigned int passdb_id;
-	int ret;
+	enum passdb_result ret;
 
 	if (str_to_uint(args[0], &passdb_id) < 0 || args[1] == NULL ||
 	    args[2] == NULL) {
@@ -336,15 +332,12 @@ auth_worker_handle_passw(struct auth_worker_command *cmd,
 	str = t_str_new(128);
 	str_printfa(str, "%u\t", request->id);
 
-	if (ret == 1) {
+	if (ret == PASSDB_RESULT_OK) {
 		str_printfa(str, "OK\t\t");
 		error = NULL;
-	} else if (ret == 0) {
-		str_printfa(str, "FAIL\t%d", PASSDB_RESULT_PASSWORD_MISMATCH);
-		error = passdb_result_to_string(PASSDB_RESULT_PASSWORD_MISMATCH);
 	} else {
-		str_printfa(str, "FAIL\t%d", PASSDB_RESULT_INTERNAL_FAILURE);
-		error = passdb_result_to_string(PASSDB_RESULT_INTERNAL_FAILURE);
+		str_printfa(str, "FAIL\t%d", ret);
+		error = passdb_result_to_string(ret);
 	}
 
 	str_append_c(str, '\n');
@@ -516,11 +509,10 @@ lookup_user_callback(enum userdb_result result,
 		str_append(str, "OK\t");
 		if (auth_request->user_changed_by_lookup)
 			str_append_tabescaped(str, auth_request->fields.user);
-		str_append_c(str, '\t');
 		/* export only the fields changed by this lookup */
 		auth_fields_append(auth_request->fields.userdb_reply, str,
-				   AUTH_FIELD_FLAG_CHANGED,
-				   AUTH_FIELD_FLAG_CHANGED);
+				   AUTH_FIELD_FLAG_CHANGED, AUTH_FIELD_FLAG_CHANGED,
+				   TRUE);
 		if (auth_request->userdb_lookup_tempfailed)
 			str_append(str, "\ttempfail");
 		break;

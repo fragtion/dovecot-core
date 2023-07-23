@@ -141,7 +141,6 @@ mail_crypt_acl_unset_private_keys(struct mailbox *src_box,
 static int
 mail_crypt_acl_user_create(struct mail_user *user, const char *dest_username,
 			   struct mail_user **dest_user_r,
-			   struct mail_storage_service_user **dest_service_user_r,
 			   const char **error_r)
 {
 	const struct mail_storage_service_input *old_input;
@@ -151,15 +150,13 @@ mail_crypt_acl_user_create(struct mail_user *user, const char *dest_username,
 
 	int ret;
 
-	i_assert(user->_service_user != NULL);
-	service_ctx = mail_storage_service_user_get_service_ctx(user->_service_user);
-	old_input = mail_storage_service_user_get_input(user->_service_user);
+	service_ctx = mail_storage_service_user_get_service_ctx(user->service_user);
+	old_input = mail_storage_service_user_get_input(user->service_user);
 
 	if ((cur_ioloop_ctx = io_loop_get_current_context(current_ioloop)) != NULL)
 		io_loop_context_deactivate(cur_ioloop_ctx);
 
 	i_zero(&input);
-	input.module = old_input->module;
 	input.service = old_input->service;
 	input.username = dest_username;
 	input.session_id_prefix = user->session_id;
@@ -168,7 +165,6 @@ mail_crypt_acl_user_create(struct mail_user *user, const char *dest_username,
 	input.flags_override_remove = MAIL_STORAGE_SERVICE_FLAG_NO_NAMESPACES;
 
 	ret = mail_storage_service_lookup_next(service_ctx, &input,
-						dest_service_user_r,
 						dest_user_r, error_r);
 
 	return ret;
@@ -247,7 +243,6 @@ static int mail_crypt_acl_object_update(struct acl_object *aclobj,
 	struct event *event = aclobj->backend->event;
 	const char *username;
 	struct mail_user *dest_user;
-	struct mail_storage_service_user *dest_service_user;
 	struct ioloop_context *cur_ioloop_ctx;
 	bool have_rights;
 	int ret = 0;
@@ -280,14 +275,13 @@ static int mail_crypt_acl_object_update(struct acl_object *aclobj,
 		have_rights = ret > 0;
 
 		ret = mail_crypt_acl_user_create(aclobj->backend->list->ns->user,
-						 username, &dest_user,
-						 &dest_service_user, &error);
+						 username, &dest_user, &error);
 
 		/* to make sure we get correct logging context */
 		if (ret > 0)
-			mail_storage_service_io_deactivate_user(dest_service_user);
+			mail_storage_service_io_deactivate_user(dest_user->service_user);
 		mail_storage_service_io_activate_user(
-			aclobj->backend->list->ns->user->_service_user
+			aclobj->backend->list->ns->user->service_user
 		);
 
 		if (ret <= 0) {
@@ -316,17 +310,16 @@ static int mail_crypt_acl_object_update(struct acl_object *aclobj,
 
 		/* logging context swap again */
 		mail_storage_service_io_deactivate_user(
-			aclobj->backend->list->ns->user->_service_user
+			aclobj->backend->list->ns->user->service_user
 		);
-		mail_storage_service_io_activate_user(dest_service_user);
+		mail_storage_service_io_activate_user(dest_user->service_user);
 
 		mail_user_deinit(&dest_user);
-		mail_storage_service_user_unref(&dest_service_user);
 
 		if ((cur_ioloop_ctx = io_loop_get_current_context(current_ioloop)) != NULL)
 			io_loop_context_deactivate(cur_ioloop_ctx);
 		mail_storage_service_io_activate_user(
-			aclobj->backend->list->ns->user->_service_user
+			aclobj->backend->list->ns->user->service_user
 		);
 		break;
 	case ACL_ID_OWNER:

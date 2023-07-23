@@ -81,16 +81,18 @@ void imap_urlauth_refresh_proctitle(void)
 		return;
 
 	str_append_c(title, '[');
-	switch (imap_urlauth_client_count) {
+	switch (imap_urlauth_clist->connections_count) {
 	case 0:
 		str_append(title, "idling");
 		break;
 	case 1:
-		client = imap_urlauth_clients;
+		client = container_of(imap_urlauth_clist->connections,
+				      struct client, conn);
 		str_append(title, client->username);
 		break;
 	default:
-		str_printfa(title, "%u connections", imap_urlauth_client_count);
+		str_printfa(title, "%u connections",
+			    imap_urlauth_clist->connections_count);
 		break;
 	}
 	str_append_c(title, ']');
@@ -235,8 +237,6 @@ int main(int argc, char *argv[])
 	if (IS_STANDALONE()) {
 		service_flags |= MASTER_SERVICE_FLAG_STANDALONE |
 			MASTER_SERVICE_FLAG_STD_CLIENT;
-	} else {
-		service_flags |= MASTER_SERVICE_FLAG_KEEP_CONFIG_OPEN;
 	}
 
 	master_service = master_service_init("imap-urlauth", service_flags,
@@ -254,7 +254,6 @@ int main(int argc, char *argv[])
 
 	i_zero(&input);
 	input.roots = set_roots;
-	input.module = "imap-urlauth";
 	input.service = "imap-urlauth";
 	if (master_service_settings_read(master_service, &input, &output,
 						&error) < 0)
@@ -272,9 +271,15 @@ int main(int argc, char *argv[])
 	}
 	login_set.callback = login_request_finished;
 	login_set.failure_callback = login_request_failed;
+	login_set.update_proctitle = verbose_proctitle &&
+		master_service_get_client_limit(master_service) == 1;
 
-	master_service_init_finish(master_service);
+	clients_init();
 	master_service_set_die_callback(master_service, imap_urlauth_die);
+
+	if (!IS_STANDALONE())
+		login_server = login_server_init(master_service, &login_set);
+	master_service_init_finish(master_service);
 
 	/* fake that we're running, so we know if client was destroyed
 	   while handling its initial input */
@@ -285,13 +290,12 @@ int main(int argc, char *argv[])
 			main_stdio_run(username);
 		} T_END;
 	} else {
-		login_server = login_server_init(master_service, &login_set);
 		io_loop_set_running(current_ioloop);
 	}
 
 	if (io_loop_is_running(current_ioloop))
 		master_service_run(master_service, client_connected);
-	clients_destroy_all();
+	clients_deinit();
 
 	if (login_server != NULL)
 		login_server_deinit(&login_server);

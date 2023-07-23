@@ -180,6 +180,10 @@ void auth_request_success(struct auth_request *request,
 {
 	i_assert(request->state == AUTH_REQUEST_STATE_MECH_CONTINUE);
 
+	/* preserve userdb fields set by mechanisms that don't use a passdb */
+	if (request->fields.userdb_reply != NULL)
+		auth_fields_snapshot(request->fields.userdb_reply);
+
 	if (!request->set->policy_check_after_auth) {
 		struct auth_policy_check_ctx *ctx =
 			p_new(request->pool, struct auth_policy_check_ctx, 1);
@@ -281,14 +285,21 @@ void auth_request_success_continue(struct auth_policy_check_ctx *ctx)
 		ctx->success_data->data, ctx->success_data->used);
 }
 
-void auth_request_fail(struct auth_request *request)
+void auth_request_fail_with_reply(struct auth_request *request,
+				  const void *final_data, size_t final_data_size)
 {
 	i_assert(request->state == AUTH_REQUEST_STATE_MECH_CONTINUE);
 
 	auth_request_set_state(request, AUTH_REQUEST_STATE_FINISHED);
 	auth_request_refresh_last_access(request);
 	auth_request_log_finished(request);
-	auth_request_handler_reply(request, AUTH_CLIENT_RESULT_FAILURE, "", 0);
+	auth_request_handler_reply(request, AUTH_CLIENT_RESULT_FAILURE,
+			           final_data, final_data_size);
+}
+
+void auth_request_fail(struct auth_request *request)
+{
+	auth_request_fail_with_reply(request, "", 0);
 }
 
 void auth_request_internal_failure(struct auth_request *request)
@@ -471,16 +482,12 @@ static void auth_request_save_cache(struct auth_request *request,
 		str_append_tabescaped(str, request->passdb_password);
 	}
 
-	if (!auth_fields_is_empty(request->fields.extra_fields)) {
-		str_append_c(str, '\t');
-		/* add only those extra fields to cache that were set by this
-		   passdb lookup. the CHANGED flag does this, because we
-		   snapshotted the extra_fields before the current passdb
-		   lookup. */
-		auth_fields_append(request->fields.extra_fields, str,
-				   AUTH_FIELD_FLAG_CHANGED,
-				   AUTH_FIELD_FLAG_CHANGED);
-	}
+	/* add only those extra fields to cache that were set by this passdb
+	   lookup. the CHANGED flag does this, because we snapshotted the
+	   extra_fields before the current passdb lookup. */
+	auth_fields_append(request->fields.extra_fields, str,
+			   AUTH_FIELD_FLAG_CHANGED, AUTH_FIELD_FLAG_CHANGED,
+			   TRUE);
 	auth_cache_insert(passdb_cache, request, passdb->cache_key, str_c(str),
 			  result == PASSDB_RESULT_OK);
 }
@@ -1332,8 +1339,8 @@ static void auth_request_userdb_save_cache(struct auth_request *request,
 	else {
 		str = t_str_new(128);
 		auth_fields_append(request->fields.userdb_reply, str,
-				   AUTH_FIELD_FLAG_CHANGED,
-				   AUTH_FIELD_FLAG_CHANGED);
+				   AUTH_FIELD_FLAG_CHANGED, AUTH_FIELD_FLAG_CHANGED,
+				   FALSE);
 		if (request->user_changed_by_lookup) {
 			/* username was changed by passdb or userdb */
 			if (str_len(str) > 0)
@@ -2339,21 +2346,24 @@ void auth_request_log_login_failure(struct auth_request *request,
 	event_set_min_log_level(event, orig_level);
 }
 
-int auth_request_password_verify(struct auth_request *request,
-				 const char *plain_password,
-				 const char *crypted_password,
-				 const char *scheme, const char *subsystem)
+enum passdb_result
+auth_request_password_verify(struct auth_request *request,
+			     const char *plain_password,
+			     const char *crypted_password,
+			     const char *scheme, const char *subsystem)
 {
 	return auth_request_password_verify_log(request, plain_password,
 			crypted_password, scheme, subsystem, TRUE);
 }
 
-int auth_request_password_verify_log(struct auth_request *request,
+enum passdb_result
+auth_request_password_verify_log(struct auth_request *request,
 				 const char *plain_password,
 				 const char *crypted_password,
 				 const char *scheme, const char *subsystem,
 				 bool log_password_mismatch)
 {
+	enum passdb_result result;
 	const unsigned char *raw_password;
 	size_t raw_password_size;
 	const char *error;
@@ -2365,18 +2375,18 @@ int auth_request_password_verify_log(struct auth_request *request,
 
 	if (request->fields.skip_password_check) {
 		/* passdb continue* rule after a successful authentication */
-		return 1;
+		return PASSDB_RESULT_OK;
 	}
 
 	if (request->passdb->set->deny) {
 		/* this is a deny database, we don't care about the password */
-		return 0;
+		return PASSDB_RESULT_PASSWORD_MISMATCH;
 	}
 
 	if (auth_fields_exists(request->fields.extra_fields, "nopassword")) {
 		auth_request_log_debug(request, subsystem,
 					"Allowing any password");
-		return 1;
+		return PASSDB_RESULT_OK;
 	}
 
 	ret = password_decode(crypted_password, scheme,
@@ -2389,8 +2399,9 @@ int auth_request_password_verify_log(struct auth_request *request,
 		} else {
 			auth_request_log_error(request, subsystem,
 						"Unknown scheme %s", scheme);
+			return PASSDB_RESULT_SCHEME_NOT_AVAILABLE;
 		}
-		return -1;
+		return PASSDB_RESULT_INTERNAL_FAILURE;
 	}
 
 	/* Use original_username since it may be important for some
@@ -2404,9 +2415,13 @@ int auth_request_password_verify_log(struct auth_request *request,
 		auth_request_log_error(request, subsystem,
 					"Invalid password%s in passdb: %s",
 					password_str, error);
+		result = PASSDB_RESULT_INTERNAL_FAILURE;
 	} else if (ret == 0) {
 		if (log_password_mismatch)
 			auth_request_log_password_mismatch(request, subsystem);
+		result = PASSDB_RESULT_PASSWORD_MISMATCH;
+	} else {
+		result = PASSDB_RESULT_OK;
 	}
 	if (ret <= 0 && request->set->debug_passwords) T_BEGIN {
 		log_password_failure(request, plain_password,
@@ -2414,7 +2429,7 @@ int auth_request_password_verify_log(struct auth_request *request,
 				     &gen_params,
 				     subsystem);
 	} T_END;
-	return ret;
+	return result;
 }
 
 enum passdb_result auth_request_password_missing(struct auth_request *request)

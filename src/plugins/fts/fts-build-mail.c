@@ -224,9 +224,11 @@ fts_build_body_begin(struct fts_mail_build_context *ctx,
 	parser_context.content_disposition = ctx->content_disposition;
 	parser_context.event = event_create(ctx->mail->box->event);
 	event_add_category(parser_context.event, &event_category_fts);
-	event_set_append_log_prefix(
-		parser_context.event,
-		t_strdup_printf("fts-%s: ", ctx->update_ctx->backend->name));
+	T_BEGIN {
+		const char *prefix =
+			t_strdup_printf("fts-%s: ", ctx->update_ctx->backend->name);
+		event_set_append_log_prefix(parser_context.event, prefix);
+	} T_END;
 
 	if (fts_parser_init(&parser_context, &ctx->body_parser)) {
 		/* extract text using the the returned parser */
@@ -589,7 +591,7 @@ fts_build_mail_real(struct fts_backend_update_context *update_ctx,
 		if (mail->expunged)
 			return 0;
 		mail_set_critical(mail, "Failed to read stream: %s",
-			mailbox_get_last_internal_error(mail->box, NULL));
+			mail_get_last_internal_error(mail, NULL));
 		return -1;
 	}
 
@@ -600,7 +602,8 @@ fts_build_mail_real(struct fts_backend_update_context *update_ctx,
 		ctx.pending_input = buffer_create_dynamic(default_pool, 128);
 
 	prev_part = NULL;
-	parser = message_parser_init(pool_datastack_create(), input, &parser_set);
+	pool_t parts_pool = pool_alloconly_create("fts message parts", 512);
+	parser = message_parser_init(parts_pool, input, &parser_set);
 
 	decoder = message_decoder_init(update_ctx->normalizer, 0);
 	for (;;) {
@@ -697,6 +700,7 @@ fts_build_mail_real(struct fts_backend_update_context *update_ctx,
 	i_free(ctx.content_disposition);
 	buffer_free(&ctx.word_buf);
 	buffer_free(&ctx.pending_input);
+	pool_unref(&parts_pool);
 	return ret < 0 ? -1 : 1;
 }
 

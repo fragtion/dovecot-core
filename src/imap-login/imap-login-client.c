@@ -356,7 +356,11 @@ static void imap_client_input(struct client *client)
 			client->input_blocked = TRUE;
 			break;
 		} else {
-			if (!client_handle_input(imap_client))
+			bool ret;
+			T_BEGIN {
+				ret = client_handle_input(imap_client);
+			} T_END;
+			if (!ret)
 				break;
 		}
 	}
@@ -389,6 +393,13 @@ static void imap_client_create(struct client *client, void **other_sets)
 static void imap_client_destroy(struct client *client)
 {
 	struct imap_client *imap_client = (struct imap_client *)client;
+
+	/* Prevent memory leak of ID command if client got disconnected before
+	   command was finished. */
+	if (imap_client->cmd_id != NULL) {
+		i_assert(!imap_client->cmd_finished);
+		cmd_id_free(imap_client);
+	}
 
 	i_free_and_null(imap_client->proxy_backend_capability);
 	imap_parser_unref(&imap_client->parser);

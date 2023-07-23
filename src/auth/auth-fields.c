@@ -75,7 +75,7 @@ void auth_fields_add(struct auth_fields *fields,
 		auth_fields_snapshot_preserve(fields);
 		field = array_idx_modifiable(&fields->fields, idx);
 	}
-	field->value = p_strdup_empty(fields->pool, value);
+	field->value = value == NULL ? "yes" : p_strdup(fields->pool, value);
 	field->flags = flags | AUTH_FIELD_FLAG_CHANGED;
 }
 
@@ -98,7 +98,8 @@ const char *auth_fields_find(struct auth_fields *fields, const char *key)
 		return NULL;
 
 	field = array_idx(&fields->fields, idx);
-	return field->value == NULL ? "" : field->value;
+	i_assert(field->value != NULL);
+	return field->value;
 }
 
 bool auth_fields_exists(struct auth_fields *fields, const char *key)
@@ -161,11 +162,11 @@ const ARRAY_TYPE(auth_field) *auth_fields_export(struct auth_fields *fields)
 
 void auth_fields_append(struct auth_fields *fields, string_t *dest,
 			enum auth_field_flags flags_mask,
-			enum auth_field_flags flags_result)
+			enum auth_field_flags flags_result,
+			bool prefix_with_tab)
 {
 	const struct auth_field *f;
 	unsigned int i, count;
-	bool first = TRUE;
 
 	if (!array_is_created(&fields->fields))
 		return;
@@ -175,15 +176,13 @@ void auth_fields_append(struct auth_fields *fields, string_t *dest,
 		if ((f[i].flags & flags_mask) != flags_result)
 			continue;
 
-		if (first)
-			first = FALSE;
-		else
+		if (prefix_with_tab)
 			str_append_c(dest, '\t');
+		else
+			prefix_with_tab = TRUE;
 		str_append(dest, f[i].key);
-		if (f[i].value != NULL) {
-			str_append_c(dest, '=');
-			str_append_tabescaped(dest, f[i].value);
-		}
+		str_append_c(dest, '=');
+		str_append_tabescaped(dest, f[i].value);
 	}
 }
 
@@ -191,17 +190,6 @@ bool auth_fields_is_empty(struct auth_fields *fields)
 {
 	return fields == NULL || !array_is_created(&fields->fields) ||
 		array_count(&fields->fields) == 0;
-}
-
-void auth_fields_booleanize(struct auth_fields *fields, const char *key)
-{
-	struct auth_field *field;
-	unsigned int idx;
-
-	if (auth_fields_find_idx(fields, key, &idx)) {
-		field = array_idx_modifiable(&fields->fields, idx);
-		field->value = NULL;
-	}
 }
 
 void auth_fields_snapshot(struct auth_fields *fields)

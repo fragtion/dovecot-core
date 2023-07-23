@@ -13,6 +13,7 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-settings \
 	-I$(top_srcdir)/src/lib-master \
 	-I$(top_srcdir)/src/lib-pop3 \
+	-I$(top_srcdir)/src/imap-urlauth \
 	-DPKG_RUNDIR=\""$(rundir)"\" \
 	-DPKG_STATEDIR=\""$(statedir)"\" \
 	-DPKG_LIBEXECDIR=\""$(pkglibexecdir)"\" \
@@ -24,6 +25,8 @@ AM_CPPFLAGS = \
 
 noinst_LTLIBRARIES = libconfig.la
 
+config_LDFLAGS = -export-dynamic \
+	$(BINARY_LDFLAGS)
 config_LDADD = \
 	$(noinst_LTLIBRARIES) \
 	$(LIBDOVECOT) \
@@ -33,6 +36,8 @@ config_LDADD = \
 
 config_DEPENDENCIES = $(LIBDOVECOT_DEPS) $(noinst_LTLIBRARIES)
 
+doveconf_LDFLAGS = -export-dynamic \
+	$(BINARY_LDFLAGS)
 doveconf_LDADD = \
 	$(noinst_LTLIBRARIES) \
 	$(LIBDOVECOT) \
@@ -44,6 +49,7 @@ doveconf_DEPENDENCIES = $(LIBDOVECOT_DEPS) $(noinst_LTLIBRARIES)
 
 common = \
 	config-connection.c \
+	config-dump-full.c \
 	config-filter.c \
 	config-parser.c \
 	config-request.c \
@@ -63,6 +69,7 @@ doveconf_SOURCES = \
 noinst_HEADERS = \
 	all-settings.h \
 	config-connection.h \
+	config-dump-full.h \
 	old-set-parser.h \
 	sysinfo-get.h
 

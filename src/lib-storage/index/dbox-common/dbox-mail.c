@@ -56,7 +56,9 @@ int dbox_mail_metadata_read(struct dbox_mail *mail, struct dbox_file **file_r)
 		/* we just messed up mail's input stream by reading metadata */
 		i_stream_seek((*file_r)->input, offset);
 		i_stream_sync(mail->imail.data.stream);
-	}
+	} else
+		mail_metadata_accessed_event(mail_event(&mail->imail.mail.mail));
+
 	return 0;
 }
 
@@ -141,18 +143,17 @@ int dbox_mail_get_save_date(struct mail *_mail, time_t *date_r)
 	struct dbox_storage *storage = DBOX_STORAGE(_mail->box->storage);
 	struct dbox_mail *mail = DBOX_MAIL(_mail);
 	struct index_mail_data *data = &mail->imail.data;
-	struct dbox_file *file;
 	struct stat st;
-	uoff_t offset;
 
 	if (index_mail_get_save_date(_mail, date_r) > 0)
 		return 1;
 
-	if (storage->v.mail_open(mail, &offset, &file) < 0)
+	if (storage->v.mail_file_set(mail) < 0)
 		return -1;
 
-	_mail->transaction->stats.fstat_lookup_count++;
-	if (dbox_file_stat(file, &st) < 0) {
+	_mail->transaction->stats.stat_lookup_count++;
+	if (dbox_file_stat(mail->open_file,
+	    mail_event(&mail->imail.mail.mail), &st) < 0) {
 		if (errno == ENOENT)
 			mail_set_expunged(_mail);
 		return -1;
@@ -301,11 +302,6 @@ int dbox_mail_get_stream(struct mail *_mail, bool get_body ATTR_UNUSED,
 
 		ret = get_mail_stream(mail, offset, &input);
 		if (ret <= 0) {
-			if (ret < 0)
-				return -1;
-			dbox_file_set_corrupted(mail->open_file,
-				"uid=%u points to broken data at offset="
-				"%"PRIuUOFF_T, _mail->uid, offset);
 			i_stream_unref(&input);
 			return -1;
 		}

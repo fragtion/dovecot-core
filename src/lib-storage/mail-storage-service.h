@@ -34,14 +34,11 @@ enum mail_storage_service_flags {
 	MAIL_STORAGE_SERVICE_FLAG_USE_SYSEXITS		= 0x400,
 	/* Don't create namespaces, only the user. */
 	MAIL_STORAGE_SERVICE_FLAG_NO_NAMESPACES		= 0x800,
-	/* Disable reading ssl_ca setting to save memory. */
-	MAIL_STORAGE_SERVICE_FLAG_NO_SSL_CA		= 0x1000,
 };
 
 struct mail_storage_service_input {
 	struct event *event_parent;
 
-	const char *module;
 	const char *service;
 	const char *username;
 	/* If set, use this string as the session ID */
@@ -60,6 +57,9 @@ struct mail_storage_service_input {
 
 	const char *const *forward_fields;
 
+	/* Use this settings parser instead of looking it up. */
+	struct setting_parser_context *unexpanded_set_parser;
+
 	/* Override specified global flags */
 	enum mail_storage_service_flags flags_override_add;
 	enum mail_storage_service_flags flags_override_remove;
@@ -71,6 +71,11 @@ struct mail_storage_service_input {
 	/* The end client connection (not just the previous hop proxy
 	   connection) is using TLS. */
 	bool end_client_tls_secured:1;
+	/* User is autocreated (e.g. raw storage user) */
+	bool autocreated:1;
+	/* Don't free the user if user initialization fails. The caller is
+	   expected to free the user. */
+	bool no_free_init_failure:1;
 };
 
 extern struct module *mail_storage_service_modules;
@@ -120,7 +125,6 @@ void mail_storage_service_restrict_setenv(struct mail_storage_service_ctx *ctx,
 /* Combine lookup() and next() into one call. */
 int mail_storage_service_lookup_next(struct mail_storage_service_ctx *ctx,
 				     const struct mail_storage_service_input *input,
-				     struct mail_storage_service_user **user_r,
 				     struct mail_user **mail_user_r,
 				     const char **error_r);
 void mail_storage_service_user_ref(struct mail_storage_service_user *user);
@@ -137,9 +141,6 @@ void mail_storage_service_all_init_mask(struct mail_storage_service_ctx *ctx,
 int mail_storage_service_all_next(struct mail_storage_service_ctx *ctx,
 				  const char **username_r);
 void mail_storage_service_deinit(struct mail_storage_service_ctx **ctx);
-/* Returns the first created service context. If it gets freed, NULL is
-   returned until the next time mail_storage_service_init() is called. */
-struct mail_storage_service_ctx *mail_storage_service_get_global(void);
 
 /* Activate user context. Normally this is called automatically by the ioloop,
    but e.g. during loops at deinit where all users are being destroyed, it's
@@ -166,6 +167,10 @@ mail_storage_service_user_get_service_ctx(struct mail_storage_service_user *user
 pool_t mail_storage_service_user_get_pool(struct mail_storage_service_user *user);
 const char *
 mail_storage_service_user_get_log_prefix(struct mail_storage_service_user *user);
+struct event *
+mail_storage_service_user_get_event(const struct mail_storage_service_user *user);
+const char *
+mail_storage_service_user_get_username(const struct mail_storage_service_user *user);
 
 /* Return all service settings roots. This includes the roots given to
    mail_storage_service_init() as well as all dynamically created

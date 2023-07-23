@@ -66,6 +66,10 @@ enum master_login_state {
 /* getenv(MASTER_CONFIG_FILE_ENV) provides path to configuration file/socket */
 #define MASTER_CONFIG_FILE_ENV "CONFIG_FILE"
 
+/* getenv(MASTER_VERBOSE_PROCTITLE_ENV) is non-NULL if verbose_proctitle=yes.
+   This is used by lib-master during initialization. */
+#define MASTER_VERBOSE_PROCTITLE_ENV "VERBOSE_PROCTITLE"
+
 /* getenv(MASTER_DOVECOT_VERSION_ENV) provides master's version number
    (unset if version_ignore=yes) */
 #define MASTER_DOVECOT_VERSION_ENV "DOVECOT_VERSION"
@@ -81,6 +85,10 @@ enum master_login_state {
 /* getenv(DOVECOT_LOG_DEBUG_ENV) returns the global log_debug setting. This can
    be used to initialize debug logging immediately at startup. */
 #define DOVECOT_LOG_DEBUG_ENV "LOG_DEBUG"
+
+/* getenv(DOVECOT_CONFIG_FD_ENV) returns the configuration fd provided by
+   doveconf. */
+#define DOVECOT_CONFIG_FD_ENV "DOVECOT_CONFIG_FD"
 
 /* getenv(DOVECOT_STATS_WRITER_SOCKET_PATH) returns path to the stats-writer
    socket. */
@@ -98,13 +106,15 @@ enum master_login_state {
 /* Pipe to master, used to detect when it dies. (MASTER_STATUS_FD would have
    been fine for this, except it's inefficient in Linux) */
 #define MASTER_DEAD_FD 6
+/* Configuration file descriptor. */
+#define MASTER_CONFIG_FD 7
 /* First file descriptor where process is expected to be listening.
    The file descriptor count is given in -s parameter, defaulting to 1.
 
    master_status.available_count reports how many accept()s we're still
    accepting. Once no children are listening, master will do it and create
    new child processes when needed. */
-#define MASTER_LISTEN_FD_FIRST 7
+#define MASTER_LISTEN_FD_FIRST 8
 
 /* Timeouts: base everything on how long we can wait for login clients. */
 #define MASTER_LOGIN_TIMEOUT_SECS (3*60)

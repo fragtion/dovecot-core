@@ -488,9 +488,9 @@ index_storage_mailbox_update_cache(struct mailbox *box,
 	const struct mail_cache_field *old_fields;
 	struct mail_cache_field field;
 	unsigned int i, j, old_count;
+	pool_t pool;
 
-	old_fields = mail_cache_register_get_list(box->cache,
-						  pool_datastack_create(),
+	old_fields = mail_cache_register_get_list(box->cache, &pool,
 						  &old_count);
 
 	/* There shouldn't be many fields, so don't worry about O(n^2). */
@@ -524,6 +524,7 @@ index_storage_mailbox_update_cache(struct mailbox *box,
 					   array_count(&new_fields),
 					   unsafe_data_stack_pool);
 	}
+	pool_unref(&pool);
 }
 
 static int
@@ -936,16 +937,21 @@ int index_storage_mailbox_rename(struct mailbox *src, struct mailbox *dest)
 	return 0;
 }
 
-int index_mailbox_update_last_temp_file_scan(struct mailbox *box)
+int index_mailbox_view_update_last_temp_file_scan(struct mail_index_view *view)
 {
 	uint32_t last_temp_file_scan = ioloop_time32;
 	struct mail_index_transaction *trans =
-		mail_index_transaction_begin(box->view,
+		mail_index_transaction_begin(view,
 			MAIL_INDEX_TRANSACTION_FLAG_EXTERNAL);
 	mail_index_update_header(trans,
 		offsetof(struct mail_index_header, last_temp_file_scan),
 		&last_temp_file_scan, sizeof(last_temp_file_scan), TRUE);
-	if (mail_index_transaction_commit(&trans) < 0) {
+	return mail_index_transaction_commit(&trans);
+}
+
+int index_mailbox_update_last_temp_file_scan(struct mailbox *box)
+{
+	if (index_mailbox_view_update_last_temp_file_scan(box->view) < 0) {
 		mailbox_set_index_error(box);
 		return -1;
 	}
@@ -1082,12 +1088,13 @@ void index_copy_cache_fields(struct mail_save_context *ctx,
 					 &dest_metadata) < 0)
 			i_unreached();
 
-		buf = t_buffer_create(1024);
+		buf = buffer_create_dynamic(default_pool, 1024);
 		array_foreach(src_metadata.cache_fields, field) {
 			mail_copy_cache_field(ctx, src_mail, dest_seq,
 					      field->name, buf);
 		}
 		index_copy_vsize_extension(ctx, src_mail, dest_seq);
+		buffer_free(&buf);
 	} T_END;
 }
 

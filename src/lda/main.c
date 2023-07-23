@@ -153,7 +153,10 @@ lda_raw_mail_open(struct mail_deliver_input *dinput, const char *path)
 	time_t mtime;
 	int ret;
 
-	raw_mail_user = raw_storage_create_from_set(dinput->rcpt_user->unexpanded_set_parser);
+	struct mail_storage_service_ctx *storage_service =
+		mail_storage_service_user_get_service_ctx(dinput->rcpt_user->service_user);
+	raw_mail_user = raw_storage_create_from_set(storage_service,
+				dinput->rcpt_user->unexpanded_set_parser);
 
 	mail_from = (dinput->mail_from != NULL ?
 		     dinput->mail_from : &default_envelope_sender);
@@ -346,7 +349,6 @@ int main(int argc, char *argv[])
 	const char *user, *errstr, *path;
 	struct smtp_address *rcpt_to, *final_rcpt_to, *mail_from;
 	struct mail_storage_service_ctx *storage_service;
-	struct mail_storage_service_user *service_user;
 	struct mail_storage_service_input service_input;
 	struct event *event;
 	const char *user_source = "", *rcpt_to_source = "", *mail_from_error;
@@ -517,7 +519,6 @@ int main(int argc, char *argv[])
 	dinput.event_parent = event;
 
 	i_zero(&service_input);
-	service_input.module = "lda";
 	service_input.service = "lda";
 	service_input.username = user;
 	service_input.event_parent = event;
@@ -530,7 +531,7 @@ int main(int argc, char *argv[])
 	   _lookup() and _next(), but don't bother) */
 	dinput.delivery_time_started = ioloop_timeval;
 	ret = mail_storage_service_lookup_next(storage_service,
-					       &service_input, &service_user,
+					       &service_input,
 					       &dinput.rcpt_user,
 					       &errstr);
 	if (ret <= 0) {
@@ -564,7 +565,6 @@ int main(int argc, char *argv[])
 		mailbox_free(&box);
 
 		mail_user_deinit(&dinput.rcpt_user);
-		mail_storage_service_user_unref(&service_user);
 	}
 
 	mail_deliver_session_deinit(&dinput.session);

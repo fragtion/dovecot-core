@@ -10,10 +10,6 @@
 #include "event-filter.h"
 #include "event-filter-private.h"
 
-/* Note: this has to match the regexp behavior in the event filter lexer file */
-#define event_filter_append_escaped(dst, str) \
-	str_append_escaped((dst), (str), strlen(str))
-
 enum event_filter_code {
 	EVENT_FILTER_CODE_NAME		= 'n',
 	EVENT_FILTER_CODE_SOURCE	= 's',
@@ -156,8 +152,9 @@ static bool filter_node_requires_event_name(struct event_filter_node *node)
 	}
 }
 
-int event_filter_parse(const char *str, struct event_filter *filter,
-		       const char **error_r)
+static int
+event_filter_parse_real(const char *str, struct event_filter *filter,
+			const char **error_r)
 {
 	struct event_filter_query_internal *int_query;
 	struct event_filter_parser_state state;
@@ -200,6 +197,16 @@ int event_filter_parse(const char *str, struct event_filter *filter,
 	 */
 
 	return (ret != 0) ? -1 : 0;
+}
+
+int event_filter_parse(const char *str, struct event_filter *filter,
+		       const char **error_r)
+{
+	int ret;
+	T_BEGIN {
+		ret = event_filter_parse_real(str, filter, error_r);
+	} T_END_PASS_STR_IF(ret < 0, error_r);
+	return ret;
 }
 
 bool event_filter_category_to_log_type(const char *name,
@@ -254,6 +261,8 @@ clone_expr(pool_t pool, struct event_filter_node *old)
 	new->ambiguous_unit = old->ambiguous_unit;
 	new->warned_ambiguous_unit = old->warned_ambiguous_unit;
 	new->warned_type_mismatch = old->warned_type_mismatch;
+	new->warned_string_inequality = old->warned_string_inequality;
+	new->warned_timeval_not_implemented = old->warned_timeval_not_implemented;
 
 	return new;
 }
@@ -304,6 +313,17 @@ void event_filter_merge_with_context(struct event_filter *dest,
 				     void *new_context)
 {
 	event_filter_merge_with_context_internal(dest, src, new_context, TRUE);
+}
+
+static void
+event_filter_append_escaped(string_t *dest, const char *src, bool wildcard)
+{
+	if (!wildcard)
+		str_append_escaped(dest, src, strlen(src));
+	else {
+		/* src is already escaped */
+		str_append(dest, src);
+	}
 }
 
 static const char *
@@ -366,14 +386,15 @@ event_filter_export_query_expr(const struct event_filter_query_internal *query,
 		str_append(dest, "event");
 		str_append(dest, event_filter_export_query_expr_op(node->op));
 		str_append_c(dest, '"');
-		event_filter_append_escaped(dest, node->str);
+		event_filter_append_escaped(dest, node->str,
+			node->type == EVENT_FILTER_NODE_TYPE_EVENT_NAME_WILDCARD);
 		str_append_c(dest, '"');
 		break;
 	case EVENT_FILTER_NODE_TYPE_EVENT_SOURCE_LOCATION:
 		str_append(dest, "source_location");
 		str_append(dest, event_filter_export_query_expr_op(node->op));
 		str_append_c(dest, '"');
-		event_filter_append_escaped(dest, node->str);
+		event_filter_append_escaped(dest, node->str, FALSE);
 		if (node->intmax != 0)
 			str_printfa(dest, ":%ju", node->intmax);
 		str_append_c(dest, '"');
@@ -383,7 +404,7 @@ event_filter_export_query_expr(const struct event_filter_query_internal *query,
 		str_append(dest, event_filter_export_query_expr_op(node->op));
 		if (node->category.name != NULL) {
 			str_append_c(dest, '"');
-			event_filter_append_escaped(dest, node->category.name);
+			event_filter_append_escaped(dest, node->category.name, FALSE);
 			str_append_c(dest, '"');
 		} else
 			str_append(dest, event_filter_category_from_log_type(node->category.log_type));
@@ -392,11 +413,12 @@ event_filter_export_query_expr(const struct event_filter_query_internal *query,
 	case EVENT_FILTER_NODE_TYPE_EVENT_FIELD_WILDCARD:
 	case EVENT_FILTER_NODE_TYPE_EVENT_FIELD_NUMERIC_WILDCARD:
 		str_append_c(dest, '"');
-		event_filter_append_escaped(dest, node->field.key);
+		event_filter_append_escaped(dest, node->field.key, FALSE);
 		str_append_c(dest, '"');
 		str_append(dest, event_filter_export_query_expr_op(node->op));
 		str_append_c(dest, '"');
-		event_filter_append_escaped(dest, node->field.value.str);
+		event_filter_append_escaped(dest, node->field.value.str,
+			node->type != EVENT_FILTER_NODE_TYPE_EVENT_FIELD_EXACT);
 		str_append_c(dest, '"');
 		break;
 	}
@@ -509,8 +531,8 @@ event_match_strlist_recursive(struct event *event,
 		i_assert(field->value_type == EVENT_FIELD_VALUE_TYPE_STRLIST);
 		array_foreach_elem(&field->value.strlist, value) {
 			*seen = TRUE;
-			match = use_strcmp ? strcmp(value, wanted_value) == 0 :
-				wildcard_match_icase(value, wanted_value);
+			match = use_strcmp ? strcasecmp(value, wanted_value) == 0 :
+				wildcard_match_escaped_icase(value, wanted_value);
 			if (match)
 				return TRUE;
 		}
@@ -590,8 +612,21 @@ event_match_field(struct event *event, struct event_filter_node *node,
 
 	switch (field->value_type) {
 	case EVENT_FIELD_VALUE_TYPE_STR:
+		/* We only support string equality comparisons. */
 		if (node->op != EVENT_FILTER_OP_CMP_EQ) {
-			/* we only support string equality comparisons */
+			/* Warn about non-equality comparisons. */
+			if (!node->warned_string_inequality) {
+				const char *name = event->sending_name;
+				/* Use i_warning to prevent event filter recursions. */
+				i_warning("Event filter for string field '%s' "
+					  "only supports equality operation "
+					  "'=' not '%s'. (event=%s, source=%s:%u)",
+					  wanted_field->key,
+					  event_filter_export_query_expr_op(node->op),
+					  name != NULL ? name : "",
+					  source_filename, source_linenum);
+				node->warned_string_inequality = TRUE;
+			}
 			return FALSE;
 		}
 		if (field->value.str[0] == '\0') {
@@ -601,7 +636,7 @@ event_match_field(struct event *event, struct event_filter_node *node,
 		if (use_strcmp)
 			return strcasecmp(field->value.str, wanted_field->value.str) == 0;
 		else
-			return wildcard_match_icase(field->value.str, wanted_field->value.str);
+			return wildcard_match_escaped_icase(field->value.str, wanted_field->value.str);
 	case EVENT_FIELD_VALUE_TYPE_INTMAX:
 		if (node->ambiguous_unit) {
 			if (!node->warned_ambiguous_unit) {
@@ -620,8 +655,12 @@ event_match_field(struct event *event, struct event_filter_node *node,
 				node->warned_ambiguous_unit = TRUE;
 			}
 			return FALSE;
-		} else if ((wanted_field->value_type != EVENT_FIELD_VALUE_TYPE_INTMAX) &&
-		    (node->type != EVENT_FILTER_NODE_TYPE_EVENT_FIELD_NUMERIC_WILDCARD)) {
+		} else if (wanted_field->value_type == EVENT_FIELD_VALUE_TYPE_INTMAX) {
+			/* compare against an integer */
+			return event_filter_handle_numeric_operation(
+				node->op, field->value.intmax, wanted_field->value.intmax);
+		} else if (use_strcmp ||
+			   (node->type != EVENT_FILTER_NODE_TYPE_EVENT_FIELD_NUMERIC_WILDCARD)) {
 			if (!node->warned_type_mismatch) {
 				const char *name = event->sending_name;
 				/* Use i_warning to prevent event filter recursions. */
@@ -635,31 +674,108 @@ event_match_field(struct event *event, struct event_filter_node *node,
 				node->warned_type_mismatch = TRUE;
 			}
 			return FALSE;
-		} else if (wanted_field->value_type == EVENT_FIELD_VALUE_TYPE_INTMAX) {
-			/* compare against an integer */
-			return event_filter_handle_numeric_operation(
-				node->op, field->value.intmax, wanted_field->value.intmax);
 		} else if (node->op != EVENT_FILTER_OP_CMP_EQ) {
-			/* we only support string equality comparisons */
-			return FALSE;
-		} else if (use_strcmp) {
-			/* If the matched value was a number, it was already matched
-			   in the previous branch. So here we have a non-wildcard
-			   string, which can never be a match to a number. */
+			/* In this branch a numeric value is matched against a
+			   wildcard, which requires an equality operation. */
+			if (!node->warned_type_mismatch) {
+				const char *name = event->sending_name;
+				/* Use i_warning to prevent event filter recursions. */
+				i_warning("Event filter matches integer field "
+					  "'%s' against wildcard value '%s' "
+					  "with an incompatible operation '%s', "
+					  "please use '='. (event=%s, "
+					  "source=%s:%u)",
+					  wanted_field->key,
+					  wanted_field->value.str,
+					  event_filter_export_query_expr_op(node->op),
+					  name != NULL ? name : "",
+					  source_filename, source_linenum);
+				node->warned_type_mismatch = TRUE;
+			}
 			return FALSE;
 		} else {
 			char tmp[MAX_INT_STRLEN];
 			i_snprintf(tmp, sizeof(tmp), "%jd", field->value.intmax);
-			return wildcard_match_icase(tmp, wanted_field->value.str);
+			return wildcard_match_escaped_icase(tmp, wanted_field->value.str);
 		}
-	case EVENT_FIELD_VALUE_TYPE_TIMEVAL:
-		/* there's no point to support matching exact timestamps */
+	case EVENT_FIELD_VALUE_TYPE_TIMEVAL: {
+		/* Filtering for timeval fields is not implemented. */
+		if (!node->warned_timeval_not_implemented) {
+		     const char *name = event->sending_name;
+		     i_warning("Event filter for timeval field '%s' is "
+			       "currently not implemented. (event=%s, "
+			       "source=%s:%u)",
+			       wanted_field->key, name != NULL ? name : "",
+			       source_filename, source_linenum);
+			node->warned_timeval_not_implemented = TRUE;
+		}
 		return FALSE;
+	}
+	case EVENT_FIELD_VALUE_TYPE_IP:
+		if (node->op != EVENT_FILTER_OP_CMP_EQ) {
+			/* we only support IP equality comparisons */
+			if (!node->warned_ip_inequality) {
+				const char *name = event->sending_name;
+				/* Use i_warning to prevent event filter recursions. */
+				i_warning("Event filter for IP field '%s' "
+					  "only supports equality operation "
+					  "'=' not '%s'. (event=%s, source=%s:%u)",
+					  wanted_field->key,
+					  event_filter_export_query_expr_op(node->op),
+					  name != NULL ? name : "",
+					  source_filename, source_linenum);
+				node->warned_ip_inequality = TRUE;
+			}
+			return FALSE;
+		}
+		if (wanted_field->value_type == EVENT_FIELD_VALUE_TYPE_IP) {
+			return net_is_in_network(&field->value.ip,
+						 &wanted_field->value.ip,
+						 wanted_field->value.ip_bits);
+		}
+		if (use_strcmp) {
+			/* If the matched value was a number, it was already
+			   matched in the previous branch. So here we have a
+			   non-wildcard IP, which can never be a match to an
+			   IP. */
+			if (!node->warned_type_mismatch) {
+				const char *name = event->sending_name;
+				/* Use i_warning to prevent event filter recursions. */
+				i_warning("Event filter matches IP field "
+					  "'%s' against non-IP value '%s'. "
+					  "(event=%s, source=%s:%u)",
+					  wanted_field->key,
+					  wanted_field->value.str,
+					  name != NULL ? name : "",
+					  source_filename, source_linenum);
+				node->warned_type_mismatch = TRUE;
+			}
+			return FALSE;
+		}
+		bool ret;
+		T_BEGIN {
+			ret = wildcard_match_escaped_icase(net_ip2addr(&field->value.ip),
+							   wanted_field->value.str);
+		} T_END;
+		return ret;
 	case EVENT_FIELD_VALUE_TYPE_STRLIST:
 		/* check if the value is (or is not) on the list,
 		   only string matching makes sense here. */
-		if (node->op != EVENT_FILTER_OP_CMP_EQ)
+		if (node->op != EVENT_FILTER_OP_CMP_EQ) {
+			if (!node->warned_string_inequality) {
+				const char *name = event->sending_name;
+				i_warning("Event filter for string list field "
+					  "'%s' only supports equality "
+					  "operation '=' not '%s'. (event=%s, "
+					  "source=%s:%u)",
+					  wanted_field->key,
+					  event_filter_export_query_expr_op(node->op),
+					  name != NULL ? name : "",
+					  source_filename, source_linenum);
+				node->warned_string_inequality = TRUE;
+			}
 			return FALSE;
+		}
 		return event_match_strlist(event, wanted_field, use_strcmp);
 	}
 	i_unreached();
@@ -685,7 +801,7 @@ event_filter_query_match_cmp(struct event_filter_node *node,
 			       strcmp(event->sending_name, node->str) == 0;
 		case EVENT_FILTER_NODE_TYPE_EVENT_NAME_WILDCARD:
 			return (event->sending_name != NULL) &&
-			       wildcard_match(event->sending_name, node->str);
+			       wildcard_match_escaped(event->sending_name, node->str);
 		case EVENT_FILTER_NODE_TYPE_EVENT_SOURCE_LOCATION:
 			return !((source_linenum != node->intmax &&
 				  node->intmax != 0) ||

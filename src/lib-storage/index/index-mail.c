@@ -817,12 +817,12 @@ static void index_mail_body_parsed_cache_message_parts(struct index_mail *mail)
 		return;
 	}
 
-	T_BEGIN {
-		buffer = t_buffer_create(1024);
-		message_part_serialize(mail->data.parts, buffer);
-		index_mail_cache_add_idx(mail, cache_field,
-					 buffer->data, buffer->used);
-	} T_END;
+	pool_t pool = pool_alloconly_create("mail parts", 2048);
+	buffer = buffer_create_dynamic(pool, 1024);
+	message_part_serialize(mail->data.parts, buffer);
+	index_mail_cache_add_idx(mail, cache_field,
+				 buffer->data, buffer->used);
+	pool_unref(&pool);
 
 	data->messageparts_saved_to_cache = TRUE;
 }
@@ -955,6 +955,12 @@ bool index_mail_want_cache(struct index_mail *mail, enum index_cache_field field
 	case MAIL_CACHE_BODY_SNIPPET:
 		fetch_field = MAIL_FETCH_BODY_SNIPPET;
 		break;
+	case MAIL_CACHE_IMAP_BODY:
+		fetch_field = MAIL_FETCH_IMAP_BODY;
+		break;
+	case MAIL_CACHE_IMAP_BODYSTRUCTURE:
+		fetch_field = MAIL_FETCH_IMAP_BODYSTRUCTURE;
+		break;
 	default:
 		i_unreached();
 	}
@@ -995,7 +1001,6 @@ static void index_mail_save_finish_make_snippet(struct index_mail *mail)
 static void index_mail_cache_sizes(struct index_mail *mail)
 {
 	struct mail *_mail = &mail->mail.mail;
-	struct mail_index_view *view = _mail->transaction->view;
 
 	static enum index_cache_field size_fields[] = {
 		MAIL_CACHE_VIRTUAL_FULL_SIZE,
@@ -1016,10 +1021,7 @@ static void index_mail_cache_sizes(struct index_mail *mail)
 		size is not cached or
 		cached size differs
 	*/
-	if ((mail_index_map_get_ext_idx(view->index->map, _mail->box->mail_vsize_ext_id, &idx) ||
-	     mail_index_map_get_ext_idx(view->index->map, _mail->box->vsize_hdr_ext_id, &idx)) &&
-	    (sizes[0] != UOFF_T_MAX &&
-	     sizes[0] < (uint32_t)-1)) {
+	if ((sizes[0] != UOFF_T_MAX && sizes[0] < (uint32_t)-1)) {
 		const uint32_t *vsize_ext =
 			index_mail_get_vsize_extension(_mail);
 		/* vsize = 0 means it's not present in index, consult cache.
@@ -1475,6 +1477,13 @@ int index_mail_init_stream(struct index_mail *mail,
 	return 0;
 }
 
+static bool index_mail_want_write_snippet(struct index_mail *mail,
+				     	  enum index_cache_field field)
+{
+	if (field == MAIL_CACHE_BODY_SNIPPET) return TRUE;
+	return index_mail_want_cache(mail, MAIL_CACHE_BODY_SNIPPET);
+}
+
 static int
 index_mail_parse_bodystructure_full(struct index_mail *mail,
 				    enum index_cache_field field)
@@ -1484,7 +1493,7 @@ index_mail_parse_bodystructure_full(struct index_mail *mail,
 	if ((data->save_bodystructure_header &&
 	     !data->parsed_bodystructure_header) ||
 	    !data->save_bodystructure_body ||
-	    field == MAIL_CACHE_BODY_SNIPPET) {
+	    index_mail_want_write_snippet(mail, field)) {
 		/* we haven't parsed the header yet */
 		const char *reason =
 			index_mail_cache_reason(&mail->mail.mail, "bodystructure");
@@ -1534,41 +1543,47 @@ static int index_mail_parse_bodystructure(struct index_mail *mail,
 	}
 	i_assert(data->parts != NULL);
 
-	/* if we didn't want to have the body(structure) cached,
-	   it's still not written. */
-	switch (field) {
-	case MAIL_CACHE_IMAP_BODY:
-		if (data->body == NULL) {
-			str = str_new(mail->mail.data_pool, 128);
-			if (index_mail_write_bodystructure(mail, str, FALSE) < 0)
-				return -1;
-			data->body = str_c(str);
-		}
-		break;
-	case MAIL_CACHE_IMAP_BODYSTRUCTURE:
-		if (data->bodystructure == NULL) {
-			str = str_new(mail->mail.data_pool, 128);
-			if (index_mail_write_bodystructure(mail, str, TRUE) < 0)
-				return -1;
-			data->bodystructure = str_c(str);
-		}
-		break;
-	case MAIL_CACHE_BODY_SNIPPET:
-		if (data->body_snippet == NULL) {
-			if (index_mail_write_body_snippet(mail) < 0)
-				return -1;
+	if (data->body_snippet == NULL &&
+	    index_mail_want_write_snippet(mail, field)) {
+		if (index_mail_write_body_snippet(mail) < 0)
+			return -1;
 
-			if (index_mail_want_cache(mail, MAIL_CACHE_BODY_SNIPPET))
-				index_mail_cache_add(mail, MAIL_CACHE_BODY_SNIPPET,
-						     mail->data.body_snippet,
-						     strlen(mail->data.body_snippet));
-		}
+		index_mail_cache_add_if_wanted(mail, MAIL_CACHE_BODY_SNIPPET,
+					       mail->data.body_snippet,
+					       strlen(mail->data.body_snippet));
+
 		i_assert(data->body_snippet != NULL &&
 			 data->body_snippet[0] != '\0');
-		break;
-	default:
-		i_unreached();
 	}
+
+	if (data->body == NULL &&
+	    (field == MAIL_CACHE_IMAP_BODY ||
+	     index_mail_want_cache(mail, MAIL_CACHE_IMAP_BODY))) {
+		str = str_new(mail->mail.data_pool, 128);
+		if (index_mail_write_bodystructure(mail, str, FALSE) < 0)
+			return -1;
+		data->body = str_c(str);
+
+		index_mail_cache_add_if_wanted(mail, MAIL_CACHE_IMAP_BODY,
+					       data->body, strlen(data->body));
+	}
+
+	if (data->bodystructure == NULL &&
+	    (field == MAIL_CACHE_IMAP_BODYSTRUCTURE ||
+	     index_mail_want_cache(mail, MAIL_CACHE_IMAP_BODYSTRUCTURE))) {
+		str = str_new(mail->mail.data_pool, 128);
+		if (index_mail_write_bodystructure(mail, str, TRUE) < 0)
+			return -1;
+		data->bodystructure = str_c(str);
+
+		index_mail_cache_add_if_wanted(mail, MAIL_CACHE_IMAP_BODYSTRUCTURE,
+					      data->bodystructure,
+					      strlen(data->bodystructure));
+	}
+
+	if (!data->messageparts_saved_to_cache)
+		index_mail_body_parsed_cache_message_parts(mail);
+
 	return 0;
 }
 

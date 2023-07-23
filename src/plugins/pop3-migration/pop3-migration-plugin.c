@@ -271,7 +271,7 @@ get_hdr_sha1(struct mail *mail, unsigned char sha1_r[STATIC_ARRAY SHA1_RESULTLEN
 	int ret;
 
 	if (mail_get_hdr_stream(mail, NULL, &input) < 0) {
-		errstr = mailbox_get_last_internal_error(mail->box, &error);
+		errstr = mail_get_last_internal_error(mail, &error);
 		e_error(event,
 			"pop3_migration: Failed to get header for msg %u: %s",
 			mail->seq, errstr);
@@ -311,7 +311,7 @@ get_hdr_sha1(struct mail *mail, unsigned char sha1_r[STATIC_ARRAY SHA1_RESULTLEN
 	   (and/or RETR) and we'll parse the header ourself from it. This
 	   should work around any similar bugs in all IMAP/POP3 servers. */
 	if (mail_get_stream_because(mail, NULL, NULL, "pop3-migration", &input) < 0) {
-		errstr = mailbox_get_last_internal_error(mail->box, &error);
+		errstr = mail_get_last_internal_error(mail, &error);
 		e_error(event,
 			"pop3_migration: Failed to get body for msg %u: %s",
 			mail->seq, errstr);
@@ -539,7 +539,7 @@ map_read_hdr_hashes(struct mailbox *box, struct array *msg_map, uint32_t seq1)
 
 static int
 pop3_map_read_hdr_hashes(struct mail_storage *storage, struct mailbox *pop3_box,
-			 unsigned first_seq)
+			 unsigned int first_seq)
 {
 	struct pop3_migration_mail_storage *mstorage =
 		POP3_MIGRATION_CONTEXT_REQUIRE(storage);

@@ -56,15 +56,15 @@ static size_t event_filter_parser_input_proc(char *buf, size_t size, yyscan_t sc
 				}
 	/* Note: these have to match the event_filter_append_escaped() behavior */
 <string>[^\\"]+			{ str_append(str_buf, yytext); }
-<string>\\\\			{ str_append_c(str_buf, '\\'); }
-<string>\\\"			{ str_append_c(str_buf, '"'); }
+<string>\\\\			{ str_append(str_buf, yytext); }
+<string>\\\"			{ str_append(str_buf, yytext); }
 <string>\\.			{ str_append(str_buf, yytext); }
 
 [Aa][Nn][Dd]			{ return AND; }
 [Oo][Rr]			{ return OR; }
 [Nn][Oo][Tt]			{ return NOT; }
 [<>=()]				{ return *yytext; }
-[A-Za-z0-9:.*?_-]+		{ yylval->str = t_strdup(yytext); return TOKEN; }
+[A-Za-z0-9:.*?/%_-]+		{ yylval->str = t_strdup(yytext); return TOKEN; }
 [ \t\n\r]			{ /* ignore */ }
 .				{
 					/*

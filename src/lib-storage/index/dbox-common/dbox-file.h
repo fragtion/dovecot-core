@@ -122,6 +122,7 @@ struct dbox_file {
 
 	bool appending:1;
 	bool corrupted:1;
+	bool fixing:1;
 };
 
 struct dbox_file_append_context {
@@ -147,7 +148,7 @@ void dbox_file_close(struct dbox_file *file);
 
 /* fstat() or stat() the file. If file is already deleted, fails with
    errno=ENOENT. */
-int dbox_file_stat(struct dbox_file *file, struct stat *st_r);
+int dbox_file_stat(struct dbox_file *file, struct event *event, struct stat *st_r);
 
 /* Try to lock the dbox file. Returns 1 if ok, 0 if already locked by someone
    else, -1 if error. */

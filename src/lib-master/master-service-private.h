@@ -30,6 +30,7 @@ struct master_service {
 	char *name;
 	char *configured_name;
 	char *getopt_str;
+	const struct option *longopts;
 	enum master_service_flags flags;
 
 	int argc;
@@ -38,7 +39,8 @@ struct master_service {
 	const char *version_string;
 	char *config_path;
 	ARRAY_TYPE(const_string) config_overrides;
-	int config_fd;
+	void *config_mmap_base;
+	size_t config_mmap_size;
 	int syslog_facility;
 	data_stack_frame_t datastack_frame_id;
 
@@ -106,7 +108,6 @@ struct master_service {
 
 void master_service_io_listeners_add(struct master_service *service);
 void master_status_update(struct master_service *service);
-void master_service_close_config_fd(struct master_service *service);
 
 void master_service_io_listeners_remove(struct master_service *service);
 void master_service_ssl_io_listeners_remove(struct master_service *service);

@@ -429,8 +429,10 @@ mail_index_sync_begin_to2(struct mail_index *index,
 	if (log_file_seq != (uint32_t)-1)
 		flags |= MAIL_INDEX_SYNC_FLAG_REQUIRE_CHANGES;
 
-	ret = mail_index_sync_begin_init(index, flags, log_file_seq,
-					 log_file_offset);
+	T_BEGIN {
+		ret = mail_index_sync_begin_init(index, flags, log_file_seq,
+						 log_file_offset);
+	} T_END;
 	if (ret <= 0)
 		return ret;
 
@@ -544,6 +546,12 @@ static bool mail_index_sync_view_have_any(struct mail_index_view *view,
 		return TRUE;
 
 	mail_transaction_log_get_head(view->index->log, &log_seq, &log_offset);
+	if (log_seq < view->map->hdr.log_file_seq ||
+	    ((log_seq == view->map->hdr.log_file_seq &&
+	      log_offset < view->map->hdr.log_file_tail_offset))) {
+		/* invalid offsets - let the syncing handle the error */
+		return TRUE;
+	}
 	if (mail_transaction_log_view_set(view->log_view,
 					  view->map->hdr.log_file_seq,
 					  view->map->hdr.log_file_tail_offset,
@@ -990,7 +998,7 @@ void mail_index_sync_flags_apply(const struct mail_index_sync_rec *sync_rec,
 {
 	i_assert(sync_rec->type == MAIL_INDEX_SYNC_TYPE_FLAGS);
 
-	*flags = (*flags & ENUM_NEGATE(sync_rec->remove_flags)) | sync_rec->add_flags;
+	*flags = (*flags & ~sync_rec->remove_flags) | sync_rec->add_flags;
 }
 
 bool mail_index_sync_keywords_apply(const struct mail_index_sync_rec *sync_rec,

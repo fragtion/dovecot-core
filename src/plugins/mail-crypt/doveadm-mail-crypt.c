@@ -72,7 +72,6 @@ p_as_null_terminated_array(pool_t pool, const char *value)
 static int
 mcp_user_create(struct mail_user *user, const char *dest_username,
 		struct mail_user **dest_user_r,
-		struct mail_storage_service_user **dest_service_user_r,
 		const char **error_r)
 {
 	const struct mail_storage_service_input *old_input;
@@ -82,15 +81,13 @@ mcp_user_create(struct mail_user *user, const char *dest_username,
 
 	int ret;
 
-	i_assert(user->_service_user != NULL);
-	service_ctx = mail_storage_service_user_get_service_ctx(user->_service_user);
-	old_input = mail_storage_service_user_get_input(user->_service_user);
+	service_ctx = mail_storage_service_user_get_service_ctx(user->service_user);
+	old_input = mail_storage_service_user_get_input(user->service_user);
 
 	if ((cur_ioloop_ctx = io_loop_get_current_context(current_ioloop)) != NULL)
 		io_loop_context_deactivate(cur_ioloop_ctx);
 
 	i_zero(&input);
-	input.module = old_input->module;
 	input.service = old_input->service;
 	input.username = dest_username;
 	input.session_id_prefix = user->session_id;
@@ -98,7 +95,6 @@ mcp_user_create(struct mail_user *user, const char *dest_username,
 				   MAIL_STORAGE_SERVICE_FLAG_NO_LOG_INIT;
 
 	ret = mail_storage_service_lookup_next(service_ctx, &input,
-						dest_service_user_r,
 						dest_user_r, error_r);
 
 	if (ret == 0)
@@ -114,7 +110,6 @@ mcp_update_shared_key(struct mailbox_transaction_context *t,
 {
 	const char *error;
 	struct mail_user *dest_user;
-	struct mail_storage_service_user *dest_service_user;
 	struct ioloop_context *cur_ioloop_ctx;
 	struct dcrypt_public_key *pkey;
 	const char *dest_username;
@@ -123,13 +118,12 @@ mcp_update_shared_key(struct mailbox_transaction_context *t,
 	bool disallow_insecure =
 		mail_user_plugin_getenv_bool(user, MAIL_CRYPT_ACL_SECURE_SHARE_SETTING);
 
-	ret = mcp_user_create(user, target_uid, &dest_user,
-			      &dest_service_user, &error);
+	ret = mcp_user_create(user, target_uid, &dest_user, &error);
 
 	/* to make sure we get correct logging context */
 	if (ret > 0)
-		mail_storage_service_io_deactivate_user(dest_service_user);
-	mail_storage_service_io_activate_user(user->_service_user);
+		mail_storage_service_io_deactivate_user(dest_user->service_user);
+	mail_storage_service_io_activate_user(user->service_user);
 
 	if (ret <= 0) {
 		e_error(user->event, "Cannot initialize destination user %s: %s",
@@ -166,16 +160,15 @@ mcp_update_shared_key(struct mailbox_transaction_context *t,
 	}
 
 	/* logging context swap again */
-	mail_storage_service_io_deactivate_user(user->_service_user);
-	mail_storage_service_io_activate_user(dest_service_user);
+	mail_storage_service_io_deactivate_user(user->service_user);
+	mail_storage_service_io_activate_user(dest_user->service_user);
 
 	mail_user_deinit(&dest_user);
-	mail_storage_service_user_unref(&dest_service_user);
 
 	if ((cur_ioloop_ctx = io_loop_get_current_context(current_ioloop)) != NULL)
 		io_loop_context_deactivate(cur_ioloop_ctx);
 
-	mail_storage_service_io_activate_user(user->_service_user);
+	mail_storage_service_io_activate_user(user->service_user);
 
 	return ret;
 }
@@ -453,6 +446,14 @@ static int mcp_keypair_generate_run(struct doveadm_mail_cmd_context *_ctx,
 	return 0;
 }
 
+static void
+cmd_mcp_keypair_generate_init(struct doveadm_mail_cmd_context *ctx ATTR_UNUSED)
+{
+	doveadm_print_header("success", "  ", 0);
+	doveadm_print_header("box", "Folder", 0);
+	doveadm_print_header("pubid", "Public ID", 0);
+}
+
 static int cmd_mcp_keypair_generate_run(struct doveadm_mail_cmd_context *_ctx,
 					struct mail_user *user)
 {
@@ -472,11 +473,6 @@ static int cmd_mcp_keypair_generate_run(struct doveadm_mail_cmd_context *_ctx,
 
 	if (mcp_keypair_generate_run(_ctx, user, &result) < 0)
 		_ctx->exit_code = EX_DATAERR;
-
-	doveadm_print_init(DOVEADM_PRINT_TYPE_TABLE);
-	doveadm_print_header("success", "  ", 0);
-	doveadm_print_header("box", "Folder", 0);
-	doveadm_print_header("pubid", "Public ID", 0);
 
 	const struct generated_key *res;
 
@@ -627,6 +623,14 @@ static void cmd_mcp_key_list_cb(const struct generated_key *_key, void *context)
 	key->active = _key->active;
 }
 
+static void
+cmd_mcp_key_list_init(struct doveadm_mail_cmd_context *_ctx ATTR_UNUSED)
+{
+	doveadm_print_header("box", "Folder", 0);
+	doveadm_print_header("active", "Active", 0);
+	doveadm_print_header("pubid", "Public ID", 0);
+}
+
 static int cmd_mcp_key_list_run(struct doveadm_mail_cmd_context *_ctx,
 				struct mail_user *user)
 {
@@ -643,11 +647,6 @@ static int cmd_mcp_key_list_run(struct doveadm_mail_cmd_context *_ctx,
 	p_array_init(&iter_ctx.keys, _ctx->pool, 8);
 
 	mcp_key_list(ctx, user, cmd_mcp_key_list_cb, &iter_ctx);
-
-	doveadm_print_init(DOVEADM_PRINT_TYPE_TABLE);
-	doveadm_print_header("box", "Folder", 0);
-	doveadm_print_header("active", "Active", 0);
-	doveadm_print_header("pubid", "Public ID", 0);
 
 	const struct generated_key *key;
 	array_foreach(&iter_ctx.keys, key) {
@@ -698,6 +697,14 @@ static void cmd_mcp_key_export_cb(const struct generated_key *key,
 		dcrypt_key_unref_private(&pkey);
 	}
 }
+static void
+cmd_mcp_key_export_init(struct doveadm_mail_cmd_context *_ctx ATTR_UNUSED)
+{
+	doveadm_print_header("box", "Folder", 0);
+	doveadm_print_header("name", "Public ID", 0);
+	doveadm_print_header("error", "Error", 0);
+	doveadm_print_header("key", "Key", 0);
+}
 
 static int cmd_mcp_key_export_run(struct doveadm_mail_cmd_context *_ctx,
 				  struct mail_user *user)
@@ -709,15 +716,15 @@ static int cmd_mcp_key_export_run(struct doveadm_mail_cmd_context *_ctx,
 	ctx->userkey_only = doveadm_cmd_param_flag(cctx, "user-key");
 	(void)doveadm_cmd_param_str(cctx, "mailbox", &ctx->mailbox);
 
-	doveadm_print_init(DOVEADM_PRINT_TYPE_PAGER);
-	doveadm_print_header("box", "Folder", 0);
-	doveadm_print_header("name", "Public ID", 0);
-	doveadm_print_header("error", "Error", 0);
-	doveadm_print_header("key", "Key", 0);
-
 	mcp_key_list(ctx, user, cmd_mcp_key_export_cb, NULL);
 
 	return 0;
+}
+
+static void
+cmd_mcp_key_password_init(struct doveadm_mail_cmd_context *_ctx ATTR_UNUSED)
+{
+	doveadm_print_header_simple("result");
 }
 
 static int cmd_mcp_key_password_run(struct doveadm_mail_cmd_context *_ctx,
@@ -742,10 +749,6 @@ static int cmd_mcp_key_password_run(struct doveadm_mail_cmd_context *_ctx,
 	};
 
 	ARRAY(struct raw_key) raw_keys;
-
-	doveadm_print_init(DOVEADM_PRINT_TYPE_PAGER);
-
-	doveadm_print_header_simple("result");
 
 	if (ctx->ask_old_password) {
 		if (ctx->old_password != NULL) {
@@ -920,6 +923,8 @@ static struct doveadm_mail_cmd_context *cmd_mcp_keypair_generate_alloc(void)
 
 	ctx = doveadm_mail_cmd_alloc(struct mcp_cmd_context);
 	ctx->ctx.v.run = cmd_mcp_keypair_generate_run;
+	ctx->ctx.v.init = cmd_mcp_keypair_generate_init;
+	doveadm_print_init(DOVEADM_PRINT_TYPE_TABLE);
 	return &ctx->ctx;
 }
 
@@ -929,6 +934,8 @@ static struct doveadm_mail_cmd_context *cmd_mcp_key_list_alloc(void)
 
 	ctx = doveadm_mail_cmd_alloc(struct mcp_cmd_context);
 	ctx->ctx.v.run = cmd_mcp_key_list_run;
+	ctx->ctx.v.init = cmd_mcp_key_list_init;
+	doveadm_print_init(DOVEADM_PRINT_TYPE_TABLE);
 	return &ctx->ctx;
 }
 
@@ -938,6 +945,8 @@ static struct doveadm_mail_cmd_context *cmd_mcp_key_export_alloc(void)
 
 	ctx = doveadm_mail_cmd_alloc(struct mcp_cmd_context);
 	ctx->ctx.v.run = cmd_mcp_key_export_run;
+	ctx->ctx.v.init = cmd_mcp_key_export_init;
+	doveadm_print_init(DOVEADM_PRINT_TYPE_PAGER);
 	return &ctx->ctx;
 }
 
@@ -947,6 +956,8 @@ static struct doveadm_mail_cmd_context *cmd_mcp_key_password_alloc(void)
 
 	ctx = doveadm_mail_cmd_alloc(struct mcp_cmd_context);
 	ctx->ctx.v.run = cmd_mcp_key_password_run;
+	ctx->ctx.v.init = cmd_mcp_key_password_init;
+	doveadm_print_init(DOVEADM_PRINT_TYPE_PAGER);
 	return &ctx->ctx;
 }
 

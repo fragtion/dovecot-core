@@ -140,12 +140,18 @@ void dsync_mailbox_node_append_full_name(string_t *str,
 void dsync_mailbox_node_copy_data(struct dsync_mailbox_node *dest,
 				  const struct dsync_mailbox_node *src);
 
+/* Split mailbox name into its hierarchical parts. The mailbox name is
+   unescaped if the escape_char is not '\0'. */
+const char *const *
+dsync_mailbox_name_to_parts(const char *name, char hierarchy_sep,
+			    char escape_char);
 /* Add nodes to tree from the given namespace. If box_name or box_guid is
    non-NULL, add only that mailbox to the tree. */
 int dsync_mailbox_tree_fill(struct dsync_mailbox_tree *tree,
 			    struct mail_namespace *ns, const char *box_name,
 			    const guid_128_t box_guid,
 			    const char *const *exclude_mailboxes,
+			    char alt_char,
 			    struct event *event,
 			    enum mail_error *error_r);
 

@@ -25,8 +25,6 @@
 
 #include <ctype.h>
 
-#define SEARCH_NOTIFY_INTERVAL_SECS 10
-
 #define SEARCH_COST_DENTRY 3ULL
 #define SEARCH_COST_ATTR 1ULL
 #define SEARCH_COST_FILES_READ 25ULL
@@ -528,6 +526,23 @@ static void compress_lwsp(string_t *dest, const unsigned char *src,
 	}
 }
 
+static pool_t
+search_context_temp_pool(struct index_search_context *ctx, size_t size)
+{
+	if (ctx->temp_pool != NULL) {
+		p_clear(ctx->temp_pool);
+		return ctx->temp_pool;
+	}
+
+	if (size <= 1024)
+		return pool_datastack_create();
+	/* This could just as well be allocated from data stack, but it
+	   makes it more difficult to track bad data_stack_grow events.
+	   Use a temporary memory pool instead. */
+	ctx->temp_pool = pool_alloconly_create("search context temp", size);
+	return ctx->temp_pool;
+}
+
 static void search_header_arg(struct mail_search_arg *arg,
 			      struct search_header_context *ctx)
 {
@@ -601,25 +616,31 @@ static void search_header_arg(struct mail_search_arg *arg,
 		case SEARCH_HEADER:
 			/* simple match */
 			break;
-		case SEARCH_HEADER_ADDRESS:
+		case SEARCH_HEADER_ADDRESS: {
 			/* we have to match against normalized address */
-			addr = message_address_parse(pool_datastack_create(),
+			pool_t pool = search_context_temp_pool(ctx->index_ctx,
+						ctx->hdr->full_value_len);
+			addr = message_address_parse(pool,
 						     ctx->hdr->full_value,
 						     ctx->hdr->full_value_len,
 						     UINT_MAX,
 						     MESSAGE_ADDRESS_PARSE_FLAG_FILL_MISSING);
-			str = t_str_new(ctx->hdr->value_len);
+			str = str_new(pool, ctx->hdr->value_len);
 			message_address_write(str, addr);
 			hdr.value = hdr.full_value = str_data(str);
 			hdr.value_len = hdr.full_value_len = str_len(str);
 			break;
-		case SEARCH_HEADER_COMPRESS_LWSP:
+		}
+		case SEARCH_HEADER_COMPRESS_LWSP: {
 			/* convert LWSP to single spaces */
-			str = t_str_new(hdr.full_value_len);
+			pool_t pool = search_context_temp_pool(ctx->index_ctx,
+						hdr.full_value_len);
+			str = str_new(pool, hdr.full_value_len);
 			compress_lwsp(str, hdr.full_value, hdr.full_value_len);
 			hdr.value = hdr.full_value = str_data(str);
 			hdr.value_len = hdr.full_value_len = str_len(str);
 			break;
+		}
 		default:
 			i_unreached();
 		}
@@ -1392,6 +1413,7 @@ int index_storage_search_deinit(struct mail_search_context *_ctx)
 	if (ctx->failed)
 		mail_storage_last_error_pop(ctx->box->storage);
 	array_free(&ctx->mail_ctx.mails);
+	pool_unref(&ctx->temp_pool);
 	i_free(ctx);
 	return ret;
 }
@@ -1530,38 +1552,6 @@ static int search_match_next(struct index_search_context *ctx)
 	return ret;
 }
 
-static void index_storage_search_notify(struct mailbox *box,
-					struct index_search_context *ctx)
-{
-	float percentage;
-	unsigned int msecs, secs;
-
-	if (ctx->last_notify.tv_sec == 0) {
-		/* set the search time in here, in case a plugin
-		   already spent some time indexing the mailbox */
-		ctx->search_start_time = ioloop_timeval;
-	} else if (box->storage->callbacks.notify_ok != NULL &&
-		   !ctx->mail_ctx.progress_hidden) {
-		percentage = ctx->mail_ctx.progress_cur * 100.0 /
-			ctx->mail_ctx.progress_max;
-		msecs = timeval_diff_msecs(&ioloop_timeval,
-					   &ctx->search_start_time);
-		secs = (msecs / (percentage / 100.0) - msecs) / 1000;
-
-		T_BEGIN {
-			const char *text;
-
-			text = t_strdup_printf("Searched %d%% of the mailbox, "
-					       "ETA %d:%02d", (int)percentage,
-					       secs/60, secs%60);
-			box->storage->callbacks.
-				notify_ok(box, text,
-					  box->storage->callback_context);
-		} T_END;
-	}
-	ctx->last_notify = ioloop_timeval;
-}
-
 static bool search_would_block(struct index_search_context *ctx)
 {
 	struct timeval now;
@@ -1668,18 +1658,22 @@ static int search_more_with_mail(struct index_search_context *ctx,
 		return 0;
 	}
 
-	if (ioloop_time - ctx->last_notify.tv_sec >=
-	    SEARCH_NOTIFY_INTERVAL_SECS)
-		index_storage_search_notify(box, ctx);
-
 	mail_search_args_reset(_ctx->args->args, FALSE);
 
 	cost1 = search_get_cost(mail->transaction);
 	ret = -1;
-	while (box->v.search_next_update_seq(_ctx)) {
+	for (;;) {
+		bool more;
+		T_BEGIN {
+			more = box->v.search_next_update_seq(_ctx);
+		} T_END;
+		if (!more)
+			break;
 		mail_set_seq(mail, _ctx->seq);
 
-		ret = box->v.search_next_match_mail(_ctx, mail);
+		T_BEGIN {
+			ret = box->v.search_next_match_mail(_ctx, mail);
+		} T_END;
 		if (ret != 0)
 			break;
 
@@ -1772,7 +1766,9 @@ static int search_more_with_prefetching(struct index_search_context *ctx,
 		array_pop_front(&ctx->mail_ctx.mails);
 		array_push_back(&ctx->mail_ctx.mails, mail_r);
 	}
-	index_mail_update_access_parts_post(*mail_r);
+	T_BEGIN {
+		index_mail_update_access_parts_post(*mail_r);
+	} T_END;
 	return 1;
 }
 
@@ -1816,6 +1812,7 @@ static int search_more(struct index_search_context *ctx,
 			ret = -1;
 			break;
 		}
+		mailbox_search_notify(ctx->box, &ctx->mail_ctx);
 	}
 	return ret;
 }
@@ -1870,8 +1867,9 @@ bool index_storage_search_next_nonblock(struct mail_search_context *_ctx,
 	}
 
 	if (!ctx->sorted) {
-		while ((ret = search_more(ctx, &mail)) > 0)
+		while ((ret = search_more(ctx, &mail)) > 0) T_BEGIN {
 			index_sort_list_add(_ctx->sort_program, mail);
+		} T_END;
 
 		if (ret == 0) {
 			*tryagain_r = TRUE;

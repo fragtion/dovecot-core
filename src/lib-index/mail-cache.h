@@ -86,15 +86,16 @@ mail_cache_register_lookup(struct mail_cache *cache, const char *name);
 /* Returns specified field */
 const struct mail_cache_field *
 mail_cache_register_get_field(struct mail_cache *cache, unsigned int field_idx);
-/* Returns a list of all registered fields */
+/* Returns a list of all registered fields. The returned pool must be freed. */
 struct mail_cache_field *
-mail_cache_register_get_list(struct mail_cache *cache, pool_t pool,
+mail_cache_register_get_list(struct mail_cache *cache, pool_t *pool_r,
 			     unsigned int *count_r);
 
 /* Returns TRUE if cache should be purged. */
 bool mail_cache_need_purge(struct mail_cache *cache, const char **reason_r);
 /* Set cache file to be purged later. */
-void mail_cache_purge_later(struct mail_cache *cache, const char *reason);
+void mail_cache_purge_later(struct mail_cache *cache,
+			    const char *reason_format, ...) ATTR_FORMAT(2, 3);
 /* Don't try to purge the cache file later after all. */
 void mail_cache_purge_later_reset(struct mail_cache *cache);
 /* Purge cache file. Offsets are updated to given transaction.

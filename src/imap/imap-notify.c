@@ -399,6 +399,7 @@ static void imap_notify_callback(struct mailbox *box, struct client *client)
 	cmd = client_command_alloc(client);
 	cmd->tag = "*";
 	cmd->name = "NOTIFY-CALLBACK";
+	cmd->internal = TRUE;
 	client_command_init_finished(cmd);
 
 	if (!client->notify_ctx->selected_immediate_expunges)
@@ -423,6 +424,9 @@ static void imap_notify_watch_selected_mailbox(struct client *client)
 	}
 	mailbox_notify_changes(client->mailbox, imap_notify_callback, client);
 	client->notify_ctx->watching_mailbox = TRUE;
+	/* There may have been changes before the mailbox notification watch
+	   was added. Check that now. */
+	imap_notify_callback(client->mailbox, client);
 }
 
 static void imap_notify_watch_timeout(struct client *client)

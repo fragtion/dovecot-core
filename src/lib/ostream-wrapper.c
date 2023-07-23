@@ -922,9 +922,9 @@ static int wrapper_ostream_flush(struct ostream_private *stream)
 		}
 	} while (ret == 0 && stream->ostream.blocking);
 
-	if (ret > 0 && stream->finished) {
+	if (stream->finished && ret >= 0 &&
+	    wrapper_ostream_is_empty(wostream)) {
 		/* This was an o_stream_finish() call or subsequent flush */
-		i_assert(wrapper_ostream_is_empty(wostream));
 		while ((ret = wrapper_ostream_finish(wostream)) == 0) {
 			if (!stream->ostream.blocking) {
 				/* Not yet finished completely */
@@ -1155,7 +1155,7 @@ int wrapper_ostream_continue(struct wrapper_ostream *wostream)
 	if (ret == 0)
 		wostream->flush_pending = TRUE;
 
-	if (!stream->ostream.blocking)
+	if (ret >= 0 && !stream->ostream.blocking)
 		wrapper_ostream_output_manage(wostream, FALSE);
 
 	if (ret < 0 || ostream->stream_errno != 0 ||

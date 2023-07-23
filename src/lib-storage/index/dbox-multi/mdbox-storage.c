@@ -178,11 +178,10 @@ mdbox_mailbox_alloc(struct mail_storage *storage, struct mailbox_list *list,
 int mdbox_mailbox_open(struct mailbox *box)
 {
 	struct mdbox_mailbox *mbox = MDBOX_MAILBOX(box);
-	time_t path_ctime;
 
-	if (dbox_mailbox_check_existence(box, &path_ctime) < 0)
+	if (dbox_mailbox_check_existence(box) < 0)
 		return -1;
-	if (dbox_mailbox_open(box, path_ctime) < 0)
+	if (dbox_mailbox_open(box) < 0)
 		return -1;
 
 	mbox->ext_id =
@@ -205,7 +204,7 @@ static void mdbox_mailbox_close(struct mailbox *box)
 	if (mstorage->corrupted && !mstorage->rebuilding_storage)
 		(void)mdbox_storage_rebuild(mstorage);
 
-	index_storage_mailbox_close(box);
+	dbox_mailbox_close(box);
 }
 
 int mdbox_read_header(struct mdbox_mailbox *mbox,
@@ -526,6 +525,7 @@ struct mailbox mdbox_mailbox = {
 struct dbox_storage_vfuncs mdbox_dbox_storage_vfuncs = {
 	mdbox_file_unrefed,
 	mdbox_file_create_fd,
+	mdbox_mail_file_set,
 	mdbox_mail_open,
 	mdbox_mailbox_create_indexes,
 	mdbox_get_attachment_path_suffix,

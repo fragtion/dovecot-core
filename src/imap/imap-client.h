@@ -120,6 +120,7 @@ struct client_command_context {
 	bool temp_executed:1; /* temporary execution state tracking */
 	bool tagline_sent:1;
 	bool executing:1;
+	bool internal:1;
 };
 
 struct imap_client_vfuncs {
@@ -167,7 +168,6 @@ struct client {
 	guid_128_t anvil_conn_guid;
 
 	pool_t pool;
-	struct mail_storage_service_user *service_user;
 	const struct imap_settings *set;
 	const struct smtp_submit_settings *smtp_set;
 	string_t *capability_string;
@@ -212,6 +212,8 @@ struct client {
 	/* NOTIFY extension */
 	struct imap_notify_context *notify_ctx;
 	uint32_t notify_uidnext;
+	/* COMPRESS extension */
+	const struct compression_handler *compress_handler;
 
 	/* client input/output is locked by this command */
 	struct client_command_context *input_lock;
@@ -270,7 +272,6 @@ extern unsigned int imap_feature_qresync;
    if the handle is a socket. */
 struct client *client_create(int fd_in, int fd_out, bool unhibernated,
 			     struct event *event, struct mail_user *user,
-			     struct mail_storage_service_user *service_user,
 			     const struct imap_settings *set,
 			     const struct smtp_submit_settings *smtp_set);
 void client_create_finish_io(struct client *client);

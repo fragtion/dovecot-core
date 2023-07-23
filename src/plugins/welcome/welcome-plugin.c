@@ -90,28 +90,18 @@ welcome_create_box(struct mailbox *box,
 		   const struct mailbox_update *update, bool directory)
 {
 	struct welcome_mailbox *wbox = WELCOME_CONTEXT(box);
+	const char *cmd;
 
 	if (wbox->module_ctx.super.create_box(box, update, directory) < 0)
 		return -1;
-	/* the mailbox isn't fully created here yet, so just mark it as created
-	   and wait until open() time to actually run it */
-	wbox->created = TRUE;
-	return 0;
-}
-
-static int welcome_open_box(struct mailbox *box)
-{
-	struct welcome_mailbox *wbox = WELCOME_CONTEXT(box);
-	const char *cmd;
-
-	cmd = !wbox->created ? NULL :
-		mail_user_plugin_getenv(box->storage->user, "welcome_script");
+	cmd = mail_user_plugin_getenv(box->storage->user, "welcome_script");
 	if (cmd != NULL) {
 		bool wait = mail_user_plugin_getenv_bool(box->storage->user,
 							 "welcome_wait");
 		script_execute(box->storage->user, cmd, wait);
 	}
-	return wbox->module_ctx.super.open(box);
+
+	return 0;
 }
 
 static void welcome_mailbox_allocated(struct mailbox *box)
@@ -127,7 +117,6 @@ static void welcome_mailbox_allocated(struct mailbox *box)
 	box->vlast = &wbox->module_ctx.super;
 
 	v->create_box = welcome_create_box;
-	v->open = welcome_open_box;
 	MODULE_CONTEXT_SET(box, welcome_storage_module, wbox);
 }
 

@@ -119,7 +119,8 @@ static int maildir_mail_stat(struct mail *mail, struct stat *st_r)
 		struct istream *input;
 
 		(void)mail_get_stream(mail, NULL, NULL, &input);
-	}
+	} else
+		mail_metadata_accessed_event(mail_event(mail));
 
 	if (imail->data.stream != NULL &&
 	    (fd = i_stream_get_fd(imail->data.stream)) != -1) {
@@ -223,6 +224,7 @@ static int maildir_get_pop3_state(struct index_mail *mail)
 	enum mail_cache_decision_type dec, vsize_dec;
 	enum mail_fetch_field allowed_pop3_fields;
 	bool not_pop3_only = FALSE;
+	pool_t pool;
 
 	if (mail->pop3_state_set)
 		return mail->pop3_state;
@@ -247,8 +249,7 @@ static int maildir_get_pop3_state(struct index_mail *mail)
 	} else {
 		/* also check if there are any non-[pv]size cached fields */
 		vsize_dec = MAIL_CACHE_DECISION_NO;
-		fields = mail_cache_register_get_list(box->cache,
-						      pool_datastack_create(),
+		fields = mail_cache_register_get_list(box->cache, &pool,
 						      &count);
 		for (i = 0; i < count; i++) {
 			dec = fields[i].decision & ENUM_NEGATE(MAIL_CACHE_DECISION_FORCED);
@@ -258,6 +259,7 @@ static int maildir_get_pop3_state(struct index_mail *mail)
 				 fields[i].idx != psize_idx)
 				not_pop3_only = TRUE;
 		}
+		pool_unref(&pool);
 	}
 
 	if (index_mail_get_vsize_extension(&mail->mail.mail) != NULL) {

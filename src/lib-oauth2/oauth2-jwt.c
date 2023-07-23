@@ -337,14 +337,8 @@ static int
 oauth2_jwt_header_process(struct json_tree *tree, const char **alg_r,
 			  const char **kid_r, const char **error_r)
 {
-	const char *typ = get_field(tree, "typ", NULL);
 	const char *alg = get_field(tree, "alg", NULL);
 	const char *kid = get_field(tree, "kid", NULL);
-
-	if (typ != NULL && strcasecmp(typ, "JWT") != 0) {
-		*error_r = t_strdup_printf("Unsupported typ value '%s'", typ);
-		return -1;
-	}
 
 	if (alg == NULL) {
 		*error_r = "Cannot find 'alg' field";
@@ -356,6 +350,17 @@ oauth2_jwt_header_process(struct json_tree *tree, const char **alg_r,
 	*alg_r = t_str_ucase(alg);
 	*kid_r = t_strdup(kid);
 	return 0;
+}
+
+static bool check_scope(const char *req, const char *got)
+{
+	const char *const *scope_req = t_strsplit_spaces(req, " ,");
+	const char *const *scope_got = t_strsplit_spaces(got, " ,");
+
+	for (; *scope_req != NULL; scope_req++)
+		if (!str_array_icase_find(scope_got, *scope_req))
+			return FALSE;
+	return TRUE;
 }
 
 static int
@@ -424,6 +429,37 @@ oauth2_jwt_body_process(const struct oauth2_settings *set, const char *alg,
 		if (!str_array_find(set->issuers, iss)) {
 			*error_r = t_strdup_printf("Issuer '%s' is not allowed",
 						   str_sanitize_utf8(iss, 128));
+			return -1;
+		}
+	}
+
+	const char *aud = get_field(tree, "aud", NULL);
+	/* if there is client_id configured, then aud should be present */
+	if (set->client_id != NULL && *set->client_id != '\0') {
+		if (aud == NULL) {
+			*error_r = "client_id set but aud is missing";
+			return -1;
+
+		}
+		const char *const *auds = t_strsplit_spaces(aud, " ");
+		if (!str_array_find(auds, set->client_id)) {
+			*error_r = "client_id not found in aud field";
+			return -1;
+		}
+	}
+
+	const char *got_scope = get_field(tree, "scope", NULL);
+	const char *req_scope = set->scope;
+
+	if (req_scope != NULL && *req_scope != '\0') {
+		if (got_scope == NULL) {
+			*error_r = "scope set but not found in token";
+			return -1;
+		}
+
+		if (!check_scope(req_scope, got_scope)) {
+			*error_r = t_strdup_printf("configured scope '%s' missing from token scope '%s'",
+						   req_scope, got_scope);
 			return -1;
 		}
 	}

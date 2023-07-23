@@ -1,6 +1,8 @@
 #ifndef TEST_SUBPROCESS_H
 #define TEST_SUBPROCESS_H
 
+#define TEST_SIGNALS_DEFAULT_TIMEOUT_MS 10000
+
 struct test_subprocess;
 
 /* Fork a sub-process for this test. The func is the main function for the
@@ -25,8 +27,10 @@ void test_subprocess_set_cleanup_callback(void (*callback)(void));
 
 /* Send a notification signal (SIGHUP) to the given PID */
 void test_subprocess_notify_signal_send(int signo, pid_t pid);
-/* Send a notificatino signal to the parent process. */
+/* Send a notification signal to the parent process. */
 void test_subprocess_notify_signal_send_parent(int signo);
+/* Send a notification signal to all the subprocesses. */
+void test_subprocess_notify_signal_all(int signo);
 /* Reset any previously sent notification signals. */
 void test_subprocess_notify_signal_reset(int signo);
 /* Wait until a notification signal is sent, or return immediately if it was

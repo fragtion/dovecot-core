@@ -206,6 +206,12 @@ static bool client_auth_parse_args(const struct client *client, bool success,
 			}
 		} else if (str_begins_with(key, "forward_")) {
 			/* these are passed to upstream */
+		} else if (str_begins(key, "event_", &key)) {
+			/* add key to event */
+			event_add_str(client->event_auth, key, value);
+		} else if (strcmp(key, "resp") == 0) {
+			/* ignore final response */
+			continue;
 		} else
 			e_debug(client->event_auth,
 				"Ignoring unknown passdb extra field: %s", key);
@@ -257,7 +263,7 @@ static void client_proxy_append_conn_info(string_t *str, struct client *client)
 {
 	const char *source_host;
 
-	source_host = login_proxy_get_source_host(client->login_proxy);
+	source_host = net_ip2addr(login_proxy_get_source_host(client->login_proxy));
 	if (source_host[0] != '\0')
 		str_printfa(str, " from %s", source_host);
 	if (strcmp(client->virtual_user, client->proxy_user) != 0) {
@@ -797,7 +803,7 @@ client_auth_handle_reply(struct client *client,
 
 void client_auth_respond(struct client *client, const char *response)
 {
-	client->auth_waiting = FALSE;
+	client->auth_client_continue_pending = FALSE;
 	client_set_auth_waiting(client);
 	auth_client_request_continue(client->auth_request, response);
 	if (!client_does_custom_io(client))
@@ -850,6 +856,13 @@ void client_auth_parse_response(struct client *client)
 {
 	if (client_auth_read_line(client) <= 0)
 		return;
+
+	/* This has to happen before * handling, otherwise
+	   client can abort failed request. */
+	if (client->final_response) {
+		sasl_server_auth_delayed_final(client);
+		return;
+	}
 
 	if (strcmp(str_c(client->auth_response), "*") == 0) {
 		sasl_server_auth_abort(client);
@@ -979,7 +992,6 @@ sasl_callback(struct client *client, enum sasl_server_reply sasl_reply,
 			data = t_strdup_printf("Internal login failure (pid=%s id=%u)",
 					       my_pid, client->master_auth_id);
 		}
-		client->no_extra_disconnect_reason = TRUE;
 		client_destroy(client, data);
 		break;
 	case SASL_SERVER_REPLY_CONTINUE:
@@ -992,7 +1004,7 @@ sasl_callback(struct client *client, enum sasl_server_reply sasl_reply,
 			str_truncate(client->auth_response, 0);
 
 		i_assert(client->io == NULL);
-		client->auth_waiting = TRUE;
+		client->auth_client_continue_pending = TRUE;
 		if (!client_does_custom_io(client)) {
 			client->io = io_add_istream(client->input,
 						    client_auth_input, client);
@@ -1095,7 +1107,9 @@ void clients_notify_auth_connected(void)
 
 		timeout_remove(&client->to_auth_waiting);
 
-		client_notify_auth_ready(client);
+		T_BEGIN {
+			client_notify_auth_ready(client);
+		} T_END;
 
 		if (!client_does_custom_io(client) && client->input_blocked) {
 			client->input_blocked = FALSE;

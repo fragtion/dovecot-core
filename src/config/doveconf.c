@@ -17,12 +17,12 @@
 #include "all-settings.h"
 #include "sysinfo-get.h"
 #include "old-set-parser.h"
+#include "config-dump-full.h"
 #include "config-connection.h"
 #include "config-parser.h"
 #include "config-request.h"
 #include "dovecot-version.h"
 
-#include <stdio.h>
 #include <ctype.h>
 #include <unistd.h>
 #include <sysexits.h>
@@ -134,8 +134,7 @@ static void prefix_stack_reset_str(ARRAY_TYPE(prefix_stack) *stack)
 }
 
 static struct config_dump_human_context *
-config_dump_human_init(const char *const *modules, enum config_dump_scope scope,
-		       bool check_settings, bool in_section)
+config_dump_human_init(enum config_dump_scope scope, bool check_settings)
 {
 	struct config_dump_human_context *ctx;
 	enum config_dump_flags flags;
@@ -152,9 +151,7 @@ config_dump_human_init(const char *const *modules, enum config_dump_scope scope,
 		CONFIG_DUMP_FLAG_CALLBACK_ERRORS;
 	if (check_settings)
 		flags |= CONFIG_DUMP_FLAG_CHECK_SETTINGS;
-	if (in_section)
-		flags |= CONFIG_DUMP_FLAG_IN_SECTION;
-	ctx->export_ctx = config_export_init(modules, NULL, scope, flags,
+	ctx->export_ctx = config_export_init(scope, flags,
 					     config_request_get_strings, ctx);
 	return ctx;
 }
@@ -335,12 +332,13 @@ config_dump_human_output(struct config_dump_human_context *ctx,
 	unsigned int i, j, count, prefix_count;
 	unsigned int prefix_idx = UINT_MAX;
 	size_t len, skip_len, setting_name_filter_len;
+	unsigned int section_idx = 0;
 	bool unique_key;
 	int ret = 0;
 
 	setting_name_filter_len = setting_name_filter == NULL ? 0 :
 		strlen(setting_name_filter);
-	if (config_export_finish(&ctx->export_ctx) < 0)
+	if (config_export_finish(&ctx->export_ctx, &section_idx) < 0)
 		return -1;
 
 	array_sort(&ctx->strings, config_string_cmp);
@@ -555,7 +553,7 @@ config_dump_filter_end(struct ostream *output, unsigned int indent)
 static int
 config_dump_human_sections(struct ostream *output,
 			   const struct config_filter *filter,
-			   const char *const *modules, bool hide_passwords)
+			   bool hide_passwords)
 {
 	struct config_filter_parser *const *filters;
 	static struct config_dump_human_context *ctx;
@@ -569,8 +567,7 @@ config_dump_human_sections(struct ostream *output,
 	filters++;
 
 	for (; *filters != NULL; filters++) {
-		ctx = config_dump_human_init(modules, CONFIG_DUMP_SCOPE_SET,
-					     FALSE, TRUE);
+		ctx = config_dump_human_init(CONFIG_DUMP_SCOPE_SET, FALSE);
 		indent = config_dump_filter_begin(ctx->list_prefix,
 						  &(*filters)->filter);
 		config_export_parsers(ctx->export_ctx, (*filters)->parsers);
@@ -584,7 +581,7 @@ config_dump_human_sections(struct ostream *output,
 }
 
 static int ATTR_NULL(4)
-config_dump_human(const struct config_filter *filter, const char *const *modules,
+config_dump_human(const struct config_filter *filter,
 		  enum config_dump_scope scope, const char *setting_name_filter,
 		  bool hide_passwords)
 {
@@ -596,13 +593,13 @@ config_dump_human(const struct config_filter *filter, const char *const *modules
 	o_stream_set_no_error_handling(output, TRUE);
 	o_stream_cork(output);
 
-	ctx = config_dump_human_init(modules, scope, TRUE, FALSE);
+	ctx = config_dump_human_init(scope, TRUE);
 	config_export_by_filter(ctx->export_ctx, filter);
 	ret = config_dump_human_output(ctx, output, 0, setting_name_filter, hide_passwords);
 	config_dump_human_deinit(ctx);
 
 	if (setting_name_filter == NULL)
-		ret = config_dump_human_sections(output, filter, modules, hide_passwords);
+		ret = config_dump_human_sections(output, filter, hide_passwords);
 
 	o_stream_uncork(output);
 	o_stream_destroy(&output);
@@ -617,11 +614,12 @@ config_dump_one(const struct config_filter *filter, bool hide_key,
 	static struct config_dump_human_context *ctx;
 	const char *str;
 	size_t len;
+	unsigned int section_idx = 0;
 	bool dump_section = FALSE;
 
-	ctx = config_dump_human_init(NULL, scope, FALSE, FALSE);
+	ctx = config_dump_human_init(scope, FALSE);
 	config_export_by_filter(ctx->export_ctx, filter);
-	if (config_export_finish(&ctx->export_ctx) < 0)
+	if (config_export_finish(&ctx->export_ctx, &section_idx) < 0)
 		return -1;
 
 	len = strlen(setting_name_filter);
@@ -645,7 +643,7 @@ config_dump_one(const struct config_filter *filter, bool hide_key,
 	config_dump_human_deinit(ctx);
 
 	if (dump_section)
-		(void)config_dump_human(filter, NULL, scope, setting_name_filter, hide_passwords);
+		(void)config_dump_human(filter, scope, setting_name_filter, hide_passwords);
 	return 0;
 }
 
@@ -668,15 +666,6 @@ static void config_request_simple_stdout(const char *key, const char *value,
 		    (key[filter_len] == '\0' || key[filter_len] == '/'))
 			printf("%s=%s\n", key, value);
 	}
-}
-
-static void config_request_putenv(const char *key, const char *value,
-				  enum config_key_type type ATTR_UNUSED,
-				  void *context ATTR_UNUSED)
-{
-	T_BEGIN {
-		env_put(t_str_ucase(key), value);
-	} T_END;
 }
 
 static const char *get_setting(const char *module, const char *name)
@@ -868,17 +857,17 @@ int main(int argc, char *argv[])
 		MASTER_SERVICE_FLAG_STANDALONE |
 		MASTER_SERVICE_FLAG_NO_INIT_DATASTACK_FRAME;
 	enum config_dump_scope scope = CONFIG_DUMP_SCOPE_ALL_WITHOUT_HIDDEN;
-	const char *orig_config_path, *config_path, *module;
-	ARRAY(const char *) module_names;
+	const char *orig_config_path, *config_path;
 	struct config_filter filter;
-	const char *const *wanted_modules, *error;
+	const char *import_environment, *error;
 	char **exec_args = NULL, **setting_name_filters = NULL;
 	unsigned int i;
 	int c, ret, ret2;
 	bool config_path_specified, expand_vars = FALSE, hide_key = FALSE;
-	bool parse_full_config = FALSE, simple_output = FALSE;
-	bool dump_defaults = FALSE, host_verify = FALSE;
+	bool simple_output = FALSE;
+	bool dump_defaults = FALSE, host_verify = FALSE, dump_full = FALSE;
 	bool print_plugin_banner = FALSE, hide_passwords = TRUE;
+	bool disable_check_settings = FALSE;
 
 	if (getenv("USE_SYSEXITS") != NULL) {
 		/* we're coming from (e.g.) LDA */
@@ -887,24 +876,27 @@ int main(int argc, char *argv[])
 
 	i_zero(&filter);
 	master_service = master_service_init("config", master_service_flags,
-					     &argc, &argv, "adf:hHm:nNpPexsS");
+					     &argc, &argv, "adEf:FhHm:nNpPexsS");
 	orig_config_path = t_strdup(master_service_get_config_path(master_service));
 
 	i_set_failure_prefix("doveconf: ");
-	t_array_init(&module_names, 4);
 	while ((c = master_getopt(master_service)) > 0) {
-		if (c == 'e') {
-			expand_vars = TRUE;
-			break;
-		}
 		switch (c) {
 		case 'a':
 			break;
 		case 'd':
 			dump_defaults = TRUE;
 			break;
+		case 'E':
+			disable_check_settings = TRUE;
+			break;
 		case 'f':
 			filter_parse_arg(&filter, optarg);
+			break;
+		case 'F':
+			dump_full = TRUE;
+			simple_output = TRUE;
+			expand_vars = TRUE;
 			break;
 		case 'h':
 			hide_key = TRUE;
@@ -913,17 +905,14 @@ int main(int argc, char *argv[])
 			host_verify = TRUE;
 			break;
 		case 'm':
-			module = t_strdup(optarg);
-			array_push_back(&module_names, &module);
+		case 'p':
+			/* not supported anymore - ignore */
 			break;
 		case 'n':
 			scope = CONFIG_DUMP_SCOPE_CHANGED;
 			break;
 		case 'N':
 			scope = CONFIG_DUMP_SCOPE_SET;
-			break;
-		case 'p':
-			parse_full_config = TRUE;
 			break;
 		case 'P':
 			hide_passwords = FALSE;
@@ -941,9 +930,6 @@ int main(int argc, char *argv[])
 			return FATAL_DEFAULT;
 		}
 	}
-	array_append_zero(&module_names);
-	wanted_modules = array_count(&module_names) == 1 ? NULL :
-		array_front(&module_names);
 
 	config_path = master_service_get_config_path(master_service);
 	/* use strcmp() instead of !=, because dovecot -n always gives us
@@ -953,9 +939,9 @@ int main(int argc, char *argv[])
 	if (host_verify)
 		hostname_verify_format(argv[optind]);
 
-	if (c == 'e') {
+	if (dump_full && argv[optind] != NULL) {
 		if (argv[optind] == NULL)
-			i_fatal("Missing command for -e");
+			i_fatal("Missing command for -F");
 		exec_args = &argv[optind];
 	} else if (argv[optind] != NULL) {
 		/* print only a single config setting */
@@ -983,10 +969,17 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	enum config_parse_flags flags = 0;
+	if (expand_vars)
+		flags |= CONFIG_PARSE_FLAG_EXPAND_VALUES;
+	if (disable_check_settings)
+		flags |= CONFIG_PARSE_FLAG_HIDE_ERRORS;
+	if (null_strcmp(getenv("DOVECONF_SERVICE"), "doveadm") == 0) {
+		/* FIXME: temporary kludge - remove later */
+		flags |= CONFIG_PARSE_FLAG_SKIP_SSL_SERVER;
+	}
 	if ((ret = config_parse_file(dump_defaults ? NULL : config_path,
-				     expand_vars,
-				     parse_full_config ? NULL : wanted_modules,
-				     &error)) == 0 &&
+				     flags, &error)) == 0 &&
 	    access(EXAMPLE_CONFIG_DIR, X_OK) == 0) {
 		i_fatal("%s (copy example configs from "EXAMPLE_CONFIG_DIR"/)",
 			error);
@@ -995,15 +988,41 @@ int main(int argc, char *argv[])
 	if ((ret == -1 && exec_args != NULL) || ret == 0 || ret == -2)
 		i_fatal("%s", error);
 
-	if (simple_output) {
+	enum config_dump_flags dump_flags = disable_check_settings ? 0 :
+		CONFIG_DUMP_FLAG_CHECK_SETTINGS;
+	if (dump_full && exec_args == NULL) {
+		ret2 = config_dump_full(CONFIG_DUMP_FULL_DEST_STDOUT,
+					dump_flags,
+					&import_environment);
+	} else if (dump_full) {
+		int temp_fd = config_dump_full(CONFIG_DUMP_FULL_DEST_TEMPDIR,
+					       dump_flags,
+					       &import_environment);
+		if (getenv(DOVECOT_PRESERVE_ENVS_ENV) != NULL) {
+			/* Standalone binary is getting its configuration via
+			   doveconf. Clean the environment before calling it.
+			   Do this only if the environment exists, because
+			   lib-master doesn't set it if it doesn't want the
+			   environment to be cleaned (e.g. -k parameter). */
+			master_service_import_environment(import_environment);
+			master_service_env_clean();
+		}
+		if (temp_fd != -1) {
+			env_put(DOVECOT_CONFIG_FD_ENV, dec2str(temp_fd));
+			execvp(exec_args[0], exec_args);
+			i_fatal("execvp(%s) failed: %m", exec_args[0]);
+		}
+		ret2 = -1;
+	} else if (simple_output) {
 		struct config_export_context *ctx;
+		unsigned int section_idx = 0;
 
-		ctx = config_export_init(wanted_modules, NULL, scope,
+		ctx = config_export_init(scope,
 					 CONFIG_DUMP_FLAG_CHECK_SETTINGS,
 					 config_request_simple_stdout,
 					 setting_name_filters);
 		config_export_by_filter(ctx, &filter);
-		ret2 = config_export_finish(&ctx);
+		ret2 = config_export_finish(&ctx, &section_idx);
 	} else if (setting_name_filters != NULL) {
 		ret2 = 0;
 		/* ignore settings-check failures in configuration. this allows
@@ -1016,7 +1035,7 @@ int main(int argc, char *argv[])
 					    setting_name_filters[i], hide_passwords) < 0)
 				ret2 = -1;
 		}
-	} else if (exec_args == NULL) {
+	} else {
 		const char *info;
 
 		info = sysinfo_get(get_setting("mail", "mail_location"));
@@ -1028,32 +1047,7 @@ int main(int argc, char *argv[])
 		if (scope == CONFIG_DUMP_SCOPE_ALL_WITHOUT_HIDDEN)
 			printf("# NOTE: Send doveconf -n output instead when asking for help.\n");
 		fflush(stdout);
-		ret2 = config_dump_human(&filter, wanted_modules, scope, NULL, hide_passwords);
-	} else {
-		struct config_export_context *ctx;
-
-		ctx = config_export_init(wanted_modules, NULL, CONFIG_DUMP_SCOPE_SET,
-					 CONFIG_DUMP_FLAG_CHECK_SETTINGS,
-					 config_request_putenv, NULL);
-		config_export_by_filter(ctx, &filter);
-
-		if (getenv(DOVECOT_PRESERVE_ENVS_ENV) != NULL) {
-			/* Standalone binary is getting its configuration via
-			   doveconf. Clean the environment before calling it.
-			   Do this only if the environment exists, because
-			   lib-master doesn't set it if it doesn't want the
-			   environment to be cleaned (e.g. -k parameter). */
-			const char *import_environment =
-				config_export_get_import_environment(ctx);
-			master_service_import_environment(import_environment);
-			master_service_env_clean();
-		}
-
-		env_put("DOVECONF_ENV", "1");
-		if (config_export_finish(&ctx) < 0)
-			i_fatal("Invalid configuration");
-		execvp(exec_args[0], exec_args);
-		i_fatal("execvp(%s) failed: %m", exec_args[0]);
+		ret2 = config_dump_human(&filter, scope, NULL, hide_passwords);
 	}
 
 	if (ret < 0) {

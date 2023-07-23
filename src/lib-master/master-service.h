@@ -17,10 +17,6 @@ enum master_service_flags {
 	/* Log to configured log file instead of stderr. By default when
 	   _FLAG_STANDALONE is set, logging is done to stderr. */
 	MASTER_SERVICE_FLAG_DONT_LOG_TO_STDERR	= 0x04,
-	/* Service is going to do multiple configuration lookups,
-	   keep the connection to config service open. Also opens the config
-	   socket before dropping privileges. */
-	MASTER_SERVICE_FLAG_KEEP_CONFIG_OPEN	= 0x08,
 	/* Don't read settings, but use whatever is in environment */
 	MASTER_SERVICE_FLAG_NO_CONFIG_SETTINGS	= 0x10,
 	/* Use MASTER_LOGIN_NOTIFY_FD to track login overflow state */
@@ -30,12 +26,6 @@ enum master_service_flags {
 	/* Show number of connections in process title
 	   (only if verbose_proctitle setting is enabled) */
 	MASTER_SERVICE_FLAG_UPDATE_PROCTITLE	= 0x100,
-	/* Don't read any SSL settings. This is mainly needed to prevent master
-	   process from trying to pass through huge list of SSL CA certificates
-	   through environment for ssl_ca setting, which could fail. Although
-	   the same problem can still happen with standalone doveadm if it
-	   reads settings via doveconf instead of config socket. */
-	MASTER_SERVICE_FLAG_DISABLE_SSL_SET	= 0x200,
 	/* Don't initialize SSL context automatically. */
 	MASTER_SERVICE_FLAG_NO_SSL_INIT		= 0x400,
 	/* Don't create a data stack frame between master_service_init() and
@@ -120,15 +110,23 @@ master_service_avail_overflow_callback_t(bool kill, struct timeval *created_r);
 
 extern struct master_service *master_service;
 
+extern const struct option master_service_helpopt;
+
 const char *master_service_getopt_string(void);
 
 /* Start service initialization. */
 struct master_service *
 master_service_init(const char *name, enum master_service_flags flags,
 		    int *argc, char **argv[], const char *getopt_str);
+void master_service_register_long_options(struct master_service *service,
+					  const struct option *longopts);
 /* Call getopt() and handle internal parameters. Return values are the same as
    getopt()'s. */
 int master_getopt(struct master_service *service);
+/* Call getopt_long() and handle internal parameters. Return values are the
+   same as getopt_long()'s. Additionally if a long option was encountered, its
+   name is written to longopt_r. */
+int master_getopt_long(struct master_service *service, const char **longopt_r);
 /* Returns TRUE if str is a valid getopt_str. Currently this only checks for
    duplicate args so they aren't accidentally added. */
 bool master_getopt_str_is_valid(const char *str);
@@ -287,10 +285,10 @@ void master_service_deinit_forked(struct master_service **_service);
    The line is expected to be in format:
    VERSION <tab> service_name <tab> major version <tab> minor version */
 bool version_string_verify(const char *line, const char *service_name,
-			   unsigned major_version);
+			   unsigned int major_version);
 /* Same as version_string_verify(), but return the minor version. */
 bool version_string_verify_full(const char *line, const char *service_name,
-				unsigned major_version,
+				unsigned int major_version,
 				unsigned int *minor_version_r);
 
 /* Sets process shutdown filter */

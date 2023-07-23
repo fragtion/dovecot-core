@@ -14,6 +14,29 @@ struct oauth2_auth_request {
 	bool failed;
 };
 
+static bool oauth2_find_oidc_url(struct auth_request *req, const char **url_r)
+{
+	struct auth_passdb *db = req->passdb;
+	if (req->openid_config_url != NULL) {
+		*url_r = req->openid_config_url;
+		return TRUE;
+	}
+
+	/* keep looking until you get a value */
+	for (; db != NULL; db = db->next) {
+		if (strcmp(db->passdb->iface.name, "oauth2") == 0) {
+			const char *url =
+				passdb_oauth2_get_oidc_url(req->passdb->passdb);
+			if (url == NULL || *url == '\0')
+				continue;
+			*url_r = url;
+			return TRUE;
+		}
+	}
+
+	return FALSE;
+}
+
 /* RFC5801 based unescaping */
 static bool oauth2_unescape_username(const char *in, const char **username_r)
 {
@@ -42,8 +65,7 @@ static void oauth2_verify_callback(enum passdb_result result,
 				   const char *const *error_fields,
 				   struct auth_request *request)
 {
-	struct oauth2_auth_request *oauth2_req =
-			(struct oauth2_auth_request*)request;
+	const char *oidc_url;
 
 	i_assert(result == PASSDB_RESULT_OK || error_fields != NULL);
 	switch (result) {
@@ -51,8 +73,8 @@ static void oauth2_verify_callback(enum passdb_result result,
 		auth_request_success(request, "", 0);
 		break;
 	case PASSDB_RESULT_INTERNAL_FAILURE:
-		auth_request_internal_failure(request);
-		break;
+		request->internal_failure = TRUE;
+		/* fall through */
 	default:
 		/* we could get new token after this */
 		if (request->mech_password != NULL)
@@ -76,19 +98,30 @@ static void oauth2_verify_callback(enum passdb_result result,
 		   This **must** be removed from here and db-oauth2 once the
 		   validation result et al is handled here.
 		*/
-		if (request->openid_config_url != NULL) {
+		if (oauth2_find_oidc_url(request, &oidc_url)) {
 			if (str_len(error) > 0)
 				str_append_c(error, ',');
 			str_printfa(error, "\"openid-configuration\":\"");
-			json_append_escaped(error, request->openid_config_url);
+			json_append_escaped(error, oidc_url);
 			str_append_c(error, '"');
 		}
 		str_append_c(error, '}');
-		auth_request_handler_reply_continue(request, str_data(error),
-						    str_len(error));
-		oauth2_req->failed = TRUE;
+		auth_request_fail_with_reply(request, str_data(error), str_len(error));
 		break;
 	}
+}
+
+static void mech_oauth2_verify_token(struct auth_request *request,
+				     const char *token,
+				     enum passdb_result result,
+				     verify_plain_callback_t callback)
+{
+	i_assert(token != NULL);
+	if (result != PASSDB_RESULT_OK) {
+		request->passdb_result = result;
+		request->failed = TRUE;
+	}
+	auth_request_verify_plain(request, token, callback);
 }
 
 static void
@@ -121,16 +154,6 @@ mech_xoauth2_auth_continue(struct auth_request *request,
 			   const unsigned char *data,
 			   size_t data_size)
 {
-	struct oauth2_auth_request *oauth2_req =
-			(struct oauth2_auth_request*)request;
-
-	/* Specification says that client is sent "invalid token" challenge
-	   which the client is supposed to ack with empty response */
-	if (oauth2_req->failed) {
-		auth_request_fail(request);
-		return;
-	}
-
 	/* split the data from ^A */
 	bool user_given = FALSE;
 	const char *value, *error;
@@ -152,7 +175,8 @@ mech_xoauth2_auth_continue(struct auth_request *request,
 			} else {
 				e_info(request->mech_event,
 				       "Invalid continued data");
-				auth_request_fail(request);
+				xoauth2_verify_callback(PASSDB_RESULT_PASSWORD_MISMATCH,
+							request);
 				return;
 			}
 		}
@@ -162,16 +186,16 @@ mech_xoauth2_auth_continue(struct auth_request *request,
 	if (user_given && !auth_request_set_username(request, username, &error)) {
 		e_info(request->mech_event,
 		       "%s", error);
-		auth_request_fail(request);
+		xoauth2_verify_callback(PASSDB_RESULT_PASSWORD_MISMATCH, request);
 		return;
 	}
 
 	if (user_given && token != NULL)
-		auth_request_verify_plain(request, token,
-					  xoauth2_verify_callback);
+		mech_oauth2_verify_token(request, token, PASSDB_RESULT_OK,
+					 xoauth2_verify_callback);
 	else {
 		e_info(request->mech_event, "Username or token missing");
-		auth_request_fail(request);
+		xoauth2_verify_callback(PASSDB_RESULT_PASSWORD_MISMATCH, request);
 	}
 }
 
@@ -183,14 +207,6 @@ mech_oauthbearer_auth_continue(struct auth_request *request,
 			       const unsigned char *data,
 			       size_t data_size)
 {
-	struct oauth2_auth_request *oauth2_req =
-			(struct oauth2_auth_request*)request;
-
-	if (oauth2_req->failed) {
-		auth_request_fail(request);
-		return;
-	}
-
 	bool user_given = FALSE;
 	const char *value, *error;
 	const char *username;
@@ -203,7 +219,8 @@ mech_oauthbearer_auth_continue(struct auth_request *request,
 	if (*fields == NULL || *(fields[0]) == '\0') {
 		e_info(request->mech_event,
 		       "Invalid continued data");
-		auth_request_fail(request);
+		oauthbearer_verify_callback(PASSDB_RESULT_PASSWORD_MISMATCH,
+					    request);
 		return;
 	}
 
@@ -213,13 +230,15 @@ mech_oauthbearer_auth_continue(struct auth_request *request,
 		case 'f':
 			e_info(request->mech_event,
 			       "Client requested non-standard mechanism");
-			auth_request_fail(request);
+			oauthbearer_verify_callback(PASSDB_RESULT_PASSWORD_MISMATCH,
+						    request);
 			return;
 		case 'p':
 			/* channel binding is not supported */
 			e_info(request->mech_event,
 			       "Client requested and used channel-binding");
-			auth_request_fail(request);
+			oauthbearer_verify_callback(PASSDB_RESULT_PASSWORD_MISMATCH,
+						    request);
 			return;
 		case 'n':
 		case 'y':
@@ -230,8 +249,9 @@ mech_oauthbearer_auth_continue(struct auth_request *request,
 			    !oauth2_unescape_username((*ptr)+2, &username)) {
 				 e_info(request->mech_event,
 					"Invalid username escaping");
-				 auth_request_fail(request);
-				 return;
+				oauthbearer_verify_callback(PASSDB_RESULT_PASSWORD_MISMATCH,
+							    request);
+				return;
 			} else {
 				user_given = TRUE;
 			}
@@ -239,7 +259,8 @@ mech_oauthbearer_auth_continue(struct auth_request *request,
 		default:
 			e_info(request->mech_event,
 			       "Invalid gs2-header in request");
-			auth_request_fail(request);
+			oauthbearer_verify_callback(PASSDB_RESULT_PASSWORD_MISMATCH,
+						    request);
 			return;
 		}
 	}
@@ -252,7 +273,8 @@ mech_oauthbearer_auth_continue(struct auth_request *request,
 			} else {
 				e_info(request->mech_event,
 				       "Invalid continued data");
-				auth_request_fail(request);
+				oauthbearer_verify_callback(PASSDB_RESULT_PASSWORD_MISMATCH,
+							    request);
 				return;
 			}
 		}
@@ -261,15 +283,17 @@ mech_oauthbearer_auth_continue(struct auth_request *request,
 	if (user_given && !auth_request_set_username(request, username, &error)) {
 		e_info(request->mech_event,
 		       "%s", error);
-		auth_request_fail(request);
+		oauthbearer_verify_callback(PASSDB_RESULT_PASSWORD_MISMATCH,
+					    request);
 		return;
 	}
 	if (user_given && token != NULL)
-		auth_request_verify_plain(request, token,
-					  oauthbearer_verify_callback);
+		mech_oauth2_verify_token(request, token, PASSDB_RESULT_OK,
+					 oauthbearer_verify_callback);
 	else {
 		e_info(request->mech_event, "Missing username or token");
-		auth_request_fail(request);
+		oauthbearer_verify_callback(PASSDB_RESULT_PASSWORD_MISMATCH,
+					    request);
 	}
 }
 

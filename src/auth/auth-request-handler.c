@@ -171,11 +171,8 @@ auth_str_append_extra_fields(struct auth_request *request, string_t *dest)
 {
 	const struct auth_request_fields *fields = &request->fields;
 
-	if (!auth_fields_is_empty(fields->extra_fields)) {
-		str_append_c(dest, '\t');
-		auth_fields_append(fields->extra_fields, dest,
-				   AUTH_FIELD_FLAG_HIDDEN, 0);
-	}
+	auth_fields_append(fields->extra_fields, dest,
+			   AUTH_FIELD_FLAG_HIDDEN, 0, TRUE);
 
 	if (fields->original_username != NULL &&
 	    null_strcmp(fields->original_username, fields->user) != 0 &&
@@ -273,11 +270,6 @@ auth_request_handler_reply_success_finish(struct auth_request *request)
 		auth_penalty_update(auth_penalty, request, 0);
 	}
 
-	/* sanitize these fields, since the login code currently assumes they
-	   are exactly in this format. */
-	auth_fields_booleanize(request->fields.extra_fields, "nologin");
-	auth_fields_booleanize(request->fields.extra_fields, "proxy");
-
 	str_printfa(str, "OK\t%u\tuser=", request->id);
 	str_append_tabescaped(str, request->fields.user);
 	auth_str_append_extra_fields(request, str);
@@ -334,11 +326,6 @@ auth_request_handler_reply_failure_finish(struct auth_request *request)
 			code = AUTH_CLIENT_FAIL_CODE_PASS_EXPIRED;
 			break;
 		}
-	}
-
-	if (auth_fields_exists(request->fields.extra_fields, "nodelay")) {
-		/* this is normally a hidden field, need to add it explicitly */
-		str_append(str, "\tnodelay");
 	}
 
 	if (code != NULL) {
@@ -419,6 +406,12 @@ auth_request_handler_default_reply_callback(struct auth_request *request,
 		break;
 	case AUTH_CLIENT_RESULT_FAILURE:
 		auth_request_proxy_finish_failure(request);
+		if (reply_size > 0) {
+			str = t_str_new(MAX_BASE64_ENCODED_SIZE(reply_size));
+			base64_encode(auth_reply, reply_size, str);
+			auth_fields_add(request->fields.extra_fields, "resp",
+					str_c(str), 0);
+		}
 		auth_request_handler_reply_failure_finish(request);
 		break;
 	}
@@ -742,9 +735,8 @@ bool auth_request_handler_auth_continue(struct auth_request_handler *handler,
 static void auth_str_append_userdb_extra_fields(struct auth_request *request,
 						string_t *dest)
 {
-	str_append_c(dest, '\t');
 	auth_fields_append(request->fields.userdb_reply, dest,
-			   AUTH_FIELD_FLAG_HIDDEN, 0);
+			   AUTH_FIELD_FLAG_HIDDEN, 0, TRUE);
 
 	if (request->fields.master_user != NULL &&
 	    !auth_fields_exists(request->fields.userdb_reply, "master_user")) {
@@ -951,7 +943,7 @@ void auth_request_handler_flush_failures(bool flush_all)
 	}
 
 	/* flush the requests */
-	for (i = 0; i < count; i++) {
+	for (i = 0; i < count; i++) T_BEGIN {
 		auth_request = auth_requests[aqueue_idx(auth_failures, 0)];
 		aqueue_delete_tail(auth_failures);
 
@@ -961,7 +953,7 @@ void auth_request_handler_flush_failures(bool flush_all)
 					   AUTH_CLIENT_RESULT_FAILURE,
 					   uchar_empty_ptr, 0);
 		auth_request_unref(&auth_request);
-	}
+	} T_END;
 }
 
 static void auth_failure_timeout(void *context ATTR_UNUSED)

@@ -223,7 +223,7 @@ mail_cache_register_get_field(struct mail_cache *cache, unsigned int field_idx)
 }
 
 struct mail_cache_field *
-mail_cache_register_get_list(struct mail_cache *cache, pool_t pool,
+mail_cache_register_get_list(struct mail_cache *cache, pool_t *pool_r,
 			     unsigned int *count_r)
 {
         struct mail_cache_field *list;
@@ -232,11 +232,12 @@ mail_cache_register_get_list(struct mail_cache *cache, pool_t pool,
 	if (!cache->opened)
 		(void)mail_cache_open_and_verify(cache);
 
+	*pool_r = pool_alloconly_create("mail cache register fields", 1024);
 	list = cache->fields_count == 0 ? NULL :
-		p_new(pool, struct mail_cache_field, cache->fields_count);
+		p_new(*pool_r, struct mail_cache_field, cache->fields_count);
 	for (i = 0; i < cache->fields_count; i++) {
 		list[i] = cache->fields[i].field;
-		list[i].name = p_strdup(pool, list[i].name);
+		list[i].name = p_strdup(*pool_r, list[i].name);
 	}
 
 	*count_r = cache->fields_count;
@@ -325,8 +326,8 @@ mail_cache_header_fields_get_offset(struct mail_cache *cache,
 	cache->last_field_header_offset = offset;
 
 	if (next_count > cache->index->optimization_set.cache.purge_header_continue_count) {
-		mail_cache_purge_later(cache, t_strdup_printf(
-			"Too many continued headers (%u)", next_count));
+		mail_cache_purge_later(cache,
+			"Too many continued headers (%u)", next_count);
 	}
 
 	if (field_hdr_r != NULL) {
@@ -494,19 +495,19 @@ int mail_cache_header_fields_read(struct mail_cache *cache)
 		case MAIL_CACHE_PURGE_DROP_DECISION_NONE:
 			break;
 		case MAIL_CACHE_PURGE_DROP_DECISION_DROP:
-			mail_cache_purge_later(cache, t_strdup_printf(
+			mail_cache_purge_later(cache,
 				"Drop old field %s (last_used=%"PRIdTIME_T")",
 				cache->fields[fidx].field.name,
-				cache->fields[fidx].field.last_used));
+				cache->fields[fidx].field.last_used);
 			break;
 		case MAIL_CACHE_PURGE_DROP_DECISION_TO_TEMP:
 			/* This cache decision change can cause the field to be
 			   dropped for old mails, so do it via purging. */
-			mail_cache_purge_later(cache, t_strdup_printf(
+			mail_cache_purge_later(cache,
 				"Change cache decision to temp for old field %s "
 				"(last_used=%"PRIdTIME_T")",
 				cache->fields[fidx].field.name,
-				cache->fields[fidx].field.last_used));
+				cache->fields[fidx].field.last_used);
 			break;
 		}
 

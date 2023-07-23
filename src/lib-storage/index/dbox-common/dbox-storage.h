@@ -37,6 +37,8 @@ struct dbox_storage_vfuncs {
 	   if parents=TRUE, create the directory if necessary */
 	int (*file_create_fd)(struct dbox_file *file, const char *path,
 			      bool parents);
+	/* Initialize the mail file, but don't actually open it. */
+	int (*mail_file_set)(struct dbox_mail *mail);
 	/* open the mail and return its file/offset */
 	int (*mail_open)(struct dbox_mail *mail, uoff_t *offset_r,
 			 struct dbox_file **file_r);
@@ -71,8 +73,12 @@ int dbox_storage_create(struct mail_storage *storage,
 void dbox_storage_destroy(struct mail_storage *storage);
 uint32_t dbox_get_uidvalidity_next(struct mailbox_list *list);
 void dbox_notify_changes(struct mailbox *box);
-int dbox_mailbox_check_existence(struct mailbox *box, time_t *path_ctime_r);
-int dbox_mailbox_open(struct mailbox *box, time_t path_ctime);
+int dbox_mailbox_check_existence(struct mailbox *box);
+int dbox_mailbox_open(struct mailbox *box);
+void dbox_mailbox_close(struct mailbox *box);
+void dbox_mailbox_close_cleanup(struct mailbox *box);
+int dbox_mailbox_list_cleanup(struct mail_user *user, const char *path,
+			      time_t last_temp_file_scan);
 int dbox_mailbox_create(struct mailbox *box,
 			const struct mailbox_update *update, bool directory);
 int dbox_mailbox_create_indexes(struct mailbox *box,

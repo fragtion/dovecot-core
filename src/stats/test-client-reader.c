@@ -44,11 +44,12 @@ bool test_stats_callback(struct event *event,
 	return TRUE;
 }
 
-static const char *settings_blob_1 =
-"metric=test\n"
-"metric/test/metric_name=test\n"
-"metric/test/filter=event=test\n"
-"\n";
+static const char *const settings_blob_1[] = {
+	"metric=test",
+	"metric/test/metric_name=test",
+	"metric/test/filter=event=test",
+	NULL
+};
 
 static int test_reader_server_input_args(struct connection *conn ATTR_UNUSED,
 					 const char *const *args)
@@ -123,12 +124,13 @@ static void test_client_reader(void)
 	test_end();
 }
 
-static const char *settings_blob_2 =
-"metric=test\n"
-"metric/test/metric_name=test\n"
-"metric/test/filter=event=test\n"
-"metric/test/group_by=test_name\n"
-"\n";
+static const char *const settings_blob_2[] = {
+	"metric=test",
+	"metric/test/metric_name=test",
+	"metric/test/filter=event=test",
+	"metric/test/group_by=test_name",
+	NULL
+};
 
 static int
 test_reader_server_input_args_group_by(struct connection *conn,
@@ -195,7 +197,7 @@ static void test_client_reader_group_by(void)
 	struct event *event = event_create(NULL);
 	event_add_category(event, &test_category);
 	event_set_name(event, "test");
-	event_add_str(event, "event_name", "alpha");
+	event_add_str(event, "test_name", "alpha");
 	test_event_send(event);
 	event_unref(&event);
 

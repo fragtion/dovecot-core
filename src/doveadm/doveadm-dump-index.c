@@ -106,6 +106,15 @@ struct virtual_mail_index_mailbox_record {
 	uint32_t next_uid;
 	uint64_t highest_modseq;
 };
+struct virtual_mail_index_ext2_header {
+	uint8_t version;
+	uint8_t ext_record_size;
+	uint16_t hdr_size;
+	uint32_t change_counter;
+};
+struct virtual_mail_index_mailbox_ext2_record {
+	uint8_t guid[16];
+};
 struct virtual_mail_index_record {
 	uint32_t mailbox_id;
 	uint32_t real_uid;
@@ -313,6 +322,23 @@ static void dump_extension_header(struct mail_index *index,
 
 			name += rec->name_len;
 		}
+	} else if (strcmp(ext->name, "virtual2") == 0) {
+		const struct virtual_mail_index_ext2_header *hdr = data;
+		const struct virtual_mail_index_mailbox_ext2_record *rec;
+		unsigned int i, count;
+
+		printf("header\n");
+		printf(" - version .......... = %u\n", hdr->version);
+		printf(" - ext_record_size .. = %u\n", hdr->ext_record_size);
+		printf(" - hdr_size ......... = %u\n", hdr->hdr_size);
+		printf(" - change_counter ... = %u\n", hdr->change_counter);
+
+		count = (ext->hdr_size - hdr->hdr_size) / hdr->ext_record_size;
+		for (i = 0; i < count; i++, rec++) {
+			rec = CONST_PTR_OFFSET(data, hdr->hdr_size +
+					       i * hdr->ext_record_size);
+			printf(" - guid = %s\n", guid_128_to_string(rec->guid));
+		}
 	} else if (strcmp(ext->name, "list") == 0) {
 		printf("header ........ = %s\n",
 		       binary_to_hex(data, ext->hdr_size));
@@ -431,6 +457,7 @@ static void dump_cache_hdr(struct mail_cache *cache)
 	const struct mail_cache_header *hdr;
 	const struct mail_cache_field *fields, *field;
 	unsigned int i, count, cache_idx;
+	pool_t pool;
 
 	(void)mail_cache_open_and_verify(cache);
 	if (MAIL_CACHE_IS_UNUSABLE(cache)) {
@@ -454,8 +481,7 @@ static void dump_cache_hdr(struct mail_cache *cache)
 	       hdr->field_header_offset);
 
 	printf("-- Cache fields --\n");
-	fields = mail_cache_register_get_list(cache, pool_datastack_create(),
-					      &count);
+	fields = mail_cache_register_get_list(cache, &pool, &count);
 	printf(
 " #  Name                                         Type Size Dec  Last used\n");
 	for (i = 0; i < cache->file_fields_count; i++) {
@@ -473,6 +499,7 @@ static void dump_cache_hdr(struct mail_cache *cache)
 		       cache_decision2str(field->decision),
 		       unixdate2str(field->last_used));
 	}
+	pool_unref(&pool);
 }
 
 static void dump_message_part(string_t *str, const struct message_part *part)

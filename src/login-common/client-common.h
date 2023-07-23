@@ -64,6 +64,8 @@ enum client_auth_fail_code {
 	CLIENT_AUTH_FAIL_CODE_MECH_INVALID,
 	CLIENT_AUTH_FAIL_CODE_MECH_SSL_REQUIRED,
 	CLIENT_AUTH_FAIL_CODE_ANONYMOUS_DENIED,
+
+	CLIENT_AUTH_FAIL_CODE_COUNT
 };
 
 enum client_auth_result {
@@ -197,16 +199,22 @@ struct client {
 
 	char *auth_mech_name;
 	enum sasl_server_auth_flags auth_flags;
+	/* Auth request set while the client is authenticating.
+	   During this time authenticating=TRUE also. */
 	struct auth_client_request *auth_request;
 	struct auth_client_request *reauth_request;
 	string_t *auth_response;
-	time_t auth_first_started, auth_finished;
-	const char *sasl_final_resp;
+	struct timeval auth_first_started, auth_finished;
+	enum sasl_server_reply delayed_final_reply;
+	const char *const *final_args;
 	const char *const *auth_passdb_args;
 	struct anvil_query *anvil_query;
 	struct anvil_request *anvil_request;
 
 	unsigned int master_auth_id;
+	/* Tag that can be used with login_client_request_abort() to abort
+	   sending client fd to mail process. authenticating is always TRUE
+	   while this is non-zero. */
 	unsigned int master_tag;
 	sasl_server_callback_t *sasl_callback;
 
@@ -230,7 +238,6 @@ struct client {
 	bool destroyed:1;
 	bool input_blocked:1;
 	bool login_success:1;
-	bool no_extra_disconnect_reason:1;
 	/* Client/proxy connection is using TLS. Either Dovecot or HAProxy
 	   has terminated the TLS connection. */
 	bool connection_tls_secured:1;
@@ -257,8 +264,16 @@ struct client {
 	bool connection_trusted:1;
 	bool ssl_servername_settings_read:1;
 	bool banner_sent:1;
+	/* Authentication is going on. This is set a bit before auth_request is
+	   created, and it can fail early e.g. due to unknown SASL mechanism.
+	   Also this is still TRUE while the client fd is being sent to the
+	   mail process (master_tag != 0). */
 	bool authenticating:1;
-	bool auth_try_aborted:1;
+	/* SASL authentication is waiting for client to send a continuation */
+	bool auth_client_continue_pending:1;
+	/* Client asked for SASL authentication to be aborted by sending
+	   "*" line. */
+	bool auth_aborted_by_client:1;
 	bool auth_initializing:1;
 	bool auth_process_comm_fail:1;
 	bool auth_anonymous:1;
@@ -268,10 +283,12 @@ struct client {
 	bool proxy_nopipelining:1;
 	bool proxy_not_trusted:1;
 	bool proxy_redirect_reauth:1;
-	bool auth_waiting:1;
 	bool notified_auth_ready:1;
 	bool notified_disconnect:1;
 	bool fd_proxying:1;
+	bool shutting_down:1;
+	bool resource_constraint:1;
+	bool final_response:1;
 	/* ... */
 };
 
@@ -323,9 +340,13 @@ void client_add_forward_field(struct client *client, const char *key,
 			      const char *value);
 bool client_forward_decode_base64(struct client *client, const char *value);
 void client_set_title(struct client *client);
-const char *client_get_extra_disconnect_reason(struct client *client);
+bool client_get_extra_disconnect_reason(struct client *client,
+					const char **human_reason_r,
+					const char **event_reason_r);
 
 void client_auth_respond(struct client *client, const char *response);
+/* Called when client asks for SASL authentication to be aborted by sending
+   "*" line. */
 void client_auth_abort(struct client *client);
 bool client_is_tls_enabled(struct client *client);
 void client_auth_fail(struct client *client, const char *text);

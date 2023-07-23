@@ -72,12 +72,16 @@ void imap_refresh_proctitle(void)
 #define IMAP_PROCTITLE_PREFERRED_LEN 80
 	struct client *client;
 	struct client_command_context *cmd;
-	string_t *title = t_str_new(128);
 	bool wait_output;
 
 	if (!verbose_proctitle)
 		return;
+	if (imap_client_count == 0) {
+		if (imap_master_clients_refresh_proctitle())
+			return;
+	}
 
+	string_t *title = t_str_new(128);
 	str_append_c(title, '[');
 	switch (imap_client_count) {
 	case 0:
@@ -125,7 +129,7 @@ static void client_kill_idle(struct client *client)
 	if (client->output_cmd_lock != NULL)
 		return;
 
-	mail_storage_service_io_activate_user(client->service_user);
+	mail_storage_service_io_activate_user(client->user->service_user);
 	client_send_line(client, "* BYE "MASTER_SERVICE_SHUTTING_DOWN_MSG".");
 	client_destroy(client, MASTER_SERVICE_SHUTTING_DOWN_MSG);
 }
@@ -242,7 +246,6 @@ int client_create_from_input(const struct mail_storage_service_input *input,
 			     struct client **client_r, const char **error_r)
 {
 	struct mail_storage_service_input service_input;
-	struct mail_storage_service_user *user;
 	struct mail_user *mail_user;
 	struct client *client;
 	struct imap_settings *imap_set;
@@ -256,18 +259,18 @@ int client_create_from_input(const struct mail_storage_service_input *input,
 		{ .key = NULL }
 	});
 	if (input->local_ip.family != 0)
-		event_add_str(event, "local_ip", net_ip2addr(&input->local_ip));
+		event_add_ip(event, "local_ip", &input->local_ip);
 	if (input->local_port != 0)
 		event_add_int(event, "local_port", input->local_port);
 	if (input->remote_ip.family != 0)
-		event_add_str(event, "remote_ip", net_ip2addr(&input->remote_ip));
+		event_add_ip(event, "remote_ip", &input->remote_ip);
 	if (input->remote_port != 0)
 		event_add_int(event, "remote_port", input->remote_port);
 
 	service_input = *input;
 	service_input.event_parent = event;
 	if (mail_storage_service_lookup_next(storage_service, &service_input,
-					     &user, &mail_user, error_r) <= 0) {
+					     &mail_user, error_r) <= 0) {
 		event_unref(&event);
 		return -1;
 	}
@@ -285,7 +288,7 @@ int client_create_from_input(const struct mail_storage_service_input *input,
 		verbose_proctitle = TRUE;
 
 	client = client_create(fd_in, fd_out, unhibernated,
-			       event, mail_user, user, imap_set, smtp_set);
+			       event, mail_user, imap_set, smtp_set);
 	client->userdb_fields = input->userdb_fields == NULL ? NULL :
 		p_strarray_dup(client->pool, input->userdb_fields);
 	event_unref(&event);
@@ -301,7 +304,7 @@ static void main_stdio_run(const char *username)
 	const char *value, *error, *input_base64;
 
 	i_zero(&input);
-	input.module = input.service = "imap";
+	input.service = "imap";
 	input.username = username != NULL ? username : getenv("USER");
 	if (input.username == NULL && IS_STANDALONE())
 		input.username = getlogin();
@@ -354,7 +357,7 @@ login_request_finished(const struct login_server_request *request,
 	const char *error;
 
 	i_zero(&input);
-	input.module = input.service = "imap";
+	input.service = "imap";
 	input.local_ip = request->auth_req.local_ip;
 	input.remote_ip = request->auth_req.remote_ip;
 	input.local_port = request->auth_req.local_port;
@@ -479,7 +482,6 @@ int main(int argc, char *argv[])
 	struct login_server_settings login_set;
 	enum master_service_flags service_flags = 0;
 	enum mail_storage_service_flags storage_service_flags =
-		MAIL_STORAGE_SERVICE_FLAG_NO_SSL_CA |
 		/*
 		 * We include MAIL_STORAGE_SERVICE_FLAG_NO_NAMESPACES so
 		 * that the mail_user initialization is fast and we can
@@ -506,8 +508,6 @@ int main(int argc, char *argv[])
 	if (IS_STANDALONE()) {
 		service_flags |= MASTER_SERVICE_FLAG_STANDALONE |
 			MASTER_SERVICE_FLAG_STD_CLIENT;
-	} else {
-		service_flags |= MASTER_SERVICE_FLAG_KEEP_CONFIG_OPEN;
 	}
 
 	master_service = master_service_init("imap", service_flags,
@@ -544,6 +544,9 @@ int main(int argc, char *argv[])
 	imap_features_init();
 	clients_init();
 	imap_master_clients_init();
+	/* this is needed before settings are read */
+	verbose_proctitle = !IS_STANDALONE() &&
+		getenv(MASTER_VERBOSE_PROCTITLE_ENV) != NULL;
 
 	const char *error;
 	if (t_abspath(auth_socket_path, &login_set.auth_socket_path, &error) < 0)
@@ -555,6 +558,8 @@ int main(int argc, char *argv[])
 	}
 	login_set.callback = login_request_finished;
 	login_set.failure_callback = login_request_failed;
+	login_set.update_proctitle = verbose_proctitle &&
+		master_service_get_client_limit(master_service) == 1;
 
 	if (!IS_STANDALONE())
 		login_server = login_server_init(master_service, &login_set);

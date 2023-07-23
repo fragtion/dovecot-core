@@ -52,6 +52,13 @@ static const char *values_single[] = {
 	"foo.c",
 	"foo.c:123",
 
+	"0",
+	"123",
+	"123*",
+
+	"127.0.0.1",
+	"127.0.0.*",
+
 	/* wildcards */
 	"*foo",
 	"f*o",
@@ -234,10 +241,10 @@ static void testcase(const char *name, const char *input, const char *exp,
 
 		event_filter_export(filter, tmp);
 
-		test_out_quiet(t_strdup_printf("input: %s", input),
+		test_out_quiet(t_strdup_printf("input: %s (%s)", input, str_c(tmp)),
 			       strcmp(exp, str_c(tmp)) == 0);
 	} else {
-		test_out_quiet(t_strdup_printf("input: %s", input),
+		test_out_quiet(t_strdup_printf("input: %s (%s)", input, error),
 			       str_begins_with(error, exp));
 	}
 

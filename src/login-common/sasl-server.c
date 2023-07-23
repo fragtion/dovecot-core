@@ -3,12 +3,14 @@
 #include "login-common.h"
 #include "array.h"
 #include "md5.h"
+#include "sasl-server.h"
 #include "str.h"
 #include "base64.h"
 #include "buffer.h"
 #include "hex-binary.h"
 #include "ioloop.h"
 #include "istream.h"
+#include "strfuncs.h"
 #include "write-full.h"
 #include "strescape.h"
 #include "str-sanitize.h"
@@ -200,7 +202,7 @@ static int master_send_request(struct anvil_request *anvil_request)
 	req.data_size = buf->used;
 	i_stream_skip(client->input, size);
 
-	client->auth_finished = ioloop_time;
+	client->auth_finished = ioloop_timeval;
 
 	i_zero(&params);
 	params.client_fd = fd;
@@ -299,20 +301,19 @@ sasl_server_check_login(struct client *client)
 	return TRUE;
 }
 
-static bool args_parse_user(struct client *client, const char *arg)
+static bool
+args_parse_user(struct client *client, const char *key, const char *value)
 {
-	const char *value;
-
-	if (str_begins(arg, "user=", &value)) {
+	if (strcmp(key, "user") == 0) {
 		i_free(client->virtual_user);
 		i_free_and_null(client->virtual_user_orig);
 		i_free_and_null(client->virtual_auth_user);
 		client->virtual_user = i_strdup(value);
 		event_add_str(client->event, "user", client->virtual_user);
-	} else if (str_begins(arg, "original_user=", &value)) {
+	} else if (strcmp(key, "original_user") == 0) {
 		i_free(client->virtual_user_orig);
 		client->virtual_user_orig = i_strdup(value);
-	} else if (str_begins(arg, "auth_user=", &value)) {
+	} else if (strcmp(key, "auth_user") == 0) {
 		i_free(client->virtual_auth_user);
 		client->virtual_auth_user = i_strdup(value);
 	} else {
@@ -327,7 +328,6 @@ authenticate_callback(struct auth_client_request *request,
 		      const char *const *args, void *context)
 {
 	struct client *client = context;
-	const char *value;
 	unsigned int i;
 	bool nologin;
 
@@ -336,7 +336,7 @@ authenticate_callback(struct auth_client_request *request,
 		i_assert(status < 0);
 		return;
 	}
-	client->auth_waiting = FALSE;
+	client->auth_client_continue_pending = FALSE;
 
 	i_assert(client->auth_request == request);
 	switch (status) {
@@ -354,21 +354,23 @@ authenticate_callback(struct auth_client_request *request,
 
 		nologin = FALSE;
 		for (i = 0; args[i] != NULL; i++) {
-			if (args_parse_user(client, args[i]))
-				;
-			else if (str_begins(args[i], "postlogin_socket=", &value)) {
+			const char *key, *value;
+			t_split_key_value_eq(args[i], &key, &value);
+
+			if (args_parse_user(client, key, value))
+				continue;
+
+			if (strcmp(key, "postlogin_socket") == 0) {
 				client->postlogin_socket_path =
 					p_strdup(client->pool, value);
-			} else if (strcmp(args[i], "nologin") == 0 ||
-				   strcmp(args[i], "proxy") == 0) {
+			} else if (strcmp(key, "nologin") == 0 ||
+				   strcmp(key, "proxy") == 0) {
 				/* user can't login */
 				nologin = TRUE;
-			} else if (strcmp(args[i], "anonymous") == 0 ) {
+			} else if (strcmp(key, "anonymous") == 0) {
 				client->auth_anonymous = TRUE;
-			} else if (str_begins(args[i], "resp=", &value) &&
-				   login_binary->sasl_support_final_reply) {
-				client->sasl_final_resp =
-					p_strdup(client->pool, value);
+			} else if (str_begins(args[i], "event_", &key)) {
+				event_add_str(client->event_auth, key, value);
 			}
 		}
 
@@ -389,15 +391,33 @@ authenticate_callback(struct auth_client_request *request,
 	case AUTH_REQUEST_STATUS_ABORT:
 		client->auth_request = NULL;
 
+		const char *sasl_final_delayed_resp = NULL;
 		if (args != NULL) {
 			/* parse our username if it's there */
-			for (i = 0; args[i] != NULL; i++)
-				(void)args_parse_user(client, args[i]);
+			for (i = 0; args[i] != NULL; i++) {
+				const char *key, *value;
+				t_split_key_value_eq(args[i], &key, &value);
+				if (args_parse_user(client, key, value))
+					continue;
+				if (strcmp(key, "resp") == 0) {
+					sasl_final_delayed_resp =
+						p_strdup(client->preproxy_pool, value);
+				}
+			}
 		}
 
-		client->authenticating = FALSE;
-		call_client_callback(client, SASL_SERVER_REPLY_AUTH_FAILED,
-				     NULL, args);
+		if (sasl_final_delayed_resp != NULL &&
+		    !login_binary->sasl_support_final_reply) {
+			client->final_response = TRUE;
+			client->final_args = p_strarray_dup(client->preproxy_pool, args);
+			client->delayed_final_reply = SASL_SERVER_REPLY_AUTH_FAILED;
+			client->sasl_callback(client, SASL_SERVER_REPLY_CONTINUE,
+					      sasl_final_delayed_resp, NULL);
+		} else {
+			client->authenticating = FALSE;
+			call_client_callback(client, SASL_SERVER_REPLY_AUTH_FAILED,
+					     NULL, args);
+		}
 		break;
 	}
 }
@@ -458,7 +478,6 @@ int sasl_server_auth_request_info_fill(struct client *client,
 
 	if (client->ssl_iostream != NULL) {
 		unsigned char hash[MD5_RESULTLEN];
-		info_r->cert_username = ssl_iostream_get_peer_name(client->ssl_iostream);
 		info_r->ssl_cipher = ssl_iostream_get_cipher(client->ssl_iostream,
 							 &info_r->ssl_cipher_bits);
 		info_r->ssl_pfs = ssl_iostream_get_pfs(client->ssl_iostream);
@@ -505,10 +524,11 @@ void sasl_server_auth_begin(struct client *client, const char *mech_name,
 	i_assert(auth_client_is_connected(auth_client));
 
 	client->auth_attempts++;
+	client->auth_aborted_by_client = FALSE;
 	client->authenticating = TRUE;
 	client->master_auth_id = 0;
-	if (client->auth_first_started == 0)
-		client->auth_first_started = ioloop_time;
+	if (client->auth_first_started.tv_sec == 0)
+		client->auth_first_started = ioloop_timeval;
 	i_free(client->auth_mech_name);
 	client->auth_mech_name = str_ucase(i_strdup(mech_name));
 	client->auth_anonymous = FALSE;
@@ -589,11 +609,19 @@ void sasl_server_auth_failed(struct client *client, const char *reason,
 
 void sasl_server_auth_abort(struct client *client)
 {
-	client->auth_try_aborted = TRUE;
+	client->auth_aborted_by_client = TRUE;
 	if (client->anvil_query != NULL) {
 		anvil_client_query_abort(anvil, &client->anvil_query);
 		i_free(client->anvil_request);
 	}
 	sasl_server_auth_cancel(client, "Aborted", NULL,
 				SASL_SERVER_REPLY_AUTH_ABORTED);
+}
+
+void sasl_server_auth_delayed_final(struct client *client)
+{
+	client->final_response = FALSE;
+	client->authenticating = FALSE;
+	client->auth_client_continue_pending = FALSE;
+	call_client_callback(client, client->delayed_final_reply, NULL, client->final_args);
 }

@@ -36,6 +36,8 @@ test_deps = \
 	../lib-mail/libmail.la \
 	../lib-charset/libcharset.la \
 	../lib-dns/libdns.la \
+	../lib-auth/libauth.la \
+	../lib-otp/libotp.la \
 	../lib-test/libtest.la \
 	../lib/liblib.la
 

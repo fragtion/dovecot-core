@@ -61,13 +61,22 @@ struct service {
 	ARRAY(struct service_listener *) listeners;
 	/* per-process unix_listeners */
 	ARRAY(struct service_listener *) unix_pid_listeners;
-	/* linked list of all processes belonging to this service */
-	struct service_process *processes;
+	/* linked list of processes belonging to this service, which have
+	   idle_start == 0. */
+	struct service_process *busy_processes;
+	/* linked list of processes belonging to this service, which have
+	   ldle_start != 0. */
+	struct service_process *idle_processes_head, *idle_processes_tail;
 
 	/* number of processes currently created for this service */
 	unsigned int process_count;
 	/* number of processes currently accepting new clients */
 	unsigned int process_avail;
+	/* number of processes currently idling (idle_start != 0) */
+	unsigned int process_idling;
+	/* Lowest number of processes that have been idling at the same time.
+	   This is reset to process_idling every idle_kill seconds. */
+	unsigned int process_idling_lowwater_since_kills;
 	/* max number of processes allowed */
 	unsigned int process_limit;
 	/* Total number of processes ever created */
@@ -110,6 +119,8 @@ struct service {
 	struct timeout *to_drop;
 	/* delayed process_limit reached warning with SERVICE_TYPE_WORKER */
 	struct timeout *to_drop_warning;
+	/* next time to try to kill idling processes */
+	struct timeout *to_idle;
 
 	/* prefork processes up to process_min_avail if there's time */
 	struct timeout *to_prefork;

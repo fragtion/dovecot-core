@@ -116,7 +116,6 @@ static int client_check_mta_state(struct quota_client *client)
 static void client_handle_request(struct quota_client *client)
 {
 	struct mail_storage_service_input input;
-	struct mail_storage_service_user *service_user;
 	struct mail_user *user;
 	struct smtp_address *rcpt;
 	const char *value = NULL, *error;
@@ -150,7 +149,7 @@ static void client_handle_request(struct quota_client *client)
 				       rcpt, &input.username, &delim,
 				       &detail);
 	ret = mail_storage_service_lookup_next(storage_service, &input,
-					       &service_user, &user, &error);
+					       &user, &error);
 	restrict_access_allow_coredumps(TRUE);
 	if (ret == 0) {
 		e_debug(client->event, "User `%s' not found", input.username);
@@ -193,7 +192,6 @@ static void client_handle_request(struct quota_client *client)
 		}
 		value = t_strdup(value); /* user's pool is being freed */
 		mail_user_deinit(&user);
-		mail_storage_service_user_unref(&service_user);
 	} else {
 		e_error(client->event,
 			"Failed to lookup user %s: %s", input.username, error);
@@ -294,7 +292,6 @@ static void main_init(void)
 
 	i_zero(&input);
 	input.service = "quota-status";
-	input.module = "mail";
 	input.username = "";
 
 	quota_status_pool = pool_alloconly_create("quota status settings", 512);
@@ -322,8 +319,7 @@ static void main_deinit(void)
 
 int main(int argc, char *argv[])
 {
-	enum master_service_flags service_flags =
-		MASTER_SERVICE_FLAG_KEEP_CONFIG_OPEN;
+	enum master_service_flags service_flags = 0;
 	int c;
 
 	protocol = QUOTA_PROTOCOL_UNKNOWN;

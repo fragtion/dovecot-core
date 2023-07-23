@@ -540,6 +540,8 @@ LIBDOVECOT_LA_LIBS='\
 	$(top_builddir)/src/lib-mail/libmail.la \
 	$(top_builddir)/src/lib-sasl/libsasl.la \
 	$(top_builddir)/src/lib-auth/libauth.la \
+	$(top_builddir)/src/lib-otp/libotp.la \
+	$(top_builddir)/src/lib-auth-client/libauth-client.la \
 	$(top_builddir)/src/lib-charset/libcharset.la \
 	$(top_builddir)/src/lib-ssl-iostream/libssl_iostream.la \
 	$(top_builddir)/src/lib-dcrypt/libdcrypt.la \
@@ -691,7 +693,7 @@ dnl **
 dnl IDLE doesn't really belong to banner. It's there just to make Blackberries
 dnl happy, because otherwise BIS server disables push email.
 capability_banner="IMAP4rev1 SASL-IR LOGIN-REFERRALS ID ENABLE IDLE"
-capability="$capability_banner SORT SORT=DISPLAY THREAD=REFERENCES THREAD=REFS THREAD=ORDEREDSUBJECT MULTIAPPEND URL-PARTIAL CATENATE UNSELECT CHILDREN NAMESPACE UIDPLUS LIST-EXTENDED I18NLEVEL=1 CONDSTORE QRESYNC ESEARCH ESORT SEARCHRES WITHIN CONTEXT=SEARCH LIST-STATUS BINARY MOVE SNIPPET=FUZZY PREVIEW=FUZZY PREVIEW STATUS=SIZE SAVEDATE COMPRESS=DEFLATE"
+capability="$capability_banner SORT SORT=DISPLAY THREAD=REFERENCES THREAD=REFS THREAD=ORDEREDSUBJECT MULTIAPPEND URL-PARTIAL CATENATE UNSELECT CHILDREN NAMESPACE UIDPLUS LIST-EXTENDED I18NLEVEL=1 CONDSTORE QRESYNC ESEARCH ESORT SEARCHRES WITHIN CONTEXT=SEARCH LIST-STATUS BINARY MOVE SNIPPET=FUZZY PREVIEW=FUZZY PREVIEW STATUS=SIZE SAVEDATE COMPRESS=DEFLATE INPROGRESS"
 AC_DEFINE_UNQUOTED(CAPABILITY_STRING, "$capability", [IMAP capabilities])
 AC_DEFINE_UNQUOTED(CAPABILITY_BANNER_STRING, "$capability_banner", [IMAP capabilities advertised in banner])
 
@@ -735,6 +737,7 @@ src/Makefile
 src/lib/Makefile
 src/lib-sql/Makefile
 src/lib-auth/Makefile
+src/lib-auth-client/Makefile
 src/lib-charset/Makefile
 src/lib-compression/Makefile
 src/lib-dcrypt/Makefile
@@ -794,15 +797,13 @@ src/imap/Makefile
 src/imap-hibernate/Makefile
 src/imap-login/Makefile
 src/imap-urlauth/Makefile
+src/imap-urlauth-login/Makefile
 src/login-common/Makefile
 src/master/Makefile
 src/pop3/Makefile
 src/pop3-login/Makefile
 src/submission/Makefile
 src/submission-login/Makefile
-src/replication/Makefile
-src/replication/aggregator/Makefile
-src/replication/replicator/Makefile
 src/stats/Makefile
 src/util/Makefile
 src/plugins/Makefile
@@ -824,7 +825,6 @@ src/plugins/pop3-migration/Makefile
 src/plugins/quota/Makefile
 src/plugins/quota-clone/Makefile
 src/plugins/imap-quota/Makefile
-src/plugins/replication/Makefile
 src/plugins/trash/Makefile
 src/plugins/virtual/Makefile
 src/plugins/welcome/Makefile

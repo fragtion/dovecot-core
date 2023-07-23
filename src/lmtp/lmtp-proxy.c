@@ -585,8 +585,8 @@ lmtp_proxy_rcpt_get_connection(struct lmtp_proxy_recipient *lprcpt,
 
 	event_add_str(lprcpt->rcpt->rcpt->event, "dest_host", set->set.host);
 	if (set->set.host_ip.family != 0) {
-		event_add_str(lprcpt->rcpt->rcpt->event, "dest_ip",
-			      net_ip2addr(&set->set.host_ip));
+		event_add_ip(lprcpt->rcpt->rcpt->event, "dest_ip",
+			     &set->set.host_ip);
 	}
 	*conn_r = lprcpt->conn = conn;
 	return 0;
@@ -931,7 +931,7 @@ int lmtp_proxy_rcpt(struct client *client,
 	lrcpt->backend_context = lprcpt;
 
 	i_zero(&input);
-	input.module = input.service = "lmtp";
+	input.service = "lmtp";
 	mail_storage_service_init_settings(storage_service, &input);
 
 	lmtp_proxy_rcpt_init_auth_user_info(lrcpt, &info);

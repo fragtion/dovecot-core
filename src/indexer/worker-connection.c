@@ -37,11 +37,11 @@ static unsigned int worker_last_process_limit = 0;
 static struct connection_list *worker_connections;
 
 static void worker_connection_call_callback(struct worker_connection *worker,
-					    int percentage)
+					    const struct indexer_status *status)
 {
 	if (worker->request != NULL)
-		worker->callback(percentage, worker->request);
-	if (percentage < 0 || percentage == 100)
+		worker->callback(status, worker->request);
+	if (status->state != INDEXER_STATE_PROCESSING)
 		worker->request = NULL;
 }
 
@@ -50,7 +50,8 @@ static void worker_connection_destroy(struct connection *conn)
 	struct worker_connection *worker =
 		container_of(conn, struct worker_connection, conn);
 
-	worker_connection_call_callback(worker, -1);
+	struct indexer_status status = { .state = INDEXER_STATE_FAILED };
+	worker_connection_call_callback(worker, &status);
 	i_free_and_null(worker->request_username);
 	connection_deinit(conn);
 
@@ -96,19 +97,36 @@ worker_connection_input_args(struct connection *conn, const char *const *args)
 {
 	struct worker_connection *worker =
 		container_of(conn, struct worker_connection, conn);
-	int percentage;
+	unsigned int progress = 0, total = 0;
+	int state;
 	int ret = 1;
 
-	if (str_to_int(args[0], &percentage) < 0 ||
-	    percentage < -1 || percentage > 100) {
-		e_error(conn->event, "Worker sent invalid progress '%s'", args[0]);
+	if (str_to_int(args[0], &state) < 0 ||
+	    state < INDEXER_STATE_FAILED || state > INDEXER_STATE_COMPLETED) {
+		e_error(conn->event, "Worker sent invalid state '%s'", args[0]);
 		return -1;
 	}
 
-	if (percentage < 0)
+	if (state == INDEXER_STATE_FAILED)
 		ret = -1;
+	else if (args[1] != NULL && args[2] != NULL) {
+		if (str_to_uint32(args[1], &progress) < 0) {
+			e_error(conn->event, "Worker sent invalid progress '%s'", args[1]);
+			return -1;
+		}
 
-	worker_connection_call_callback(worker, percentage);
+		if (str_to_uint32(args[2], &total) < 0) {
+			e_error(conn->event, "Worker sent invalid total '%s'", args[2]);
+			return -1;
+		}
+	}
+
+	struct indexer_status status = {
+		.state = state,
+		.progress = progress,
+		.total = total,
+	};
+	worker_connection_call_callback(worker, &status);
 	if (worker->request == NULL) {
 		/* disconnect after each request */
 		ret = -1;

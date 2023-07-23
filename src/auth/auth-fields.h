@@ -35,11 +35,9 @@ const ARRAY_TYPE(auth_field) *auth_fields_export(struct auth_fields *fields);
 /* Append fields where (flag & flags_mask) == flags_result. */
 void auth_fields_append(struct auth_fields *fields, string_t *dest,
 			enum auth_field_flags flags_mask,
-			enum auth_field_flags flags_result);
+			enum auth_field_flags flags_result,
+			bool prefix_with_tab);
 bool auth_fields_is_empty(struct auth_fields *fields);
-/* If the field exists, clear its value (so the exported string will be "key"
-   instead of e.g. "key=y"). */
-void auth_fields_booleanize(struct auth_fields *fields, const char *key);
 
 /* Remember the current fields. */
 void auth_fields_snapshot(struct auth_fields *fields);

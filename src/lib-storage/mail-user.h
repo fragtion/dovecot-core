@@ -34,8 +34,7 @@ struct mail_user {
 	/* User's creator if such exists. For example for autocreated shared
 	   mailbox users their creator is the logged in user. */
 	struct mail_user *creator;
-	/* Set if user was created via mail_storage_service. */
-	struct mail_storage_service_user *_service_user;
+	struct mail_storage_service_user *service_user;
 
 	const char *username;
 	/* don't access the home directly. It may be set lazily. */
@@ -127,12 +126,11 @@ extern struct mail_user_module_register mail_user_module_register;
 extern struct auth_master_connection *mail_user_auth_master_conn;
 extern const struct var_expand_func_table *mail_user_var_expand_func_table;
 
-struct mail_user *mail_user_alloc(struct event *parent_event,
-				  const char *username,
-				  struct setting_parser_context *unexpanded_set_parser);
 struct mail_user *
-mail_user_alloc_nodup_set(struct event *parent_event,
-			  const char *username,
+mail_user_alloc(struct mail_storage_service_user *service_user,
+		struct setting_parser_context *unexpanded_set_parser);
+struct mail_user *
+mail_user_alloc_nodup_set(struct mail_storage_service_user *service_user,
 			  struct setting_parser_context *set_parser);
 /* Returns -1 if settings were invalid. */
 int mail_user_init(struct mail_user *user, const char **error_r);
@@ -161,9 +159,9 @@ int mail_user_var_expand(struct mail_user *user,
 			 const struct setting_parser_info *info, void *set,
 			 const char **error_r);
 
-/* Specify the user's home directory. This should be called also when it's
-   known that the user doesn't have a home directory to avoid the internal
-   lookup. */
+/* Specify the user's home directory. This should be called also with home=NULL
+   when it's known that the user doesn't have a home directory to avoid the
+   internal lookup. */
 void mail_user_set_home(struct mail_user *user, const char *home);
 /* Get the home directory for the user. Returns 1 if home directory looked up
    successfully, 0 if there is no home directory (either user doesn't exist or
@@ -214,6 +212,9 @@ const char *const *mail_user_get_alt_usernames(struct mail_user *user);
    storage plugins when needed. */
 struct mail_storage *
 mail_user_get_storage_class(struct mail_user *user, const char *name);
+
+/* Import any event_ fields from userdb fields to mail user event. */
+void mail_user_add_event_fields(struct mail_user *user);
 
 /* Initialize SSL client settings from mail_user settings. */
 void mail_user_init_ssl_client_settings(struct mail_user *user,

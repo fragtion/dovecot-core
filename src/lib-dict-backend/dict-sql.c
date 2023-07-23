@@ -33,6 +33,7 @@ struct sql_dict_param {
 	double value_double;
 	const void *value_binary;
 	size_t value_binary_size;
+	guid_128_t value_uuid;
 };
 ARRAY_DEFINE_TYPE(sql_dict_param, struct sql_dict_param);
 
@@ -45,6 +46,7 @@ struct sql_dict_iterate_context {
 
 	struct sql_result *result;
 	string_t *key;
+	pool_t value_pool;
 	const struct dict_sql_map *map;
 	size_t key_prefix_len, pattern_prefix_len;
 	unsigned int sql_fields_start_idx, next_map_idx;
@@ -258,6 +260,11 @@ sql_dict_statement_bind(struct sql_statement *stmt, unsigned int column_idx,
 		sql_statement_bind_binary(stmt, column_idx, param->value_binary,
 					  param->value_binary_size);
 		break;
+	case DICT_SQL_TYPE_UUID:
+		sql_statement_bind_uuid(stmt, column_idx, param->value_uuid);
+		break;
+	case DICT_SQL_TYPE_COUNT:
+		i_unreached();
 	}
 }
 
@@ -331,8 +338,19 @@ sql_dict_value_get(const struct dict_sql_map *map,
 			return -1;
 		}
 		return 0;
+	case DICT_SQL_TYPE_UUID:
+		if (value_suffix[0] != '\0' ||
+		    guid_128_from_uuid_string(value, param->value_uuid) < 0) {
+			*error_r = t_strdup_printf(
+				"%s field's value isn't an uuid: %s%s (in pattern: %s)",
+				field_name, value, value_suffix, map->pattern);
+			return -1;
+		}
+		return 0;
 	case DICT_SQL_TYPE_HEXBLOB:
 		break;
+	case DICT_SQL_TYPE_COUNT:
+		i_unreached();
 	}
 
 	buf = t_buffer_create(strlen(value)/2);
@@ -493,6 +511,7 @@ sql_dict_result_unescape(enum dict_sql_type type, pool_t pool,
 	const unsigned char *data;
 	size_t size;
 	const char *value;
+	guid_128_t guid;
 	string_t *str;
 
 	switch (type) {
@@ -502,8 +521,16 @@ sql_dict_result_unescape(enum dict_sql_type type, pool_t pool,
 	case DICT_SQL_TYPE_DOUBLE:
 		value = sql_result_get_field_value(result, result_idx);
 		return value == NULL ? "" : p_strdup(pool, value);
+	case DICT_SQL_TYPE_UUID:
+		value = sql_result_get_field_value(result, result_idx);
+		if (value == NULL)
+			return "";
+		guid_128_from_uuid_string(value, guid);
+		return p_strdup(pool, guid_128_to_uuid_string(guid, FORMAT_RECORD));
 	case DICT_SQL_TYPE_HEXBLOB:
 		break;
+	case DICT_SQL_TYPE_COUNT:
+		i_unreached();
 	}
 
 	data = sql_result_get_field_value_binary(result, result_idx, &size);
@@ -828,6 +855,7 @@ sql_dict_iterate_init(struct dict *_dict,
 	ctx->path = p_strdup(pool, path);
 
 	ctx->key = str_new(pool, 256);
+	ctx->value_pool = pool_alloconly_create("sql dict iterate value", 256);
 	return &ctx->ctx;
 }
 
@@ -917,8 +945,9 @@ static bool sql_dict_iterate(struct dict_iterate_context *_ctx,
 
 	*key_r = str_c(ctx->key);
 	if ((ctx->flags & DICT_ITERATE_FLAG_NO_VALUE) == 0) {
+		p_clear(ctx->value_pool);
 		*values_r = sql_dict_result_unescape_values(ctx->map,
-			pool_datastack_create(), ctx->result);
+				ctx->value_pool, ctx->result);
 	}
 	return TRUE;
 }
@@ -935,6 +964,7 @@ static int sql_dict_iterate_deinit(struct dict_iterate_context *_ctx,
 		sql_result_unref(ctx->result);
 	ctx->destroyed = TRUE;
 
+	pool_unref(&ctx->value_pool);
 	pool_t pool_copy = ctx->pool;
 	pool_unref(&pool_copy);
 	return ret;

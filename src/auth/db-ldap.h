@@ -66,7 +66,6 @@ struct ldap_settings {
 	const char *iterate_filter;
 
 	const char *default_pass_scheme;
-	bool userdb_warning_disable; /* deprecated for now at least */
 	bool blocking;
 
 	/* ... */
@@ -218,5 +217,13 @@ bool db_ldap_result_iterate_next(struct db_ldap_result_iterate_context *ctx,
 				 const char **name_r,
 				 const char *const **values_r);
 void db_ldap_result_iterate_deinit(struct db_ldap_result_iterate_context **ctx);
+
+/* exposed only for unit tests */
+
+const char *const *db_ldap_parse_attrs(const char *cstr);
+
+void db_ldap_field_multi_expand_parse_data(
+	const char *data, const char **field_name_r,
+	const char **separator_r, const char **default_r);
 
 #endif

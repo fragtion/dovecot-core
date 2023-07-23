@@ -12,6 +12,7 @@
 #include "str.h"
 #include "strescape.h"
 #include "env-util.h"
+#include "mmap-util.h"
 #include "home-expand.h"
 #include "process-title.h"
 #include "time-util.h"
@@ -26,6 +27,7 @@
 #include "master-service-settings.h"
 #include "iostream-ssl.h"
 
+#include <getopt.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <syslog.h>
@@ -48,6 +50,8 @@
 #define MASTER_SERVICE_DIE_TIMEOUT_MSECS (30*1000)
 
 struct master_service *master_service;
+
+const struct option master_service_helpopt = {"help", no_argument, NULL, 0};
 
 static struct event_category master_service_category = {
 	.name = NULL, /* set dynamically later */
@@ -489,6 +493,9 @@ master_service_init(const char *name, enum master_service_flags flags,
 		flags |= MASTER_SERVICE_FLAG_STANDALONE;
 
 	process_title_init(*argc, argv);
+	if ((flags & MASTER_SERVICE_FLAG_STANDALONE) == 0 &&
+	    getenv(MASTER_VERBOSE_PROCTITLE_ENV) != NULL)
+		process_title_set("[initializing]");
 
 	/* process_title_init() might destroy all environments.
 	   Need to look this up again. */
@@ -516,7 +523,6 @@ master_service_init(const char *name, enum master_service_flags flags,
 	service->flags = flags;
 	service->ioloop = io_loop_create();
 	service->service_count_left = UINT_MAX;
-	service->config_fd = -1;
 	service->datastack_frame_id = datastack_frame_id;
 
 	service->config_path = i_strdup(getenv(MASTER_CONFIG_FILE_ENV));
@@ -527,18 +533,16 @@ master_service_init(const char *name, enum master_service_flags flags,
 
 	if ((flags & MASTER_SERVICE_FLAG_STANDALONE) == 0) {
 		service->version_string = getenv(MASTER_DOVECOT_VERSION_ENV);
-		service->socket_count = 1;
+		/* listener configuration */
+		value = getenv("SOCKET_COUNT");
+		if (value == NULL || str_to_uint(value, &service->socket_count) < 0)
+			i_fatal("Invalid SOCKET_COUNT environment");
+		T_BEGIN {
+			master_service_init_socket_listeners(service);
+		} T_END;
 	} else {
 		service->version_string = PACKAGE_VERSION;
 	}
-
-	/* listener configuration */
-	value = getenv("SOCKET_COUNT");
-	if (value != NULL && str_to_uint(value, &service->socket_count) < 0)
-		i_fatal("Invalid SOCKET_COUNT environment");
-	T_BEGIN {
-		master_service_init_socket_listeners(service);
-	} T_END;
 
 	/* Load the SSL module if we already know it is necessary. It can also
 	   get loaded later on-demand. */
@@ -615,12 +619,6 @@ master_service_init(const char *name, enum master_service_flags flags,
 		master_service_set_client_limit(service, 1);
 		master_service_set_service_count(service, 1);
 	}
-	if ((flags & MASTER_SERVICE_FLAG_KEEP_CONFIG_OPEN) != 0) {
-		/* since we're going to keep the config socket open anyway,
-		   open it now so we can read settings even after privileges
-		   are dropped. */
-		master_service_config_socket_try_open(service);
-	}
 	if ((flags & MASTER_SERVICE_FLAG_DONT_SEND_STATS) == 0) {
 		/* Initialize stats-client early so it can see all events. */
 		value = getenv(DOVECOT_STATS_WRITER_SOCKET_PATH);
@@ -630,6 +628,13 @@ master_service_init(const char *name, enum master_service_flags flags,
 
 	master_service_verify_version_string(service);
 	return service;
+}
+
+void
+master_service_register_long_options(struct master_service *service,
+				     const struct option *longopts)
+{
+	service->longopts = longopts;
 }
 
 int master_getopt(struct master_service *service)
@@ -643,6 +648,30 @@ int master_getopt(struct master_service *service)
 		if (!master_service_parse_option(service, c, optarg))
 			break;
 	}
+	i_assert(c != 0);
+	return c;
+}
+
+int
+master_getopt_long(struct master_service *service, const char **longopt_r)
+{
+	if (service->longopts == NULL)
+		return master_getopt(service);
+
+	i_assert(master_getopt_str_is_valid(service->getopt_str));
+
+	int c;
+	int longopt_idx = -1;
+	while ((c = getopt_long(service->argc, service->argv,
+				service->getopt_str, service->longopts,
+				&longopt_idx)) > 0) {
+		if (!master_service_parse_option(service, c, optarg))
+			break;
+	}
+	if (longopt_idx >= 0)
+		*longopt_r = service->longopts[longopt_idx].name;
+	else
+		i_assert(c != 0);
 	return c;
 }
 
@@ -956,6 +985,12 @@ void master_service_init_finish(struct master_service *service)
 		if (!t_pop(&service->datastack_frame_id))
 			i_panic("Leaked t_pop() call");
 	}
+	/* If nothing else has updated the process title yet, it should still
+	   be [initializing]. Remove it here. */
+	if ((service->flags & MASTER_SERVICE_FLAG_STANDALONE) == 0 &&
+	    process_title_get_counter() == 1 &&
+	    getenv(MASTER_VERBOSE_PROCTITLE_ENV) != NULL)
+		process_title_set("");
 }
 
 static void master_service_import_environment_real(const char *import_environment)
@@ -1502,11 +1537,6 @@ static void master_service_refresh_login_state(struct master_service *service)
 		master_service_set_login_state(service, state);
 }
 
-void master_service_close_config_fd(struct master_service *service)
-{
-	i_close_fd(&service->config_fd);
-}
-
 static void master_service_deinit_real(struct master_service **_service)
 {
 	struct master_service *service = *_service;
@@ -1532,7 +1562,6 @@ static void master_service_deinit_real(struct master_service **_service)
 
 	if (service->stats_client != NULL)
 		stats_client_deinit(&service->stats_client);
-	master_service_close_config_fd(service);
 	timeout_remove(&service->to_overflow_call);
 	timeout_remove(&service->to_die);
 	timeout_remove(&service->to_overflow_state);
@@ -1545,6 +1574,11 @@ static void master_service_deinit_real(struct master_service **_service)
 	if (service->set_parser != NULL) {
 		settings_parser_unref(&service->set_parser);
 		pool_unref(&service->set_pool);
+	}
+	if (service->config_mmap_base != NULL) {
+		if (munmap(service->config_mmap_base,
+			   service->config_mmap_size) < 0)
+			i_error("munmap(<config>) failed: %m");
 	}
 	i_free(master_service_category_name);
 	master_service_category.name = NULL;
@@ -1958,7 +1992,7 @@ void master_status_update(struct master_service *service)
 }
 
 bool version_string_verify(const char *line, const char *service_name,
-			   unsigned major_version)
+			   unsigned int major_version)
 {
 	unsigned int minor_version;
 
@@ -1967,7 +2001,7 @@ bool version_string_verify(const char *line, const char *service_name,
 }
 
 bool version_string_verify_full(const char *line, const char *service_name,
-				unsigned major_version,
+				unsigned int major_version,
 				unsigned int *minor_version_r)
 {
 	size_t service_name_len = strlen(service_name);

@@ -164,7 +164,8 @@ int sdbox_read_header(struct sdbox_mailbox *mbox,
 		ret = -1;
 	} else {
 		i_zero(hdr);
-		memcpy(hdr, data, I_MIN(data_size, sizeof(*hdr)));
+		if (data_size > 0)
+			memcpy(hdr, data, I_MIN(data_size, sizeof(*hdr)));
 		if (guid_128_is_empty(hdr->mailbox_guid))
 			ret = -1;
 		else {
@@ -305,9 +306,7 @@ void sdbox_set_mailbox_corrupted(struct mailbox *box)
 
 static void sdbox_set_file_corrupted(struct dbox_file *_file)
 {
-	struct sdbox_file *file = (struct sdbox_file *)_file;
-
-	sdbox_set_mailbox_corrupted(&file->mbox->box);
+	(void)dbox_file_fix(_file, 0);
 }
 
 static int sdbox_mailbox_alloc_index(struct sdbox_mailbox *mbox)
@@ -333,20 +332,27 @@ static int sdbox_mailbox_open(struct mailbox *box)
 	struct sdbox_mailbox *mbox = SDBOX_MAILBOX(box);
 	struct sdbox_index_header hdr;
 	bool need_resize;
-	time_t path_ctime;
+	int existence_ret;
 
-	if (dbox_mailbox_check_existence(box, &path_ctime) < 0)
+	if ((existence_ret = dbox_mailbox_check_existence(box)) < 0)
 		return -1;
 
 	if (sdbox_mailbox_alloc_index(mbox) < 0)
 		return -1;
 
-	if (dbox_mailbox_open(box, path_ctime) < 0)
+	if (dbox_mailbox_open(box) < 0)
 		return -1;
 
 	if (box->creating) {
 		/* wait for mailbox creation to initialize the index */
 		return 0;
+	}
+
+	if (box->list->set.index_dir != NULL && existence_ret == 0) {
+		/* If there is an separate INDEX directory configured but no
+		   index files found for this mailbox, do an index rebuild */
+		if (sdbox_sync(mbox, SDBOX_SYNC_FLAG_FORCE_REBUILD) < 0)
+			return -1;
 	}
 
 	/* get/generate mailbox guid */
@@ -374,7 +380,9 @@ static void sdbox_mailbox_close(struct mailbox *box)
 
 	if (mbox->corrupted_rebuild_count != 0)
 		(void)sdbox_sync(mbox, 0);
-	index_storage_mailbox_close(box);
+
+	dbox_mailbox_close_cleanup(box);
+	dbox_mailbox_close(box);
 }
 
 static int
@@ -524,6 +532,7 @@ struct mailbox sdbox_mailbox = {
 struct dbox_storage_vfuncs sdbox_dbox_storage_vfuncs = {
 	sdbox_file_free,
 	sdbox_file_create_fd,
+	sdbox_mail_file_set,
 	sdbox_mail_open,
 	sdbox_mailbox_create_indexes,
 	sdbox_get_attachment_path_suffix,

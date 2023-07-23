@@ -52,6 +52,16 @@ struct dict_sql_settings_cache {
 
 static HASH_TABLE(const char *, struct dict_sql_settings_cache *) dict_sql_settings_cache;
 
+static const char *dict_sql_type_names[] = {
+	"string",
+	"int",
+	"uint",
+	"double",
+	"hexblob",
+	"uuid",
+};
+static_assert_array_size(dict_sql_type_names, DICT_SQL_TYPE_COUNT);
+
 static const char *pattern_read_name(const char **pattern)
 {
 	const char *p = *pattern, *name;
@@ -135,19 +145,14 @@ static const char *dict_sql_fields_map(struct setting_parser_ctx *ctx)
 static bool
 dict_sql_value_type_parse(const char *value_type, enum dict_sql_type *type_r)
 {
-	if (strcmp(value_type, "string") == 0)
-		*type_r = DICT_SQL_TYPE_STRING;
-	else if (strcmp(value_type, "hexblob") == 0)
-		*type_r = DICT_SQL_TYPE_HEXBLOB;
-	else if (strcmp(value_type, "int") == 0)
-		*type_r = DICT_SQL_TYPE_INT;
-	else if (strcmp(value_type, "uint") == 0)
-		*type_r = DICT_SQL_TYPE_UINT;
-	else if (strcmp(value_type, "double") == 0)
-		*type_r = DICT_SQL_TYPE_DOUBLE;
-	else
-		return FALSE;
-	return TRUE;
+	for (enum dict_sql_type type = DICT_SQL_TYPE_STRING;
+	    type < DICT_SQL_TYPE_COUNT; type++) {
+		if (strcmp(value_type, dict_sql_type_names[type]) == 0) {
+			*type_r = type;
+			return TRUE;
+		}
+	}
+	return FALSE;
 }
 
 static const char *dict_sql_map_finish(struct setting_parser_ctx *ctx)
@@ -177,7 +182,7 @@ static const char *dict_sql_map_finish(struct setting_parser_ctx *ctx)
 			return "Number of fields in value_fields doesn't match value_type";
 		for (i = 0; i < ctx->cur_map.values_count; i++) {
 			if (!dict_sql_value_type_parse(types[i], &value_types[i]))
-				return "Invalid value in value_type";
+				return t_strdup_printf("Invalid value %s in value_type", types[i]);
 		}
 	} else {
 		for (i = 0; i < ctx->cur_map.values_count; i++) {
@@ -241,6 +246,9 @@ parse_setting(const char *key, const char *value,
 		} else if (str_begins(value, "${double:", &arg) && *last == '}') {
 			field->variable = p_strdup_until(ctx->pool, arg, last);
 			field->sql_field.value_type = DICT_SQL_TYPE_DOUBLE;
+		} else if (str_begins(value, "${uuid:", &arg) && *last == '}') {
+			field->variable = p_strdup_until(ctx->pool, arg, last);
+			field->sql_field.value_type = DICT_SQL_TYPE_UUID;
 		} else {
 			field->variable = p_strdup(ctx->pool, value + 1);
 		}

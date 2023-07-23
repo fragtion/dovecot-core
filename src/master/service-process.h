@@ -21,10 +21,16 @@ struct service_process {
 
 	/* Timestamp when the process was created */
 	time_t create_time;
-	/* time when process started idling, or 0 if we're not idling */
+	/* Time when process started idling, or 0 if we're not idling. This is
+	   updated when the process sends a notification via its status pipe
+	   about the number of clients it is processing.
+
+	   This field also determines whether the process is in the service's
+	   "busy" or "idle" processes linked list. */
 	time_t idle_start;
-	/* kill process if it hits idle timeout */
-	struct timeout *to_idle;
+	/* Timeout for processing idle-kill SIGINT. Either the process will die
+	   or it sends a notification about not being idling anymore */
+	struct timeout *to_idle_kill;
 
 	/* time when we last received a status update */
 	time_t last_status_update;

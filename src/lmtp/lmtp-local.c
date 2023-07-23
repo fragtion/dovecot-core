@@ -1,6 +1,7 @@
 /* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
 
 #include "lmtp-common.h"
+#include "smtp-server.h"
 #include "str.h"
 #include "istream.h"
 #include "strescape.h"
@@ -44,6 +45,8 @@ struct lmtp_local {
 
 	struct mail *raw_mail, *first_saved_mail;
 	struct mail_user *rcpt_user;
+
+	struct smtp_server_stats stats;
 };
 
 /*
@@ -58,7 +61,9 @@ lmtp_local_init(struct client *client)
 	local = i_new(struct lmtp_local, 1);
 	local->client = client;
 	i_array_init(&local->rcpt_to, 8);
-
+	const struct smtp_server_stats *stats =
+	        smtp_server_connection_get_stats(local->client->conn);
+	local->stats = *stats;
 	return local;
 }
 
@@ -299,7 +304,7 @@ int lmtp_local_rcpt(struct client *client,
 	int ret = 0;
 
 	i_zero(&input);
-	input.module = input.service = "lmtp";
+	input.service = "lmtp";
 	input.username = username;
 	input.local_ip = client->local_ip;
 	input.remote_ip = client->remote_ip;
@@ -587,8 +592,22 @@ int lmtp_local_default_deliver(struct client *client,
 	dinput.delivery_time_started = lldctx->delivery_time_started;
 
 	mail_deliver_init(&dctx, &dinput);
+
+	/* Copy statistics to mail user session event here */
+	const struct smtp_server_stats *stats =
+		smtp_server_connection_get_stats(local->client->conn);
+	event_add_int(event, "net_in_bytes",
+		      stats->input - local->stats.input);
+	event_add_int(event, "net_out_bytes",
+		      stats->output - local->stats.output);
+	event_add_int(lrcpt->rcpt->event, "net_in_bytes",
+		      stats->input - local->stats.input);
+	event_add_int(lrcpt->rcpt->event, "net_out_bytes",
+		      stats->output - local->stats.output);
+	local->stats = *stats;
 	ret = lmtp_local_default_do_deliver(local, llrcpt, lldctx, &dctx);
 	mail_deliver_deinit(&dctx);
+
 	event_unref(&event);
 
 	return ret;
@@ -622,8 +641,10 @@ lmtp_local_deliver_to_rcpts(struct lmtp_local *local,
 			continue;
 		}
 
-		ret = lmtp_local_deliver(local, cmd,
-			trans, llrcpt, src_mail, session);
+		T_BEGIN {
+			ret = lmtp_local_deliver(local, cmd, trans, llrcpt,
+						 src_mail, session);
+		} T_END;
 		client_update_data_state(client, NULL);
 
 		/* succeeded and mail_user is not saved in first_saved_mail */
@@ -634,20 +655,20 @@ lmtp_local_deliver_to_rcpts(struct lmtp_local *local,
 		    (ret != 0 && local->rcpt_user != NULL)) {
 			if (i == (count - 1))
 				mail_user_autoexpunge(local->rcpt_user);
-			mail_storage_service_io_deactivate_user(local->rcpt_user->_service_user);
+			mail_storage_service_io_deactivate_user(local->rcpt_user->service_user);
 			mail_user_deinit(&local->rcpt_user);
 		} else if (ret == 0) {
 			/* use the first saved message to save it elsewhere too.
 			   this might allow hard linking the files.
 			   mail_user is saved in first_saved_mail,
 			   will be unreferenced later on */
-			mail_storage_service_io_deactivate_user(local->rcpt_user->_service_user);
+			mail_storage_service_io_deactivate_user(local->rcpt_user->service_user);
 			local->rcpt_user = NULL;
 			src_mail = local->first_saved_mail;
 			first_uid = geteuid();
 			i_assert(first_uid != 0);
 		} else if (local->rcpt_user != NULL) {
-			mail_storage_service_io_deactivate_user(local->rcpt_user->_service_user);
+			mail_storage_service_io_deactivate_user(local->rcpt_user->service_user);
 		}
 	}
 	return first_uid;
@@ -720,12 +741,12 @@ void lmtp_local_data(struct client *client,
 				i_fatal("seteuid() failed: %m");
 		}
 
-		mail_storage_service_io_activate_user(user->_service_user);
+		mail_storage_service_io_activate_user(user->service_user);
 		mail_free(&mail);
 		mailbox_transaction_rollback(&trans);
 		mailbox_free(&box);
 		mail_user_autoexpunge(user);
-		mail_storage_service_io_deactivate_user(user->_service_user);
+		mail_storage_service_io_deactivate_user(user->service_user);
 		mail_user_deinit(&user);
 	}
 

@@ -382,32 +382,37 @@ fts_backend_solr_expunge_flush(struct solr_fts_backend_update_context *ctx)
 	str_append(ctx->cmd_expunge, "<delete>");
 }
 
+static int fts_backend_solr_commit(struct solr_fts_backend_update_context *ctx)
+{
+	struct solr_fts_backend *backend =
+		(struct solr_fts_backend *) ctx->ctx.backend;
+	struct fts_solr_user *fuser =
+		FTS_SOLR_USER_CONTEXT_REQUIRE(ctx->ctx.backend->ns->user);
+
+	if (!fuser->set.soft_commit)
+		return 0;
+
+	const char *str = t_strdup_printf(
+		"<commit softCommit=\"true\" waitSearcher=\"%s\"/>",
+		ctx->documents_added ? "true" : "false");
+	return solr_connection_post(backend->solr_conn, str);
+}
+
 static int
 fts_backend_solr_update_deinit(struct fts_backend_update_context *_ctx)
 {
 	struct solr_fts_backend_update_context *ctx =
 		(struct solr_fts_backend_update_context *)_ctx;
-	struct solr_fts_backend *backend =
-		(struct solr_fts_backend *)_ctx->backend;
-	struct fts_solr_user *fuser = FTS_SOLR_USER_CONTEXT(_ctx->backend->ns->user);
 	struct solr_fts_field *field;
-	const char *str;
 	int ret = _ctx->failed ? -1 : 0;
 
 	if (fts_backed_solr_build_flush(ctx) < 0)
 		ret = -1;
 
-	if (ctx->documents_added || ctx->expunges) {
-		/* commit and wait until the documents we just indexed are
-		   visible to the following search */
-		if (ctx->expunges)
-			fts_backend_solr_expunge_flush(ctx);
-		if (fuser->set.soft_commit) {
-			str = t_strdup_printf("<commit softCommit=\"true\" waitSearcher=\"%s\"/>",
-					      ctx->documents_added ? "true" : "false");
-			if (solr_connection_post(backend->solr_conn, str) < 0)
-				ret = -1;
-		}
+	if (ctx->expunges) {
+		fts_backend_solr_expunge_flush(ctx);
+		if (fts_backend_solr_commit(ctx) < 0)
+			ret = -1;
 	}
 
 	str_free(&ctx->cmd);
@@ -436,8 +441,12 @@ fts_backend_solr_update_set_mailbox(struct fts_backend_update_context *_ctx,
 		   last_uid before we know it has succeeded */
 		if (fts_backed_solr_build_flush(ctx) < 0)
 			_ctx->failed = TRUE;
-		else if (!_ctx->failed)
-			fts_index_set_last_uid(ctx->cur_box, ctx->prev_uid);
+		else if (!_ctx->failed) {
+			if (fts_backend_solr_commit(ctx) < 0)
+				_ctx->failed = TRUE;
+			else
+				fts_index_set_last_uid(ctx->cur_box, ctx->prev_uid);
+		}
 		ctx->prev_uid = 0;
 	}
 
@@ -494,7 +503,8 @@ fts_backend_solr_uid_changed(struct solr_fts_backend_update_context *ctx,
 {
 	struct solr_fts_backend *backend =
 		(struct solr_fts_backend *)ctx->ctx.backend;
-	struct fts_solr_user *fuser = FTS_SOLR_USER_CONTEXT(ctx->ctx.backend->ns->user);
+	struct fts_solr_user *fuser =
+		FTS_SOLR_USER_CONTEXT_REQUIRE(ctx->ctx.backend->ns->user);
 
 	if (ctx->mails_since_flush >= fuser->set.batch_size) {
 		if (fts_backed_solr_build_flush(ctx) < 0)

@@ -8,6 +8,7 @@
 #include "istream.h"
 #include "ostream.h"
 #include "iostream-rawlog.h"
+#include "str-sanitize.h"
 #include "crc32.h"
 #include "str.h"
 #include "llist.h"
@@ -25,7 +26,8 @@
 #include <unistd.h>
 
 /* max. length of input command line (spec says 512) */
-#define MAX_INBUF_SIZE 2048
+#define POP3_RFC_MAX_LINE_LEN 512
+#define MAX_INBUF_SIZE (POP3_RFC_MAX_LINE_LEN*4)
 
 /* Disconnect client when it sends too many bad commands in a row */
 #define CLIENT_MAX_BAD_COMMANDS 20
@@ -338,7 +340,7 @@ static void pop3_lock_session_refresh(struct client *client)
 int pop3_lock_session(struct client *client)
 {
 	const struct mail_storage_settings *mail_set =
-		mail_storage_service_user_get_mail_set(client->service_user);
+		mail_storage_service_user_get_mail_set(client->user->service_user);
 	struct dotlock_settings dotlock_set;
 	enum mailbox_list_path_type type;
 	const char *dir, *path;
@@ -383,7 +385,6 @@ int pop3_lock_session(struct client *client)
 
 struct client *client_create(int fd_in, int fd_out,
 			     struct event *event, struct mail_user *user,
-			     struct mail_storage_service_user *service_user,
 			     const struct pop3_settings *set)
 {
 	struct client *client;
@@ -398,7 +399,6 @@ struct client *client_create(int fd_in, int fd_out,
 	client->pool = pool;
 	client->event = event;
 	event_ref(client->event);
-	client->service_user = service_user;
 	client->v = pop3_client_vfuncs;
 	client->set = set;
 	client->fd_in = fd_in;
@@ -541,7 +541,8 @@ static const char *client_stats(struct client *client)
 		       dec2str(client->deleted_count), "deleted_count" },
 		{ 'm', dec2str(client->messages_count), "message_count" },
 		{ 's', dec2str(client->total_size), "message_bytes" },
-		{ 'i', dec2str(client->input->v_offset), "input" },
+		{ 'i', dec2str(i_stream_get_absolute_offset(client->input)),
+		  "input" },
 		{ 'o', dec2str(client->output->offset), "output" },
 		{ 'u', uidl_change, "uidl_change" },
 		{ '\0', !client->delete_success ? "0" :
@@ -563,6 +564,10 @@ static const char *client_stats(struct client *client)
 			"Failed to expand pop3_logout_format=%s: %s",
 			client->set->pop3_logout_format, error);
 	}
+
+	event_add_int(client->event, "net_in_bytes", i_stream_get_absolute_offset(client->input));
+	event_add_int(client->event, "net_out_bytes", client->output->offset);
+
 	return str_c(str);
 }
 
@@ -645,7 +650,6 @@ static void client_default_destroy(struct client *client, const char *reason)
 	pop3_refresh_proctitle();
 	mail_user_autoexpunge(client->user);
 	mail_user_deinit(&client->user);
-	mail_storage_service_user_unref(&client->service_user);
 
 	pop3_client_count--;
 	DLLIST_REMOVE(&pop3_clients, client);
@@ -739,33 +743,77 @@ void client_send_storage_error(struct client *client)
 	}
 }
 
+static void pop3_cmd_event_finished(struct pop3_command_context *cctx, int result)
+{
+	const char *human_args =
+		str_sanitize(cctx->orig_args, POP3_RFC_MAX_LINE_LEN);
+	const char *cmd_name;
+
+	event_set_name(cctx->event, "pop3_command_finished");
+	if (cctx->command != NULL)
+		cmd_name = t_str_ucase(cctx->command->name);
+	else
+		cmd_name = "unknown";
+	event_add_str(cctx->event, "cmd_name", cmd_name);
+	event_add_str(cctx->event, "cmd_args", human_args);
+	event_add_str(cctx->event, "cmd_input_name",
+		      str_sanitize(cctx->orig_command, POP3_RFC_MAX_LINE_LEN));
+	if (result > 0)
+		event_add_str(cctx->event, "reply_state", "OK");
+	else
+		event_add_str(cctx->event, "reply_state", "ERR");
+
+	uint64_t in = i_stream_get_absolute_offset(cctx->client->input) -
+		cctx->stats.bytes_in;
+	uint64_t out = cctx->client->output->offset - cctx->stats.bytes_out;
+
+	event_add_int(cctx->event, "net_in_bytes", in);
+	event_add_int(cctx->event, "net_out_bytes", out);
+
+	e_debug(cctx->event, "Command finished: %s %s", cmd_name, human_args);
+	event_unref(&cctx->event);
+}
+
 bool client_handle_input(struct client *client)
 {
 	char *line, *args;
-	int ret;
+	uint64_t in_pos = i_stream_get_absolute_offset(client->input);
 
 	o_stream_cork(client->output);
 	while (!client->output->closed &&
 	       (line = i_stream_next_line(client->input)) != NULL) {
+		struct pop3_command_context cctx = {
+			.client = client,
+			.event = event_create(client->event),
+			.stats = {
+				.bytes_in = in_pos,
+				.bytes_out = client->output->offset,
+			},
+		};
+		int result;
 		args = strchr(line, ' ');
 		if (args != NULL)
 			*args++ = '\0';
 
-		const struct pop3_command *cmd = pop3_command_find(line);
-		if (cmd == NULL) {
+		cctx.command = pop3_command_find(line);
+		cctx.orig_command = line;
+		cctx.args = args != NULL ? args : "";
+		cctx.orig_args = cctx.args;
+		if (cctx.command == NULL) {
 			client_send_line(client, "-ERR Unknown command: %s", line);
-			ret = -1;
+			result = -1;
 		} else T_BEGIN {
 			const char *reason_code =
 				event_reason_code_prefix("pop3", "cmd_",
-							 cmd->name);
+							 cctx.command->name);
 			struct event_reason *reason =
 				event_reason_begin(reason_code);
-			ret = client_command_execute(client, cmd,
-						     args != NULL ? args : "");
+			result = client_command_execute(&cctx);
 			event_reason_end(&reason);
 		} T_END;
-		if (ret >= 0) {
+		/* send event */
+		pop3_cmd_event_finished(&cctx, result);
+		if (result >= 0) {
 			client->bad_counter = 0;
 			if (client->cmd != NULL) {
 				o_stream_set_flush_pending(client->output,
@@ -777,6 +825,7 @@ bool client_handle_input(struct client *client)
 			client_send_line(client, "-ERR Too many bad commands.");
 			client_disconnect(client, "Too many bad commands.");
 		}
+		in_pos = i_stream_get_absolute_offset(client->input);
 	}
 	o_stream_uncork(client->output);
 
@@ -862,7 +911,7 @@ static int client_output(struct client *client)
 
 void client_kick(struct client *client)
 {
-	mail_storage_service_io_activate_user(client->service_user);
+	mail_storage_service_io_activate_user(client->user->service_user);
 	if (client->cmd == NULL) {
 		client_send_line(client,
 			"-ERR [SYS/TEMP] "MASTER_SERVICE_SHUTTING_DOWN_MSG".");

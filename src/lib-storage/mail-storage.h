@@ -14,7 +14,8 @@ struct message_size;
 #include "mailbox-attribute.h"
 
 /* If some operation is taking long, call notify_ok every n seconds. */
-#define MAIL_STORAGE_STAYALIVE_SECS 15
+#define MAIL_STORAGE_NOTIFY_INTERVAL_SECS 10
+
 /* Expunge transactions are to be commited after
    every MAIL_EXPUNGE_BATCH_SIZE mails */
 #define MAIL_EXPUNGE_BATCH_SIZE 1000
@@ -425,6 +426,21 @@ struct mail {
 	enum mail_lookup_abort lookup_abort;
 };
 
+struct mail_storage_progress_details {
+	const char *verb;
+	unsigned int total;
+	unsigned int processed;
+
+	/* "now" could be inferred directly by the callback, but that
+	   would create mismatches in the concept of 'now' between caller
+	   and callback, given that the structure allows for microseconds
+	   precision.
+	   Also, this way the caller can capture 'now' in the most
+	   representative point along the execution. */
+	struct timeval now;
+	struct timeval start_time;
+};
+
 struct mail_storage_callbacks {
 	/* "* OK <text>" */
 	void (*notify_ok)(struct mailbox *mailbox, const char *text,
@@ -432,7 +448,10 @@ struct mail_storage_callbacks {
 	/* "* NO <text>" */
 	void (*notify_no)(struct mailbox *mailbox, const char *text,
 			  void *context);
-
+	/* "* OK [INPROGRESS (...)] <text>" */
+	void (*notify_progress)(struct mailbox *mailbox,
+				const struct mail_storage_progress_details *dtl,
+				void *context);
 };
 
 struct mailbox_virtual_pattern {
@@ -505,6 +524,10 @@ mail_storage_get_last_internal_error(struct mail_storage *storage,
 const char * ATTR_NOWARN_UNUSED_RESULT
 mailbox_get_last_internal_error(struct mailbox *box,
 				enum mail_error *error_r) ATTR_NULL(2);
+/* Wrapper for mail_storage_get_last_internal_error(); */
+const char * ATTR_NOWARN_UNUSED_RESULT
+mail_get_last_internal_error(struct mail *mail,
+			     enum mail_error *error_r) ATTR_NULL(2);
 
 /* Save the last error until it's popped. This is useful for cases where the
    storage has already failed, but the cleanup code path changes the error to
@@ -728,6 +751,9 @@ mailbox_search_init(struct mailbox_transaction_context *t,
 		    struct mailbox_header_lookup_ctx *wanted_headers);
 /* Deinitialize search request. */
 int mailbox_search_deinit(struct mail_search_context **ctx);
+void mailbox_search_set_progress_hidden(struct mail_search_context *ctx,
+					bool hidden);
+void mailbox_search_reset_progress_start(struct mail_search_context *ctx);
 /* Search the next message. Returns TRUE if found, FALSE if not. */
 bool mailbox_search_next(struct mail_search_context *ctx, struct mail **mail_r);
 /* Like mailbox_search_next(), but don't spend too much time searching.
@@ -735,6 +761,7 @@ bool mailbox_search_next(struct mail_search_context *ctx, struct mail **mail_r);
    more results will be returned by calling the function again. */
 bool mailbox_search_next_nonblock(struct mail_search_context *ctx,
 				  struct mail **mail_r, bool *tryagain_r);
+void mailbox_search_notify(struct mailbox *box, struct mail_search_context *ctx);
 /* Returns TRUE if some messages were already expunged and we couldn't
    determine correctly if those messages should have been returned in this
    search. */
@@ -986,6 +1013,9 @@ int mail_get_backend_mail(struct mail *mail, struct mail **real_mail_r);
    '>' in the *value_r return parameter or NULL if the header wasn't found or
    its value was invalid. */
 int mail_get_message_id(struct mail *mail, const char **value_r);
+/* Try to retrieve a properly parsed Message-ID header, if that fails return
+   the raw header value as it is. */
+int mail_get_message_id_no_validation(struct mail *mail, const char **value_r);
 
 /* Update message flags. */
 void mail_update_flags(struct mail *mail, enum modify_type modify_type,
@@ -1022,8 +1052,8 @@ void mail_generate_guid_128_hash(const char *guid, guid_128_t guid_128_r);
 
    Returns 0 and timestamp on success, -1 if the string couldn't be parsed.
    Currently supported string formats: yyyy-mm-dd (utc=FALSE),
-   imap date (utc=FALSE), unix timestamp (utc=TRUE), interval (e.g. n days,
-   utc=TRUE). */
+   imap date (utc=FALSE), imap date-time (utc=TRUE), unix timestamp (utc=TRUE),
+   interval (e.g. n days, utc=TRUE). */
 int mail_parse_human_timestamp(const char *str, time_t *timestamp_r,
 			       bool *utc_r);
 

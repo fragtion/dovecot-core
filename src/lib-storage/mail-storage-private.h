@@ -130,6 +130,10 @@ struct mail_storage_error {
 	enum mail_error error;
 	char *last_internal_error;
 	char *last_internal_error_mailbox;
+	/* Note: This is the uid of the mail that triggered the error. Use
+		 UINT32_MAX to denote 'unset', as 0 is used for mails currently
+		 being saved. */
+	uint32_t last_internal_error_mail_uid;
 	bool last_error_is_internal;
 };
 
@@ -166,6 +170,7 @@ struct mail_storage {
 	/* Last error set in mail_storage_set_critical(). */
 	char *last_internal_error;
 	char *last_internal_error_mailbox;
+	uint32_t last_internal_error_mail_uid;
 
 	char *error_string;
 	enum mail_error error;
@@ -685,6 +690,9 @@ struct mail_search_context {
 	struct mailbox_header_lookup_ctx *wanted_headers;
 	normalizer_func_t *normalizer;
 
+	struct timeval search_start_time, last_notify;
+	unsigned int search_notify_passes;
+
 	/* if non-NULL, specifies that a search resulting is being updated.
 	   this can be used as a search optimization: if searched message
 	   already exists in search result, it's not necessary to check if
@@ -844,6 +852,8 @@ bool mail_stream_access_start(struct mail *mail);
 bool mail_metadata_access_start(struct mail *mail);
 /* Emit mail opened events */
 void mail_opened_event(struct mail *mail);
+/* Emit mail metadata accessed events */
+void mail_metadata_accessed_event(struct event *mail_event);
 
 /* Emit mail expunge_requested event */
 void mail_expunge_requested_event(struct mail *mail);

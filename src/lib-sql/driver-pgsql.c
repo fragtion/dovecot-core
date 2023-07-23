@@ -146,6 +146,7 @@ static void driver_pgsql_close(struct pgsql_db *db)
 	timeout_remove(&db->to_connect);
 
 	driver_pgsql_set_state(db, SQL_DB_STATE_DISCONNECTED);
+	sql_connection_log_finished(&db->api);
 
 	if (db->ioloop != NULL) {
 		/* running a sync query, stop it */
@@ -156,15 +157,20 @@ static void driver_pgsql_close(struct pgsql_db *db)
 
 static const char *last_error(struct pgsql_db *db)
 {
-	const char *msg;
+	const char *msg, *pos, *orig;
 	size_t len;
 
-	msg = PQerrorMessage(db->pg);
+	orig = msg = PQerrorMessage(db->pg);
 	if (msg == NULL)
 		return "(no error set)";
 
-	/* Error message should contain trailing \n, we don't want it */
 	len = strlen(msg);
+	/* The error can contain multiple lines, but we only want the last */
+	while ((pos = strchr(msg, '\n')) != NULL && (pos - orig) < (ptrdiff_t)len - 1)
+		msg = pos + 1;
+
+	len = strlen(msg);
+	/* Error message should contain trailing \n, we don't want it */
 	return len == 0 || msg[len-1] != '\n' ? msg :
 		t_strndup(msg, len-1);
 }
@@ -193,6 +199,8 @@ static void connect_callback(struct pgsql_db *db)
 	case PGRES_POLLING_FAILED:
 		e_error(db->api.event, "Connect failed to database %s: %s (state: %s)",
 			PQdb(db->pg), last_error(db), db->connect_state);
+		i_free(db->api.last_connect_error);
+		db->api.last_connect_error = i_strdup(last_error(db));
 		driver_pgsql_close(db);
 		return;
 	}
@@ -221,9 +229,10 @@ static void connect_callback(struct pgsql_db *db)
 static void driver_pgsql_connect_timeout(struct pgsql_db *db)
 {
 	unsigned int secs = ioloop_time - db->api.last_connect_try;
-
-	e_error(db->api.event, "Connect failed: Timeout after %u seconds (state: %s)",
-		secs, db->connect_state);
+	i_free(db->api.last_connect_error);
+	db->api.last_connect_error = i_strdup_printf("Timeout after %u seconds (state: %s)",
+						     secs, db->connect_state);
+	e_error(db->api.event, "Connect failed: %s", db->api.last_connect_error);
 	driver_pgsql_close(db);
 }
 
@@ -240,7 +249,7 @@ static int driver_pgsql_connect(struct sql_db *_db)
 
 	db->pg = PQconnectStart(db->connect_string);
 	if (db->pg == NULL) {
-		i_fatal("pgsql: PQconnectStart() failed (out of memory)");
+		i_fatal_status(FATAL_OUTOFMEM, "pgsql: PQconnectStart() failed (out of memory)");
 	}
 
 	(void)PQsetNoticeProcessor(db->pg, pgsql_notice_processor, db);
@@ -248,6 +257,8 @@ static int driver_pgsql_connect(struct sql_db *_db)
 	if (PQstatus(db->pg) == CONNECTION_BAD) {
 		e_error(_db->event, "Connect failed to database %s: %s",
 			PQdb(db->pg), last_error(db));
+		i_free(db->api.last_connect_error);
+		db->api.last_connect_error = i_strdup(last_error(db));
 		driver_pgsql_close(db);
 		return -1;
 	}
@@ -1281,13 +1292,13 @@ static void driver_pgsql_wait(struct sql_db *_db)
 	if (!driver_pgsql_have_work(db))
 		return;
 
-	struct ioloop *prev_ioloop = current_ioloop;
+	db->orig_ioloop = current_ioloop;
 	db->ioloop = io_loop_create();
 	db->io = io_loop_move_io(&db->io);
 	while (driver_pgsql_have_work(db))
 		io_loop_run(db->ioloop);
 
-	io_loop_set_current(prev_ioloop);
+	io_loop_set_current(db->orig_ioloop);
 	db->io = io_loop_move_io(&db->io);
 	io_loop_set_current(db->ioloop);
 	io_loop_destroy(&db->ioloop);

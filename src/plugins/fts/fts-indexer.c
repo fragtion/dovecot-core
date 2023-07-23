@@ -14,8 +14,8 @@
 #include "fts-api.h"
 #include "fts-storage.h"
 #include "fts-indexer.h"
+#include "fts-indexer-status.h"
 
-#define INDEXER_NOTIFY_INTERVAL_SECS 10
 #define INDEXER_SOCKET_NAME "indexer"
 #define INDEXER_WAIT_MSECS 250
 
@@ -26,7 +26,7 @@ struct fts_indexer_context {
 	struct ioloop *ioloop;
 
 	struct timeval search_start_time, last_notify;
-	unsigned int percentage;
+	struct indexer_status status;
 	struct connection_list *connection_list;
 
 	bool notified:1;
@@ -34,35 +34,36 @@ struct fts_indexer_context {
 	bool completed:1;
 };
 
+static void fts_indexer_idle_timeout(struct connection *conn);
+
 static void fts_indexer_notify(struct fts_indexer_context *ctx)
 {
-	unsigned long long elapsed_msecs, est_total_msecs;
-	unsigned int eta_secs;
+	struct mail_storage *storage = ctx->box->storage;
 
-	if (ioloop_time - ctx->last_notify.tv_sec < INDEXER_NOTIFY_INTERVAL_SECS)
+	if (ctx->search_start_time.tv_sec == 0) {
+		ctx->search_start_time = ioloop_timeval;
 		return;
+	}
+
+	if (ctx->last_notify.tv_sec == 0)
+		ctx->last_notify = ctx->search_start_time;
+
+	if (storage->callbacks.notify_progress == NULL ||
+	    ioloop_time - ctx->last_notify.tv_sec < MAIL_STORAGE_NOTIFY_INTERVAL_SECS)
+		return;
+
 	ctx->last_notify = ioloop_timeval;
 
-	if (ctx->box->storage->callbacks.notify_ok == NULL ||
-	    ctx->percentage == 0)
-		return;
-
-	elapsed_msecs = timeval_diff_msecs(&ioloop_timeval,
-					   &ctx->search_start_time);
-	est_total_msecs = elapsed_msecs * 100 / ctx->percentage;
-	eta_secs = (est_total_msecs - elapsed_msecs) / 1000;
-
-	T_BEGIN {
-		const char *text;
-
-		text = t_strdup_printf("Indexed %d%% of the mailbox, "
-				       "ETA %d:%02d", ctx->percentage,
-				       eta_secs/60, eta_secs%60);
-		ctx->box->storage->callbacks.
-			notify_ok(ctx->box, text,
-				  ctx->box->storage->callback_context);
-		ctx->notified = TRUE;
-	} T_END;
+	struct mail_storage_progress_details dtl = {
+		.verb = "Indexed",
+		.total = ctx->status.total,
+		.processed = ctx->status.progress,
+		.start_time = ctx->search_start_time,
+		.now = ioloop_timeval,
+	};
+	storage->callbacks.notify_progress(ctx->box, &dtl,
+					   storage->callback_context);
+	ctx->notified = TRUE;
 }
 
 static int fts_indexer_more_int(struct fts_indexer_context *ctx)
@@ -145,7 +146,6 @@ fts_indexer_input_args(struct connection *conn, const char *const *args)
 {
 	struct fts_indexer_context *ctx =
 		container_of(conn, struct fts_indexer_context, conn);
-	int percentage;
 	if (args[1] == NULL) {
 		e_error(conn->event, "indexer sent invalid reply");
 		return -1;
@@ -156,19 +156,44 @@ fts_indexer_input_args(struct connection *conn, const char *const *args)
 	}
 	if (strcmp(args[1], "OK") == 0)
 		return 1;
-	if (str_to_int(args[1], &percentage) < 0) {
-		e_error(conn->event, "indexer sent invalid progress: %s", args[1]);
+	if (str_to_int(args[1], &ctx->status.state) < 0) {
+		e_error(conn->event, "indexer sent invalid percentage: %s", args[1]);
 		ctx->failed = TRUE;
 		return -1;
 	}
-	if (percentage < 0) {
+	if (ctx->status.state < INDEXER_STATE_FAILED ||
+	    ctx->status.state > INDEXER_STATE_COMPLETED) {
+		e_error(conn->event, "indexer sent invalid state: %s", args[2]);
+		ctx->failed = TRUE;
+		return -1;
+	}
+	if (ctx->status.state == INDEXER_STATE_FAILED) {
 		e_error(ctx->box->event, "indexer failed to index mailbox");
 		ctx->failed = TRUE;
 		return -1;
 	}
-	ctx->percentage = percentage;
-	if (ctx->percentage == 100)
+	if (str_array_length(args) < 4) {
+		e_error(conn->event, "indexer sent invalid reply");
+		return -1;
+	}
+	if (str_to_uint32(args[2], &ctx->status.progress) < 0) {
+		e_error(conn->event, "indexer sent invalid processed: %s", args[2]);
+		ctx->failed = TRUE;
+		return -1;
+	}
+	if (str_to_uint32(args[3], &ctx->status.total) < 0) {
+		e_error(conn->event, "indexer sent invalid total: %s", args[3]);
+		ctx->failed = TRUE;
+		return -1;
+	}
+	time_t elapsed = ioloop_time - ctx->search_start_time.tv_sec;
+	if (ctx->status.state == INDEXER_STATE_COMPLETED)
 		ctx->completed = TRUE;
+	else if (ctx->conn.input_idle_timeout_secs > 0 &&
+		 elapsed > ctx->conn.input_idle_timeout_secs) {
+		fts_indexer_idle_timeout(&ctx->conn);
+		return -1;
+	}
 	return 1;
 }
 

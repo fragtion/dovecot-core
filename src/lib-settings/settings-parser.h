@@ -16,9 +16,6 @@ struct var_expand_func_table;
 #define SETTING_STRVAR_UNEXPANDED "0"
 #define SETTING_STRVAR_EXPANDED "1"
 
-/* When parsing streams, this character is translated to LF. */
-#define SETTING_STREAM_LF_CHAR "\003"
-
 enum setting_type {
 	SET_BOOL,
 	SET_UINT,
@@ -177,21 +174,6 @@ int settings_parse_line(struct setting_parser_context *ctx, const char *line);
 /* Parse key/value pair. Returns 1 if OK, 0 if key is unknown, -1 if error. */
 int settings_parse_keyvalue(struct setting_parser_context *ctx,
 			    const char *key, const char *value);
-/* Parse data already read in input stream. */
-int settings_parse_stream(struct setting_parser_context *ctx,
-			  struct istream *input);
-/* Read data from input stream and parser it. returns -1 = error,
-   0 = done, 1 = not finished yet (stream is non-blocking) */
-int settings_parse_stream_read(struct setting_parser_context *ctx,
-         		       struct istream *input);
-/* Open file and parse it. */
-int settings_parse_file(struct setting_parser_context *ctx,
-			const char *path, size_t max_line_length);
-int settings_parse_environ(struct setting_parser_context *ctx);
-/* Execute the given binary and wait for it to return the configuration. */
-int settings_parse_exec(struct setting_parser_context *ctx,
-			const char *bin_path, const char *config_path,
-			const char *service);
 /* Call all check_func()s to see if currently parsed settings are valid. */
 bool settings_parser_check(struct setting_parser_context *ctx, pool_t pool,
 			   const char **error_r);

@@ -16,6 +16,7 @@
 #include "master-instance.h"
 #include "master-service-private.h"
 #include "master-service-settings.h"
+#include "log-error-buffer.h"
 #include "askpass.h"
 #include "capabilities.h"
 #include "master-client.h"
@@ -60,6 +61,8 @@ bool have_proc_fs_suid_dumpable;
 bool have_proc_sys_kernel_core_pattern;
 const char *ssl_manual_key_password;
 int global_master_dead_pipe_fd[2];
+struct log_error_buffer *log_error_buffer;
+int global_config_fd = -1;
 struct service_list *services;
 bool startup_finished = FALSE;
 
@@ -141,6 +144,25 @@ int get_gid(const char *group, gid_t *gid_r, const char **error_r)
 		*gid_r = gr.gr_gid;
 		return 0;
 	}
+}
+
+static void ATTR_FORMAT(2, 0)
+master_error_handler(const struct failure_context *ctx,
+		     const char *fmt, va_list args)
+{
+	va_list args2;
+
+	VA_COPY(args2, args);
+	struct log_error error = {
+		.type = ctx->type,
+		.timestamp = ioloop_timeval,
+		.prefix = ctx->log_prefix != NULL ? ctx->log_prefix : "",
+		.text = t_strdup_vprintf(fmt, args2),
+	};
+	log_error_buffer_add(log_error_buffer, &error);
+	va_end(args2);
+
+	orig_error_callback(ctx, fmt, args);
 }
 
 static void ATTR_NORETURN ATTR_FORMAT(2, 0)
@@ -396,14 +418,19 @@ sig_settings_reload(const siginfo_t *si ATTR_UNUSED,
 
 	i_zero(&input);
 	input.roots = set_roots;
-	input.module = MASTER_SERVICE_NAME;
 	input.config_path = services_get_config_socket_path(services);
+	input.never_exec = TRUE;
+	input.reload_config = TRUE;
+	input.return_config_fd = TRUE;
 	if (master_service_settings_read(master_service, &input,
 					 &output, &error) < 0) {
 		i_error("Error reading configuration: %s", error);
 		i_sd_notify(0, "READY=1");
 		return;
 	}
+	i_close_fd(&global_config_fd);
+	global_config_fd = output.config_fd;
+	fd_close_on_exec(global_config_fd, TRUE);
 	set = master_service_settings_get_root_set(master_service,
 						   &master_setting_parser_info);
 
@@ -428,8 +455,10 @@ sig_settings_reload(const siginfo_t *si ATTR_UNUSED,
 	/* anvil never dies. it just gets moved to the new services list */
 	service = service_lookup_type(services, SERVICE_TYPE_ANVIL);
 	if (service != NULL) {
-		while (service->processes != NULL)
-			service_process_destroy(service->processes);
+		while (service->busy_processes != NULL)
+			service_process_destroy(service->busy_processes);
+		while (service->idle_processes_head != NULL)
+			service_process_destroy(service->idle_processes_head);
 	}
 	services_destroy(services, FALSE);
 
@@ -476,12 +505,14 @@ static struct master_settings *master_settings_read(void)
 
 	i_zero(&input);
 	input.roots = set_roots;
-	input.module = "master";
-	input.parse_full_config = TRUE;
 	input.preserve_environment = TRUE;
+	input.always_exec = TRUE;
+	input.return_config_fd = TRUE;
 	if (master_service_settings_read(master_service, &input, &output,
 					 &error) < 0)
 		i_fatal("Error reading configuration: %s", error);
+	global_config_fd = output.config_fd;
+	fd_close_on_exec(global_config_fd, TRUE);
 	return master_service_settings_get_root_set(master_service,
 						    &master_setting_parser_info);
 }
@@ -594,6 +625,9 @@ static void main_deinit(void)
 	service_pids_deinit();
 	/* notify systemd that we are done */
 	i_sd_notify(0, "STATUS=Dovecot stopped");
+
+	i_set_error_handler(orig_error_callback);
+	log_error_buffer_deinit(&log_error_buffer);
 }
 
 static const char *get_full_config_path(struct service_list *list)
@@ -758,8 +792,10 @@ int main(int argc, char *argv[])
 	int i, c;
 
 #ifdef DEBUG
-	if (getenv("GDB") == NULL)
-		fd_debug_verify_leaks(3, 1024);
+	if (getenv("GDB") == NULL) {
+		fd_debug_verify_leaks(3, MASTER_CONFIG_FD - 1);
+		fd_debug_verify_leaks(MASTER_CONFIG_FD + 1, 1024);
+	}
 #endif
 	/* drop -- prefix from all --args. ugly, but the only way that it
 	   works with standard getopt() in all OSes.. */
@@ -777,8 +813,7 @@ int main(int argc, char *argv[])
 				MASTER_SERVICE_FLAG_STANDALONE |
 				MASTER_SERVICE_FLAG_DONT_SEND_STATS |
 				MASTER_SERVICE_FLAG_DONT_LOG_TO_STDERR |
-				MASTER_SERVICE_FLAG_NO_INIT_DATASTACK_FRAME |
-				MASTER_SERVICE_FLAG_DISABLE_SSL_SET,
+				MASTER_SERVICE_FLAG_NO_INIT_DATASTACK_FRAME,
 				&argc, &argv, "+Fanp");
 	i_unset_failure_prefix();
 
@@ -909,8 +944,9 @@ int main(int argc, char *argv[])
 	if (chdir(set->base_dir) < 0)
 		i_fatal("chdir(%s) failed: %m", set->base_dir);
 
+	log_error_buffer = log_error_buffer_init();
 	i_set_fatal_handler(master_fatal_callback);
-	i_set_error_handler(orig_error_callback);
+	i_set_error_handler(master_error_handler);
 
 	if (!foreground)
 		daemonize();

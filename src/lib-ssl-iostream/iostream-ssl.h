@@ -122,9 +122,17 @@ int ssl_iostream_check_cert_validity(struct ssl_iostream *ssl_io,
    will always return FALSE before even checking the hostname. */
 bool ssl_iostream_cert_match_name(struct ssl_iostream *ssl_io, const char *name,
 				  const char **reason_r);
+/* Returns name of the peer if available, NULL if not. Usually used to retrieve
+   username from certificate. */
 const char *ssl_iostream_get_peer_name(struct ssl_iostream *ssl_io);
+/* Returns used compression, if any. Returns NULL if not available. */
 const char *ssl_iostream_get_compression(struct ssl_iostream *ssl_io);
+/* Returns TLS extension server_name(0) requested by client, or NULL if not
+   provided.
+ */
 const char *ssl_iostream_get_server_name(struct ssl_iostream *ssl_io);
+/* Returns textual representation of the security parameters for the connection,
+   or NULL if handshake has not been done. */
 const char *ssl_iostream_get_security_string(struct ssl_iostream *ssl_io);
 
 /* Returns ClientHello based JA3 string. Will return NULL

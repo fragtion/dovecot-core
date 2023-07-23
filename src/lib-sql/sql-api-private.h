@@ -118,6 +118,8 @@ struct sql_db_vfuncs {
 				     unsigned int column_idx, int64_t value);
 	void (*statement_bind_double)(struct sql_statement *stmt,
 				      unsigned int column_idx, double value);
+	void (*statement_bind_uuid)(struct sql_statement *stmt,
+				    unsigned int column_idx, const guid_128_t uuid);
 	void (*statement_query)(struct sql_statement *stmt,
 				sql_query_callback_t *callback, void *context);
 	struct sql_result *(*statement_query_s)(struct sql_statement *stmt);
@@ -154,6 +156,8 @@ struct sql_db {
 	unsigned int connect_delay;
 	unsigned int connect_failure_count;
 	struct timeout *to_reconnect;
+	/* last connection error */
+	char *last_connect_error;
 
 	uint64_t succeeded_queries;
 	uint64_t failed_queries;

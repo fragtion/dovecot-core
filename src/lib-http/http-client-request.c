@@ -91,13 +91,13 @@ http_client_request_result_event(struct http_client_request *req)
 	struct event_passthrough *e = event_create_passthrough(req->event);
 	if (req->queue != NULL &&
 	    req->queue->addr.type != HTTP_CLIENT_PEER_ADDR_UNIX)
-		e->add_str("dest_ip", net_ip2addr(&req->queue->addr.a.tcp.ip));
+		e->add_ip("dest_ip", &req->queue->addr.a.tcp.ip);
 
 	return e->add_int("status_code", req->last_status)->
 		add_int("attempts", req->attempts)->
 		add_int("redirects", req->redirects)->
-		add_int("bytes_in", req->bytes_in)->
-		add_int("bytes_out", req->bytes_out);
+		add_int("net_in_bytes", req->bytes_in)->
+		add_int("net_out_bytes", req->bytes_out);
 }
 
 static struct http_client_request *
@@ -1040,14 +1040,14 @@ static int http_client_request_flush_payload(struct http_client_request *req)
 	struct http_client_connection *conn = req->conn;
 	int ret;
 
-	if (req->payload_output != conn->conn.output &&
-	    (ret = o_stream_finish(req->payload_output)) <= 0) {
-		if (ret < 0)
-			http_client_connection_handle_output_error(conn);
-		return ret;
-	}
+	if (req->payload_output == conn->conn.output)
+		ret = o_stream_flush(req->payload_output);
+	else
+		ret = o_stream_finish(req->payload_output);
 
-	return 1;
+	if (ret < 0)
+		http_client_connection_handle_output_error(conn);
+	return ret;
 }
 
 static int
@@ -1067,10 +1067,17 @@ http_client_request_finish_payload_out(struct http_client_request *req)
 		if (ret == 0) {
 			e_debug(req->event,
 				"Not quite finished sending payload");
+			conn->output_locked = TRUE;
 			return 0;
 		}
 		o_stream_unref(&req->payload_output);
 		req->payload_output = NULL;
+	}
+	if (o_stream_get_buffer_used_size(conn->conn.output) > 0) {
+		e_debug(req->event,
+			"Not quite finished sending request");
+		conn->output_locked = TRUE;
+		return 0;
 	}
 
 	i_assert(req->request_offset < conn->conn.output->offset);
@@ -1524,6 +1531,10 @@ bool http_client_request_callback(struct http_client_request *req,
 	http_client_request_callback_t *callback = req->callback;
 	unsigned int orig_attempts = req->attempts;
 
+	i_assert(req->state >= HTTP_REQUEST_STATE_PAYLOAD_OUT);
+	i_assert(req->conn != NULL);
+	if (req->state == HTTP_REQUEST_STATE_PAYLOAD_OUT)
+		req->conn->output_locked = FALSE;
 	req->state = HTTP_REQUEST_STATE_GOT_RESPONSE;
 	req->last_status = response->status;
 

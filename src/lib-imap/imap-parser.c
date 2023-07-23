@@ -989,16 +989,19 @@ imap_parser_read_next_atom(struct imap_parser *parser, bool parsing_tag,
 		/* quoted-specials: */
 		case '"':
 		case '\\':
+			return -1;
 		/* resp-specials: */
 		case ']':
-			return -1;
+			if (!parsing_tag)
+				return -1;
+			break;
 		case '+':
 			if (parsing_tag)
 				return -1;
 			break;
 		default:
 			if ((unsigned char)data[i] < ' ' ||
-			    (unsigned char)data[i] >= 0x80)
+			    (unsigned char)data[i] >= 0x7F)
 				return -1;
 		}
 	}

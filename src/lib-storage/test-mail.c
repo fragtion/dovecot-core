@@ -464,7 +464,7 @@ static void test_bodystructure_corruption_reparsing(void)
 	mail_set_seq(mail, 1);
 
 	test_assert(mail_get_special(mail, MAIL_FETCH_IMAP_BODY, &value) == 0);
-	test_expect_error_string("Mailbox INBOX: Deleting corrupted cache record uid=1: UID 1: Broken MIME parts in mailbox INBOX: test");
+	test_expect_error_string("Mailbox INBOX: UID 1: Deleting corrupted cache record: Broken MIME parts in mailbox INBOX: test");
 	mail_set_cache_corrupted(mail, MAIL_FETCH_MESSAGE_PARTS, "test");
 	test_expect_no_more_errors();
 	test_assert(mail_get_special(mail, MAIL_FETCH_IMAP_BODYSTRUCTURE, &value) == 0);
@@ -477,6 +477,254 @@ static void test_bodystructure_corruption_reparsing(void)
 	test_end();
 }
 
+static void test_mail_set_critical(void)
+{
+	struct test_mail_storage_settings set = {
+		.driver = "sdbox",
+	};
+
+	struct test_mail_storage_ctx *ctx = test_mail_storage_init();
+	test_mail_storage_init_user(ctx, &set);
+
+	struct mailbox *box =
+		mailbox_alloc(ctx->user->namespaces->list, "INBOX", 0);
+	test_assert(mailbox_open(box) == 0);
+
+	test_mail_save(box,
+		       "From: <test1@example.com>\n"
+		       "\n"
+		       "test body\n");
+
+	struct mail_private *pmail;
+	enum mail_error mail_error;
+	const char *last_internal_error;
+
+	test_begin("mail_set_critical (UID)");
+	struct mailbox_transaction_context *trans =
+		mailbox_transaction_begin(box, 0, __func__);
+	struct mail *mail = mail_alloc(trans, 0, NULL);
+	mail_set_seq(mail, 1);
+	mail->saving = FALSE;
+	test_expect_error_string("Mailbox INBOX: UID 1: Mail Error: uid=1, "
+				 "saving=false");
+	mail_set_critical(mail, "Mail Error: uid=%u, saving=%s", mail->uid,
+			  "false");
+	test_expect_no_more_errors();
+	last_internal_error = mail_get_last_internal_error(mail, &mail_error);
+	test_assert(mail_error == MAIL_ERROR_TEMP);
+	test_assert_strcmp(last_internal_error,
+			   "Mail Error: uid=1, saving=false");
+	mail_free(&mail);
+	test_assert(mailbox_transaction_commit(&trans) == 0);
+	test_end();
+
+	test_begin("mail_set_critical (saving-prefix: no uid)");
+	trans = mailbox_transaction_begin(box, 0, __func__);
+	mail = mail_alloc(trans, 0, NULL);
+	pmail = container_of(mail, struct mail_private, mail);
+	event_unref(&pmail->_event);
+	mail->saving = TRUE;
+	test_expect_error_string("Mailbox INBOX: Saving mail: Mail Error: "
+				 "uid=0, saving=true");
+	mail_set_critical(mail, "Mail Error: uid=%u, saving=%s", mail->uid,
+			  "true");
+	test_expect_no_more_errors();
+	last_internal_error = mail_get_last_internal_error(mail, &mail_error);
+	test_assert(mail_error == MAIL_ERROR_TEMP);
+	test_assert_strcmp(last_internal_error,
+			   "Mail Error: uid=0, saving=true");
+	mail_free(&mail);
+	test_assert(mailbox_transaction_commit(&trans) == 0);
+	test_end();
+
+	test_begin("mail_set_critical (saving-prefix: UID)");
+	trans = mailbox_transaction_begin(box, 0, __func__);
+	mail = mail_alloc(trans, 0, NULL);
+	mail_set_seq(mail, 1);
+	pmail = container_of(mail, struct mail_private, mail);
+	event_unref(&pmail->_event);
+	mail->saving = TRUE;
+	test_expect_error_string("Mailbox INBOX: Saving mail UID 1: "
+				 "Mail Error: uid=1, saving=true");
+	mail_set_critical(mail, "Mail Error: uid=%u, saving=%s", mail->uid,
+			  "true");
+	test_expect_no_more_errors();
+	last_internal_error = mail_get_last_internal_error(mail, &mail_error);
+	test_assert(mail_error == MAIL_ERROR_TEMP);
+	test_assert_strcmp(last_internal_error,
+			   "Mail Error: uid=1, saving=true");
+	test_end();
+
+	mail_free(&mail);
+	test_assert(mailbox_transaction_commit(&trans) == 0);
+	mailbox_free(&box);
+	test_mail_storage_deinit_user(ctx);
+	test_mail_storage_deinit(&ctx);
+}
+
+static void test_mail_set_critical_different_mailboxes(void)
+{
+	struct test_mail_storage_settings set = {
+		.driver = "sdbox",
+	};
+
+	struct test_mail_storage_ctx *ctx = test_mail_storage_init();
+	test_mail_storage_init_user(ctx, &set);
+
+	struct mailbox *box1 =
+		mailbox_alloc(ctx->user->namespaces->list, "INBOX", 0);
+	test_assert(mailbox_open(box1) == 0);
+
+	test_mail_save(box1,
+		       "From: <test1@example.com>\n"
+		       "\n"
+		       "test body\n");
+
+	struct mailbox_transaction_context *trans =
+		mailbox_transaction_begin(box1, 0, __func__);
+	struct mail *mail = mail_alloc(trans, 0, NULL);
+	mail_set_seq(mail, 1);
+
+	const char *last_internal_error;
+	enum mail_error mail_error;
+
+	test_begin("mail_set_critical (different mailboxes)");
+	test_expect_error_string("Mailbox INBOX: UID 1: Mail Error: uid 1");
+	mail_set_critical(mail, "Mail Error: uid %u", mail->uid);
+	test_expect_no_more_errors();
+	last_internal_error = mail_get_last_internal_error(mail, &mail_error);
+	test_assert_strcmp(last_internal_error, "Mail Error: uid 1");
+	mail_free(&mail);
+	test_assert(mailbox_transaction_commit(&trans) == 0);
+
+	struct mailbox *box2 =
+		mailbox_alloc(ctx->user->namespaces->list, "testbox", 0);
+	test_assert(mailbox_create(box2, NULL, FALSE) == 0);
+	test_assert(mailbox_open(box2) == 0);
+	struct mailbox_transaction_context *trans2 =
+		mailbox_transaction_begin(box2, 0, __func__);
+	mail = mail_alloc(trans2, 0, NULL);
+	last_internal_error = mail_get_last_internal_error(mail, &mail_error);
+	test_assert_strcmp(last_internal_error,
+			   "Mailbox INBOX: UID 1: Mail Error: uid 1");
+	mail_free(&mail);
+	test_assert(mailbox_transaction_commit(&trans2) == 0);
+	test_end();
+
+	mailbox_free(&box2);
+	mailbox_free(&box1);
+	test_mail_storage_deinit_user(ctx);
+	test_mail_storage_deinit(&ctx);
+}
+
+static void test_mail_get_last_internal_error(void)
+{
+	struct test_mail_storage_settings set = {
+		.driver = "sdbox",
+	};
+
+	struct test_mail_storage_ctx *ctx = test_mail_storage_init();
+	test_mail_storage_init_user(ctx, &set);
+
+	struct mailbox *box1 =
+		mailbox_alloc(ctx->user->namespaces->list, "INBOX", 0);
+	struct mailbox *box2 =
+		mailbox_alloc(ctx->user->namespaces->list, "testbox", 0);
+	test_assert(mailbox_create(box2, NULL, FALSE) == 0);
+	test_assert(mailbox_open(box1) == 0);
+	test_assert(mailbox_open(box2) == 0);
+
+	for (int i = 0; i < 2; i++)
+		test_mail_save(box1,
+			       "From: <test1@example.com>\n"
+			       "\n"
+			       "test body\n");
+
+	struct mailbox_transaction_context *trans1 =
+		mailbox_transaction_begin(box1, 0, __func__);
+	struct mailbox_transaction_context *trans2 =
+		mailbox_transaction_begin(box2, 0, __func__);
+	struct mail *mail1 = mail_alloc(trans1, 0, NULL);
+	mail_set_seq(mail1, 1);
+	struct mail *mail2 = mail_alloc(trans2, 0, NULL);
+	struct mail_storage *storage = mailbox_get_storage(mail1->box);
+
+	const char *last_internal_error;
+	enum mail_error mail_error;
+
+	test_begin("mail*_get_last_internal_error (mail_set_critical)");
+	test_expect_error_string("Mailbox INBOX: UID 1: mail_set_critical");
+	mail_set_critical(mail1, "mail_set_critical");
+	test_expect_no_more_errors();
+
+	last_internal_error = mail_get_last_internal_error(mail1, &mail_error);
+	test_assert_strcmp(last_internal_error, "mail_set_critical");
+	last_internal_error = mailbox_get_last_internal_error(box1, &mail_error);
+	test_assert_strcmp(last_internal_error, "UID 1: mail_set_critical");
+	last_internal_error = mail_get_last_internal_error(mail2, &mail_error);
+	test_assert_strcmp(last_internal_error, "Mailbox INBOX: UID 1: mail_set_critical");
+	last_internal_error = mailbox_get_last_internal_error(box2, &mail_error);
+	test_assert_strcmp(last_internal_error, "Mailbox INBOX: UID 1: mail_set_critical");
+	last_internal_error = mail_storage_get_last_internal_error(storage, &mail_error);
+	test_assert_strcmp(last_internal_error, "Mailbox INBOX: UID 1: mail_set_critical");
+	test_end();
+
+	test_begin("mail*_get_last_internal_error (mailbox_set_critical)");
+	test_expect_error_string("Mailbox INBOX: mailbox_set_critical");
+	mailbox_set_critical(box1, "mailbox_set_critical");
+	test_expect_no_more_errors();
+
+	last_internal_error = mail_get_last_internal_error(mail1, &mail_error);
+	test_assert_strcmp(last_internal_error, "mailbox_set_critical");
+	last_internal_error = mailbox_get_last_internal_error(box1, &mail_error);
+	test_assert_strcmp(last_internal_error, "mailbox_set_critical");
+	last_internal_error = mail_get_last_internal_error(mail2, &mail_error);
+	test_assert_strcmp(last_internal_error, "Mailbox INBOX: mailbox_set_critical");
+	last_internal_error = mailbox_get_last_internal_error(box2, &mail_error);
+	test_assert_strcmp(last_internal_error, "Mailbox INBOX: mailbox_set_critical");
+	last_internal_error = mail_storage_get_last_internal_error(storage, &mail_error);
+	test_assert_strcmp(last_internal_error, "Mailbox INBOX: mailbox_set_critical");
+	test_end();
+
+	test_begin("mail*_get_last_internal_error (mail_storage_set_critical)");
+	test_expect_error_string("mail_storage_set_critical");
+	mail_storage_set_critical(storage, "mail_storage_set_critical");
+	test_expect_no_more_errors();
+
+	last_internal_error = mail_get_last_internal_error(mail1, &mail_error);
+	test_assert_strcmp(last_internal_error, "mail_storage_set_critical");
+	last_internal_error = mailbox_get_last_internal_error(box1, &mail_error);
+	test_assert_strcmp(last_internal_error, "mail_storage_set_critical");
+	last_internal_error = mail_storage_get_last_internal_error(storage, &mail_error);
+	test_assert_strcmp(last_internal_error, "mail_storage_set_critical");
+	test_end();
+
+	test_begin("mail*_get_last_internal_error (different UID)");
+	struct mail *mail1b = mail_alloc(trans1, 0, NULL);
+	mail_set_seq(mail1b, 2);
+	test_expect_error_string("Mailbox INBOX: UID 1: mail_set_critical "
+				 "(different UID)");
+	mail_set_critical(mail1, "mail_set_critical (different UID)");
+	test_expect_no_more_errors();
+	last_internal_error = mail_get_last_internal_error(mail1, &mail_error);
+	test_assert_strcmp(last_internal_error,
+			   "mail_set_critical (different UID)");
+	last_internal_error = mail_get_last_internal_error(mail1b, &mail_error);
+	test_assert_strcmp(last_internal_error,
+			   "UID 1: mail_set_critical (different UID)");
+	test_end();
+
+	mail_free(&mail1b);
+	mail_free(&mail2);
+	mail_free(&mail1);
+	test_assert(mailbox_transaction_commit(&trans2) == 0);
+	test_assert(mailbox_transaction_commit(&trans1) == 0);
+	mailbox_free(&box2);
+	mailbox_free(&box1);
+	test_mail_storage_deinit_user(ctx);
+	test_mail_storage_deinit(&ctx);
+}
+
 int main(int argc, char **argv)
 {
 	void (*const tests[])(void) = {
@@ -484,6 +732,9 @@ int main(int argc, char **argv)
 		test_attachment_flags_during_header_fetch,
 		test_bodystructure_reparsing,
 		test_bodystructure_corruption_reparsing,
+		test_mail_set_critical,
+		test_mail_set_critical_different_mailboxes,
+		test_mail_get_last_internal_error,
 		NULL
 	};
 	int ret;

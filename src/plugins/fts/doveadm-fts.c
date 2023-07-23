@@ -148,6 +148,7 @@ cmd_fts_expand_run(struct doveadm_mail_cmd_context *ctx,
 		i_fatal("Couldn't expand search args");
 	mail_search_args_to_cmdline(str, ctx->search_args->args);
 	printf("%s\n", str_c(str));
+	mail_search_args_deinit(ctx->search_args);
 	mailbox_free(&box);
 	return 0;
 }
@@ -292,7 +293,6 @@ cmd_fts_tokenize_init(struct doveadm_mail_cmd_context *_ctx)
 
 	ctx->tokens = p_strdup(_ctx->pool, t_strarray_join(args, " "));
 
-	doveadm_print_init(DOVEADM_PRINT_TYPE_FLOW);
 	doveadm_print_header("token", "token", DOVEADM_PRINT_HEADER_FLAG_HIDE_TITLE);
 }
 
@@ -304,6 +304,7 @@ cmd_fts_tokenize_alloc(void)
 	ctx = doveadm_mail_cmd_alloc(struct fts_tokenize_cmd_context);
 	ctx->ctx.v.run = cmd_fts_tokenize_run;
 	ctx->ctx.v.init = cmd_fts_tokenize_init;
+	doveadm_print_init(DOVEADM_PRINT_TYPE_FLOW);
 	return &ctx->ctx;
 }
 
@@ -476,7 +477,6 @@ void doveadm_fts_plugin_init(struct module *module ATTR_UNUSED)
 
 	for (i = 0; i < N_ELEMENTS(fts_commands); i++)
 		doveadm_cmd_register_ver2(&fts_commands[i]);
-	doveadm_dump_fts_expunge_log_init();
 }
 
 void doveadm_fts_plugin_deinit(void)

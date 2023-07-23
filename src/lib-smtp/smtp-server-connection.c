@@ -50,6 +50,7 @@ smtp_server_connection_update_stats(struct smtp_server_connection *conn)
 		conn->stats.input = conn->conn.input->v_offset;
 	if (conn->conn.output != NULL)
 		conn->stats.output = conn->conn.output->offset;
+	connection_update_counters(&conn->conn);
 }
 
 const struct smtp_server_stats *
@@ -600,6 +601,11 @@ static void smtp_server_connection_input(struct connection *_conn)
 	    conn->callbacks->conn_cmd_input_post != NULL)
 		conn->callbacks->conn_cmd_input_post(conn->context);
 	conn->handling_input = FALSE;
+
+	/* Handle output errors from immediate replies sent to client
+	   (normal replies are exclusively sent in output handler). */
+	if (conn->conn.output != NULL && conn->conn.output->closed)
+               	smtp_server_connection_handle_output_error(conn);
 	smtp_server_connection_unref(&conn);
 }
 

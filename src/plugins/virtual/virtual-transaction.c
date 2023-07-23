@@ -10,7 +10,7 @@ virtual_transaction_get(struct mailbox_transaction_context *trans,
 			struct mailbox *backend_box)
 {
 	struct virtual_transaction_context *vt =
-		(struct virtual_transaction_context *)trans;
+		container_of(trans, struct virtual_transaction_context, t);
 	struct mailbox_transaction_context *const *bt, *new_bt;
 	unsigned int i, count;
 
@@ -30,7 +30,8 @@ virtual_transaction_begin(struct mailbox *box,
 			  enum mailbox_transaction_flags flags,
 			  const char *reason)
 {
-	struct virtual_mailbox *mbox = (struct virtual_mailbox *)box;
+	struct virtual_mailbox *mbox =
+		container_of(box, struct virtual_mailbox, box);
 	struct virtual_transaction_context *vt;
 
 	vt = i_new(struct virtual_transaction_context, 1);
@@ -44,20 +45,25 @@ int virtual_transaction_commit(struct mailbox_transaction_context *t,
 			       struct mail_transaction_commit_changes *changes_r)
 {
 	struct virtual_transaction_context *vt =
-		(struct virtual_transaction_context *)t;
-	struct mailbox_transaction_context **bt;
-	unsigned int i, count;
-	int ret = 0;
+		container_of(t, struct virtual_transaction_context, t);
 
 	if (t->save_ctx != NULL) {
 		virtual_save_free(t->save_ctx);
 		t->save_ctx = NULL;
 	}
 
-	bt = array_get_modifiable(&vt->backend_transactions, &count);
-	for (i = 0; i < count; i++) {
-		if (mailbox_transaction_commit(&bt[i]) < 0)
+	int ret = 0;
+	struct mailbox_transaction_context *bt;
+	array_foreach_elem(&vt->backend_transactions, bt) {
+		struct mailbox *bbox = bt->box;
+		unsigned int changes = bt->changes == NULL ? 0 :
+			array_count(&bt->changes->saved_uids);
+		if (mailbox_transaction_commit(&bt) < 0) {
+			if (bbox->mailbox_deleted && changes == 0)
+				continue;
 			ret = -1;
+			virtual_box_copy_error(vt->t.box, bbox);
+		}
 	}
 	array_free(&vt->backend_transactions);
 
@@ -69,7 +75,7 @@ int virtual_transaction_commit(struct mailbox_transaction_context *t,
 void virtual_transaction_rollback(struct mailbox_transaction_context *t)
 {
 	struct virtual_transaction_context *vt =
-		(struct virtual_transaction_context *)t;
+		container_of(t, struct virtual_transaction_context, t);
 	struct mailbox_transaction_context **bt;
 	unsigned int i, count;
 

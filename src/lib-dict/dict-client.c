@@ -5,6 +5,7 @@
 #include "llist.h"
 #include "str.h"
 #include "strescape.h"
+#include "str-parse.h"
 #include "file-lock.h"
 #include "time-util.h"
 #include "connection.h"
@@ -23,7 +24,7 @@
    that the socket is disconnected immediately after returning to ioloop. */
 #define DICT_CLIENT_DEFAULT_TIMEOUT_MSECS 0
 
-/* Abort dict lookup after this many seconds. */
+/* Abort dict lookup after this many milliseconds. */
 #define DICT_CLIENT_REQUEST_TIMEOUT_MSECS 30000
 /* When dict lookup timeout is reached, wait a bit longer if the last dict
    ioloop wait was shorter than this. */
@@ -74,7 +75,7 @@ struct client_dict {
 
 	char *uri;
 	enum dict_data_type value_type;
-	unsigned warn_slow_msecs;
+	unsigned int slow_warn_msecs;
 
 	time_t last_failed_connect;
 	char *last_connect_error;
@@ -83,7 +84,7 @@ struct client_dict {
 	uint64_t last_timer_switch_usecs;
 	struct timeout *to_requests;
 	struct timeout *to_idle;
-	unsigned int idle_msecs;
+	unsigned int idle_timeout_msecs;
 
 	ARRAY(struct client_dict_cmd *) cmds;
 	struct client_dict_transaction_context *transactions;
@@ -422,10 +423,10 @@ static bool client_dict_have_nonbackground_cmds(struct client_dict *dict)
 static void client_dict_add_timeout(struct client_dict *dict)
 {
 	if (dict->to_idle != NULL) {
-		if (dict->idle_msecs > 0)
+		if (dict->idle_timeout_msecs > 0)
 			timeout_reset(dict->to_idle);
 	} else if (client_dict_is_finished(dict)) {
-		dict->to_idle = timeout_add(dict->idle_msecs,
+		dict->to_idle = timeout_add(dict->idle_timeout_msecs,
 					    client_dict_timeout, dict);
 		timeout_remove(&dict->to_requests);
 	} else if (dict->transactions == NULL &&
@@ -708,30 +709,37 @@ client_dict_init(struct dict *driver, const char *uri,
 	struct ioloop *old_ioloop = current_ioloop;
 	struct client_dict *dict;
 	const char *p, *dest_uri, *value, *path;
-	unsigned int idle_msecs = DICT_CLIENT_DEFAULT_TIMEOUT_MSECS;
-	unsigned int warn_slow_msecs = DICT_CLIENT_DEFAULT_WARN_SLOW_MSECS;
+	const char *error;
+	unsigned int idle_timeout_msecs = DICT_CLIENT_DEFAULT_TIMEOUT_MSECS;
+	unsigned int slow_warn_msecs = DICT_CLIENT_DEFAULT_WARN_SLOW_MSECS;
 
-	/* uri = [idle_msecs=<n>:] [warn_slow_msecs=<n>:] [<path>] ":" <uri> */
+	/* uri = [idle_timeout=<n>:] [slow_warn=<n>:] [<path>] ":" <uri> */
 	for (;;) {
-		if (str_begins(uri, "idle_msecs=", &value)) {
+		if (str_begins(uri, "idle_timeout=", &value)) {
 			p = strchr(value, ':');
 			if (p == NULL) {
 				*error_r = t_strdup_printf("Invalid URI: %s", uri);
 				return -1;
 			}
-			if (str_to_uint(t_strdup_until(value, p), &idle_msecs) < 0) {
-				*error_r = "Invalid idle_msecs";
+			const char *value_str = t_strdup_until(value, p);
+			if (str_parse_get_interval_msecs(value_str, &idle_timeout_msecs,
+							 &error) < 0) {
+				*error_r = t_strdup_printf(
+					"Invalid idle_timeout: %s", error);
 				return -1;
 			}
 			uri = p+1;
-		} else if (str_begins(uri, "warn_slow_msecs=", &value)) {
+		} else if (str_begins(uri, "slow_warn=", &value)) {
 			p = strchr(value, ':');
 			if (p == NULL) {
 				*error_r = t_strdup_printf("Invalid URI: %s", uri);
 				return -1;
 			}
-			if (str_to_uint(t_strdup_until(value, p), &warn_slow_msecs) < 0) {
-				*error_r = "Invalid warn_slow_msecs";
+			const char *value_str = t_strdup_until(value, p);
+			if (str_parse_get_interval_msecs(value_str, &slow_warn_msecs,
+							 &error) < 0) {
+				*error_r = t_strdup_printf(
+					"Invalid slow_warn: %s", error);
 				return -1;
 			}
 			uri = p+1;
@@ -754,8 +762,8 @@ client_dict_init(struct dict *driver, const char *uri,
 	dict->dict = *driver;
 	dict->conn.dict = dict;
 	dict->conn.conn.event_parent = set->event_parent;
-	dict->idle_msecs = idle_msecs;
-	dict->warn_slow_msecs = warn_slow_msecs;
+	dict->idle_timeout_msecs = idle_timeout_msecs;
+	dict->slow_warn_msecs = slow_warn_msecs;
 	i_array_init(&dict->cmds, 32);
 
 	if (uri[0] == ':') {
@@ -943,6 +951,10 @@ client_dict_lookup_async_callback(struct client_dict_cmd *cmd,
 		result.error = t_strdup_printf(
 			"dict-client: Invalid lookup '%s' reply: %c%s",
 			cmd->query, reply, value);
+		/* This is already the command's callback being called.
+		   Make sure it is not called again by
+		   dict_cmd_callback_error() */
+		cmd->callback = NULL;
 		client_dict_disconnect(dict, result.error);
 		result.ret = -1;
 		break;
@@ -954,7 +966,7 @@ client_dict_lookup_async_callback(struct client_dict_cmd *cmd,
 		result.error = t_strdup_printf("%s (reply took %s)",
 			result.error, dict_warnings_sec(cmd, diff, extra_args));
 	} else if (!cmd->background &&
-		   diff >= (int)dict->warn_slow_msecs) {
+		   diff >= (int)dict->slow_warn_msecs) {
 		e_warning(dict->conn.conn.event, "dict lookup took %s: %s",
 			  dict_warnings_sec(cmd, diff, extra_args),
 			  cmd->query);
@@ -1068,7 +1080,7 @@ client_dict_iter_api_callback(struct client_dict_iterate_context *ctx,
 			i_free(ctx->error);
 			ctx->error = new_error;
 		} else if (!cmd->background &&
-			   diff >= (int)dict->warn_slow_msecs) {
+			   diff >= (int)dict->slow_warn_msecs) {
 			e_warning(dict->conn.conn.event, "dict iteration took %s: %s",
 				  dict_warnings_sec(cmd, diff, extra_args),
 				  cmd->query);
@@ -1332,6 +1344,10 @@ client_dict_transaction_commit_callback(struct client_dict_cmd *cmd,
 		result.error = t_strdup_printf(
 			"dict-client: Invalid commit reply: %c%s",
 			reply, value);
+		/* This is already the command's callback being called.
+		   Make sure it is not called again by
+		   dict_cmd_callback_error() */
+		cmd->callback = NULL;
 		client_dict_disconnect(dict, result.error);
 		break;
 	}
@@ -1342,7 +1358,7 @@ client_dict_transaction_commit_callback(struct client_dict_cmd *cmd,
 		result.error = t_strdup_printf("%s (reply took %s)",
 			result.error, dict_warnings_sec(cmd, diff, extra_args));
 	} else if (!cmd->background && !cmd->trans->ctx.set.no_slowness_warning &&
-		   diff >= (int)dict->warn_slow_msecs) {
+		   diff >= (int)dict->slow_warn_msecs) {
 		e_warning(dict->conn.conn.event, "dict commit took %s: "
 			  "%s (%u commands, first: %s)",
 			  dict_warnings_sec(cmd, diff, extra_args),

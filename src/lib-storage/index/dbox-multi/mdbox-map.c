@@ -80,12 +80,25 @@ mdbox_map_init(struct mdbox_storage *storage, struct mailbox_list *root_list)
 	return map;
 }
 
+static void mdbox_map_deinit_cleanup(struct mdbox_map *map)
+{
+	if (map->view == NULL)
+		return;
+
+	const struct mail_index_header *hdr =
+		mail_index_get_header(map->view);
+	if (dbox_mailbox_list_cleanup(map->storage->storage.storage.user,
+				      map->path, hdr->last_temp_file_scan) > 0)
+		index_mailbox_view_update_last_temp_file_scan(map->view);
+}
+
 void mdbox_map_deinit(struct mdbox_map **_map)
 {
 	struct mdbox_map *map = *_map;
 
 	*_map = NULL;
 
+	mdbox_map_deinit_cleanup(map);
 	if (map->view != NULL) {
 		mail_index_view_close(&map->view);
 		mail_index_close(map->index);
@@ -112,28 +125,6 @@ static int mdbox_map_mkdir_storage(struct mdbox_map *map)
 		return -1;
 	}
 	return 0;
-}
-
-static void mdbox_map_cleanup(struct mdbox_map *map)
-{
-	unsigned int interval =
-		MAP_STORAGE(map)->set->mail_temp_scan_interval;
-	struct stat st;
-
-	if (stat(map->path, &st) < 0)
-		return;
-
-	/* check once in a while if there are temp files to clean up */
-	if (interval == 0) {
-		/* disabled */
-	} else if (st.st_atime > st.st_ctime + DBOX_TMP_DELETE_SECS) {
-		/* there haven't been any changes to this directory since we
-		   last checked it. */
-	} else if (st.st_atime < ioloop_time - (time_t)interval) {
-		/* time to scan */
-		(void)unlink_old_files(map->path, DBOX_TEMP_FILE_PREFIX,
-				       ioloop_time - DBOX_TMP_DELETE_SECS);
-	}
 }
 
 static int mdbox_map_open_internal(struct mdbox_map *map, bool create_missing)
@@ -184,7 +175,6 @@ static int mdbox_map_open_internal(struct mdbox_map *map, bool create_missing)
 	}
 
 	map->view = mail_index_view_open(map->index);
-	mdbox_map_cleanup(map);
 
 	if (mail_index_get_header(map->view)->uid_validity == 0) {
 		if (mdbox_map_generate_uid_validity(map) < 0) {
@@ -264,7 +254,8 @@ mdbox_map_get_ext_hdr(struct mdbox_map *map, struct mail_index_view *view,
 
 	mail_index_get_header_ext(view, map->map_ext_id, &data, &data_size);
 	i_zero(hdr_r);
-	memcpy(hdr_r, data, I_MIN(data_size, sizeof(*hdr_r)));
+	if (data_size > 0)
+		memcpy(hdr_r, data, I_MIN(data_size, sizeof(*hdr_r)));
 }
 
 uint32_t mdbox_map_get_rebuild_count(struct mdbox_map *map)

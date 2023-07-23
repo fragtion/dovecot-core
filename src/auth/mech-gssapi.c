@@ -24,11 +24,6 @@
 
 #if defined(BUILTIN_GSSAPI) || defined(PLUGIN_BUILD)
 
-#ifndef HAVE___GSS_USEROK
-#  define USE_KRB5_USEROK
-#  include <krb5.h>
-#endif
-
 #ifdef HAVE_GSSAPI_GSSAPI_H
 #  include <gssapi/gssapi.h>
 #elif defined (HAVE_GSSAPI_H)
@@ -39,8 +34,6 @@
 #  include <gssapi/gssapi_krb5.h>
 #elif defined (HAVE_GSSAPI_KRB5_H)
 #  include <gssapi_krb5.h>
-#else
-#  undef USE_KRB5_USEROK
 #endif
 
 #ifdef HAVE_GSSAPI_GSSAPI_EXT_H
@@ -403,7 +396,6 @@ mech_gssapi_wrap(struct gssapi_auth_request *request, gss_buffer_desc inbuf)
 	return 0;
 }
 
-#ifdef USE_KRB5_USEROK
 static bool
 k5_principal_is_authorized(struct auth_request *request, const char *name)
 {
@@ -480,7 +472,6 @@ mech_gssapi_krb5_userok(struct gssapi_auth_request *request,
 	krb5_free_context(ctx);
 	return authorized;
 }
-#endif
 
 static int
 mech_gssapi_userok(struct gssapi_auth_request *request, const char *login_user)
@@ -488,9 +479,6 @@ mech_gssapi_userok(struct gssapi_auth_request *request, const char *login_user)
 	struct auth_request *auth_request = &request->auth_request;
 	OM_uint32 major_status, minor_status;
 	int equal_authn_authz;
-#ifdef HAVE___GSS_USEROK
-	int login_ok;
-#endif
 
 	/* if authn and authz names equal, don't bother checking further. */
 	major_status = gss_compare_name(&minor_status,
@@ -507,24 +495,6 @@ mech_gssapi_userok(struct gssapi_auth_request *request, const char *login_user)
 	if (equal_authn_authz != 0)
 		return 0;
 
-	/* handle cross-realm authentication */
-#ifdef HAVE___GSS_USEROK
-	/* Solaris */
-	major_status = __gss_userok(&minor_status, request->authn_name,
-				    login_user, &login_ok);
-	if (GSS_ERROR(major_status) != 0) {
-		mech_gssapi_log_error(auth_request, major_status,
-				      GSS_C_GSS_CODE, "__gss_userok failed");
-		return -1;
-	}
-
-	if (login_ok == 0) {
-		e_info(auth_request->mech_event,
-		       "User not authorized to log in as %s", login_user);
-		return -1;
-	}
-	return 0;
-#elif defined(USE_KRB5_USEROK)
 	if (!mech_gssapi_krb5_userok(request, request->authn_name,
 				     login_user, TRUE)) {
 		e_info(auth_request->mech_event,
@@ -533,13 +503,6 @@ mech_gssapi_userok(struct gssapi_auth_request *request, const char *login_user)
 	}
 
 	return 0;
-#else
-	e_info(auth_request->mech_event,
-	       "Cross-realm authentication not supported "
-	       "(authn_name=%s, authz_name=%s)",
-	       request->auth_request.fields.original_username, login_user);
-	return -1;
-#endif
 }
 
 static void
@@ -602,6 +565,7 @@ mech_gssapi_unwrap(struct gssapi_auth_request *request, gss_buffer_desc inbuf)
 	if (outbuf.length < 4) {
 		e_error(auth_request->mech_event,
 			"Invalid response length");
+		(void)gss_release_buffer(&minor_status, &outbuf);
 		return -1;
 	}
 
@@ -612,6 +576,7 @@ mech_gssapi_unwrap(struct gssapi_auth_request *request, gss_buffer_desc inbuf)
 		if (data_has_nuls(name, name_len)) {
 			e_info(auth_request->mech_event,
 			       "authz_name has NULs");
+			(void)gss_release_buffer(&minor_status, &outbuf);
 			return -1;
 		}
 
@@ -621,13 +586,16 @@ mech_gssapi_unwrap(struct gssapi_auth_request *request, gss_buffer_desc inbuf)
 		request->authz_name = duplicate_name(auth_request,
 						     request->authn_name);
 		if (get_display_name(auth_request, request->authz_name,
-				     NULL, &login_user) < 0)
+				     NULL, &login_user) < 0) {
+			(void)gss_release_buffer(&minor_status, &outbuf);
 			return -1;
+		}
 	}
 
 	if (request->authz_name == GSS_C_NO_NAME) {
 		e_info(auth_request->mech_event,
 		       "no authz_name");
+		(void)gss_release_buffer(&minor_status, &outbuf);
 		return -1;
 	}
 
@@ -639,6 +607,7 @@ mech_gssapi_unwrap(struct gssapi_auth_request *request, gss_buffer_desc inbuf)
 	if (!auth_request_set_username(auth_request, login_user, &error)) {
 		e_info(auth_request->mech_event,
 		       "authz_name: %s", error);
+		(void)gss_release_buffer(&minor_status, &outbuf);
 		return -1;
 	}
 
@@ -647,6 +616,7 @@ mech_gssapi_unwrap(struct gssapi_auth_request *request, gss_buffer_desc inbuf)
 	auth_request->passdb_success = TRUE; /* default to success */
 	auth_request_lookup_credentials(&request->auth_request, "",
 					gssapi_credentials_callback);
+	(void)gss_release_buffer(&minor_status, &outbuf);
 	return 0;
 }
 

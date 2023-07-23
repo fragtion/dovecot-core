@@ -91,7 +91,7 @@ static int ssl_protocols_to_min_protocol(const char *ssl_protocols,
 			enable = FALSE;
 			++p;
 		}
-		for (unsigned i = 0; i < N_ELEMENTS(protocol_versions); i++) {
+		for (unsigned int i = 0; i < N_ELEMENTS(protocol_versions); i++) {
 			if (strcmp(p, protocol_versions[i]) == 0) {
 				if (enable) {
 					protos[i] = 1;
@@ -108,8 +108,8 @@ static int ssl_protocols_to_min_protocol(const char *ssl_protocols,
 		found:;
 	}
 
-	unsigned min = N_ELEMENTS(protocol_versions);
-	for (unsigned i = 0; i < N_ELEMENTS(protocol_versions); i++) {
+	unsigned int min = N_ELEMENTS(protocol_versions);
+	for (unsigned int i = 0; i < N_ELEMENTS(protocol_versions); i++) {
 		if (explicit_enable) {
 			if (protos[i] > 0)
 				min = I_MIN(min, i);
@@ -354,6 +354,12 @@ old_settings_handle_root(struct config_parser_context *ctx,
 		value = t_strarray_join((void *)args, " ");
 		config_parser_apply_line(ctx, CONFIG_LINE_TYPE_KEYVALUE, key,
 					 value);
+		return TRUE;
+	}
+	if (strcmp(key, "imap_id_log") == 0) {
+		obsolete(ctx,
+			 "'imap_id_log' has been removed. Use event exporter "
+			 "for the 'imap_id_received' event instead.");
 		return TRUE;
 	}
 
@@ -639,7 +645,7 @@ static bool old_auth_section(struct config_parser_context *ctx,
 	}
 	if (strcmp(key, "socket") == 0 && ctx->old->auth_section == 2) {
 		if (strcmp(value, "connect") == 0) {
-			obsolete(ctx, "socket connect {} is no longer supported, configure external auth server separately");
+			obsolete(ctx, "socket connect {} is no longer supported");
 			return FALSE;
 		}
 		if (strcmp(value, "listen") != 0)

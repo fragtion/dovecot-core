@@ -151,6 +151,18 @@ static inline char *i_strchr_to_next(const char *str, char chr)
 	return tmp == NULL ? NULL : tmp+1;
 }
 
+/* Split only on the first separator encountered.
+   Returns TRUE if the separator was found, FALSE and *value_r = "" otherwise.
+   Normally it's fine (or even useful) to treat "key" and "key=" identically,
+   so return value can just be ignored. */
+bool t_split_key_value(const char *arg, char separator,
+		       const char **key_r, const char **value_r)
+	ATTR_NOWARN_UNUSED_RESULT;
+static inline bool ATTR_NOWARN_UNUSED_RESULT
+t_split_key_value_eq(const char *arg, const char **key_r, const char **value_r) {
+	return t_split_key_value(arg, '=', key_r, value_r);
+}
+
 /* separators is an array of separator characters, not a separator string.
    an empty data string results in an array containing only NULL. */
 char **p_strsplit(pool_t pool, const char *data, const char *separators)

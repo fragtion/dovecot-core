@@ -25,6 +25,8 @@ bool doveadm_print_hide_titles = FALSE;
 struct ostream *doveadm_print_ostream = NULL;
 
 static struct doveadm_print_context *ctx;
+static bool doveadm_print_init_disallowed = FALSE;
+static bool doveadm_print_header_disallowed = FALSE;
 
 bool doveadm_print_is_initialized(void)
 {
@@ -38,6 +40,9 @@ void doveadm_print_header(const char *key, const char *title,
 	struct doveadm_print_header_context *hdr_ctx;
 
 	i_assert(title != NULL);
+
+	if (doveadm_print_header_disallowed)
+		i_panic("doveadm_print_header() is called in wrong place");
 
 	i_zero(&hdr);
 	hdr.key = key;
@@ -163,6 +168,8 @@ void doveadm_print_init(const char *name)
 		/* already forced the type */
 		return;
 	}
+	if (doveadm_print_init_disallowed)
+		i_panic("doveadm_print_init() is called in wrong place");
 
 	pool = pool_alloconly_create("doveadm print", 1024);
 	ctx = p_new(pool, struct doveadm_print_context, 1);
@@ -198,4 +205,17 @@ void doveadm_print_deinit(void)
 		i_free(hdr->sticky_value);
 	pool_unref(&ctx->pool);
 	ctx = NULL;
+
+	doveadm_print_init_disallowed = FALSE;
+	doveadm_print_header_disallowed = FALSE;
+}
+
+void doveadm_print_init_disallow(bool disallow)
+{
+	doveadm_print_init_disallowed = disallow;
+}
+
+void doveadm_print_header_disallow(bool disallow)
+{
+	doveadm_print_header_disallowed = disallow;
 }

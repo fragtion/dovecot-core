@@ -89,14 +89,11 @@ int openssl_iostream_load_key(const struct ssl_iostream_cert *set,
 	struct ssl_iostream_password_context ctx;
 	EVP_PKEY *pkey;
 	BIO *bio;
-	char *key;
 
-	key = t_strdup_noconst(set->key);
-	bio = BIO_new_mem_buf(key, strlen(key));
+	bio = BIO_new_mem_buf(set->key, strlen(set->key));
 	if (bio == NULL) {
 		*error_r = t_strdup_printf("BIO_new_mem_buf() failed: %s",
 					   openssl_iostream_error());
-		safe_memset(key, 0, strlen(key));
 		return -1;
 	}
 
@@ -115,7 +112,6 @@ int openssl_iostream_load_key(const struct ssl_iostream_cert *set,
 	}
 	BIO_free(bio);
 
-	safe_memset(key, 0, strlen(key));
 	*pkey_r = pkey;
 	*error_r = ctx.error;
 	return pkey == NULL ? -1 : 0;
@@ -126,11 +122,9 @@ int openssl_iostream_load_dh(const struct ssl_iostream_settings *set,
 			     EVP_PKEY **pkey_r, const char **error_r)
 {
 	BIO *bio;
-	char *dhvalue;
 	EVP_PKEY *pkey = NULL;
 
-	dhvalue = t_strdup_noconst(set->dh);
-	bio = BIO_new_mem_buf(dhvalue, strlen(dhvalue));
+	bio = BIO_new_mem_buf(set->dh, strlen(set->dh));
 
 	if (bio == NULL) {
 		*error_r = t_strdup_printf("BIO_new_mem_buf() failed: %s",
@@ -218,7 +212,7 @@ static int ssl_ctx_use_certificate_chain(SSL_CTX *ctx, const char *cert)
 	X509 *x;
 	int ret = 0;
 
-	in = BIO_new_mem_buf(t_strdup_noconst(cert), strlen(cert));
+	in = BIO_new_mem_buf(cert, strlen(cert));
 	if (in == NULL)
 		i_fatal("BIO_new_mem_buf() failed");
 
@@ -273,7 +267,7 @@ static int load_ca(X509_STORE *store, const char *ca,
 	BIO *bio;
 	int i;
 
-	bio = BIO_new_mem_buf(t_strdup_noconst(ca), strlen(ca));
+	bio = BIO_new_mem_buf(ca, strlen(ca));
 	if (bio == NULL)
 		i_fatal("BIO_new_mem_buf() failed");
 	inf = PEM_X509_INFO_read_bio(bio, NULL, NULL, NULL);
@@ -462,7 +456,7 @@ static int ssl_clienthello_callback(SSL *ssl, int *al ATTR_UNUSED,
 	int ver = SSL_version(ssl)-1;
 	const unsigned char *ciphers = NULL;
 	size_t nciphers = 0;
-	string_t *ja3 = str_new(ssl_io->ctx->pool, 64);
+	string_t *ja3 = t_str_new(64);
 
 	str_printfa(ja3, "%d,", ver);
 	nciphers = SSL_client_hello_get0_ciphers(ssl, &ciphers);
@@ -500,7 +494,7 @@ static int ssl_clienthello_callback(SSL *ssl, int *al ATTR_UNUSED,
 	    extlen > 0) {
 		bool first = TRUE;
 		unsigned short veclen = be16_to_cpu_unaligned(ext);
-		if (veclen+2 == extlen) {
+		if (veclen+2U == extlen) {
 			for (size_t i = 2; i < extlen; i+=2) {
 				uint16_t group = be16_to_cpu_unaligned(&ext[i]);
 				if (ssl_ja3_is_ext_greased(group))
@@ -518,7 +512,7 @@ static int ssl_clienthello_callback(SSL *ssl, int *al ATTR_UNUSED,
 	/* Process extension 11 - ec point formats */
 	ext = NULL;
 	if (SSL_client_hello_get0_ext(ssl, 11, &ext, &extlen) == 1 &&
-	    extlen > 0 && extlen == ext[0]+1) {
+	    extlen > 0 && extlen == ext[0]+1U) {
 		for (size_t i = 1; i < extlen; i++) {
 			if (i > 1)
 				str_append_c(ja3, '-');
@@ -527,7 +521,8 @@ static int ssl_clienthello_callback(SSL *ssl, int *al ATTR_UNUSED,
 	}
 
 	/* Store ja3 string */
-	ssl_io->ja3_str = str_c(ja3);
+	i_free(ssl_io->ja3_str);
+	ssl_io->ja3_str = i_strdup(str_c(ja3));
 
 	return SSL_CLIENT_HELLO_SUCCESS;
 }

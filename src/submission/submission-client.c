@@ -178,7 +178,6 @@ static void client_init_urlauth(struct client *client)
 struct client *
 client_create(int fd_in, int fd_out, struct event *event,
 	      struct mail_user *user,
-	      struct mail_storage_service_user *service_user,
 	      const struct submission_settings *set, const char *helo,
 	      const struct smtp_proxy_data *proxy_data,
 	      const unsigned char *pdata, unsigned int pdata_len,
@@ -188,6 +187,7 @@ client_create(int fd_in, int fd_out, struct event *event,
 		set->parsed_workarounds;
 	const struct mail_storage_settings *mail_set;
 	struct smtp_server_settings smtp_set;
+	struct smtp_server_connection *conn;
 	struct client *client;
 	pool_t pool;
 
@@ -202,7 +202,6 @@ client_create(int fd_in, int fd_out, struct event *event,
 	client->event = event;
 	event_ref(client->event);
 	client->user = user;
-	client->service_user = service_user;
 	client->set = set;
 
 	i_array_init(&client->pending_backends, 4);
@@ -233,11 +232,11 @@ client_create(int fd_in, int fd_out, struct event *event,
 
 	p_array_init(&client->module_contexts, client->pool, 5);
 
-	client->conn = smtp_server_connection_create(smtp_server,
+	conn = client->conn = smtp_server_connection_create(smtp_server,
 		fd_in, fd_out, user->conn.remote_ip, user->conn.remote_port,
 		FALSE, &smtp_set, &smtp_callbacks, client);
-	smtp_server_connection_set_proxy_data(client->conn, proxy_data);
-	smtp_server_connection_login(client->conn, client->user->username, helo,
+	smtp_server_connection_set_proxy_data(conn, proxy_data);
+	smtp_server_connection_login(conn, client->user->username, helo,
 				     pdata, pdata_len,
 				     user->conn.end_client_tls_secured);
 
@@ -263,16 +262,17 @@ client_create(int fd_in, int fd_out, struct event *event,
 	if (hook_client_created != NULL)
 		hook_client_created(&client);
 
-	if (user->anonymous && !client->anonymous_allowed) {
+	if (user->anonymous) {
 		smtp_server_connection_abort(
-			&client->conn, 534, "5.7.9",
+			&conn, 534, "5.7.9",
 			"Anonymous login is not allowed for submission");
+		client = NULL;
 	} else if (client->backend_capabilities_configured) {
 		client_apply_backend_capabilities(client);
-		smtp_server_connection_start(client->conn);
+		smtp_server_connection_start(conn);
 	} else {
 		submission_backend_start(client->backend_default);
-		smtp_server_connection_start_pending(client->conn);
+		smtp_server_connection_start_pending(conn);
 	}
 
 	submission_refresh_proctitle();
@@ -328,7 +328,6 @@ client_default_destroy(struct client *client)
 		imap_urlauth_deinit(&client->urlauth_ctx);
 
 	mail_user_deinit(&client->user);
-	mail_storage_service_user_unref(&client->service_user);
 
 	client_state_reset(client);
 
@@ -422,6 +421,10 @@ static const char *client_stats(struct client *client)
 			"Failed to expand submission_logout_format=%s: %s",
 			client->set->submission_logout_format, error);
 	}
+
+	event_add_int(client->event, "net_in_bytes", stats->input);
+	event_add_int(client->event, "net_out_bytes", stats->output);
+
 	return str_c(str);
 }
 
@@ -504,7 +507,7 @@ void client_add_extra_capability(struct client *client, const char *capability,
 
 void client_kick(struct client *client)
 {
-	mail_storage_service_io_activate_user(client->service_user);
+	mail_storage_service_io_activate_user(client->user->service_user);
 	client_destroy(&client, "4.3.2", MASTER_SERVICE_SHUTTING_DOWN_MSG);
 }
 

@@ -15,6 +15,7 @@
 #include "mail-storage-service.h"
 #include "mail-search-build.h"
 #include "master-connection.h"
+#include "indexer.h"
 
 #include <unistd.h>
 
@@ -77,8 +78,6 @@ index_mailbox_precache(struct master_connection *conn, struct mailbox *box)
 	struct mail *mail;
 	struct mailbox_metadata metadata;
 	uint32_t seq, first_uid = 0, last_uid = 0;
-	char percentage_str[2+1+1];
-	unsigned int counter = 0, max, percentage, percentage_sent = 0;
 	int ret = 0;
 	struct event *index_event = event_create(box->event);
 	event_add_category(index_event, &event_category_indexer_worker);
@@ -110,7 +109,12 @@ index_mailbox_precache(struct master_connection *conn, struct mailbox *box)
 				  metadata.precache_fields, NULL);
 	mail_search_args_unref(&search_args);
 
-	max = status.messages + 1 - seq;
+	/* otherwise the client doesn't receive the updates timely */
+	o_stream_uncork(conn->conn.output);
+
+	unsigned int counter = 0;
+	unsigned int percentage_sent = 0;
+	unsigned int goal = status.messages + 1 - seq;
 	while (mailbox_search_next(ctx, &mail)) {
 		if (first_uid == 0)
 			first_uid = mail->uid;
@@ -120,24 +124,22 @@ index_mailbox_precache(struct master_connection *conn, struct mailbox *box)
 		if (mail_precache(mail) < 0) {
 			e_error(index_event, "Precache for UID=%u failed: %s%s",
 				mail->uid,
-				mailbox_get_last_internal_error(box, NULL),
+				mail_get_last_internal_error(mail, NULL),
 				get_attempt_error(counter, first_uid, last_uid));
 			ret = -1;
 			break;
 		}
-		if (++counter % 100 == 0) {
-			percentage = counter*100 / max;
-			if (percentage != percentage_sent && percentage < 100) {
-				percentage_sent = percentage;
-				if (i_snprintf(percentage_str,
-					       sizeof(percentage_str), "%u\n",
-					       percentage) < 0)
-					i_unreached();
-				o_stream_nsend_str(conn->conn.output,
-						   percentage_str);
-			}
+		unsigned int percentage = (++counter * 100) / goal;
+		if (percentage_sent < percentage) {
+			percentage_sent = percentage;
+			if (percentage < 100) T_BEGIN {
+				const char *update = t_strdup_printf(
+					"%d\t%u\t%u\n", INDEXER_STATE_PROCESSING,
+					counter, goal);
+				o_stream_nsend_str(conn->conn.output, update);
+			} T_END;
 			indexer_worker_refresh_proctitle(username, box_vname,
-							 counter, max);
+							 counter, goal);
 		}
 	}
 	if (mailbox_search_deinit(&ctx) < 0) {
@@ -257,13 +259,11 @@ master_connection_cmd_index(struct master_connection *conn,
 			    unsigned int max_recent_msgs, const char *what)
 {
 	struct mail_storage_service_input input;
-	struct mail_storage_service_user *service_user;
 	struct mail_user *user;
 	const char *error;
 	int ret;
 
 	i_zero(&input);
-	input.module = "mail";
 	input.service = "indexer-worker";
 	input.username = username;
 	/* if session-id is given, use it as a prefix to a unique session ID.
@@ -274,7 +274,7 @@ master_connection_cmd_index(struct master_connection *conn,
 		input.session_id_prefix = session_id;
 
 	if (mail_storage_service_lookup_next(conn->storage_service, &input,
-					     &service_user, &user, &error) <= 0) {
+					     &user, &error) <= 0) {
 		e_error(conn->conn.event, "User %s lookup failed: %s",
 			username, error);
 		return -1;
@@ -303,7 +303,6 @@ master_connection_cmd_index(struct master_connection *conn,
 	}
 
 	mail_user_deinit(&user);
-	mail_storage_service_user_unref(&service_user);
 	indexer_worker_refresh_proctitle(NULL, NULL, 0, 0);
 	return ret;
 }
@@ -313,7 +312,6 @@ master_connection_input_args(struct connection *_conn, const char *const *args)
 {
 	struct master_connection *conn =
 		container_of(_conn, struct master_connection, conn);
-	const char *str;
 	unsigned int max_recent_msgs;
 	int ret;
 
@@ -332,7 +330,8 @@ master_connection_input_args(struct connection *_conn, const char *const *args)
 	ret = master_connection_cmd_index(conn, username, mailbox, session_id,
 					  max_recent_msgs, what);
 
-	str = ret < 0 ? "-1\n" : "100\n";
+	const char *str = t_strdup_printf("%d\n",
+		ret < 0 ? INDEXER_STATE_FAILED: INDEXER_STATE_COMPLETED);
 	o_stream_nsend_str(conn->conn.output, str);
 	return ret;
 }

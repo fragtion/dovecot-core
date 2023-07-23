@@ -3,7 +3,12 @@
 /* @UNSAFE: whole file */
 
 #include "lib.h"
+#include "safe-memset.h"
 #include "buffer.h"
+
+/* Disable our memcpy() safety wrapper. This file is very performance sensitive
+   and it's been checked to work correctly with memcpy(). */
+#undef memcpy
 
 struct real_buffer {
 	union {
@@ -252,7 +257,7 @@ void buffer_insert(buffer_t *_buf, size_t pos,
 
 	if (pos >= buf->used)
 		buffer_write(_buf, pos, data, data_size);
-	else {
+	else if (data_size > 0) {
 		buffer_copy(_buf, pos + data_size, _buf, pos, SIZE_MAX);
 		memcpy(buf->w_buffer + pos, data, data_size);
 	}
@@ -411,6 +416,14 @@ void buffer_set_used_size(buffer_t *_buf, size_t used_size)
 		buf->dirty = buf->used;
 
 	buf->used = used_size;
+}
+
+void buffer_clear_safe(buffer_t *_buf)
+{
+	struct real_buffer *buf = container_of(_buf, struct real_buffer, buf);
+
+	safe_memset(buf->w_buffer, 0, I_MAX(buf->used, buf->dirty));
+	buffer_clear(_buf);
 }
 
 size_t buffer_get_size(const buffer_t *_buf)

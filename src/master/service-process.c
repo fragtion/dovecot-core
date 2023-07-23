@@ -218,6 +218,17 @@ service_dup_fds(struct service *service)
 		i_set_failure_internal();
 	}
 
+	if (service->type == SERVICE_TYPE_LOG) {
+		/* Pass our config fd to the log process, so it won't depend
+		   on config process. Note that we don't want to do this for
+		   other processes, since it prevents config reload. */
+		i_assert(global_config_fd != -1);
+		if (lseek(global_config_fd, 0, SEEK_SET) < 0)
+			i_fatal("lseek(config fd, 0) failed: %m");
+		dup2_append(&dups, global_config_fd, MASTER_CONFIG_FD);
+		env_put(DOVECOT_CONFIG_FD_ENV, dec2str(MASTER_CONFIG_FD));
+	}
+
 	/* Switch log writing back to stderr before the log fds are closed.
 	   There's no guarantee that writing to stderr is visible anywhere, but
 	   it's better than the process just dying with FATAL_LOGWRITE. */
@@ -270,25 +281,9 @@ drop_privileges(struct service *service)
 
 static void service_process_setup_config_environment(struct service *service)
 {
-	const struct master_service_settings *set = service->list->service_set;
-
 	switch (service->type) {
 	case SERVICE_TYPE_CONFIG:
 		env_put(MASTER_CONFIG_FILE_ENV, service->config_file_path);
-		break;
-	case SERVICE_TYPE_LOG:
-		/* give the log's configuration directly, so it won't depend
-		   on config process */
-		env_put("DOVECONF_ENV", "1");
-		env_put("LOG_PATH", set->log_path);
-		env_put("INFO_LOG_PATH", set->info_log_path);
-		env_put("DEBUG_LOG_PATH", set->debug_log_path);
-		env_put("LOG_TIMESTAMP", set->log_timestamp);
-		env_put("SYSLOG_FACILITY", set->syslog_facility);
-		env_put("INSTANCE_NAME", set->instance_name);
-		if (set->verbose_proctitle)
-			env_put("VERBOSE_PROCTITLE", "1");
-		env_put("SSL", "no");
 		break;
 	default:
 		env_put(MASTER_CONFIG_FILE_ENV,
@@ -321,6 +316,8 @@ service_process_setup_environment(struct service *service, unsigned int uid,
 	env_put(MY_HOSTNAME_ENV, my_hostname);
 	env_put(MY_HOSTDOMAIN_ENV, hostdomain);
 
+	if (service_set->verbose_proctitle)
+		env_put(MASTER_VERBOSE_PROCTITLE_ENV, "1");
 	if (!service->set->master_set->version_ignore)
 		env_put(MASTER_DOVECOT_VERSION_ENV, PACKAGE_VERSION);
 
@@ -432,10 +429,13 @@ struct service_process *service_process_create(struct service *service)
 	}
 
 	process->available_count = service->client_limit;
+	process->idle_start = ioloop_time;
 	service->process_count_total++;
 	service->process_count++;
 	service->process_avail++;
-	DLLIST_PREPEND(&service->processes, process);
+	service->process_idling++;
+	DLLIST2_APPEND(&service->idle_processes_head,
+		       &service->idle_processes_tail, process);
 
 	service_list_ref(service->list);
 	hash_table_insert(service_pids, POINTER_CAST(process->pid), process);
@@ -463,16 +463,29 @@ void service_process_destroy(struct service_process *process)
 		}
 	}
 
-	DLLIST_REMOVE(&service->processes, process);
+	if (process->idle_start == 0)
+		DLLIST_REMOVE(&service->busy_processes, process);
+	else {
+		DLLIST2_REMOVE(&service->idle_processes_head,
+			       &service->idle_processes_tail, process);
+		i_assert(service->process_idling > 0);
+		service->process_idling--;
+		service->process_idling_lowwater_since_kills =
+			I_MIN(service->process_idling_lowwater_since_kills,
+			      service->process_idling);
+	}
 	hash_table_remove(service_pids, POINTER_CAST(process->pid));
 
-	if (process->available_count > 0)
+	if (process->available_count > 0) {
+		i_assert(service->process_avail > 0);
 		service->process_avail--;
+	}
+	i_assert(service->process_count > 0);
 	service->process_count--;
 	i_assert(service->process_avail <= service->process_count);
 
 	timeout_remove(&process->to_status);
-	timeout_remove(&process->to_idle);
+	timeout_remove(&process->to_idle_kill);
 	if (service->list->log_byes != NULL)
 		service_process_notify_add(service->list->log_byes, process);
 

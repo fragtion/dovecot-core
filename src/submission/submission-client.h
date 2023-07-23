@@ -19,8 +19,6 @@ struct client_state {
 	struct submission_backend *backend;
 	struct istream *data_input;
 	uoff_t data_size;
-
-	bool anonymous_allowed:1;
 };
 
 struct client_extra_capability {
@@ -94,7 +92,6 @@ struct client {
 	ARRAY(struct submission_recipient *) rcpt_to;
 	ARRAY(struct submission_backend *) rcpt_backends;
 
-	struct mail_storage_service_user *service_user;
 	struct mail_user *user;
 
 	/* IMAP URLAUTH context (RFC4467) for BURL (RFC4468) */
@@ -119,7 +116,6 @@ struct client {
 	bool destroyed:1;
 	bool anvil_sent:1;
 	bool backend_capabilities_configured:1;
-	bool anonymous_allowed:1;
 };
 
 struct submission_module_register {
@@ -138,7 +134,6 @@ extern unsigned int submission_client_count;
 struct client *
 client_create(int fd_in, int fd_out, struct event *event,
 	      struct mail_user *user,
-	      struct mail_storage_service_user *service_user,
 	      const struct submission_settings *set, const char *helo,
 	      const struct smtp_proxy_data *proxy_data,
 	      const unsigned char *pdata, unsigned int pdata_len,

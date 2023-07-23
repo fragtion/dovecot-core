@@ -29,6 +29,7 @@ enum connection_disconnect_reason {
 };
 
 struct connection_vfuncs {
+	void (*init)(struct connection *conn);
 	void (*destroy)(struct connection *conn);
 	/* For UNIX socket clients this gets called immediately (unless
 	   delayed_unix_client_connected_callback=TRUE) with success=TRUE,
@@ -228,6 +229,9 @@ void connection_update_event(struct connection *conn);
 
 /* Update connection properties and labels */
 void connection_update_properties(struct connection *conn);
+
+/* Update byte counters in event */
+void connection_update_counters(struct connection *conn);
 
 /* This needs to be called if the input/output streams are changed */
 void connection_streams_changed(struct connection *conn);

@@ -424,7 +424,8 @@ test_client_connection_refused(const struct http_client_settings *client_set)
 	struct _connection_refused *ctx;
 
 	/* wait for the server side to close the socket */
-	test_subprocess_notify_signal_wait(SIGUSR1, 10000);
+	test_subprocess_notify_signal_wait(
+		SIGUSR1, TEST_SIGNALS_DEFAULT_TIMEOUT_MS);
 
 	ctx = i_new(struct _connection_refused, 1);
 	ctx->count = 2;
@@ -3808,6 +3809,7 @@ static int test_run_dns(test_dns_init_t dns_test)
 	if (debug)
 		i_debug("PID=%s", my_pid);
 
+	test_subprocess_notify_signal_send_parent(SIGHUP);
 	ioloop = io_loop_create();
 	dns_test();
 	io_loop_destroy(&ioloop);
@@ -3847,7 +3849,6 @@ test_run_client_server(const struct http_client_settings *client_set,
 {
 	unsigned int i;
 
-	test_subprocess_notify_signal_reset(SIGHUP);
 	test_server_init = NULL;
 	test_server_deinit = NULL;
 	test_server_input = NULL;
@@ -3868,10 +3869,11 @@ test_run_client_server(const struct http_client_settings *client_set,
 
 			/* Fork server */
 			fd_listen = fds[i];
-			test_subprocess_fork(test_run_server, &data, FALSE);
-			i_close_fd(&fd_listen);
-			test_subprocess_notify_signal_wait(SIGHUP, 10000);
 			test_subprocess_notify_signal_reset(SIGHUP);
+			test_subprocess_fork(test_run_server, &data, FALSE);
+			test_subprocess_notify_signal_wait(
+				SIGHUP, TEST_SIGNALS_DEFAULT_TIMEOUT_MS);
+			i_close_fd(&fd_listen);
 		}
 	}
 
@@ -3886,7 +3888,10 @@ test_run_client_server(const struct http_client_settings *client_set,
 
 		/* Fork DNS service */
 		fd_listen = fd;
+		test_subprocess_notify_signal_reset(SIGHUP);
 		test_subprocess_fork(test_run_dns, dns_test, FALSE);
+		test_subprocess_notify_signal_wait(
+			SIGHUP, TEST_SIGNALS_DEFAULT_TIMEOUT_MS);
 		i_close_fd(&fd_listen);
 	}
 

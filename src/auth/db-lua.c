@@ -8,6 +8,7 @@
 #include "array.h"
 #include "sha1.h"
 #include "hex-binary.h"
+#include "strescape.h"
 #include "auth.h"
 #include "passdb.h"
 #include "userdb.h"
@@ -17,7 +18,9 @@
 #include "password-scheme.h"
 #include "auth-request-var-expand.h"
 
+#define AUTH_LUA_PASSDB_INIT "auth_passdb_init"
 #define AUTH_LUA_PASSDB_LOOKUP "auth_passdb_lookup"
+#define AUTH_LUA_USERDB_INIT "auth_userdb_init"
 #define AUTH_LUA_USERDB_LOOKUP "auth_userdb_lookup"
 #define AUTH_LUA_USERDB_ITERATE "auth_userdb_iterate"
 
@@ -190,6 +193,10 @@ static int auth_request_lua_password_verify(lua_State *L)
 	const unsigned char *raw_password = NULL;
 	size_t raw_password_size;
 	int ret;
+	if (crypted_password == NULL)
+		return luaL_error(L, "Crypted password must not be nil");
+	if (plain_password == NULL)
+		return luaL_error(L, "Plain password must not be nil");
 	struct password_generate_params gen_params = {
 		.user = request->fields.original_username,
 		.rounds = 0
@@ -392,14 +399,6 @@ static void auth_lua_dovecot_auth_register(lua_State *L)
 	lua_pop(L, 1);
 }
 
-int auth_lua_script_init(struct dlua_script *script, const char **error_r)
-{
-	dlua_dovecot_register(script);
-	auth_lua_dovecot_auth_register(script->L);
-	auth_lua_auth_request_register(script->L);
-	return dlua_script_init(script, error_r);
-}
-
 static int auth_lua_call_lookup(lua_State *L, const char *fn,
 				struct auth_request *req, const char **error_r)
 {
@@ -417,9 +416,9 @@ static int auth_lua_call_lookup(lua_State *L, const char *fn,
 					   "(expected number got %s)",
 					   fn, luaL_typename(L, -2));
 		err = -1;
-	} else if (!lua_isstring(L, -1) && !lua_istable(L, -1)) {
+	} else if (!lua_isstring(L, -1) && !lua_istable(L, -1) && !lua_isnil(L, -1)) {
 		*error_r = t_strdup_printf("db-lua: %s(req) invalid return value "
-					   "(expected string or table, got %s)",
+					   "(expected nil, string or table, got %s)",
 					   fn, luaL_typename(L, -1));
 		err = -1;
 	}
@@ -431,6 +430,49 @@ static int auth_lua_call_lookup(lua_State *L, const char *fn,
 		return PASSDB_RESULT_INTERNAL_FAILURE;
 	}
 
+	return 0;
+}
+
+int auth_lua_script_init(const struct auth_lua_script_parameters *params,
+			 const char **error_r)
+{
+	struct dlua_script *script = params->script;
+	dlua_dovecot_register(script);
+	auth_lua_dovecot_auth_register(script->L);
+	auth_lua_auth_request_register(script->L);
+	if (dlua_script_init(script, error_r) < 0)
+		return -1;
+	const char *fn;
+	switch (params->stype) {
+	case AUTH_LUA_SCRIPT_TYPE_PASSDB:
+		fn = AUTH_LUA_PASSDB_INIT;
+		break;
+	case AUTH_LUA_SCRIPT_TYPE_USERDB:
+		fn = AUTH_LUA_USERDB_INIT;
+		break;
+	default:
+		i_unreached();
+	}
+	if (!dlua_script_has_function(script, fn))
+		return 0;
+	i_assert(params->arguments == NULL ||
+		 (str_array_length(params->arguments) % 2 == 0));
+	if (params->arguments != NULL) {
+		/* prepare a table for arguments */
+		lua_createtable(script->L, 0, str_array_length(params->arguments) / 2);
+		for (const char *const *p = params->arguments; *p != NULL; p += 2) {
+			lua_pushstring(script->L, p[1]);
+			lua_setfield(script->L, -2, p[0]);
+		}
+	} else {
+		lua_newtable(script->L);
+	}
+
+	/* call the function */
+	if (dlua_pcall(script->L, fn, 1, 0, error_r) < 0)
+		return -1;
+
+	i_assert(lua_gettop(script->L) == 0);
 	return 0;
 }
 
@@ -470,6 +512,19 @@ static void auth_lua_export_table(lua_State *L, struct auth_request *req,
 	lua_pushnil(L);
 	while (lua_next(L, -2) != 0) {
 		const char *key = t_strdup(lua_tostring(L, -2));
+		if (*key == '\0') {
+			e_warning(authdb_event(req),
+				  "db-lua: Field key cannot be empty - ignoring");
+			lua_pop(L, 1);
+			continue;
+		}
+		if (strpbrk(key, "\t\n\r") != NULL) {
+			e_warning(authdb_event(req),
+				  "db-lua: Field key cannot contain <CR>, <LF> or <TAB> - ignoring");
+			lua_pop(L, 1);
+			continue;
+		}
+
 		const char *value;
 		int type = lua_type(L, -1);
 		switch(type) {
@@ -489,10 +544,12 @@ static void auth_lua_export_table(lua_State *L, struct auth_request *req,
 			e_warning(authdb_event(req),
 				  "db-lua: '%s' has invalid value type %s - ignoring",
 				  key, lua_typename(L, -1));
-			value = "";
+			value = NULL;
 		}
 
-		if (password_r != NULL && strcmp(key, "password") == 0) {
+		if (value == NULL) {
+			/* do not add */
+		} else if (password_r != NULL && strcmp(key, "password") == 0) {
 			*scheme_r = password_get_scheme(&value);
 			*password_r = value;
 		} else if (req->userdb_lookup) {
@@ -567,7 +624,7 @@ auth_lua_call_lookup_finish(lua_State *L, struct auth_request *req,
 
 	if (ret != PASSDB_RESULT_OK && ret != PASSDB_RESULT_NEXT) {
 		*error_r = str;
-	} else {
+	} else if (str != NULL) {
 		auth_lua_export_fields(req, str, scheme_r, password_r);
 	}
 
@@ -599,9 +656,9 @@ auth_lua_call_password_verify(struct dlua_script *script,
 					   AUTH_LUA_PASSWORD_VERIFY,
 					   luaL_typename(L, -2));
 		err = -1;
-	} else if (!lua_isstring(L, -1) && !lua_istable(L, -1)) {
+	} else if (!lua_isstring(L, -1) && !lua_istable(L, -1) && !lua_isnil(L, -1)) {
 		*error_r = t_strdup_printf("db-lua: %s invalid return value "
-					   "(expected string or table, got %s)",
+					   "(expected nil, string or table, got %s)",
 					   AUTH_LUA_PASSWORD_VERIFY,
 					   luaL_typename(L, -1));
 		err = -1;
@@ -662,7 +719,8 @@ auth_lua_call_userdb_lookup(struct dlua_script *script,
 		*error_r = str;
 		return ret;
 	}
-	auth_lua_export_fields(req, str, NULL, NULL);
+	if (str != NULL)
+		auth_lua_export_fields(req, str, NULL, NULL);
 
 	return USERDB_RESULT_OK;
 }

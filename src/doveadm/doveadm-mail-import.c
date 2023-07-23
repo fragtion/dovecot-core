@@ -161,13 +161,11 @@ cmd_import_box(struct import_cmd_context *ctx, struct mail_user *dest_user,
 static void cmd_import_init_source_user(struct import_cmd_context *ctx, struct mail_user *dest_user)
 {
 	struct mail_storage_service_input input;
-	struct mail_storage_service_user *service_user;
 	struct mail_user *user;
 	const char *error;
 
 	/* create a user for accessing the source storage */
 	i_zero(&input);
-	input.module = "mail";
 	input.username = ctx->src_username != NULL ?
 			 ctx->src_username :
 			 dest_user->username;
@@ -176,14 +174,13 @@ static void cmd_import_init_source_user(struct import_cmd_context *ctx, struct m
 	input.flags_override_add = MAIL_STORAGE_SERVICE_FLAG_NO_NAMESPACES |
 		MAIL_STORAGE_SERVICE_FLAG_NO_RESTRICT_ACCESS;
 	if (mail_storage_service_lookup_next(ctx->ctx.storage_service, &input,
-					     &service_user, &user, &error) < 0)
+					     &user, &error) < 0)
 		i_fatal("Import user initialization failed: %s", error);
 	if (mail_namespaces_init_location(user, ctx->src_location, &error) < 0)
 		i_fatal("Import namespace initialization failed: %s", error);
 
 	ctx->src_user = user;
-	mail_storage_service_io_deactivate_user(service_user);
-	mail_storage_service_user_unref(&service_user);
+	mail_storage_service_io_deactivate_user(user->service_user);
 	mail_storage_service_io_activate_user(ctx->ctx.cur_service_user);
 }
 

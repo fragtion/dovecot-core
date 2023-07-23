@@ -12,6 +12,7 @@
 #include "safe-mkstemp.h"
 #include "str.h"
 #include "strescape.h"
+#include "strfuncs.h"
 #include "var-expand.h"
 #include "settings-parser.h"
 #include "iostream-ssl.h"
@@ -40,28 +41,43 @@ static void mail_user_deinit_base(struct mail_user *user)
 		dict_deinit(&user->_attr_dict);
 	}
 	mail_namespaces_deinit(&user->namespaces);
-	if (user->_service_user != NULL)
-		mail_storage_service_user_unref(&user->_service_user);
+	mail_storage_service_user_unref(&user->service_user);
 }
 
 static void mail_user_deinit_pre_base(struct mail_user *user ATTR_UNUSED)
 {
 }
 
+void mail_user_add_event_fields(struct mail_user *user)
+{
+	if (user->userdb_fields == NULL)
+		return;
+	for (unsigned int i = 0; user->userdb_fields[i] != NULL; i++) {
+		const char *field = user->userdb_fields[i];
+		const char *key, *value;
+		t_split_key_value_eq(field, &key, &value);
+		if (str_begins(key, "event_", &key))
+			event_add_str(user->event, key, value);
+	}
+}
+
 static struct mail_user *
-mail_user_alloc_int(struct event *parent_event,
-		    const char *username,
+mail_user_alloc_int(struct mail_storage_service_user *service_user,
 		    struct setting_parser_context *unexpanded_set_parser,
 		    pool_t pool)
 {
 	struct mail_user *user;
-
-	i_assert(username != NULL);
+	struct event *parent_event =
+		mail_storage_service_user_get_event(service_user);
+	const char *username =
+		mail_storage_service_user_get_username(service_user);
 	i_assert(*username != '\0');
 
 	user = p_new(pool, struct mail_user, 1);
 	user->pool = pool;
 	user->refcount = 1;
+	user->service_user = service_user;
+	mail_storage_service_user_ref(service_user);
 	user->username = p_strdup(pool, username);
 	user->unexpanded_set_parser = unexpanded_set_parser;
 	settings_parser_ref(user->unexpanded_set_parser);
@@ -85,19 +101,16 @@ mail_user_alloc_int(struct event *parent_event,
 }
 
 struct mail_user *
-mail_user_alloc_nodup_set(struct event *parent_event,
-			  const char *username,
+mail_user_alloc_nodup_set(struct mail_storage_service_user *service_user,
 			  struct setting_parser_context *unexpanded_set_parser)
 {
 	pool_t pool;
 
 	pool = pool_alloconly_create(MEMPOOL_GROWING"mail user", 16*1024);
-	return mail_user_alloc_int(parent_event, username,
-				   unexpanded_set_parser, pool);
+	return mail_user_alloc_int(service_user, unexpanded_set_parser, pool);
 }
 
-struct mail_user *mail_user_alloc(struct event *parent_event,
-				  const char *username,
+struct mail_user *mail_user_alloc(struct mail_storage_service_user *service_user,
 				  struct setting_parser_context *unexpanded_set_parser)
 {
 	pool_t pool;
@@ -106,7 +119,7 @@ struct mail_user *mail_user_alloc(struct event *parent_event,
 	struct setting_parser_context *set_parser =
 		settings_parser_dup(unexpanded_set_parser, pool);
 	struct mail_user *user =
-		mail_user_alloc_int(parent_event, username, set_parser, pool);
+		mail_user_alloc_int(service_user, set_parser, pool);
 	settings_parser_unref(&set_parser);
 	return user;
 }
@@ -165,9 +178,7 @@ int mail_user_init(struct mail_user *user, const char **error_r)
 	i_assert(!user->initialized);
 
 	struct mail_storage_service_ctx *service_ctx =
-		user->_service_user != NULL ?
-		mail_storage_service_user_get_service_ctx(user->_service_user) :
-		mail_storage_service_get_global();
+		mail_storage_service_user_get_service_ctx(user->service_user);
 	const struct setting_parser_info *const *set_roots =
 		mail_storage_service_get_set_roots(service_ctx);
 	for (unsigned int i = 0; set_roots[i] != NULL; i++) {
@@ -217,33 +228,6 @@ void mail_user_ref(struct mail_user *user)
 	user->refcount++;
 }
 
-void mail_user_unref(struct mail_user **_user)
-{
-	struct mail_user *user = *_user;
-
-	i_assert(user->refcount > 0);
-
-	*_user = NULL;
-	if (user->refcount > 1) {
-		user->refcount--;
-		return;
-	}
-
-	user->deinitializing = TRUE;
-
-	/* call deinit() and deinit_pre() with refcount=1, otherwise we may
-	   assert-crash in mail_user_ref() that is called by some handlers. */
-	T_BEGIN {
-		user->v.deinit_pre(user);
-		user->v.deinit(user);
-	} T_END;
-	settings_parser_unref(&user->set_parser);
-	settings_parser_unref(&user->unexpanded_set_parser);
-	event_unref(&user->event);
-	i_assert(user->refcount == 1);
-	pool_unref(&user->pool);
-}
-
 static void mail_user_session_finished(struct mail_user *user)
 {
 	struct event *ev = user->event;
@@ -268,9 +252,37 @@ static void mail_user_session_finished(struct mail_user *user)
 	e_debug(e->event(), "User session is finished");
 }
 
+void mail_user_unref(struct mail_user **_user)
+{
+	struct mail_user *user = *_user;
+
+	i_assert(user->refcount > 0);
+
+	*_user = NULL;
+	if (user->refcount > 1) {
+		user->refcount--;
+		return;
+	}
+
+	user->deinitializing = TRUE;
+	if (user->creator == NULL)
+		mail_user_session_finished(user);
+
+	/* call deinit() and deinit_pre() with refcount=1, otherwise we may
+	   assert-crash in mail_user_ref() that is called by some handlers. */
+	T_BEGIN {
+		user->v.deinit_pre(user);
+		user->v.deinit(user);
+	} T_END;
+	settings_parser_unref(&user->set_parser);
+	settings_parser_unref(&user->unexpanded_set_parser);
+	event_unref(&user->event);
+	i_assert(user->refcount == 1);
+	pool_unref(&user->pool);
+}
+
 void mail_user_deinit(struct mail_user **user)
 {
-	mail_user_session_finished(*user);
 	i_assert((*user)->refcount == 1);
 	mail_user_unref(user);
 }
@@ -694,14 +706,9 @@ const char *const *mail_user_get_alt_usernames(struct mail_user *user)
 	ARRAY_TYPE(const_string) alt_usernames;
 	t_array_init(&alt_usernames, 4);
 	for (unsigned int i = 0; user->userdb_fields[i] != NULL; i++) {
-		const char *field = user->userdb_fields[i];
-		if (strncmp(field, "user_", 5) != 0)
-			continue;
-
-		const char *value = strchr(field, '=');
-		if (value != NULL) {
-			const char *key =
-				p_strdup_until(user->pool, field, value++);
+		const char *key, *value;
+		if (t_split_key_value_eq(user->userdb_fields[i], &key, &value) &&
+		    *value != '\0' && str_begins_with(key, "user_")) {
 			array_append(&alt_usernames, &key, 1);
 			array_append(&alt_usernames, &value, 1);
 		}
@@ -770,12 +777,8 @@ struct mail_user *mail_user_dup(struct mail_user *user)
 {
 	struct mail_user *user2;
 
-	user2 = mail_user_alloc(event_get_parent(user->event), user->username,
+	user2 = mail_user_alloc(user->service_user,
 				user->unexpanded_set_parser);
-	if (user2->_service_user != NULL) {
-		user2->_service_user = user->_service_user;
-		mail_storage_service_user_ref(user2->_service_user);
-	}
 	if (user->_home != NULL)
 		mail_user_set_home(user2, user->_home);
 	mail_user_set_vars(user2, user->service, &user->conn);
@@ -796,15 +799,8 @@ struct mail_user *mail_user_dup(struct mail_user *user)
 void mail_user_init_ssl_client_settings(struct mail_user *user,
 	struct ssl_iostream_settings *ssl_set_r)
 {
-	if (user->_service_user == NULL) {
-		/* Internal test user that should never actually need any
-		   SSL settings. */
-		i_zero(ssl_set_r);
-		return;
-	}
-
 	const struct master_service_ssl_settings *ssl_set =
-		mail_storage_service_user_get_ssl_settings(user->_service_user);
+		mail_storage_service_user_get_ssl_settings(user->service_user);
 
 	master_service_ssl_client_settings_to_iostream_set(ssl_set,
 		pool_datastack_create(), ssl_set_r);

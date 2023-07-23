@@ -268,9 +268,6 @@ struct db_oauth2 *db_oauth2_init(const char *config_path)
 	db->oauth2_set.use_grant_password = db->set.use_grant_password;
 	db->oauth2_set.scope = db->set.scope;
 
-	if (*db->set.active_attribute != '\0' &&
-	    *db->set.active_value == '\0')
-		i_fatal("oauth2: Cannot have empty active_value if active_attribute is set");
 	if (*db->set.active_attribute == '\0' &&
 	    *db->set.active_value != '\0')
 		i_fatal("oauth2: Cannot have empty active_attribute is active_value is set");
@@ -372,6 +369,11 @@ db_oauth2_add_openid_config_url(struct db_oauth2_request *req)
 	req->auth_request->openid_config_url =
 		p_strdup_empty(req->auth_request->pool,
 			       req->db->set.openid_configuration_url);
+}
+
+const char *db_oauth2_get_openid_configuration_url(const struct db_oauth2 *db)
+{
+	return db->set.openid_configuration_url;
 }
 
 static bool
@@ -591,6 +593,7 @@ db_oauth2_validate_username(struct db_oauth2_request *req,
 		*result_r = PASSDB_RESULT_USER_UNKNOWN;
 		return FALSE;
 	} else {
+		req->username = p_strdup(req->pool, str_c(username_val));
 		return TRUE;
 	}
 }
@@ -599,17 +602,44 @@ static bool
 db_oauth2_user_is_enabled(struct db_oauth2_request *req,
 			  enum passdb_result *result_r, const char **error_r)
 {
-	if (*req->db->set.active_attribute != '\0' &&
-	    *req->db->set.active_value != '\0') {
-		const char *active_value =
-			auth_fields_find(req->fields, req->db->set.active_attribute);
-		if (active_value != NULL &&
-		    strcmp(req->db->set.active_value, active_value) != 0) {
-			*error_r = "Provided token is not valid";
-			*result_r = PASSDB_RESULT_PASSWORD_MISMATCH;
-			return FALSE;
-		}
+	if (*req->db->set.active_attribute == '\0' ) {
+		e_debug(authdb_event(req->auth_request),
+			"oauth2 active_attribute is not configured; skipping the check");
+	    	return TRUE;
 	}
+
+	const char *active_value =
+		auth_fields_find(req->fields, req->db->set.active_attribute);
+
+	if (active_value == NULL) {
+		e_debug(authdb_event(req->auth_request),
+			"oauth2 active_attribute \"%s\" is not present in the oauth2 server's response",
+			req->db->set.active_attribute);
+		*error_r = "Missing active_attribute from token";
+		*result_r = PASSDB_RESULT_PASSWORD_MISMATCH;
+		return FALSE;
+	}
+
+	if (*req->db->set.active_value == '\0') {
+		e_debug(authdb_event(req->auth_request),
+			"oauth2 active_attribute \"%s\" present; skipping the check on value",
+			req->db->set.active_attribute);
+	    	return TRUE;
+	}
+
+	if (strcmp(req->db->set.active_value, active_value) != 0) {
+		e_debug(authdb_event(req->auth_request),
+			"oauth2 active_attribute check failed: expected %s=\"%s\" but got \"%s\"",
+			req->db->set.active_attribute,
+			req->db->set.active_value,
+			active_value);
+		*error_r = "Provided token is not valid";
+		*result_r = PASSDB_RESULT_PASSWORD_MISMATCH;
+		return FALSE;
+	}
+
+	e_debug(authdb_event(req->auth_request),
+		"oauth2 active_attribute check succeeded");
 	return TRUE;
 }
 

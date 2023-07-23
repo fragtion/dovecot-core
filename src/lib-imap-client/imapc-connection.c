@@ -102,7 +102,20 @@ struct imapc_connection {
 	struct timeval last_connect;
 	unsigned int reconnect_count;
 
-	struct imapc_client_mailbox *selecting_box, *selected_box;
+	/* If QRESYNC isn't used, this is set immediately after issuing
+	   SELECT/EXAMINE. We could differentiate better whether a mailbox is
+	   "being selected" vs "fully selected", but that code is already in
+	   the imapc-storage side so it would have to be moved or duplicated
+	   here. And since nothing actually cares about this distinction (yet),
+	   don't bother with it for now. This is set to NULL when the mailbox
+	   is closed from imapc-storage point of view, even if the server is
+	   still in selected state (see selected_on_server). */
+	struct imapc_client_mailbox *selected_box;
+	/* If QRESYNC is used, this is set when SELECT/EXAMINE is issued.
+	   If the server is already in selected state, the selected_box is most
+	   likely already NULL at this point, because imapc-storage has closed
+	   it. */
+	struct imapc_client_mailbox *qresync_selecting_box;
 	enum imapc_connection_state state;
 	char *disconnect_reason;
 
@@ -141,6 +154,10 @@ struct imapc_connection {
 	bool idle_stopping:1;
 	bool idle_plus_waiting:1;
 	bool select_waiting_reply:1;
+	/* TRUE if IMAP server is in SELECTED state. select_box may be NULL
+	   though, if we already closed the mailbox from client point of
+	   view. */
+	bool selected_on_server:1;
 };
 
 static void imapc_connection_capability_cb(const struct imapc_command_reply *reply,
@@ -399,8 +416,9 @@ static void imapc_connection_set_state(struct imapc_connection *conn,
 		conn->idle_stopping = FALSE;
 
 		conn->select_waiting_reply = FALSE;
-		conn->selecting_box = NULL;
+		conn->qresync_selecting_box = NULL;
 		conn->selected_box = NULL;
+		conn->selected_on_server = FALSE;
 		/* fall through */
 	case IMAPC_CONNECTION_STATE_DONE:
 		/* if we came from imapc_client_get_capabilities(), stop so
@@ -776,9 +794,11 @@ imapc_connection_handle_resp_text_code(struct imapc_connection *conn,
 	}
 	if (strcasecmp(key, "CLOSED") == 0) {
 		/* QRESYNC: SELECTing another mailbox */
-		if (conn->selecting_box != NULL) {
-			conn->selected_box = conn->selecting_box;
-			conn->selecting_box = NULL;
+		if (conn->qresync_selecting_box != NULL) {
+			conn->selected_box = conn->qresync_selecting_box;
+			conn->qresync_selecting_box = NULL;
+		} else {
+			conn->selected_on_server = FALSE;
 		}
 	}
 	return 0;
@@ -1493,7 +1513,7 @@ static int imapc_connection_input_tagged(struct imapc_connection *conn)
 	    (cmd->flags & IMAPC_COMMAND_FLAG_SELECT) != 0 &&
 	    conn->selected_box != NULL) {
 		/* EXAMINE/SELECT failed: mailbox is no longer selected */
-		imapc_connection_unselect(conn->selected_box);
+		imapc_connection_unselect(conn->selected_box, TRUE);
 	}
 
 	if (conn->reconnect_command_count > 0 &&
@@ -1707,8 +1727,10 @@ static int imapc_connection_connected(struct imapc_connection *conn)
 				    conn);
 
 	if (conn->client->set.ssl_mode == IMAPC_CLIENT_SSL_MODE_IMMEDIATE) {
-		if (imapc_connection_ssl_init(conn) < 0)
+		if (imapc_connection_ssl_init(conn) < 0) {
 			imapc_connection_disconnect(conn);
+			return -1;
+		}
 	}
 	return imapc_connection_output(conn);
 }
@@ -2091,17 +2113,18 @@ static void imapc_connection_set_selecting(struct imapc_client_mailbox *box)
 {
 	struct imapc_connection *conn = box->conn;
 
-	i_assert(conn->selecting_box == NULL);
+	i_assert(conn->qresync_selecting_box == NULL);
 
-	if (conn->selected_box != NULL &&
+	if (conn->selected_on_server &&
 	    (conn->capabilities & IMAPC_CAPABILITY_QRESYNC) != 0) {
 		/* server will send a [CLOSED] once selected mailbox is
 		   closed */
-		conn->selecting_box = box;
+		conn->qresync_selecting_box = box;
 	} else {
 		/* we'll have to assume that all the future untagged messages
 		   are for the mailbox we're selecting */
 		conn->selected_box = box;
+		conn->selected_on_server = TRUE;
 	}
 	conn->select_waiting_reply = TRUE;
 }
@@ -2344,7 +2367,7 @@ void imapc_command_set_mailbox(struct imapc_command *cmd,
 bool imapc_command_connection_is_selected(struct imapc_command *cmd)
 {
 	return cmd->conn->selected_box != NULL ||
-		cmd->conn->selecting_box != NULL;
+		cmd->conn->qresync_selecting_box != NULL;
 }
 
 void imapc_command_send(struct imapc_command *cmd, const char *cmd_str)
@@ -2448,17 +2471,37 @@ imapc_connection_get_capabilities(struct imapc_connection *conn)
 	return conn->capabilities;
 }
 
-void imapc_connection_unselect(struct imapc_client_mailbox *box)
+void imapc_connection_unselect(struct imapc_client_mailbox *box,
+			       bool via_tagged_reply)
 {
 	struct imapc_connection *conn = box->conn;
 
-	if (conn->selected_box != NULL || conn->selecting_box != NULL) {
-		i_assert(conn->selected_box == box ||
-			 conn->selecting_box == box);
-
+	if (conn->select_waiting_reply) {
+		/* Mailbox closing was requested before SELECT/EXAMINE
+		   replied. The connection state is now unknown and
+		   shouldn't be used anymore. */
+		imapc_connection_disconnect(conn);
+	} else if (conn->qresync_selecting_box == NULL &&
+		   conn->selected_box == NULL) {
+		/* There is no mailbox selected currently. */
+		i_assert(!via_tagged_reply);
+	} else {
+		/* Mailbox was closed in a known state. Either due to
+		   SELECT/EXAMINE failing (via_tagged_reply) or by
+		   imapc-storage after the mailbox was already fully
+		   selected. */
+		i_assert(conn->qresync_selecting_box == box ||
+			 conn->selected_box == box);
+		conn->qresync_selecting_box = NULL;
 		conn->selected_box = NULL;
-		conn->selecting_box = NULL;
+		if (via_tagged_reply)
+			conn->selected_on_server = FALSE;
+		else {
+			/* We didn't actually send UNSELECT command, so don't
+			   touch selected_on_server state. */
+		}
 	}
+
 	imapc_connection_send_idle_done(conn);
 	imapc_connection_abort_commands(conn, box, FALSE);
 }
@@ -2466,8 +2509,8 @@ void imapc_connection_unselect(struct imapc_client_mailbox *box)
 struct imapc_client_mailbox *
 imapc_connection_get_mailbox(struct imapc_connection *conn)
 {
-	if (conn->selecting_box != NULL)
-		return conn->selecting_box;
+	if (conn->qresync_selecting_box != NULL)
+		return conn->qresync_selecting_box;
 	return conn->selected_box;
 }
 

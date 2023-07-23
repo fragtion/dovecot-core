@@ -9,7 +9,9 @@ LIBDOVECOT_SUBDIRS = \
 	lib-test \
 	lib \
 	lib-settings \
+	lib-otp \
 	lib-auth \
+	lib-auth-client \
 	lib-dns \
 	lib-ssl-iostream \
 	lib-master \
@@ -42,7 +44,6 @@ SUBDIRS = \
 	lib-index \
 	lib-storage \
 	lib-sql \
-	lib-otp \
 	lib-lda \
 	lib-dict-backend \
 	anvil \
@@ -56,6 +57,7 @@ SUBDIRS = \
 	imap-login \
 	imap \
 	imap-urlauth \
+	imap-urlauth-login \
 	pop3-login \
 	pop3 \
 	submission-login \
@@ -64,7 +66,6 @@ SUBDIRS = \
 	lmtp \
 	log \
 	config \
-	replication \
 	util \
 	doveadm \
 	stats \

@@ -33,7 +33,7 @@
    where the time was spent. */
 #define IMAP_CLIENT_DISCONNECT_LOG_STATS_CMD_MIN_RUNNING_MSECS 1000
 
-extern struct mail_storage_callbacks mail_storage_callbacks;
+extern struct mail_storage_callbacks imap_storage_callbacks;
 extern struct imap_client_vfuncs imap_client_vfuncs;
 
 struct imap_module_register imap_module_register = { 0 };
@@ -114,7 +114,6 @@ static bool user_has_special_use_mailboxes(struct mail_user *user)
 
 struct client *client_create(int fd_in, int fd_out, bool unhibernated,
 			     struct event *event, struct mail_user *user,
-			     struct mail_storage_service_user *service_user,
 			     const struct imap_settings *set,
 			     const struct smtp_submit_settings *smtp_set)
 {
@@ -135,7 +134,6 @@ struct client *client_create(int fd_in, int fd_out, bool unhibernated,
 	client->unhibernated = unhibernated;
 	client->set = set;
 	client->smtp_set = smtp_set;
-	client->service_user = service_user;
 	client->fd_in = fd_in;
 	client->fd_out = fd_out;
 	client->input = i_stream_create_fd(fd_in,
@@ -246,7 +244,7 @@ int client_create_finish(struct client *client, const char **error_r)
 	if (mail_namespaces_init(client->user, error_r) < 0)
 		return -1;
 	mail_namespaces_set_storage_callbacks(client->user->namespaces,
-					      &mail_storage_callbacks, client);
+					      &imap_storage_callbacks, client);
 	client->v.init(client);
 	return 0;
 }
@@ -341,6 +339,10 @@ const char *client_stats(struct client *client)
 			"Failed to expand imap_logout_format=%s: %s",
 			client->set->imap_logout_format, error);
 	}
+
+	event_add_int(client->event, "net_in_bytes", i_stream_get_absolute_offset(client->input));
+	event_add_int(client->event, "net_out_bytes", client->output->offset);
+
 	return str_c(str);
 }
 
@@ -384,8 +386,12 @@ static const char *client_get_last_command_status(struct client *client)
 {
 	if (client->logged_out)
 		return "";
-	if (client->last_cmd_name == NULL)
-		return " (No commands sent)";
+	if (client->last_cmd_name == NULL) {
+		if (client->unhibernated)
+			return " (No commands sent after unhibernation)";
+		else
+			return " (No commands sent)";
+	}
 
 	/* client disconnected without sending LOGOUT. if the last command
 	   took over 1 second to run, log it. */
@@ -547,7 +553,6 @@ static void client_default_destroy(struct client *client, const char *reason)
 	if (array_is_created(&client->search_updates))
 		array_free(&client->search_updates);
 	pool_unref(&client->command_pool);
-	mail_storage_service_user_unref(&client->service_user);
 
 	imap_client_count--;
 	DLLIST_REMOVE(&imap_clients, client);
@@ -947,7 +952,7 @@ struct client_command_context *client_command_alloc(struct client *client)
 
 void client_command_init_finished(struct client_command_context *cmd)
 {
-	event_add_str(cmd->event, "cmd_tag", cmd->tag);
+	event_add_str(cmd->global_event, "cmd_tag", cmd->tag);
 	/* use "unknown" until we checked that the command name is known/valid */
 	event_add_str(cmd->event, "cmd_name", "unknown");
 	/* the actual command name received from client - as-is */
@@ -1012,7 +1017,8 @@ void client_command_free(struct client_command_context **_cmd)
 	if (client->mailbox_change_lock == cmd)
 		client->mailbox_change_lock = NULL;
 
-	event_set_name(cmd->event, "imap_command_finished");
+	if (!cmd->internal)
+		event_set_name(cmd->event, "imap_command_finished");
 	if (cmd->tagline_reply != NULL) {
 		event_add_str(cmd->event, "tagged_reply_state",
 			      t_strcut(cmd->tagline_reply, ' '));
@@ -1022,8 +1028,8 @@ void client_command_free(struct client_command_context **_cmd)
 			  &cmd->stats.last_run_timeval);
 	event_add_int(cmd->event, "running_usecs", cmd->stats.running_usecs);
 	event_add_int(cmd->event, "lock_wait_usecs", cmd->stats.lock_wait_usecs);
-	event_add_int(cmd->event, "bytes_in", cmd->stats.bytes_in);
-	event_add_int(cmd->event, "bytes_out", cmd->stats.bytes_out);
+	event_add_int(cmd->event, "net_in_bytes", cmd->stats.bytes_in);
+	event_add_int(cmd->event, "net_out_bytes", cmd->stats.bytes_out);
 
 	e_debug(cmd->event, "Command finished: %s %s", cmd->name,
 		cmd->human_args != NULL ? cmd->human_args : "");
@@ -1670,7 +1676,7 @@ void clients_init(void)
 
 void client_kick(struct client *client)
 {
-	mail_storage_service_io_activate_user(client->service_user);
+	mail_storage_service_io_activate_user(client->user->service_user);
 	if (client->output_cmd_lock == NULL) {
 		client_send_line(client,
 				 "* BYE "MASTER_SERVICE_SHUTTING_DOWN_MSG".");

@@ -364,11 +364,6 @@ config_filter_parser_check(struct config_parser_context *ctx,
 	bool ok;
 
 	for (; p->root != NULL; p++) {
-		/* skip checking settings we don't care about */
-		if (!config_module_want_parser(ctx->root_parsers,
-					       ctx->modules, p->root))
-			continue;
-
 		settings_parse_var_skip(p->parser);
 		T_BEGIN {
 			ok = settings_parser_check(p->parser, ctx->pool, &error);
@@ -433,7 +428,7 @@ config_all_parsers_check(struct config_parser_context *ctx,
 
 	global_ssl_set = get_str_setting(parsers[0], "ssl", "");
 	for (i = 0; i < count && ret == 0; i++) {
-		if (config_filter_parsers_get(new_filter, tmp_pool, NULL,
+		if (config_filter_parsers_get(new_filter, tmp_pool,
 					      &parsers[i]->filter,
 					      &tmp_parsers, &output,
 					      error_r) < 0) {
@@ -774,18 +769,15 @@ config_get_value(struct config_section_stack *section, const char *key,
 }
 
 static bool
-config_require_key(struct config_parser_context *ctx, const char *key)
+config_skip_key(struct config_parser_context *ctx, const char *key)
 {
-	struct config_module_parser *l;
-
-	if (ctx->modules == NULL)
+	if (ctx->skip_ssl_server_settings &&
+	    (strcmp(key, "ssl_cert") == 0 ||
+	     strcmp(key, "ssl_key") == 0 ||
+	     strcmp(key, "ssl_ca") == 0 ||
+	     strcmp(key, "ssl_verify_client_cert") == 0)) {
+		/* FIXME: temporary kludge - remove later */
 		return TRUE;
-
-	for (l = ctx->cur_section->parsers; l->root != NULL; l++) {
-		if (config_module_want_parser(ctx->root_parsers,
-					      ctx->modules, l->root) &&
-		    settings_parse_is_valid_key(l->parser, key))
-			return TRUE;
 	}
 	return FALSE;
 }
@@ -876,15 +868,11 @@ static int config_write_value(struct config_parser_context *ctx,
 			str_append_c(str, '<');
 			str_append(str, value);
 		} else {
-			if (!config_require_key(ctx, full_key)) {
-				/* don't even try to open the file */
-			} else {
-				path = fix_relative_path(value, ctx->cur_input);
-				if (str_append_file(str, full_key, path, &error) < 0) {
-					/* file reading failed */
-					ctx->error = p_strdup(ctx->pool, error);
-					return -1;
-				}
+			path = fix_relative_path(value, ctx->cur_input);
+			if (str_append_file(str, full_key, path, &error) < 0) {
+				/* file reading failed */
+				ctx->error = p_strdup(ctx->pool, error);
+				return -1;
 			}
 		}
 		break;
@@ -941,6 +929,8 @@ void config_parser_apply_line(struct config_parser_context *ctx,
 	case CONFIG_LINE_TYPE_KEYVALUE:
 	case CONFIG_LINE_TYPE_KEYFILE:
 	case CONFIG_LINE_TYPE_KEYVARIABLE:
+		if (config_skip_key(ctx, key))
+			break;
 		str_append(ctx->str, key);
 		config_parser_check_warnings(ctx, key);
 		str_append_c(ctx->str, '=');
@@ -997,8 +987,8 @@ void config_parser_apply_line(struct config_parser_context *ctx,
 	}
 }
 
-int config_parse_file(const char *path, bool expand_values,
-		      const char *const *modules, const char **error_r)
+int config_parse_file(const char *path, enum config_parse_flags flags,
+		      const char **error_r)
 {
 	struct input_stack root;
 	struct config_parser_context ctx;
@@ -1024,7 +1014,10 @@ int config_parse_file(const char *path, bool expand_values,
 	i_zero(&ctx);
 	ctx.pool = pool_alloconly_create(MEMPOOL_GROWING"config file parser", 1024*256);
 	ctx.path = path;
-	ctx.hide_errors = fd == -1;
+	ctx.hide_errors = fd == -1 ||
+		(flags & CONFIG_PARSE_FLAG_HIDE_ERRORS) != 0;
+	ctx.skip_ssl_server_settings =
+		(flags & CONFIG_PARSE_FLAG_SKIP_SSL_SERVER) != 0;
 
 	for (count = 0; all_roots[count] != NULL; count++) ;
 	ctx.root_parsers =
@@ -1039,8 +1032,7 @@ int config_parse_file(const char *path, bool expand_values,
 	i_zero(&root);
 	root.path = path;
 	ctx.cur_input = &root;
-	ctx.expand_values = expand_values;
-	ctx.modules = modules;
+	ctx.expand_values = (flags & CONFIG_PARSE_FLAG_EXPAND_VALUES) != 0;
 	hash_table_create(&ctx.seen_settings, ctx.pool, 0, str_hash, strcmp);
 
 	p_array_init(&ctx.all_parsers, ctx.pool, 128);
@@ -1155,53 +1147,6 @@ void config_parse_load_modules(void)
 	} else {
 		array_free(&new_services);
 	}
-}
-
-static bool parsers_are_connected(const struct setting_parser_info *root,
-				  const struct setting_parser_info *info)
-{
-	const struct setting_parser_info *p;
-	const struct setting_parser_info *const *dep;
-
-	/* we're trying to find info or its parents from root's dependencies. */
-
-	for (p = info; p != NULL; p = p->parent) {
-		if (p == root)
-			return TRUE;
-	}
-
-	if (root->dependencies != NULL) {
-		for (dep = root->dependencies; *dep != NULL; dep++) {
-			if (parsers_are_connected(*dep, info))
-				return TRUE;
-		}
-	}
-	return FALSE;
-}
-
-bool config_module_want_parser(struct config_module_parser *parsers,
-			       const char *const *modules,
-			       const struct setting_parser_info *root)
-{
-	struct config_module_parser *l;
-
-	if (modules == NULL)
-		return TRUE;
-	if (root == &master_service_setting_parser_info) {
-		/* everyone wants master service settings */
-		return TRUE;
-	}
-
-	for (l = parsers; l->root != NULL; l++) {
-		if (!str_array_find(modules, l->root->module_name))
-			continue;
-
-		/* see if we can find a way to get from the original parser
-		   to this parser */
-		if (parsers_are_connected(l->root, root))
-			return TRUE;
-	}
-	return FALSE;
 }
 
 void config_parser_deinit(void)

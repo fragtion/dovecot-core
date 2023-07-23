@@ -25,7 +25,7 @@ static void sdbox_mail_set_expunged(struct dbox_mail *mail)
 	sdbox_set_mailbox_corrupted(_mail->box);
 }
 
-static int sdbox_mail_file_set(struct dbox_mail *mail)
+int sdbox_mail_file_set(struct dbox_mail *mail)
 {
 	struct mail *_mail = &mail->imail.mail.mail;
 	struct sdbox_mailbox *mbox = SDBOX_MAILBOX(_mail->box);
@@ -71,7 +71,8 @@ sdbox_mail_get_special(struct mail *_mail, enum mail_fetch_field field,
 			return -1;
 
 		_mail->transaction->stats.fstat_lookup_count++;
-		if (dbox_file_stat(mail->open_file, &st) < 0) {
+		if (dbox_file_stat(mail->open_file,
+				   mail_event(&mail->imail.mail.mail), &st) < 0) {
 			if (errno == ENOENT)
 				mail_set_expunged(_mail);
 			return -1;
@@ -84,7 +85,8 @@ sdbox_mail_get_special(struct mail *_mail, enum mail_fetch_field field,
 			return -1;
 
 		_mail->transaction->stats.fstat_lookup_count++;
-		if (dbox_file_stat(mail->open_file, &st) < 0) {
+		if (dbox_file_stat(mail->open_file,
+				   mail_event(&mail->imail.mail.mail), &st) < 0) {
 			if (errno == ENOENT)
 				mail_set_expunged(_mail);
 			return -1;

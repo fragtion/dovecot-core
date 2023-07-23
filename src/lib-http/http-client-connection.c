@@ -879,7 +879,6 @@ http_client_connection_return_response(struct http_client_connection *conn,
 
 	http_client_connection_ref(conn);
 	http_client_connection_ref_request(conn, req);
-	req->state = HTTP_REQUEST_STATE_GOT_RESPONSE;
 
 	if (response->payload != NULL) {
 		/* Wrap the stream to capture the destroy event without
@@ -1446,6 +1445,7 @@ static void http_client_connection_ready(struct http_client_connection *conn)
 			struct http_response response;
 
 			conn->tunneling = TRUE;
+			req->state = HTTP_REQUEST_STATE_WAITING;
 
 			i_zero(&response);
 			response.status = 200;

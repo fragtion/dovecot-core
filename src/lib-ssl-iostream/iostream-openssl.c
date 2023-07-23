@@ -360,6 +360,7 @@ static void openssl_iostream_free(struct ssl_iostream *ssl_io)
 	i_stream_unref(&ssl_io->plain_input);
 	BIO_free(ssl_io->bio_ext);
 	SSL_free(ssl_io->ssl);
+	i_free(ssl_io->ja3_str);
 	i_free(ssl_io->plain_stream_errstr);
 	i_free(ssl_io->last_error);
 	i_free(ssl_io->connected_host);
@@ -813,22 +814,22 @@ openssl_iostream_get_peer_name(struct ssl_iostream *ssl_io)
 	len = X509_NAME_get_text_by_NID(X509_get_subject_name(x509),
 					ssl_io->username_nid, NULL, 0);
 	if (len < 0)
-		name = "";
+		name = NULL;
 	else {
 		name = t_malloc0(len + 1);
 		if (X509_NAME_get_text_by_NID(X509_get_subject_name(x509),
 					      ssl_io->username_nid,
 					      name, len + 1) < 0)
-			name = "";
+			name = NULL;
 		else if (strlen(name) != (size_t)len) {
 			/* NUL characters in name. Someone's trying to fake
 			   being another user? Don't allow it. */
-			name = "";
+			name = NULL;
 		}
 	}
 	X509_free(x509);
 
-	return *name == '\0' ? NULL : name;
+	return name;
 }
 
 static const char *openssl_iostream_get_server_name(struct ssl_iostream *ssl_io)
@@ -860,7 +861,7 @@ openssl_iostream_get_security_string(struct ssl_iostream *ssl_io)
 	int bits, alg_bits;
 
 	if (!ssl_io->handshaked)
-		return "";
+		return NULL;
 
 	cipher = SSL_get_current_cipher(ssl_io->ssl);
 	bits = SSL_CIPHER_get_bits(cipher, &alg_bits);

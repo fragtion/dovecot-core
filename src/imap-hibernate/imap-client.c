@@ -80,6 +80,7 @@ struct imap_client {
 	bool bad_done, idle_done;
 	bool unhibernate_queued;
 	bool input_pending;
+	bool shutdown_fd_on_destroy;
 };
 
 static struct imap_client *imap_clients;
@@ -218,6 +219,10 @@ imap_client_move_back_send_callback(void *context, struct ostream *output)
 		imap_client_unhibernate_failed(&client, error);
 		return;
 	}
+	/* If unhibernation fails after this, shutdown() the fd to make sure
+	   the imap process won't later on finish unhibernation after all and
+	   cause confusion. */
+	client->shutdown_fd_on_destroy = TRUE;
 	i_assert(ret > 0);
 	o_stream_nsend(output, str_data(str) + 1, str_len(str) - 1);
 }
@@ -231,6 +236,7 @@ imap_client_move_back_read_callback(void *context, const char *line)
 		/* failed - FIXME: retry later? */
 		imap_client_unhibernate_failed(&client, line+1);
 	} else {
+		client->shutdown_fd_on_destroy = FALSE;
 		imap_client_destroy(&client, NULL);
 	}
 }
@@ -599,13 +605,11 @@ imap_client_create(int fd, const struct imap_client_state *state)
 	if (state->mailbox_vname != NULL)
 		event_add_str(client->event, "mailbox", state->mailbox_vname);
 	if (state->local_ip.family != 0)
-		event_add_str(client->event, "local_ip",
-			      net_ip2addr(&state->local_ip));
+		event_add_ip(client->event, "local_ip", &state->local_ip);
 	if (state->local_port != 0)
 		event_add_int(client->event, "local_port", state->local_port);
 	if (state->remote_ip.family != 0)
-		event_add_str(client->event, "remote_ip",
-			      net_ip2addr(&state->remote_ip));
+		event_add_ip(client->event, "remote_ip", &state->remote_ip);
 	if (state->remote_port != 0)
 		event_add_int(client->event, "remote_port", state->remote_port);
 
@@ -699,6 +703,11 @@ void imap_client_destroy(struct imap_client **_client, const char *reason)
 
 	if (client->state.tag != NULL)
 		i_free(client->state.tag);
+
+	if (client->shutdown_fd_on_destroy) {
+		if (shutdown(client->fd, SHUT_RDWR) < 0)
+			e_error(client->event, "shutdown() failed: %m");
+	}
 
 	DLLIST_REMOVE(&imap_clients, client);
 	imap_client_stop(client);

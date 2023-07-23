@@ -38,39 +38,26 @@ struct master_service_settings_input {
 	bool preserve_environment;
 	bool preserve_user;
 	bool preserve_home;
+	bool reload_config;
 	bool never_exec;
+	bool always_exec;
+	bool return_config_fd;
 	bool use_sysexits;
-	bool parse_full_config;
+	bool disable_check_settings;
 
-	/* Either/both module and extra_modules can be set. Usually just one
-	   is needed, so module is simpler to set. */
-	const char *module;
-	const char *const *extra_modules;
 	const char *service;
 	const char *username;
 	struct ip_addr local_ip, remote_ip;
 	const char *local_name;
-
-	/* A bit of a memory saving kludge: Mail processes (especially imap)
-	   shouldn't read ssl_ca setting since it's likely not needed and it
-	   can use a lot of memory. */
-	bool no_ssl_ca;
 };
 
 struct master_service_settings_output {
 	/* if service was not given for lookup, this contains names of services
 	   that have more specific settings */
 	const char *const *specific_services;
+	/* Configuration file fd. Returned if input.return_config_fd=TRUE. */
+	int config_fd;
 
-	/* some settings for this service (or if service was not given,
-	   all services) contain local/remote ip/host specific settings
-	   (but this lookup didn't necessarily return any of them). */
-	bool service_uses_local:1;
-	bool service_uses_remote:1;
-	/* returned settings contain settings specific to given
-	   local/remote ip/host */
-	bool used_local:1;
-	bool used_remote:1;
 	/* Config couldn't be read because we don't have enough permissions.
 	   The process probably should be restarted and the settings read
 	   before dropping privileges. */
@@ -79,12 +66,6 @@ struct master_service_settings_output {
 
 extern const struct setting_parser_info master_service_setting_parser_info;
 
-/* Try to open the config socket if it's going to be needed later by
-   master_service_settings_read*() */
-void master_service_config_socket_try_open(struct master_service *service);
-int master_service_settings_get_filters(struct master_service *service,
-					const char *const **filters,
-					const char **error_r);
 int master_service_settings_read(struct master_service *service,
 				 const struct master_service_settings_input *input,
 				 struct master_service_settings_output *output_r,

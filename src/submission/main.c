@@ -150,7 +150,6 @@ client_create_from_input(const struct mail_storage_service_input *input,
 			 const char **error_r)
 {
 	struct mail_storage_service_input service_input;
-	struct mail_storage_service_user *user;
 	struct mail_user *mail_user;
 	struct submission_settings *set;
 	bool no_greeting = HAS_ALL_BITS(login_flags,
@@ -168,18 +167,18 @@ client_create_from_input(const struct mail_storage_service_input *input,
 		{ .key = NULL }
 	});
 	if (input->local_ip.family != 0)
-		event_add_str(event, "local_ip", net_ip2addr(&input->local_ip));
+		event_add_ip(event, "local_ip", &input->local_ip);
 	if (input->local_port != 0)
 		event_add_int(event, "local_port", input->local_port);
 	if (input->remote_ip.family != 0)
-		event_add_str(event, "remote_ip", net_ip2addr(&input->remote_ip));
+		event_add_ip(event, "remote_ip", &input->remote_ip);
 	if (input->remote_port != 0)
 		event_add_int(event, "remote_port", input->remote_port);
 
 	service_input = *input;
 	service_input.event_parent = event;
 	if (mail_storage_service_lookup_next(storage_service, &service_input,
-					     &user, &mail_user, error_r) <= 0) {
+					     &mail_user, error_r) <= 0) {
 		send_error(fd_out, event, my_hostname,
 			"4.7.0", MAIL_ERRSTR_CRITICAL_MSG);
 		event_unref(&event);
@@ -203,7 +202,6 @@ client_create_from_input(const struct mail_storage_service_input *input,
 		send_error(fd_out, event, set->hostname,
 			   "4.3.5", MAIL_ERRSTR_CRITICAL_MSG);
 		mail_user_deinit(&mail_user);
-		mail_storage_service_user_unref(&user);
 		event_unref(&event);
 		return -1;
 	}
@@ -228,7 +226,7 @@ client_create_from_input(const struct mail_storage_service_input *input,
 	}
 
 	(void)client_create(fd_in, fd_out, event, mail_user,
-			    user, set, helo, &proxy_data, data, data_len,
+			    set, helo, &proxy_data, data, data_len,
 			    no_greeting);
 	event_unref(&event);
 	return 0;
@@ -241,7 +239,7 @@ static void main_stdio_run(const char *username)
 	const char *value, *error, *input_base64;
 
 	i_zero(&input);
-	input.module = input.service = "submission";
+	input.service = "submission";
 	input.username = username != NULL ? username : getenv("USER");
 	if (input.username == NULL && IS_STANDALONE())
 		input.username = getlogin();
@@ -271,7 +269,7 @@ login_request_finished(const struct login_server_request *request,
 	buffer_t input_buf;
 
 	i_zero(&input);
-	input.module = input.service = "submission";
+	input.service = "submission";
 	input.local_ip = request->auth_req.local_ip;
 	input.remote_ip = request->auth_req.remote_ip;
 	input.local_port = request->auth_req.local_port;
@@ -366,8 +364,6 @@ int main(int argc, char *argv[])
 	if (IS_STANDALONE()) {
 		service_flags |= MASTER_SERVICE_FLAG_STANDALONE |
 			MASTER_SERVICE_FLAG_STD_CLIENT;
-	} else {
-		service_flags |= MASTER_SERVICE_FLAG_KEEP_CONFIG_OPEN;
 	}
 
 	master_service = master_service_init("submission", service_flags,
@@ -410,6 +406,9 @@ int main(int argc, char *argv[])
 	}
 	login_set.callback = login_request_finished;
 	login_set.failure_callback = login_request_failed;
+	login_set.update_proctitle =
+		getenv(MASTER_VERBOSE_PROCTITLE_ENV) != NULL &&
+		master_service_get_client_limit(master_service) == 1;
 
 	master_admin_clients_init(&admin_callbacks);
 	master_service_set_die_callback(master_service, submission_die);

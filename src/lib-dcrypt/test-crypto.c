@@ -70,7 +70,7 @@ static void test_cipher_test_vectors(void)
 		hex_to_binary(vectors[i].ct, ct);
 
 		if (!dcrypt_ctx_sym_create("AES-128-CBC", DCRYPT_MODE_ENCRYPT,
-					   &ctx, NULL)) {
+					   &ctx, &error)) {
 			test_assert_failed("dcrypt_ctx_sym_create",
 					   __FILE__, __LINE__-1);
 			continue;
@@ -127,6 +127,7 @@ static void test_cipher_aead_test_vectors(void)
 				   &ctx, &error)) {
 		test_assert_failed("dcrypt_ctx_sym_create",
 				   __FILE__, __LINE__-1);
+		test_end();
 		return;
 	}
 

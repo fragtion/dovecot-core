@@ -8,6 +8,7 @@
 #include "ioloop.h"
 #include "istream.h"
 #include "ostream.h"
+#include "ostream-final-trickle.h"
 #include "istream-crlf.h"
 #include "iostream-temp.h"
 #include "iostream-ssl.h"
@@ -18,8 +19,8 @@
 #include "test-subprocess.h"
 #include "http-url.h"
 #include "http-request.h"
-#include "http-server.h"
-#include "http-client.h"
+#include "http-server-private.h"
+#include "http-client-private.h"
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -52,6 +53,7 @@ static struct test_settings {
 	unsigned int parallel_clients;
 	bool parallel_clients_global;
 	size_t read_client_partial;
+	bool client_trickle_final_byte;
 	bool unknown_size;
 
 	/* server */
@@ -60,6 +62,7 @@ static struct test_settings {
 	enum payload_handling server_payload_handling;
 	size_t read_server_partial;
 	bool server_cork;
+	bool server_trickle_final_byte;
 
 	bool ssl;
 } tset;
@@ -68,9 +71,9 @@ static struct ip_addr bind_ip;
 static in_port_t bind_port = 0;
 static int fd_listen = -1;
 static struct ioloop *ioloop_nested = NULL;
-static unsigned ioloop_nested_first = 0;
-static unsigned ioloop_nested_last = 0;
-static unsigned ioloop_nested_depth = 0;
+static unsigned int ioloop_nested_first = 0;
+static unsigned int ioloop_nested_last = 0;
+static unsigned int ioloop_nested_depth = 0;
 
 static void main_deinit(void);
 
@@ -197,7 +200,9 @@ test_file_open(const char *path, unsigned int *status_r, const char **reason_r)
 		return NULL;
 	}
 
-	return i_stream_create_fd_autoclose(&fd, 40960);
+	struct istream *input = i_stream_create_fd_autoclose(&fd, 40960);
+	i_stream_set_name(input, path);
+	return input;
 }
 
 /*
@@ -325,7 +330,13 @@ client_handle_download_request(struct client_request *creq,
 		o_stream_destroy(&output);
 	} else {
 		http_server_response_set_payload(resp, fstream);
-		http_server_response_submit(resp);
+		if (!tset.server_trickle_final_byte)
+			http_server_response_submit(resp);
+		else {
+			/* close connection immediately, so ostream-delay can
+			   catch bugs with too early disconnects. */
+			http_server_response_submit_close(resp);
+		}
 		/* seeking the payload stream shouldn't affect lib-http */
 		i_stream_seek(fstream, 1);
 	}
@@ -857,6 +868,15 @@ static void client_accept(void *context ATTR_UNUSED)
 	}
 }
 
+static void test_http_server_connection_init(struct connection *conn)
+{
+	if (!tset.server_trickle_final_byte)
+		return;
+	struct ostream *output = o_stream_create_final_trickle(conn->output);
+	o_stream_unref(&conn->output);
+	conn->output = output;
+}
+
 /* */
 
 static void test_server_init(const struct http_server_settings *server_set)
@@ -865,6 +885,7 @@ static void test_server_init(const struct http_server_settings *server_set)
 	io_listen = io_add(fd_listen, IO_READ, client_accept, NULL);
 
 	http_server = http_server_init(server_set);
+	http_server->conn_list->v.init = test_http_server_connection_init;
 }
 
 static void test_server_deinit(void)
@@ -966,17 +987,53 @@ static void test_client_progress_timeout(void *context ATTR_UNUSED)
 	io_loop_stop(current_ioloop);
 }
 
-static void
-test_client_create_clients(const struct http_client_settings *client_set)
+static void test_client_init(void)
 {
-	struct http_client_context *http_context = NULL;
-	unsigned int i;
-
+	i_assert(to_client_progress == NULL);
 	if (!small_socket_buffers) {
 		to_client_progress = timeout_add(
 			CLIENT_PROGRESS_TIMEOUT*1000,
 			test_client_progress_timeout, NULL);
 	}
+}
+
+static void test_client_deinit(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < tset.parallel_clients; i++)
+		http_client_deinit(&http_clients[i]);
+	i_free(http_clients);
+
+	tset.parallel_clients = 1;
+
+	timeout_remove(&to_continue);
+	timeout_remove(&to_client_progress);
+
+	http_client_global_context_free();
+}
+
+static void
+(*old_test_http_client_connection_connected)(struct connection *, bool) = NULL;
+
+static void
+test_http_client_connection_connected(struct connection *conn, bool success)
+{
+	old_test_http_client_connection_connected(conn, success);
+
+	if (!tset.client_trickle_final_byte)
+		return;
+
+	struct ostream *output = o_stream_create_final_trickle(conn->output);
+	o_stream_unref(&conn->output);
+	conn->output = output;
+}
+
+static void
+test_client_create_clients(const struct http_client_settings *client_set)
+{
+	struct http_client_context *http_context = NULL;
+	unsigned int i;
 
 	if (!tset.parallel_clients_global)
 		http_context = http_client_context_create(client_set);
@@ -988,9 +1045,15 @@ test_client_create_clients(const struct http_client_settings *client_set)
 		http_clients[i] = (tset.parallel_clients_global ?
 				   http_client_init(client_set) :
 				   http_client_init_shared(http_context, NULL));
+		if (old_test_http_client_connection_connected == NULL) {
+			old_test_http_client_connection_connected =
+				http_clients[i]->cctx->conn_list->v.client_connected;
+		}
+		http_clients[i]->cctx->conn_list->v.client_connected =
+			test_http_client_connection_connected;
 	}
 
-	if (!tset.parallel_clients_global)
+	if (http_context != NULL)
 		http_client_context_unref(&http_context);
 }
 
@@ -1040,7 +1103,8 @@ test_client_download_payload_input(struct test_client_request *tcreq)
 			if (memcmp(pdata, fdata, fsize) != 0) {
 				i_fatal("test client: download: "
 					"received data does not match file "
-					"(%"PRIuUOFF_T":%"PRIuUOFF_T")",
+					"(%s, %"PRIuUOFF_T":%"PRIuUOFF_T")",
+					i_stream_get_name(tcreq->file_in),
 					payload->v_offset,
 					tcreq->file_in->v_offset);
 			}
@@ -1293,7 +1357,8 @@ static void test_client_echo_payload_input(struct test_client_request *tcreq)
 			if (memcmp(pdata, fdata, fsize) != 0) {
 				i_fatal("test client: echo: "
 					"received data does not match file "
-					"(%"PRIuUOFF_T":%"PRIuUOFF_T")",
+					"(%s, %"PRIuUOFF_T":%"PRIuUOFF_T")",
+					i_stream_get_name(tcreq->file_in),
 					payload->v_offset,
 					tcreq->file_in->v_offset);
 			}
@@ -1535,6 +1600,9 @@ static void test_client_echo_continue(void *context ATTR_UNUSED)
 		struct istream *fstream;
 		const char *path = paths[client_files_last];
 
+		if (path == NULL)
+			continue;
+
 		fstream = test_file_open(path, NULL, NULL);
 		if (fstream == NULL) {
 			paths[client_files_last] = NULL;
@@ -1674,22 +1742,6 @@ static void test_client_echo(const struct http_client_settings *client_set)
 	to_continue = timeout_add_short(0, test_client_echo_continue, NULL);
 }
 
-/* cleanup */
-
-static void test_client_deinit(void)
-{
-	unsigned int i;
-
-	for (i = 0; i < tset.parallel_clients; i++)
-		http_client_deinit(&http_clients[i]);
-	i_free(http_clients);
-
-	tset.parallel_clients = 1;
-
-	timeout_remove(&to_continue);
-	timeout_remove(&to_client_progress);
-}
-
 /*
  * Tests
  */
@@ -1751,6 +1803,7 @@ test_run_client(
 	ioloop_nested = NULL;
 	ioloop_nested_depth = 0;
 	ioloop = io_loop_create();
+	test_client_init();
 	client_init(client_set);
 	io_loop_run(ioloop);
 	test_client_deinit();
@@ -1922,6 +1975,22 @@ static void test_download_server_nonblocking(void)
 	test_run_pipeline(test_client_download);
 	test_run_parallel(test_client_download);
 	test_end();
+
+	test_begin("http payload download (server non-blocking; client trickle)");
+	test_init_defaults();
+	tset.client_trickle_final_byte = TRUE;
+	test_run_sequential(test_client_download);
+	test_run_pipeline(test_client_download);
+	test_run_parallel(test_client_download);
+	test_end();
+
+	test_begin("http payload download (server non-blocking; server trickle)");
+	test_init_defaults();
+	tset.server_trickle_final_byte = TRUE;
+	test_run_sequential(test_client_download);
+	test_run_pipeline(test_client_download);
+	test_run_parallel(test_client_download);
+	test_end();
 }
 
 static void test_download_server_blocking(void)
@@ -1968,6 +2037,28 @@ static void test_echo_server_nonblocking(void)
 	test_init_defaults();
 	tset.unknown_size = TRUE;
 	tset.server_payload_handling = PAYLOAD_HANDLING_FORWARD;
+	test_run_sequential(test_client_echo);
+	test_run_pipeline(test_client_echo);
+	test_run_parallel(test_client_echo);
+	test_end();
+
+	test_begin("http payload echo "
+		   "(server non-blocking; size unknown; client trickle)");
+	test_init_defaults();
+	tset.unknown_size = TRUE;
+	tset.server_payload_handling = PAYLOAD_HANDLING_FORWARD;
+	tset.client_trickle_final_byte = TRUE;
+	test_run_sequential(test_client_echo);
+	test_run_pipeline(test_client_echo);
+	test_run_parallel(test_client_echo);
+	test_end();
+
+	test_begin("http payload echo "
+		   "(server non-blocking; size unknown; server trickle)");
+	test_init_defaults();
+	tset.unknown_size = TRUE;
+	tset.server_payload_handling = PAYLOAD_HANDLING_FORWARD;
+	tset.server_trickle_final_byte = TRUE;
 	test_run_sequential(test_client_echo);
 	test_run_pipeline(test_client_echo);
 	test_run_parallel(test_client_echo);
@@ -2324,6 +2415,26 @@ static void test_echo_ssl(void)
 	test_init_defaults();
 	tset.unknown_size = TRUE;
 	tset.ssl = TRUE;
+	test_run_sequential(test_client_echo);
+	test_run_pipeline(test_client_echo);
+	test_run_parallel(test_client_echo);
+	test_end();
+
+	test_begin("http payload echo (ssl; unknown size; client trickle)");
+	test_init_defaults();
+	tset.unknown_size = TRUE;
+	tset.ssl = TRUE;
+	tset.client_trickle_final_byte = TRUE;
+	test_run_sequential(test_client_echo);
+	test_run_pipeline(test_client_echo);
+	test_run_parallel(test_client_echo);
+	test_end();
+
+	test_begin("http payload echo (ssl; unknown size; server trickle)");
+	test_init_defaults();
+	tset.unknown_size = TRUE;
+	tset.ssl = TRUE;
+	tset.server_trickle_final_byte = TRUE;
 	test_run_sequential(test_client_echo);
 	test_run_pipeline(test_client_echo);
 	test_run_parallel(test_client_echo);

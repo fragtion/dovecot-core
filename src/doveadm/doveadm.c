@@ -18,6 +18,7 @@
 #include "doveadm-dsync.h"
 #include "doveadm.h"
 
+#include <getopt.h>
 #include <unistd.h>
 
 const struct doveadm_print_vfuncs *doveadm_print_vfuncs_all[] = {
@@ -111,35 +112,41 @@ doveadm_usage_compress_lines(FILE *out, const char *str, const char *prefix)
 }
 
 static void ATTR_NORETURN
-usage_prefix(const char *prefix)
+usage_prefix(FILE *out, const char *prefix, int return_code)
 {
 	const struct doveadm_cmd_ver2 *cmd2;
 	string_t *str = t_str_new(1024);
 
-	fprintf(stderr, "usage: doveadm [-Dv] [-f <formatter>] ");
+	fprintf(out, "usage: doveadm [-Dv] [-f <formatter>] ");
 	if (*prefix != '\0')
-		fprintf(stderr, "%s ", prefix);
-	fprintf(stderr, "<command> [<args>]\n");
+		fprintf(out, "%s ", prefix);
+	fprintf(out, "<command> [<args>]\n");
 
 	array_foreach(&doveadm_cmds_ver2, cmd2) {
 		if ((cmd2->flags & CMD_FLAG_HIDDEN) == 0)
 			str_printfa(str, "%s\t%s\n", cmd2->name, cmd2->usage);
 	}
 
-	doveadm_usage_compress_lines(stderr, str_c(str), prefix);
+	doveadm_usage_compress_lines(out, str_c(str), prefix);
 
-	lib_exit(EX_USAGE);
+	lib_exit(return_code);
 }
 
 void usage(void)
 {
-	usage_prefix("");
+	usage_prefix(stderr, "", EX_USAGE);
+}
+
+static void ATTR_NORETURN
+print_usage_and_exit(FILE *out, const struct doveadm_cmd_ver2 *cmd, int exit_code)
+{
+	fprintf(out, "doveadm %s %s\n", cmd->name, cmd->usage);
+	lib_exit(exit_code);
 }
 
 void help_ver2(const struct doveadm_cmd_ver2 *cmd)
 {
-	fprintf(stderr, "doveadm %s %s\n", cmd->name, cmd->usage);
-	lib_exit(EX_USAGE);
+	print_usage_and_exit(stderr, cmd, EX_USAGE);
 }
 
 static void cmd_help(struct doveadm_cmd_context *cctx)
@@ -147,7 +154,7 @@ static void cmd_help(struct doveadm_cmd_context *cctx)
 	const char *cmd, *man_argv[3];
 
 	if (!doveadm_cmd_param_str(cctx, "cmd", &cmd))
-		usage_prefix("");
+		usage_prefix(stdout, "", EX_OK);
 
 	env_put("MANPATH", MANDIR);
 	man_argv[0] = "man";
@@ -216,6 +223,11 @@ static void cmd_exec(struct doveadm_cmd_context *cctx)
 	if (!doveadm_cmd_param_array(cctx, "args", &args))
 		args = NULL;
 
+	/* Avoid re-executing doveconf after the binary is executed */
+	int config_fd = doveadm_settings_get_config_fd();
+	fd_close_on_exec(config_fd, FALSE);
+	env_put(DOVECOT_CONFIG_FD_ENV, dec2str(config_fd));
+
 	path = t_strdup_printf("%s/%s", doveadm_settings->libexec_dir, binary);
 
 	unsigned int len = str_array_length(args);
@@ -254,7 +266,6 @@ int main(int argc, char *argv[])
 {
 	enum master_service_flags service_flags =
 		MASTER_SERVICE_FLAG_STANDALONE |
-		MASTER_SERVICE_FLAG_KEEP_CONFIG_OPEN |
 		MASTER_SERVICE_FLAG_NO_SSL_INIT |
 		MASTER_SERVICE_FLAG_NO_INIT_DATASTACK_FRAME;
 	const char *cmd_name;
@@ -266,13 +277,24 @@ int main(int argc, char *argv[])
 	   others just accept -+ option. */
 	master_service = master_service_init("doveadm", service_flags,
 					     &argc, &argv, "+Df:hv");
+	const struct option longopts[] = {
+		master_service_helpopt,
+		{NULL, 0, NULL, 0},
+	};
+	master_service_register_long_options(master_service, longopts);
 	struct doveadm_cmd_context *cctx = doveadm_cmd_context_create(
 		DOVEADM_CONNECTION_TYPE_CLI, doveadm_verbose || doveadm_debug);
 
 	i_set_failure_exit_callback(failure_exit_callback);
 
-	while ((c = master_getopt(master_service)) > 0) {
+	bool help_requested = FALSE;
+	const char *longopt = NULL;
+	while ((c = master_getopt_long(master_service, &longopt)) >= 0) {
 		switch (c) {
+		case 0:
+			if (strcmp(longopt, "help") == 0)
+				help_requested = TRUE;
+			break;
 		case 'D':
 			doveadm_debug = TRUE;
 			doveadm_verbose = TRUE;
@@ -287,7 +309,10 @@ int main(int argc, char *argv[])
 			doveadm_verbose = TRUE;
 			break;
 		default:
-			return FATAL_DEFAULT;
+			fprintf(stderr, "%s\n",
+				"Use doveadm --help for a list of available "
+				"options and commands.");
+			return EX_USAGE;
 		}
 	}
 	cmd_name = argv[optind];
@@ -312,6 +337,7 @@ int main(int argc, char *argv[])
 		/* special case commands: even if there is something wrong
 		   with the config (e.g. mail_plugins), don't fail these
 		   commands */
+		master_service->flags |= MASTER_SERVICE_FLAG_DONT_SEND_STATS;
 		if (strcmp(cmd_name, "help") != 0)
 			doveadm_read_settings();
 		quick_init = TRUE;
@@ -337,9 +363,11 @@ int main(int argc, char *argv[])
 		   mail_plugins have been loaded. */
 		doveadm_load_modules();
 
+		/* show usage after registering all plugins */
 		if (cmd_name == NULL) {
-			/* show usage after registering all plugins */
-			usage_prefix("");
+			FILE *out = help_requested ? stdout : stderr;
+			int exit_code = help_requested ? EX_OK : EX_USAGE;
+			usage_prefix(out, "", exit_code);
 		}
 	}
 
@@ -358,8 +386,16 @@ int main(int argc, char *argv[])
 	cctx->username = getenv("USER");
 
 	if (!doveadm_cmdline_try_run(cmd_name, argc, (const char**)argv, cctx)) {
+		help_requested = cctx->help_requested != DOVEADM_CMD_VER2_NO_HELP;
+		FILE *out = help_requested ? stdout : stderr;
+		int exit_code = help_requested ? EX_OK : EX_USAGE;
+		if (cctx->help_requested == DOVEADM_CMD_VER2_HELP_ARGUMENT &&
+		    cctx->cmd != NULL) {
+			print_usage_and_exit(stdout, cctx->cmd, EX_OK);
+		}
 		if (doveadm_has_subcommands(cmd_name))
-			usage_prefix(cmd_name);
+			usage_prefix(out, cmd_name, exit_code);
+
 		if (doveadm_has_unloaded_plugin(cmd_name)) {
 			i_fatal("Unknown command '%s', but plugin %s exists. "
 				"Try to set mail_plugins=%s",

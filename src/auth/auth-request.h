@@ -241,6 +241,8 @@ void auth_request_unref(struct auth_request **request);
 
 void auth_request_success(struct auth_request *request,
 			  const void *data, size_t data_size);
+void auth_request_fail_with_reply(struct auth_request *request,
+				  const void *final_data, size_t final_data_size);
 void auth_request_fail(struct auth_request *request);
 void auth_request_internal_failure(struct auth_request *request);
 
@@ -313,15 +315,19 @@ void auth_request_proxy_finish_failure(struct auth_request *request);
 
 void auth_request_log_password_mismatch(struct auth_request *request,
 					const char *subsystem);
-int auth_request_password_verify(struct auth_request *request,
-				 const char *plain_password,
-				 const char *crypted_password,
-				 const char *scheme, const char *subsystem);
-int auth_request_password_verify_log(struct auth_request *request,
+enum passdb_result
+auth_request_password_verify(struct auth_request *request,
+			     const char *plain_password,
+			     const char *crypted_password,
+			     const char *scheme, const char *subsystem)
+			     ATTR_WARN_UNUSED_RESULT;
+enum passdb_result
+auth_request_password_verify_log(struct auth_request *request,
 				 const char *plain_password,
 				 const char *crypted_password,
 				 const char *scheme, const char *subsystem,
-				 bool log_password_mismatch);
+				 bool log_password_mismatch)
+				 ATTR_WARN_UNUSED_RESULT;
 enum passdb_result auth_request_password_missing(struct auth_request *request);
 
 void auth_request_get_log_prefix(string_t *str, struct auth_request *auth_request,

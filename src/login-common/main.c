@@ -455,14 +455,12 @@ static void main_deinit(void)
 	timeout_remove(&auth_client_to);
 	client_common_deinit();
 	dsasl_clients_deinit();
-	login_settings_deinit();
 }
 
 int login_binary_run(struct login_binary *binary,
 		     int argc, char *argv[])
 {
 	enum master_service_flags service_flags =
-		MASTER_SERVICE_FLAG_KEEP_CONFIG_OPEN |
 		MASTER_SERVICE_FLAG_TRACK_LOGIN_STATE |
 		MASTER_SERVICE_FLAG_HAVE_STARTTLS |
 		MASTER_SERVICE_FLAG_NO_SSL_INIT;
@@ -510,8 +508,8 @@ int login_binary_run(struct login_binary *binary,
 
 	if (argv[optind] != NULL)
 		login_socket = argv[optind];
-	else if (global_login_settings->login_auth_socket_path[0] != '\0')
-		login_socket = global_login_settings->login_auth_socket_path;
+	else if (global_login_settings->login_socket_path[0] != '\0')
+		login_socket = global_login_settings->login_socket_path;
 
 	main_preinit();
 	main_init(login_socket);

@@ -1,6 +1,7 @@
 /* Copyright (c) 2006-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
+#include "eacces-error.h"
 #include "array.h"
 #include "ioloop.h"
 #include "str.h"
@@ -11,6 +12,7 @@
 
 #ifdef BUILD_SQLITE
 #include <sqlite3.h>
+#include <sys/stat.h>
 
 /* retry time if db is busy (in ms) */
 static const int sqlite_busy_timeout = 1000;
@@ -48,9 +50,20 @@ static struct event_category event_category_sqlite = {
 	.name = "sqlite"
 };
 
-static int driver_sqlite_connect(struct sql_db *_db)
+static void driver_sqlite_disconnect(struct sql_db *_db)
 {
 	struct sqlite_db *db = container_of(_db, struct sqlite_db, api);
+
+	sql_connection_log_finished(_db);
+	sqlite3_close(db->sqlite);
+	db->sqlite = NULL;
+}
+
+static int driver_sqlite_connect(struct sql_db *_db)
+{
+	struct stat st;
+	struct sqlite_db *db = container_of(_db, struct sqlite_db, api);
+	const char *err;
 	/* this is default for sqlite_open */
 	int flags;
 
@@ -66,25 +79,35 @@ static int driver_sqlite_connect(struct sql_db *_db)
 
 	db->rc = sqlite3_open_v2(db->dbfile, &db->sqlite, flags, NULL);
 
-	if (db->rc == SQLITE_OK) {
+	switch (db->rc) {
+	case SQLITE_OK:
 		db->connected = TRUE;
 		sqlite3_busy_timeout(db->sqlite, sqlite_busy_timeout);
 		return 1;
-	} else {
-		e_error(_db->event, "open(%s) failed: %s", db->dbfile,
-			sqlite3_errmsg(db->sqlite));
-		sqlite3_close(db->sqlite);
-		db->sqlite = NULL;
-		return -1;
+	case SQLITE_READONLY:
+	case SQLITE_CANTOPEN:
+	case SQLITE_PERM:
+		if (stat(db->dbfile, &st) == -1 && errno == ENOENT)
+			err = eacces_error_get_creating("creat", db->dbfile);
+		else
+			err = eacces_error_get("open", db->dbfile);
+		i_free(_db->last_connect_error);
+		_db->last_connect_error = i_strdup(err);
+		e_error(_db->event, "%s", err);
+		break;
+	case SQLITE_NOMEM:
+		i_fatal_status(FATAL_OUTOFMEM, "open(%s) failed: %s",
+			       db->dbfile, sqlite3_errmsg(db->sqlite));
+	default:
+		i_free(_db->last_connect_error);
+		_db->last_connect_error = i_strdup_printf("open(%s) failed: %s", db->dbfile,
+							  sqlite3_errmsg(db->sqlite));
+		e_error(_db->event, "%s", _db->last_connect_error);
+		break;
 	}
-}
 
-static void driver_sqlite_disconnect(struct sql_db *_db)
-{
-	struct sqlite_db *db = container_of(_db, struct sqlite_db, api);
-
-	sqlite3_close(db->sqlite);
-	db->sqlite = NULL;
+	driver_sqlite_disconnect(_db);
+	return -1;
 }
 
 static int driver_sqlite_parse_connect_string(struct sqlite_db *db,
@@ -162,8 +185,7 @@ static void driver_sqlite_deinit_v(struct sql_db *_db)
 	_db->no_reconnect = TRUE;
 	sql_db_set_state(&db->api, SQL_DB_STATE_DISCONNECTED);
 
-	sqlite3_close(db->sqlite);
-	sql_connection_log_finished(_db);
+	driver_sqlite_disconnect(_db);
 	event_unref(&_db->event);
 	array_free(&_db->module_contexts);
 	pool_unref(&db->pool);
@@ -211,15 +233,26 @@ static void driver_sqlite_result_log(const struct sql_result *result, const char
 	io_loop_time_refresh();
 
 	if (!db->connected) {
-		suffix = ": Cannot connect to database";
+		suffix = t_strdup_printf(": Cannot connect to database (%d)",
+					 db->rc);
 		e->add_str("error", "Cannot connect to database");
+		e->add_int("error_code", db->rc);
+	} else if (db->rc == SQLITE_NOMEM) {
+		suffix = t_strdup_printf(": %s (%d)", sqlite3_errmsg(db->sqlite),
+					 db->rc);
+		i_fatal_status(FATAL_OUTOFMEM, SQL_QUERY_FINISHED_FMT"%s", query,
+			       duration, suffix);
+	} else if (db->rc == SQLITE_READONLY || db->rc == SQLITE_CANTOPEN) {
+		const char *eacces_err = eacces_error_get("write", db->dbfile);
+		suffix = t_strconcat(": ", eacces_err, NULL);
+		e->add_str("error", eacces_err);
+		e->add_int("error_code", db->rc);
 	} else if (db->rc != SQLITE_OK) {
 		suffix = t_strdup_printf(": %s (%d)", sqlite3_errmsg(db->sqlite),
 					 db->rc);
 		e->add_str("error", sqlite3_errmsg(db->sqlite));
 		e->add_int("error_code", db->rc);
 	}
-
 	e_debug(e->event(), SQL_QUERY_FINISHED_FMT"%s", query, duration, suffix);
 }
 
@@ -308,7 +341,11 @@ static void driver_sqlite_result_free(struct sql_result *_result)
 		return;
 
 	if (result->stmt != NULL) {
-		if ((rc = sqlite3_finalize(result->stmt)) != SQLITE_OK) {
+		rc = sqlite3_finalize(result->stmt);
+		if (rc == SQLITE_NOMEM) {
+			i_fatal_status(FATAL_OUTOFMEM, "finalize failed: %s (%d)",
+				       sqlite3_errmsg(db->sqlite), rc);
+		} else if (rc != SQLITE_OK) {
 			e_warning(_result->event, "finalize failed: %s (%d)",
 				  sqlite3_errmsg(db->sqlite), rc);
 		}
@@ -322,12 +359,16 @@ static int driver_sqlite_result_next_row(struct sql_result *_result)
 {
 	struct sqlite_result *result =
 		container_of(_result, struct sqlite_result, api);
-
+	struct sqlite_db *db =
+		container_of(result->api.db, struct sqlite_db, api);
 	switch (sqlite3_step(result->stmt)) {
 	case SQLITE_ROW:
 		return 1;
 	case SQLITE_DONE:
 		return 0;
+	case SQLITE_NOMEM:
+		i_fatal_status(FATAL_OUTOFMEM, "sqlite3_step() failed: %s(%d)",
+			       sqlite3_errmsg(db->sqlite), SQLITE_NOMEM);
 	default:
 		return -1;
 	}
@@ -424,10 +465,24 @@ static const char *driver_sqlite_result_get_error(struct sql_result *_result)
 	struct sqlite_db *db =
 		container_of(result->api.db, struct sqlite_db, api);
 
-	if (db->connected)
-		return sqlite3_errmsg(db->sqlite);
-	else
+	if (db->connected) {
+		const char *err = sqlite3_errmsg(db->sqlite);
+		if (db->rc == SQLITE_READONLY || db->rc == SQLITE_CANTOPEN)
+			err = t_strconcat(err, ": ",
+					  eacces_error_get("write", db->dbfile), NULL);
+		return err;
+	} else if (db->rc == SQLITE_CANTOPEN) {
+		struct stat st;
+		const char *err;
+		if (stat(db->dbfile, &st) == -1 && errno == ENOENT) {
+			err = eacces_error_get_creating("creat", db->dbfile);
+		} else {
+			err = eacces_error_get("open", db->dbfile);
+		}
+		return t_strconcat("Cannot connect to database: ", err, NULL);
+	} else {
 		return "Cannot connect to database";
+	}
 }
 
 static struct sql_transaction_context *

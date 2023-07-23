@@ -11,6 +11,7 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-test \
 	-I$(top_srcdir)/src/lib-settings \
 	-I$(top_srcdir)/src/lib-auth \
+	-I$(top_srcdir)/src/lib-auth-client \
 	-I$(top_srcdir)/src/lib-compression \
 	-I$(top_srcdir)/src/lib-dict \
 	-I$(top_srcdir)/src/lib-doveadm \
@@ -25,7 +26,7 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-imap-storage \
 	-I$(top_srcdir)/src/lib-http \
 	-I$(top_srcdir)/src/lib-dcrypt \
-	-I$(top_srcdir)/src/auth \
+	-I$(top_srcdir)/src/lib-sasl \
 	-I$(top_srcdir)/src/stats \
 	-DMODULEDIR=\""$(moduledir)"\" \
 	-DAUTH_MODULE_DIR=\""$(moduledir)/auth"\" \
@@ -37,9 +38,6 @@ AM_CPPFLAGS = \
 	-DMANDIR=\""$(mandir)"\" \
 	$(BINARY_CFLAGS)
 
-cmd_pw_libs = \
-	../auth/libpassword.la \
-	../lib-otp/libotp.la
 
 libs = \
 	dsync/libdsync.la \
@@ -47,7 +45,6 @@ libs = \
 
 doveadm_LDADD = \
 	$(libs) \
-	$(cmd_pw_libs) \
 	$(CRYPT_LIBS) \
 	$(LIBDOVECOT_STORAGE) \
 	$(LIBDOVECOT) \
@@ -57,7 +54,6 @@ doveadm_LDADD = \
 
 doveadm_DEPENDENCIES = \
 	$(libs) \
-	$(cmd_pw_libs) \
 	$(LIBDOVECOT_STORAGE_DEPS) \
 	$(LIBDOVECOT_DEPS)
 
@@ -84,7 +80,6 @@ doveadm_common_cmds = \
 	doveadm-master.c \
 	doveadm-mutf7.c \
 	doveadm-penalty.c \
-	doveadm-replicator.c \
 	doveadm-sis.c \
 	doveadm-stats.c \
 	doveadm-who.c

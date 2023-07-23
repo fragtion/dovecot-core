@@ -9,7 +9,19 @@
 
 struct dlua_script;
 
-int auth_lua_script_init(struct dlua_script *script, const char **error_r);
+enum auth_lua_script_type {
+	AUTH_LUA_SCRIPT_TYPE_PASSDB,
+	AUTH_LUA_SCRIPT_TYPE_USERDB,
+};
+
+struct auth_lua_script_parameters {
+	enum auth_lua_script_type stype;
+	struct dlua_script *script;
+	const char *const *arguments;
+};
+
+int auth_lua_script_init(const struct auth_lua_script_parameters *params,
+		         const char **error_r);
 
 int auth_lua_call_password_verify(struct dlua_script *script,
 				  struct auth_request *req, const char *password,

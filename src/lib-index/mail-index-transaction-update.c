@@ -500,10 +500,10 @@ mail_index_insert_flag_update(struct mail_index_transaction *t,
 
 		updates[idx].add_flags =
 			(updates[idx].add_flags | u.add_flags) &
-			ENUM_NEGATE(u.remove_flags);
+			~u.remove_flags;
 		updates[idx].remove_flags =
 			(updates[idx].remove_flags | u.remove_flags) &
-			ENUM_NEGATE(u.add_flags);
+			~u.add_flags;
 		u.uid1 = updates[idx].uid2 + 1;
 
 		if (updates[idx].add_flags == 0 &&
@@ -715,6 +715,7 @@ void mail_index_update_header(struct mail_index_transaction *t,
 {
 	i_assert(offset < sizeof(t->pre_hdr_change));
 	i_assert(size <= sizeof(t->pre_hdr_change) - offset);
+	i_assert(size > 0);
 
 	t->log_updates = TRUE;
 
@@ -991,6 +992,7 @@ void mail_index_update_header_ext(struct mail_index_transaction *t,
 	struct mail_index_transaction_ext_hdr_update *hdr;
 	size_t new_size;
 
+	i_assert(size > 0);
 	i_assert(offset <= (uint32_t)-1 && size <= (uint32_t)-1 &&
 		 offset + size <= (uint32_t)-1);
 
@@ -1192,11 +1194,11 @@ void mail_index_update_keywords(struct mail_index_transaction *t, uint32_t seq,
 	case MODIFY_REPLACE:
 		/* split this into add+remove. remove all existing keywords not
 		   included in the keywords list */
-		if (seq < t->first_new_seq) {
+		if (seq < t->first_new_seq) T_BEGIN {
 			/* remove the ones currently in index */
 			remove_keywords = keyword_update_remove_existing(t, seq);
 			unref_keywords = remove_keywords;
-		}
+		} T_END;
 		/* remove from all changes we've done in this transaction */
 		array_foreach_modifiable(&t->keyword_updates, u)
 			seq_range_array_remove(&u->add_seq, seq);

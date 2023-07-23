@@ -1432,6 +1432,7 @@ dcrypt_openssl_load_private_key_dovecot_v2(struct dcrypt_private_key **key_r,
 			BN_free(point);
 			return FALSE;
 		}
+		BN_free(point);
 		*key_r = i_new(struct dcrypt_private_key, 1);
 		(*key_r)->key = pkey;
 		(*key_r)->ref++;
@@ -2439,6 +2440,7 @@ dcrypt_openssl_load_public_key(struct dcrypt_public_key **key_r,
 		T_BEGIN {
 			ret = dcrypt_openssl_load_public_key_jwk(key_r, data, error_r);
 		} T_END_PASS_STR_IF(!ret, error_r);
+		return ret;
 	}
 	if (format == DCRYPT_FORMAT_DOVECOT) {
 		bool ret;
@@ -3337,7 +3339,7 @@ dcrypt_openssl_key_load_private_raw(struct dcrypt_private_key **key_r,
 		ASN1_OBJECT_free(obj);
 
 		item = array_idx(keys, 1);
-		BIGNUM *point = BN_new();
+		BIGNUM *point = BN_secure_new();
 		if (BN_bin2bn(item->parameter, item->len, point) == NULL) {
 			BN_free(point);
 			return dcrypt_openssl_error(error_r);
@@ -3349,6 +3351,7 @@ dcrypt_openssl_key_load_private_raw(struct dcrypt_private_key **key_r,
 			return FALSE;
 		}
 
+		BN_free(point);
 		*key_r = i_new(struct dcrypt_private_key, 1);
 		(*key_r)->key = pkey;
 		(*key_r)->ref++;
