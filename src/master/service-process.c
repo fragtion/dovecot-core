@@ -212,7 +212,7 @@ service_dup_fds(struct service *service)
 		   to be lost. */
 		i_assert(service->log_fd[1] != -1);
 
-		env_put("LOG_SERVICE", "1");
+		env_put(MASTER_SERVICE_LOG_SERVICE_ENV, "1");
 		if (dup2(service->log_fd[1], STDERR_FILENO) < 0)
 			i_fatal("dup2(log fd) failed: %m");
 		i_set_failure_internal();
@@ -243,7 +243,7 @@ service_dup_fds(struct service *service)
 		i_fatal("service(%s): dup2s failed", service->set->name);
 
 	i_assert(fd == MASTER_LISTEN_FD_FIRST + (int)socket_listener_count);
-	env_put("SOCKET_COUNT", dec2str(socket_listener_count));
+	env_put(MASTER_SERVICE_SOCKET_COUNT_ENV, dec2str(socket_listener_count));
 }
 
 static void
@@ -286,7 +286,8 @@ static void service_process_setup_config_environment(struct service *service)
 		env_put(MASTER_CONFIG_FILE_ENV, service->config_file_path);
 		break;
 	default:
-		env_put(MASTER_CONFIG_FILE_ENV,
+		env_put(MASTER_CONFIG_FILE_ENV, services->config->config_file_path);
+		env_put(MASTER_CONFIG_FILE_SOCKET_ENV,
 			services_get_config_socket_path(service->list));
 		break;
 	}

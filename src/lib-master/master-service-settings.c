@@ -86,7 +86,7 @@ static const struct master_service_settings master_service_default_settings = {
 	.log_core_filter = "",
 	.process_shutdown_filter = "",
 	.syslog_facility = "mail",
-	.import_environment = "TZ CORE_OUTOFMEM CORE_ERROR" ENV_SYSTEMD ENV_GDB,
+	.import_environment = "TZ CORE_OUTOFMEM CORE_ERROR PATH" ENV_SYSTEMD ENV_GDB,
 	.stats_writer_socket_path = "stats-writer",
 	.config_cache_size = 1024*1024,
 	.version_ignore = FALSE,
@@ -195,7 +195,7 @@ master_service_exec_config(struct master_service *service,
 		if (input->preserve_user)
 			master_service_import_environment("USER");
 		if ((service->flags & MASTER_SERVICE_FLAG_STANDALONE) != 0)
-			master_service_import_environment("LOG_STDERR_TIMESTAMP");
+			master_service_import_environment(DOVECOT_LOG_STDERR_TIMESTAMP_ENV);
 
 		/* doveconf empties the environment before exec()ing us back
 		   if DOVECOT_PRESERVE_ENVS is set, so make sure it is. */

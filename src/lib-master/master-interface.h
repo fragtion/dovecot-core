@@ -63,8 +63,12 @@ enum master_login_state {
    in seconds. */
 #define MASTER_SERVICE_IDLE_KILL_ENV "IDLE_KILL"
 
-/* getenv(MASTER_CONFIG_FILE_ENV) provides path to configuration file/socket */
+/* getenv(MASTER_CONFIG_FILE_ENV) provides path to configuration file. */
 #define MASTER_CONFIG_FILE_ENV "CONFIG_FILE"
+
+/* getenv(MASTER_CONFIG_FILE_SOCKET_ENV) provides path to Configuration
+   socket, if available. */
+#define MASTER_CONFIG_FILE_SOCKET_ENV "CONFIG_FILE_SOCKET"
 
 /* getenv(MASTER_VERBOSE_PROCTITLE_ENV) is non-NULL if verbose_proctitle=yes.
    This is used by lib-master during initialization. */
@@ -77,6 +81,21 @@ enum master_login_state {
 /* getenv(MASTER_SSL_KEY_PASSWORD_ENV) returns manually typed SSL key password,
    if dovecot was started with -p parameter. */
 #define MASTER_SSL_KEY_PASSWORD_ENV "SSL_KEY_PASSWORD"
+
+/* getenv(MASTER_SERVICE_SOCKET_COUNT_ENV) returns number of listener sockets
+   this process receives, starting from MASTER_LISTEN_FD_FIRST.
+*/
+#define MASTER_SERVICE_SOCKET_COUNT_ENV "SOCKET_COUNT"
+
+/* getenv(MASTER_SERVICE_LOG_SERVICE_ENV) will be set to '1' when
+   stderr is redirected to the log service.
+*/
+#define MASTER_SERVICE_LOG_SERVICE_ENV "LOG_SERVICE"
+
+/* getenv(DOVECOT_LOG_STDERR_TIMESTAMP_ENV) returns the format for timestamps
+   when logging to stderr. Unset means no timestamps are added.
+*/
+#define DOVECOT_LOG_STDERR_TIMESTAMP_ENV "LOG_STDERR_TIMESTAMP"
 
 /* getenv(DOVECOT_PRESERVE_ENVS_ENV) returns a space separated list of
    environments that should be preserved. */

@@ -443,7 +443,7 @@ master_service_init(const char *name, enum master_service_flags flags,
 #ifdef DEBUG
 	if (getenv("GDB") == NULL &&
 	    (flags & MASTER_SERVICE_FLAG_STANDALONE) == 0) {
-		value = getenv("SOCKET_COUNT");
+		value = getenv(MASTER_SERVICE_SOCKET_COUNT_ENV);
 		if (value == NULL || str_to_uint(value, &count) < 0)
 			count = 0;
 		fd_debug_verify_leaks(MASTER_LISTEN_FD_FIRST + count, 1024);
@@ -525,7 +525,9 @@ master_service_init(const char *name, enum master_service_flags flags,
 	service->service_count_left = UINT_MAX;
 	service->datastack_frame_id = datastack_frame_id;
 
-	service->config_path = i_strdup(getenv(MASTER_CONFIG_FILE_ENV));
+	service->config_path = i_strdup(getenv(MASTER_CONFIG_FILE_SOCKET_ENV));
+	if (service->config_path == NULL)
+		service->config_path = i_strdup(getenv(MASTER_CONFIG_FILE_ENV));
 	if (service->config_path == NULL)
 		service->config_path = i_strdup(DEFAULT_CONFIG_FILE_PATH);
 	else
@@ -534,9 +536,9 @@ master_service_init(const char *name, enum master_service_flags flags,
 	if ((flags & MASTER_SERVICE_FLAG_STANDALONE) == 0) {
 		service->version_string = getenv(MASTER_DOVECOT_VERSION_ENV);
 		/* listener configuration */
-		value = getenv("SOCKET_COUNT");
+		value = getenv(MASTER_SERVICE_SOCKET_COUNT_ENV);
 		if (value == NULL || str_to_uint(value, &service->socket_count) < 0)
-			i_fatal("Invalid SOCKET_COUNT environment");
+			i_fatal("Invalid "MASTER_SERVICE_SOCKET_COUNT_ENV" environment");
 		T_BEGIN {
 			master_service_init_socket_listeners(service);
 		} T_END;
@@ -554,7 +556,7 @@ master_service_init(const char *name, enum master_service_flags flags,
 
 	/* set up some kind of logging until we know exactly how and where
 	   we want to log */
-	if (getenv("LOG_SERVICE") != NULL)
+	if (getenv(MASTER_SERVICE_LOG_SERVICE_ENV) != NULL)
 		i_set_failure_internal();
 	if (getenv("USER") != NULL) {
 		i_set_failure_prefix("%s(%s): ", service->configured_name,
@@ -627,6 +629,18 @@ master_service_init(const char *name, enum master_service_flags flags,
 	}
 
 	master_service_verify_version_string(service);
+
+	if ((service->flags & MASTER_SERVICE_FLAG_STANDALONE) == 0) {
+		env_remove(MASTER_SERVICE_ENV);
+		env_remove(MASTER_SERVICE_SOCKET_COUNT_ENV);
+		env_remove(MASTER_UID_ENV);
+		env_remove(MASTER_CONFIG_FILE_SOCKET_ENV);
+		T_BEGIN {
+			for (unsigned int i = 0; i < service->socket_count; i++)
+				env_remove(t_strdup_printf("SOCKET%u_SETTINGS", i));
+		} T_END;
+	}
+
 	return service;
 }
 
@@ -700,14 +714,14 @@ master_service_try_init_log(struct master_service *service,
 
 	if ((service->flags & MASTER_SERVICE_FLAG_STANDALONE) != 0 &&
 	    (service->flags & MASTER_SERVICE_FLAG_DONT_LOG_TO_STDERR) == 0) {
-		timestamp = getenv("LOG_STDERR_TIMESTAMP");
+		timestamp = getenv(DOVECOT_LOG_STDERR_TIMESTAMP_ENV);
 		if (timestamp != NULL)
 			i_set_failure_timestamp_format(timestamp);
 		i_set_failure_file("/dev/stderr", "");
 		return TRUE;
 	}
 
-	if (getenv("LOG_SERVICE") != NULL && !service->log_directly) {
+	if (getenv(MASTER_SERVICE_LOG_SERVICE_ENV) != NULL && !service->log_directly) {
 		/* logging via log service */
 		i_set_failure_internal();
 		i_set_failure_prefix("%s", prefix);

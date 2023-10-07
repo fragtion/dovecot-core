@@ -433,7 +433,7 @@ static bool db_ldap_request_queue_next(struct ldap_connection *conn)
 		return FALSE;
 	} else {
 		/* broken request, remove from queue */
-		aqueue_delete_tail(conn->request_queue);
+		aqueue_delete(conn->request_queue, conn->pending_count);
 		request->callback(conn, request, NULL);
 		return TRUE;
 	}
@@ -639,10 +639,9 @@ ldap_request_send_subquery(struct ldap_connection *conn,
 	char *name;
 	struct auth_request *auth_request = request->request.auth_request;
 	struct ldap_field_find_subquery_context ctx;
-	const struct var_expand_table *table =
+	const struct var_expand_table *var_expand_table =
 		auth_request_get_var_expand_table(auth_request, NULL);
 	const struct var_expand_func_table *ptr;
-	struct var_expand_func_table *ftable;
 	string_t *tmp_str = t_str_new(64);
 	ARRAY(struct var_expand_func_table) var_funcs_table;
 	t_array_init(&var_funcs_table, 8);
@@ -650,12 +649,18 @@ ldap_request_send_subquery(struct ldap_connection *conn,
 	for(ptr = auth_request_var_funcs_table; ptr->key != NULL; ptr++) {
 		array_push_back(&var_funcs_table, ptr);
 	}
-	ftable = array_append_space(&var_funcs_table);
-	ftable->key = "ldap";
-	ftable->func = db_ldap_field_subquery_find;
-	ftable = array_append_space(&var_funcs_table);
-	ftable->key = "ldap_ptr";
-	ftable->func = db_ldap_field_subquery_find;
+
+	static struct var_expand_func_table subquery_table[] = {
+		{ "ldap", db_ldap_field_subquery_find },
+		{ "ldap_multi", db_ldap_field_subquery_find },
+		{ "ldap_ptr", db_ldap_field_subquery_find },
+		{ NULL, NULL }
+	};
+
+	for(ptr = subquery_table; ptr->key != NULL; ptr++) {
+		array_push_back(&var_funcs_table, ptr);
+	}
+
 	array_append_zero(&var_funcs_table);
 
 	i_zero(&ctx);
@@ -666,8 +671,10 @@ ldap_request_send_subquery(struct ldap_connection *conn,
 	array_foreach(request->attr_map, field) {
 		if (field->ldap_attr_name[0] == '\0') {
 			str_truncate(tmp_str, 0);
-			if (var_expand_with_funcs(tmp_str, field->value, table,
-						  array_front(&var_funcs_table), &ctx, &error) <= 0) {
+			if (var_expand_with_funcs(tmp_str, field->value,
+						  var_expand_table,
+						  array_front(&var_funcs_table),
+						  &ctx, &error) <= 0) {
 				e_error(authdb_event(auth_request),
 					"Failed to expand subquery %s: %s",
 					field->value, error);

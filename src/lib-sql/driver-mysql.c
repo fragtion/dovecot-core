@@ -80,7 +80,7 @@ static struct event_category event_category_mysql = {
 
 static int driver_mysql_connect(struct sql_db *_db)
 {
-	struct mysql_db *db = (struct mysql_db *)_db;
+	struct mysql_db *db = container_of(_db, struct mysql_db, api);
 	const char *unix_socket, *host;
 	unsigned long client_flags = db->client_flags;
 	unsigned int secs_used;
@@ -90,9 +90,6 @@ static int driver_mysql_connect(struct sql_db *_db)
 	i_assert(db->api.state == SQL_DB_STATE_DISCONNECTED);
 
 	sql_db_set_state(&db->api, SQL_DB_STATE_CONNECTING);
-
-	if (mysql_init(db->mysql) == NULL)
-		i_fatal("mysql_init() failed");
 
 	if (db->host == NULL) {
 		/* assume option_file overrides the host, or if not we'll just
@@ -176,10 +173,9 @@ static int driver_mysql_connect(struct sql_db *_db)
 
 static void driver_mysql_disconnect(struct sql_db *_db)
 {
-	struct mysql_db *db = (struct mysql_db *)_db;
+	struct mysql_db *db = container_of(_db, struct mysql_db, api);
 	if (db->mysql != NULL)
 		mysql_close(db->mysql);
-	db->mysql = NULL;
 }
 
 static int driver_mysql_parse_connect_string(struct mysql_db *db,
@@ -276,7 +272,12 @@ static int driver_mysql_parse_connect_string(struct mysql_db *db,
 		*error_r = "No hosts given in connect string";
 		return -1;
 	}
-	db->mysql = p_new(db->pool, MYSQL, 1);
+	if (db->mysql == NULL) {
+		db->mysql = p_new(db->pool, MYSQL, 1);
+		MYSQL *ptr = mysql_init(db->mysql);
+		if (ptr == NULL)
+			i_fatal_status(FATAL_OUTOFMEM, "mysql_init() failed");
+	}
 	return 0;
 }
 
@@ -312,14 +313,12 @@ static int driver_mysql_init_full_v(const struct sql_settings *set,
 
 static void driver_mysql_deinit_v(struct sql_db *_db)
 {
-	struct mysql_db *db = (struct mysql_db *)_db;
+	struct mysql_db *db = container_of(_db, struct mysql_db, api);
 
 	_db->no_reconnect = TRUE;
 	sql_db_set_state(&db->api, SQL_DB_STATE_DISCONNECTED);
 
-	if (db->mysql != NULL)
-		mysql_close(db->mysql);
-	db->mysql = NULL;
+	driver_mysql_disconnect(_db);
 
 	sql_connection_log_finished(_db);
 	event_unref(&_db->event);
@@ -363,7 +362,7 @@ static int driver_mysql_do_query(struct mysql_db *db, const char *query,
 static const char *
 driver_mysql_escape_string(struct sql_db *_db, const char *string)
 {
-	struct mysql_db *db = (struct mysql_db *)_db;
+	struct mysql_db *db = container_of(_db, struct mysql_db, api);
 	size_t len = strlen(string);
 	char *to;
 
@@ -372,7 +371,7 @@ driver_mysql_escape_string(struct sql_db *_db, const char *string)
 		(void)sql_connect(&db->api);
 	}
 
-	if (db->mysql == NULL) {
+	if (_db->state == SQL_DB_STATE_DISCONNECTED) {
 		/* FIXME: we don't have a valid connection, so fallback
 		   to using default escaping. the next query will most
 		   likely fail anyway so it shouldn't matter that much
@@ -393,7 +392,7 @@ driver_mysql_escape_string(struct sql_db *_db, const char *string)
 
 static void driver_mysql_exec(struct sql_db *_db, const char *query)
 {
-	struct mysql_db *db = (struct mysql_db *)_db;
+	struct mysql_db *db = container_of(_db, struct mysql_db, api);
 	struct event *event = event_create(_db->event);
 
 	(void)driver_mysql_do_query(db, query, event);
@@ -416,7 +415,7 @@ static void driver_mysql_query(struct sql_db *db, const char *query,
 static struct sql_result *
 driver_mysql_query_s(struct sql_db *_db, const char *query)
 {
-	struct mysql_db *db = (struct mysql_db *)_db;
+	struct mysql_db *db = container_of(_db, struct mysql_db, api);
 	struct mysql_result *result;
 	struct event *event;
 	int ret;
@@ -459,7 +458,8 @@ driver_mysql_query_s(struct sql_db *_db, const char *query)
 
 static void driver_mysql_result_free(struct sql_result *_result)
 {
-	struct mysql_result *result = (struct mysql_result *)_result;
+	struct mysql_result *result =
+		container_of(_result, struct mysql_result, api);
 
 	i_assert(_result != &sql_not_connected_result);
 	if (_result->callback)
@@ -473,8 +473,9 @@ static void driver_mysql_result_free(struct sql_result *_result)
 
 static int driver_mysql_result_next_row(struct sql_result *_result)
 {
-	struct mysql_result *result = (struct mysql_result *)_result;
-	struct mysql_db *db = (struct mysql_db *)_result->db;
+	struct mysql_result *result =
+		container_of(_result, struct mysql_result, api);
+	struct mysql_db *db = container_of(_result->db, struct mysql_db, api);
 	int ret;
 
 	if (result->result == NULL) {
@@ -506,7 +507,8 @@ static void driver_mysql_result_fetch_fields(struct mysql_result *result)
 static unsigned int
 driver_mysql_result_get_fields_count(struct sql_result *_result)
 {
-	struct mysql_result *result = (struct mysql_result *)_result;
+	struct mysql_result *result =
+		container_of(_result, struct mysql_result, api);
 
         driver_mysql_result_fetch_fields(result);
 	return result->fields_count;
@@ -515,7 +517,8 @@ driver_mysql_result_get_fields_count(struct sql_result *_result)
 static const char *
 driver_mysql_result_get_field_name(struct sql_result *_result, unsigned int idx)
 {
-	struct mysql_result *result = (struct mysql_result *)_result;
+	struct mysql_result *result =
+		container_of(_result, struct mysql_result, api);
 
 	driver_mysql_result_fetch_fields(result);
 	i_assert(idx < result->fields_count);
@@ -525,7 +528,8 @@ driver_mysql_result_get_field_name(struct sql_result *_result, unsigned int idx)
 static int driver_mysql_result_find_field(struct sql_result *_result,
 					  const char *field_name)
 {
-	struct mysql_result *result = (struct mysql_result *)_result;
+	struct mysql_result *result =
+		container_of(_result, struct mysql_result, api);
 	unsigned int i;
 
 	driver_mysql_result_fetch_fields(result);
@@ -540,7 +544,8 @@ static const char *
 driver_mysql_result_get_field_value(struct sql_result *_result,
 				    unsigned int idx)
 {
-	struct mysql_result *result = (struct mysql_result *)_result;
+	struct mysql_result *result =
+		container_of(_result, struct mysql_result, api);
 
 	return (const char *)result->row[idx];
 }
@@ -549,7 +554,8 @@ static const unsigned char *
 driver_mysql_result_get_field_value_binary(struct sql_result *_result,
 					   unsigned int idx, size_t *size_r)
 {
-	struct mysql_result *result = (struct mysql_result *)_result;
+	struct mysql_result *result =
+		container_of(_result, struct mysql_result, api);
 	unsigned long *lengths;
 
 	lengths = mysql_fetch_lengths(result->result);
@@ -573,14 +579,15 @@ driver_mysql_result_find_field_value(struct sql_result *result,
 static const char *const *
 driver_mysql_result_get_values(struct sql_result *_result)
 {
-	struct mysql_result *result = (struct mysql_result *)_result;
+	struct mysql_result *result =
+		container_of(_result, struct mysql_result, api);
 
 	return (const char *const *)result->row;
 }
 
 static const char *driver_mysql_result_get_error(struct sql_result *_result)
 {
-	struct mysql_db *db = (struct mysql_db *)_result->db;
+	struct mysql_db *db = container_of(_result->db, struct mysql_db, api);
 	const char *errstr;
 	unsigned int idle_time;
 	int err;
@@ -637,7 +644,8 @@ transaction_send_query(struct mysql_transaction_context *ctx, const char *query,
 		ctx->failed = TRUE;
 		ret = -1;
 	} else if (affected_rows_r != NULL) {
-		struct mysql_result *result = (struct mysql_result *)_result;
+		struct mysql_result *result =
+			container_of(_result, struct mysql_result, api);
 
 		i_assert(result->affected_rows != (my_ulonglong)-1);
 		*affected_rows_r = result->affected_rows;
@@ -677,8 +685,8 @@ driver_mysql_transaction_commit_s(struct sql_transaction_context *_ctx,
 				  const char **error_r)
 {
 	struct mysql_transaction_context *ctx =
-		(struct mysql_transaction_context *)_ctx;
-	struct mysql_db *db = (struct mysql_db *)_ctx->db;
+		container_of(_ctx, struct mysql_transaction_context, ctx);
+	struct mysql_db *db = container_of(_ctx->db, struct mysql_db, api);
 	int ret = 1;
 
 	*error_r = NULL;
@@ -707,7 +715,7 @@ static void
 driver_mysql_transaction_rollback(struct sql_transaction_context *_ctx)
 {
 	struct mysql_transaction_context *ctx =
-		(struct mysql_transaction_context *)_ctx;
+		container_of(_ctx, struct mysql_transaction_context, ctx);
 
 	if (ctx->failed) {
 		bool rolledback = FALSE;
@@ -746,7 +754,7 @@ driver_mysql_update(struct sql_transaction_context *_ctx, const char *query,
 		    unsigned int *affected_rows)
 {
 	struct mysql_transaction_context *ctx =
-		(struct mysql_transaction_context *)_ctx;
+		container_of(_ctx, struct mysql_transaction_context, ctx);
 
 	sql_transaction_add_query(&ctx->ctx, ctx->query_pool,
 				  query, affected_rows);
