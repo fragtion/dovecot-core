@@ -121,7 +121,7 @@ static bool
 index_mail_want_attachment_keywords_on_fetch(struct index_mail *mail)
 {
 	const struct mail_storage_settings *mail_set =
-		mailbox_get_settings(mail->mail.mail.box);
+		mail->mail.mail.box->storage->set;
 
 	return mail_set->parsed_mail_attachment_detection_add_flags &&
 		!mail_set->parsed_mail_attachment_detection_no_flags_on_fetch &&
@@ -154,19 +154,6 @@ static struct message_part *get_unserialized_parts(struct index_mail *mail)
 			error, binary_to_hex(part_buf->data, part_buf->used));
 	}
 	return parts;
-}
-
-static bool message_parts_have_nuls(const struct message_part *part)
-{
-	for (; part != NULL; part = part->next) {
-		if ((part->flags & MESSAGE_PART_FLAG_HAS_NULS) != 0)
-			return TRUE;
-		if (part->children != NULL) {
-			if (message_parts_have_nuls(part->children))
-				return TRUE;
-		}
-	}
-	return FALSE;
 }
 
 static bool get_cached_parts(struct index_mail *mail)
@@ -1176,7 +1163,7 @@ index_mail_parse_body_finish(struct index_mail *mail,
 {
 	struct istream *parser_input = mail->data.parser_input;
 	const struct mail_storage_settings *mail_set =
-		mailbox_get_settings(mail->mail.mail.box);
+		mail->mail.mail.box->storage->set;
 	const char *error = NULL;
 	int ret;
 
@@ -1478,7 +1465,7 @@ int index_mail_init_stream(struct index_mail *mail,
 }
 
 static bool index_mail_want_write_snippet(struct index_mail *mail,
-				     	  enum index_cache_field field)
+					  enum index_cache_field field)
 {
 	if (field == MAIL_CACHE_BODY_SNIPPET) return TRUE;
 	return index_mail_want_cache(mail, MAIL_CACHE_BODY_SNIPPET);
@@ -1920,7 +1907,7 @@ void index_mail_close(struct mail *_mail)
 	/* If uid == 0 but seq != 0, we came here from saving a (non-mbox)
 	   message. If that happens, don't bother checking if anything should
 	   be cached since it was already checked. Also by now the transaction
-	   may have already been rollbacked and seq point to a nonexistent
+	   may have already been rolled back and seq point to a nonexistent
 	   message. */
 	if (mail->mail.mail.uid != 0) {
 		index_mail_cache_sizes(mail);
@@ -1929,8 +1916,8 @@ void index_mail_close(struct mail *_mail)
 
 	index_mail_close_streams_full(mail, TRUE);
 	/* Notify cache that the mail is no longer open. This mainly helps
-	   with INDEX=MEMORY to keep all data added with mail_cache_add() in
-	   memory until this point. */
+	   with mail_index_path=MEMORY to keep all data added with
+	   mail_cache_add() in memory until this point. */
 	mail_cache_close_mail(_mail->transaction->cache_trans, _mail->seq);
 
 	mailbox_header_lookup_unref(&mail->data.wanted_headers);
@@ -2224,8 +2211,8 @@ bool index_mail_prefetch(struct mail *_mail)
 		if ((mail->data.access_part & (READ_BODY | PARSE_BODY)) != 0)
 			len = 0;
 		else
-			len = MAIL_READ_HDR_BLOCK_SIZE;
-		if (posix_fadvise(fd, 0, len, POSIX_FADV_WILLNEED) < 0) {
+			len = (off_t)MAIL_READ_HDR_BLOCK_SIZE;
+		if ((errno = posix_fadvise(fd, 0, len, POSIX_FADV_WILLNEED)) != 0) {
 			e_error(mail_event(_mail),
 				"posix_fadvise(%s) failed: %m",
 				i_stream_get_name(mail->data.stream));

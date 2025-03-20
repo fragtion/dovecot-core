@@ -1,6 +1,7 @@
 /* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
+#include "llist.h"
 #include "str.h"
 #include "strescape.h"
 #include "smtp-address.h"
@@ -12,7 +13,8 @@ struct message_address_parser_context {
 	pool_t pool;
 	struct rfc822_parser_context parser;
 
-	struct message_address *first_addr, *last_addr, addr;
+	struct message_address addr;
+	struct message_address_list addr_list;
 	string_t *str;
 
 	bool fill_missing, non_strict_dots;
@@ -27,11 +29,7 @@ static void add_address(struct message_address_parser_context *ctx)
 	memcpy(addr, &ctx->addr, sizeof(ctx->addr));
 	i_zero(&ctx->addr);
 
-	if (ctx->first_addr == NULL)
-		ctx->first_addr = addr;
-	else
-		ctx->last_addr->next = addr;
-	ctx->last_addr = addr;
+	DLLIST2_APPEND(&ctx->addr_list.head, &ctx->addr_list.tail, addr);
 }
 
 /* quote with "" and escape all '\', '"' and "'" characters if need */
@@ -442,10 +440,11 @@ static int parse_path(struct message_address_parser_context *ctx)
 	return ret;
 }
 
-static struct message_address *
+static void
 message_address_parse_real(pool_t pool, const unsigned char *data, size_t size,
 			   unsigned int max_addresses,
-			   enum message_address_parse_flags flags)
+			   enum message_address_parse_flags flags,
+			   struct message_address_list *list_r)
 {
 	struct message_address_parser_context ctx;
 
@@ -465,7 +464,7 @@ message_address_parse_real(pool_t pool, const unsigned char *data, size_t size,
 	}
 	rfc822_parser_deinit(&ctx.parser);
 	str_free(&ctx.str);
-	return ctx.first_addr;
+	*list_r = ctx.addr_list;
 }
 
 static int
@@ -486,7 +485,7 @@ message_address_parse_path_real(pool_t pool, const unsigned char *data,
 
 	rfc822_parser_deinit(&ctx.parser);
 	str_free(&ctx.str);
-	*addr_r = ctx.first_addr;
+	*addr_r = ctx.addr_list.head;
 	return (ret < 0 ? -1 : 0);
 }
 
@@ -495,17 +494,24 @@ message_address_parse(pool_t pool, const unsigned char *data, size_t size,
 		      unsigned int max_addresses,
 		      enum message_address_parse_flags flags)
 {
-	struct message_address *addr;
+	struct message_address_list list;
+	message_address_parse_full(pool, data, size, max_addresses, flags,
+				   &list);
+	return list.head;
+}
 
+void message_address_parse_full(pool_t pool, const unsigned char *data,
+				size_t size, unsigned int max_addresses,
+				enum message_address_parse_flags flags,
+				struct message_address_list *list_r)
+{
 	if (pool->datastack_pool) {
-		return message_address_parse_real(pool, data, size,
-						  max_addresses, flags);
-	}
-	T_BEGIN {
-		addr = message_address_parse_real(pool, data, size,
-						  max_addresses, flags);
+		message_address_parse_real(pool, data, size,
+					   max_addresses, flags, list_r);
+	} else T_BEGIN {
+		message_address_parse_real(pool, data, size,
+					   max_addresses, flags, list_r);
 	} T_END;
-	return addr;
 }
 
 int message_address_parse_path(pool_t pool, const unsigned char *data,
@@ -633,6 +639,7 @@ const char *message_address_first_to_string(const struct message_address *addr)
 	struct message_address first_addr;
 
 	first_addr = *addr;
+	first_addr.prev = NULL;
 	first_addr.next = NULL;
 	first_addr.route = NULL;
 	return message_address_to_string(&first_addr);

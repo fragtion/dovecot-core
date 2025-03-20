@@ -8,6 +8,7 @@
 #include "connection.h"
 #include "ioloop.h"
 #include "istream.h"
+#include "settings.h"
 #include "master-service.h"
 #include "iostream-ssl.h"
 #include "auth-proxy.h"
@@ -66,7 +67,6 @@ static void doveadm_cmd_callback(const struct doveadm_server_reply *reply,
 
 static void doveadm_server_request_free(struct doveadm_server_request *request)
 {
-	ssl_iostream_context_unref(&request->set.ssl_ctx);
 	pool_unref(&request->pool);
 }
 
@@ -123,7 +123,7 @@ int doveadm_cmd_pass_lookup(struct doveadm_mail_cmd_context *ctx,
 	mail_storage_service_init_settings(ctx->storage_service, &input);
 
 	i_zero(&info);
-	info.service = master_service_get_name(master_service);
+	info.protocol = master_service_get_name(master_service);
 	info.local_ip = ctx->cctx->local_ip;
 	info.remote_ip = ctx->cctx->remote_ip;
 	info.local_port = ctx->cctx->local_port;
@@ -558,6 +558,20 @@ void doveadm_mail_server_handle(struct doveadm_server *server,
 				struct doveadm_mail_cmd_context *cmd_ctx,
 				const char *username, bool print_username)
 {
+	const char *const *args = doveadm_cmdv2_wrapper_generate_args(cmd_ctx);
+	doveadm_mail_server_handle_full(server, conn, cmd_ctx, username,
+					cmd_ctx->cmd->name, args,
+					print_username);
+}
+
+void doveadm_mail_server_handle_full(struct doveadm_server *server,
+				     struct doveadm_client *conn,
+				     struct doveadm_mail_cmd_context *cmd_ctx,
+				     const char *username,
+				     const char *cmd_name,
+				     const char *const *cmd_args,
+				     bool print_username)
+{
 	struct doveadm_mail_server_cmd *servercmd;
 	string_t *cmd;
 
@@ -571,12 +585,11 @@ void doveadm_mail_server_handle(struct doveadm_server *server,
 
 	str_append_tabescaped(cmd, username);
 	str_append_c(cmd, '\t');
-	str_append_tabescaped(cmd, cmd_ctx->cmd->name);
+	str_append_tabescaped(cmd, cmd_name);
 
-	const char *const *args = doveadm_cmdv2_wrapper_generate_args(cmd_ctx);
-	for (; *args != NULL; args++) {
-	 	str_append_c(cmd, '\t');
-	 	str_append_tabescaped(cmd, *args);
+	for (; *cmd_args != NULL; cmd_args++) {
+		str_append_c(cmd, '\t');
+		str_append_tabescaped(cmd, *cmd_args);
 	}
 	str_append_c(cmd, '\n');
 
@@ -611,8 +624,6 @@ doveadm_mail_server_request_queue_handle_next(struct doveadm_mail_cmd_context *c
 	request_copy = *request;
 	array_pop_front(&doveadm_server_request_queue);
 
-	doveadm_get_ssl_settings(&request_copy.set.ssl_set,
-				 pool_datastack_create());
 	if (doveadm_client_create(&request_copy.set, &conn, error_r) < 0) {
 		internal_failure = TRUE;
 		return -1;
@@ -810,8 +821,6 @@ int doveadm_mail_server_user(struct doveadm_mail_cmd_context *ctx,
 	}
 
 	if (doveadm_clients_count() <= limit) {
-		doveadm_get_ssl_settings(&conn_set.ssl_set,
-					 pool_datastack_create());
 		if (doveadm_client_create(&conn_set, &conn, error_r) < 0) {
 			internal_failure = TRUE;
 			return -1;

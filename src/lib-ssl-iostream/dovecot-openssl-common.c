@@ -27,12 +27,14 @@ static void *dovecot_openssl_malloc(size_t size, const char *u0 ATTR_UNUSED, int
 static void *dovecot_openssl_malloc(size_t size)
 #endif
 {
+	if (size == 0)
+		return NULL;
 	/* this may be performance critical, so don't use
 	   i_malloc() or calloc() */
 	void *mem = malloc(size);
-	if (mem == NULL) {
+	if (unlikely(mem == NULL)) {
 		i_fatal_status(FATAL_OUTOFMEM,
-			"OpenSSL: malloc(%zu): Out of memory", size);
+			       "OpenSSL: malloc(%zu): Out of memory", size);
 	}
 	return mem;
 }
@@ -43,10 +45,14 @@ static void *dovecot_openssl_realloc(void *ptr, size_t size, const char *u0 ATTR
 static void *dovecot_openssl_realloc(void *ptr, size_t size)
 #endif
 {
+	if (size == 0) {
+		free(ptr);
+		return NULL;
+	}
 	void *mem = realloc(ptr, size);
-	if (mem == NULL) {
+	if (unlikely(mem == NULL)) {
 		i_fatal_status(FATAL_OUTOFMEM,
-			"OpenSSL: realloc(%zu): Out of memory", size);
+			       "OpenSSL: realloc(%zu): Out of memory", size);
 	}
 	return mem;
 }
@@ -73,13 +79,7 @@ void dovecot_openssl_common_global_ref(void)
 		/*i_warning("CRYPTO_set_mem_functions() was called too late");*/
 	}
 
-#ifdef HAVE_OPENSSL_init_ssl
 	OPENSSL_init_ssl(0, NULL);
-#else
-	SSL_library_init();
-	SSL_load_error_strings();
-	OpenSSL_add_all_algorithms();
-#endif
 }
 
 bool dovecot_openssl_common_global_unref(void)
@@ -97,29 +97,7 @@ bool dovecot_openssl_common_global_unref(void)
 #endif
 		dovecot_openssl_engine = NULL;
 	}
-#ifdef HAVE_OPENSSL_cleanup
 	OPENSSL_cleanup();
-#else
-	/* OBJ_cleanup() is called automatically by EVP_cleanup() in
-	   newer versions. Doesn't hurt to call it anyway. */
-	OBJ_cleanup();
-#  if !defined(OPENSSL_NO_COMP)
-	SSL_COMP_free_compression_methods();
-#  endif
-	ENGINE_cleanup();
-	EVP_cleanup();
-	CRYPTO_cleanup_all_ex_data();
-#  ifdef HAVE_OPENSSL_thread_stop
-	/* no cleanup needed */
-#  elif defined(HAVE_ERR_remove_thread_state)
-	/* This was marked as deprecated in v1.1. */
-	ERR_remove_thread_state(NULL);
-#  elif defined(HAVE_ERR_remove_state)
-	/* This was deprecated by ERR_remove_thread_state(NULL) in v1.0.0. */
-	ERR_remove_state(0);
-#  endif
-	ERR_free_strings();
-#endif
 	return FALSE;
 }
 

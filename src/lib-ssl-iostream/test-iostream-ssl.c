@@ -158,7 +158,8 @@ create_test_endpoint(int fd, const struct ssl_iostream_settings *set)
 	ep->input = i_stream_create_fd(ep->fd, 512);
 	ep->output = o_stream_create_fd(ep->fd, 1024);
 	o_stream_uncork(ep->output);
-	ep->set = ssl_iostream_settings_dup(pool, set);
+	/* We assume here that strings continue to be valid pointers */
+	ep->set = p_memdup(pool, set, sizeof(*set));
 	ep->last_write = buffer_create_dynamic(pool, 1024);
 	return ep;
 }
@@ -215,15 +216,13 @@ static int test_iostream_ssl_handshake_real(struct ssl_iostream_settings *server
 		return -1;
 	}
 
-	if (io_stream_create_ssl_server(server->ctx, server->set,
-					NULL,
+	if (io_stream_create_ssl_server(server->ctx, NULL,
 					&server->input, &server->output,
 					&server->iostream, &error) != 0) {
 		ret = -1;
 	}
 
-	if (io_stream_create_ssl_client(client->ctx, client->hostname, client->set,
-					NULL,
+	if (io_stream_create_ssl_client(client->ctx, client->hostname, NULL, 0,
 					&client->input, &client->output,
 					&client->iostream, &error) != 0) {
 		ret = -1;
@@ -233,9 +232,9 @@ static int test_iostream_ssl_handshake_real(struct ssl_iostream_settings *server
 	server->io = io_add_istream(server->input, handshake_input_callback, server);
 
 	if (ssl_iostream_handshake(client->iostream) < 0)
-		return -1;
-
-	io_loop_run(current_ioloop);
+		ret = -1;
+	else
+		io_loop_run(current_ioloop);
 
 	if (client->failed || server->failed)
 		ret = -1;
@@ -319,7 +318,7 @@ static void test_iostream_ssl_handshake(void)
 	ssl_iostream_test_settings_server(&server_set);
 	ssl_iostream_test_settings_client(&client_set);
 	client_set.verify_remote_cert = TRUE;
-	client_set.ca = NULL;
+	i_zero(&client_set.ca);
 	test_expect_error_string("client: Received invalid SSL certificate");
 	test_assert_idx(test_iostream_ssl_handshake_real(&server_set, &client_set,
 							 "127.0.0.1") != 0, idx);
@@ -337,7 +336,7 @@ static void test_iostream_ssl_handshake(void)
 
 	/* missing server credentials */
 	ssl_iostream_test_settings_server(&server_set);
-	server_set.cert.key = NULL;
+	i_zero(&server_set.cert.key);
 	ssl_iostream_test_settings_client(&client_set);
 	client_set.verify_remote_cert = TRUE;
 	test_expect_error_string("client(failhost): SSL certificate not received");
@@ -345,7 +344,7 @@ static void test_iostream_ssl_handshake(void)
 							 "failhost") != 0, idx);
 	idx++;
 	ssl_iostream_test_settings_server(&server_set);
-	server_set.cert.cert = NULL;
+	i_zero(&server_set.cert.cert);
 	ssl_iostream_test_settings_client(&client_set);
 	client_set.verify_remote_cert = TRUE;
 	test_expect_error_string("client(failhost): SSL certificate not received");
@@ -371,12 +370,13 @@ static void test_iostream_ssl_handshake(void)
 	server_set.verify_remote_cert = TRUE;
 	server_set.ca = client_set.ca;
 	client_set.cert = server_set.cert;
-	test_expect_error_string("server: SSL_accept() failed: error:");
+	test_expect_error_string("server: Received invalid SSL certificate");
 	test_assert_idx(test_iostream_ssl_handshake_real(&server_set, &client_set,
 							 "127.0.0.1") != 0, idx);
 	idx++;
 
 	io_loop_destroy(&ioloop);
+	ssl_iostream_context_cache_free();
 
 	test_end();
 }
@@ -413,11 +413,10 @@ static void test_iostream_ssl_get_buffer_avail_size(void)
 	test_assert(ssl_iostream_context_init_client(client->set, &client->ctx,
 		    &error) == 0);
 
-	test_assert(io_stream_create_ssl_server(server->ctx, server->set, NULL,
+	test_assert(io_stream_create_ssl_server(server->ctx, NULL,
 						&server->input, &server->output,
 						&server->iostream, &error) == 0);
-	test_assert(io_stream_create_ssl_client(client->ctx, "localhost", client->set,
-						NULL,
+	test_assert(io_stream_create_ssl_client(client->ctx, "localhost", NULL, 0,
 						&client->input, &client->output,
 						&client->iostream, &error) == 0);
 
@@ -469,6 +468,7 @@ static void test_iostream_ssl_get_buffer_avail_size(void)
 	destroy_test_endpoint(&server);
 
 	io_loop_destroy(&ioloop);
+	ssl_iostream_context_cache_free();
 
 	test_end();
 }
@@ -505,11 +505,10 @@ static void test_iostream_ssl_small_packets(void)
 	client->other = server;
 	server->other = client;
 
-	test_assert(io_stream_create_ssl_server(server->ctx, server->set, NULL,
+	test_assert(io_stream_create_ssl_server(server->ctx, NULL,
 						&server->input, &server->output,
 						&server->iostream, &error) == 0);
-	test_assert(io_stream_create_ssl_client(client->ctx, "localhost", client->set,
-						NULL,
+	test_assert(io_stream_create_ssl_client(client->ctx, "localhost", NULL, 0,
 						&client->input, &client->output,
 						&client->iostream, &error) == 0);
 
@@ -544,6 +543,7 @@ static void test_iostream_ssl_small_packets(void)
 	destroy_test_endpoint(&client);
 
 	io_loop_destroy(&ioloop);
+	ssl_iostream_context_cache_free();
 
 	test_end();
 }

@@ -6,6 +6,7 @@
 #include "hex-binary.h"
 #include "str.h"
 #include "time-util.h"
+#include "settings.h"
 #include "sql-api-private.h"
 #include "llist.h"
 
@@ -14,12 +15,60 @@
 
 #define PGSQL_DNS_WARN_MSECS 500
 
+/* <settings checks> */
+#define PGSQL_SQLPOOL_SET_NAME "pgsql"
+/* </settings checks> */
+
+struct pgsql_settings {
+	pool_t pool;
+
+	ARRAY_TYPE(const_string) sqlpool_hosts;
+	unsigned int connection_limit;
+
+	const char *host;
+	ARRAY_TYPE(const_string) parameters;
+};
+
+#undef DEF
+#define DEF(type, name) \
+	SETTING_DEFINE_STRUCT_##type("pgsql_"#name, name, struct pgsql_settings)
+static const struct setting_define pgsql_setting_defines[] = {
+	{ .type = SET_FILTER_ARRAY, .key = PGSQL_SQLPOOL_SET_NAME,
+	  .offset = offsetof(struct pgsql_settings, sqlpool_hosts),
+	  .filter_array_field_name = "pgsql_host", },
+	DEF(UINT, connection_limit),
+
+	DEF(STR, host),
+	DEF(STRLIST, parameters),
+
+	SETTING_DEFINE_LIST_END
+};
+
+static const struct pgsql_settings pgsql_default_settings = {
+	.sqlpool_hosts = ARRAY_INIT,
+	.connection_limit = SQL_DEFAULT_CONNECTION_LIMIT,
+
+	.host = "",
+	.parameters = ARRAY_INIT,
+};
+
+const struct setting_parser_info pgsql_setting_parser_info = {
+	.name = "pgsql",
+#ifdef SQL_DRIVER_PLUGINS
+	.plugin_dependency = "libdriver_pgsql",
+#endif
+
+	.defines = pgsql_setting_defines,
+	.defaults = &pgsql_default_settings,
+
+	.struct_size = sizeof(struct pgsql_settings),
+	.pool_offset1 = 1 + offsetof(struct pgsql_settings, pool),
+};
+
 struct pgsql_db {
 	struct sql_db api;
 
-	pool_t pool;
-	char *connect_string;
-	char *host;
+	const struct pgsql_settings *set;
 	PGconn *pg;
 
 	struct io *io;
@@ -80,8 +129,17 @@ struct pgsql_transaction_context {
 	bool failed:1;
 };
 
+struct pgsql_db_cache {
+	/* Contains the sqlpool connection */
+	struct sql_db *db;
+
+	const struct pgsql_settings *set;
+};
+
 extern const struct sql_db driver_pgsql_db;
 extern const struct sql_result driver_pgsql_result;
+
+static ARRAY(struct pgsql_db_cache) pgsql_db_cache;
 
 static void result_finish(struct pgsql_result *result);
 static void
@@ -240,14 +298,33 @@ static int driver_pgsql_connect(struct sql_db *_db)
 {
 	struct pgsql_db *db = (struct pgsql_db *)_db;
 	struct timeval tv_start;
-	int msecs;
+	long long msecs;
 
 	i_assert(db->api.state == SQL_DB_STATE_DISCONNECTED);
 
 	io_loop_time_refresh();
 	tv_start = ioloop_timeval;
 
-	db->pg = PQconnectStart(db->connect_string);
+	ARRAY_TYPE(const_string) keywords, values;
+	t_array_init(&keywords, 16);
+	t_array_init(&values, 16);
+
+	const char *host_str = "host";
+	array_push_back(&keywords, &host_str);
+	array_push_back(&values, &db->set->host);
+
+	unsigned int i, count;
+	const char *const *strings =
+		array_get(&db->set->parameters, &count);
+	for (i = 0; i < count; i += 2) {
+		array_push_back(&keywords, &strings[i]);
+		array_push_back(&values, &strings[i + 1]);
+	}
+
+	array_append_zero(&keywords);
+	array_append_zero(&values);
+	db->pg = PQconnectStartParams(array_front(&keywords),
+				      array_front(&values), 0);
 	if (db->pg == NULL) {
 		i_fatal_status(FATAL_OUTOFMEM, "pgsql: PQconnectStart() failed (out of memory)");
 	}
@@ -255,8 +332,11 @@ static int driver_pgsql_connect(struct sql_db *_db)
 	(void)PQsetNoticeProcessor(db->pg, pgsql_notice_processor, db);
 
 	if (PQstatus(db->pg) == CONNECTION_BAD) {
+		const char *name = PQdb(db->pg);
+		if (name == NULL)
+			name = db->set->host;
 		e_error(_db->event, "Connect failed to database %s: %s",
-			PQdb(db->pg), last_error(db));
+			name, last_error(db));
 		i_free(db->api.last_connect_error);
 		db->api.last_connect_error = i_strdup(last_error(db));
 		driver_pgsql_close(db);
@@ -268,7 +348,7 @@ static int driver_pgsql_connect(struct sql_db *_db)
 	io_loop_time_refresh();
 	msecs = timeval_diff_msecs(&ioloop_timeval, &tv_start);
 	if (msecs > PGSQL_DNS_WARN_MSECS) {
-		e_warning(_db->event, "DNS lookup took %d.%03d s",
+		e_warning(_db->event, "DNS lookup took %lld.%03lld s",
 			  msecs/1000, msecs % 1000);
 	}
 
@@ -305,8 +385,7 @@ static void driver_pgsql_free(struct pgsql_db **_db)
 	*_db = NULL;
 
 	event_unref(&db->api.event);
-	i_free(db->connect_string);
-	i_free(db->host);
+	settings_free(db->set);
 	i_free(db->error);
 	array_free(&db->api.module_contexts);
 	i_free(db);
@@ -331,32 +410,80 @@ static enum sql_db_flags driver_pgsql_get_flags(struct sql_db *db)
 	return db->flags;
 }
 
-static int driver_pgsql_init_full_v(const struct sql_settings *set,
-				    struct sql_db **db_r, const char **error_r ATTR_UNUSED)
+static struct pgsql_db_cache *
+driver_pgsql_db_cache_find(const struct pgsql_settings *set)
+{
+	struct pgsql_db_cache *cache;
+
+	array_foreach_modifiable(&pgsql_db_cache, cache) {
+		if (settings_equal(&pgsql_setting_parser_info,
+				   set, cache->set, NULL))
+			return cache;
+	}
+	return NULL;
+}
+
+static struct pgsql_db *
+driver_pgsql_init_from_set(struct event *event_parent,
+			   const struct pgsql_settings *set)
 {
 	struct pgsql_db *db;
-	const char *value;
 
 	db = i_new(struct pgsql_db, 1);
-	db->connect_string = i_strdup(set->connect_string);
 	db->api = driver_pgsql_db;
-	db->api.event = event_create(set->event_parent);
+	db->api.event = event_create(event_parent);
+	db->set = set;
 	event_add_category(db->api.event, &event_category_pgsql);
+	event_add_str(db->api.event, "sql_driver", "pgsql");
+	event_set_append_log_prefix(db->api.event,
+				    t_strdup_printf("pgsql(%s): ", set->host));
+	return db;
+}
 
-	/* NOTE: Connection string will be parsed by pgsql itself
-		 We only pick the host part here */
-	T_BEGIN {
-		const char *const *arg = t_strsplit(db->connect_string, " ");
+static int
+driver_pgsql_init_v(struct event *event, struct sql_db **db_r,
+		    const char **error_r)
+{
+	const struct pgsql_settings *set;
 
-		for (; *arg != NULL; arg++) {
-			if (str_begins(*arg, "host=", &value))
-				db->host = i_strdup(value);
+	if (settings_get(event, &pgsql_setting_parser_info, 0,
+			 &set, error_r) < 0)
+		return -1;
+	if (array_is_empty(&set->sqlpool_hosts)) {
+		*error_r = "pgsql { .. } named list filter is missing";
+		settings_free(set);
+		return -1;
+	}
 
+	if (event_get_ptr(event, SQLPOOL_EVENT_PTR) == NULL) {
+		/* See if there is already such a database */
+		struct pgsql_db_cache *cache =
+			driver_pgsql_db_cache_find(set);
+		if (cache != NULL)
+			settings_free(set);
+		else {
+			/* Use sqlpool for managing multiple connections.
+			   Leave an extra reference to it, so it won't be freed
+			   while it's still in the cache array. */
+			struct sql_db *db =
+				driver_sqlpool_init(&driver_pgsql_db, event,
+						    PGSQL_SQLPOOL_SET_NAME,
+						    &set->sqlpool_hosts,
+						    set->connection_limit);
+			cache = array_append_space(&pgsql_db_cache);
+			cache->db = db;
+			cache->set = set;
 		}
-	} T_END;
+		sql_ref(cache->db);
+		*db_r = cache->db;
+		return 0;
+	}
+	/* We're being initialized by sqlpool - create a real pgsql
+	 connection. */
 
-	event_set_append_log_prefix(db->api.event, t_strdup_printf("pgsql(%s): ", db->host));
-
+	struct pgsql_db *db = driver_pgsql_init_from_set(event, set);
+	event_drop_parent_log_prefixes(db->api.event, 1);
+	sql_init_common(&db->api);
 	*db_r = &db->api;
 	return 0;
 }
@@ -1311,7 +1438,7 @@ const struct sql_db driver_pgsql_db = {
 
 	.v = {
 		.get_flags = driver_pgsql_get_flags,
-		.init_full = driver_pgsql_init_full_v,
+		.init = driver_pgsql_init_v,
 		.deinit = driver_pgsql_deinit_v,
 		.connect = driver_pgsql_connect,
 		.disconnect = driver_pgsql_disconnect,
@@ -1349,16 +1476,21 @@ const struct sql_result driver_pgsql_result = {
 
 const char *driver_pgsql_version = DOVECOT_ABI_VERSION;
 
-void driver_pgsql_init(void);
-void driver_pgsql_deinit(void);
-
 void driver_pgsql_init(void)
 {
+	i_array_init(&pgsql_db_cache, 4);
 	sql_driver_register(&driver_pgsql_db);
 }
 
 void driver_pgsql_deinit(void)
 {
+	struct pgsql_db_cache *cache;
+
+	array_foreach_modifiable(&pgsql_db_cache, cache) {
+		settings_free(cache->set);
+		sql_unref(&cache->db);
+	}
+	array_free(&pgsql_db_cache);
 	sql_driver_unregister(&driver_pgsql_db);
 }
 

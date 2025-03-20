@@ -3,8 +3,10 @@ noinst_LTLIBRARIES = libfs.la
 AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib \
 	-I$(top_srcdir)/src/lib-test \
+	-I$(top_srcdir)/src/lib-settings \
 	-I$(top_srcdir)/src/lib-dict \
 	-I$(top_srcdir)/src/lib-ssl-iostream \
+	-I$(top_srcdir)/src/lib-var-expand \
 	-DMODULE_DIR=\""$(moduledir)"\"
 
 libfs_la_SOURCES = \
@@ -49,6 +51,9 @@ test_programs = \
 test_deps = \
 	$(noinst_LTLIBRARIES) \
 	../lib-dict/libdict.la \
+	../lib-settings/libsettings.la \
+	../lib-dns/libdns.la \
+	../lib-var-expand/libvar_expand.la \
 	../lib-test/libtest.la \
 	../lib/liblib.la
 

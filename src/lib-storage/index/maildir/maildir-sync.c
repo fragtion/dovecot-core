@@ -184,7 +184,6 @@
 #include "maildir-sync.h"
 
 #include <stdio.h>
-#include <stddef.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -387,7 +386,7 @@ maildir_scan_dir(struct maildir_sync_context *ctx, bool final,
 			break;
 
 		if (errno != ENOENT || i == MAILDIR_DELETE_RETRY_COUNT) {
-			if (errno == EACCES) {
+			if (ENOACCESS(errno)) {
 				mailbox_set_critical(&ctx->mbox->box, "%s",
 					eacces_error_get("opendir", path));
 			} else {

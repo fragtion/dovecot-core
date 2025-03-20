@@ -6,11 +6,16 @@
 
 #include "ostream.h"
 #include "ostream-private.h"
+#include "settings.h"
 #include "ostream-zlib.h"
 
 #include "zstd.h"
 #include "zstd_errors.h"
 #include "iostream-zstd-private.h"
+
+#if HAVE_DECL_ZSTD_MINCLEVEL != 1
+#  define ZSTD_minCLevel() 1
+#endif
 
 struct zstd_ostream {
 	struct ostream_private ostream;
@@ -25,28 +30,51 @@ struct zstd_ostream {
 	bool finished:1;
 };
 
-int compression_get_min_level_zstd(void)
-{
-#if HAVE_DECL_ZSTD_MINCLEVEL == 1
-	return ZSTD_minCLevel();
-#else
-	return 1;
-#endif
-}
+struct zstd_settings {
+	pool_t pool;
+	unsigned int compress_zstd_level;
+};
 
-int compression_get_default_level_zstd(void)
-{
-#ifdef ZSTD_CLEVEL_DEFAULT
-	return ZSTD_CLEVEL_DEFAULT;
-#else
-	/* Documentation says 3 is default */
-	return 3;
-#endif
-}
+static bool zstd_settings_check(void *_set, pool_t pool, const char **error_r);
 
-int compression_get_max_level_zstd(void)
+#undef DEF
+#define DEF(type, name) \
+	SETTING_DEFINE_STRUCT_##type(#name, name, struct zstd_settings)
+static const struct setting_define zstd_setting_defines[] = {
+	DEF(UINT, compress_zstd_level),
+
+	SETTING_DEFINE_LIST_END
+};
+static const struct zstd_settings zstd_default_settings = {
+	.compress_zstd_level = 3,
+};
+
+const struct setting_parser_info zstd_setting_parser_info = {
+	.name = "zstd",
+
+	.defines = zstd_setting_defines,
+	.defaults = &zstd_default_settings,
+
+	.struct_size = sizeof(struct zstd_settings),
+	.pool_offset1 = 1 + offsetof(struct zstd_settings, pool),
+#ifndef CONFIG_BINARY
+	.check_func = zstd_settings_check,
+#endif
+};
+
+static bool zstd_settings_check(void *_set, pool_t pool ATTR_UNUSED,
+				 const char **error_r)
 {
-	return ZSTD_maxCLevel();
+	struct zstd_settings *set = _set;
+
+	if ((int)set->compress_zstd_level < ZSTD_minCLevel() ||
+	    (int)set->compress_zstd_level > ZSTD_maxCLevel()) {
+		*error_r = t_strdup_printf(
+			"compress_zstd_level must be between %d..%d",
+			ZSTD_minCLevel(), ZSTD_maxCLevel());
+		return FALSE;
+	}
+	return TRUE;
 }
 
 static void o_stream_zstd_write_error(struct zstd_ostream *zstream, size_t err)
@@ -210,14 +238,13 @@ static void o_stream_zstd_close(struct iostream_private *stream,
 		o_stream_close(zstream->ostream.parent);
 }
 
-struct ostream *
+static struct ostream *
 o_stream_create_zstd(struct ostream *output, int level)
 {
 	struct zstd_ostream *zstream;
 	size_t ret;
 
-	i_assert(level >= compression_get_min_level_zstd() &&
-		 level <= compression_get_max_level_zstd());
+	i_assert(level >= ZSTD_minCLevel() && level <= ZSTD_maxCLevel());
 
 	zstd_version_check();
 
@@ -238,6 +265,20 @@ o_stream_create_zstd(struct ostream *output, int level)
 	}
 	return o_stream_create(&zstream->ostream, output,
 			       o_stream_get_fd(output));
+}
+
+struct ostream *
+o_stream_create_zstd_auto(struct ostream *output, struct event *event)
+{
+	const struct zstd_settings *set;
+	const char *error;
+
+	if (settings_get(event, &zstd_setting_parser_info, 0,
+			 &set, &error) < 0)
+		return o_stream_create_error_str(EIO, "%s", error);
+	int level = set->compress_zstd_level;
+	settings_free(set);
+	return o_stream_create_zstd(output, level);
 }
 
 #endif

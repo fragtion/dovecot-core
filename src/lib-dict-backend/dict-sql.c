@@ -8,7 +8,6 @@
 #include "hash.h"
 #include "str.h"
 #include "sql-api-private.h"
-#include "sql-db-cache.h"
 #include "dict-private.h"
 #include "dict-sql-settings.h"
 #include "dict-sql.h"
@@ -88,41 +87,31 @@ struct sql_dict_transaction_context {
 	char *error;
 };
 
-static struct sql_db_cache *dict_sql_db_cache;
-
 static void sql_dict_prev_inc_flush(struct sql_dict_transaction_context *ctx);
 static void sql_dict_prev_set_flush(struct sql_dict_transaction_context *ctx);
 static void sql_dict_prev_inc_free(struct sql_dict_transaction_context *ctx);
 static void sql_dict_prev_set_free(struct sql_dict_transaction_context *ctx);
 
 static int
-sql_dict_init(struct dict *driver, const char *uri,
-	      const struct dict_settings *set,
+sql_dict_init(const struct dict *dict_driver, struct event *event,
 	      struct dict **dict_r, const char **error_r)
 {
-	struct sql_settings sql_set;
-	struct sql_dict *dict;
-	pool_t pool;
+	struct dict_sql_map_settings *map_set;
 
-	pool = pool_alloconly_create("sql dict", 2048);
-	dict = p_new(pool, struct sql_dict, 1);
+	if (dict_sql_settings_get(event, &map_set, error_r) < 0)
+		return -1;
+
+	pool_t pool = pool_alloconly_create("sql dict", 2048);
+	struct sql_dict *dict = p_new(pool, struct sql_dict, 1);
 	dict->pool = pool;
-	dict->dict = *driver;
-	dict->set = dict_sql_settings_read(uri, error_r);
-	if (dict->set == NULL) {
+	dict->dict = *dict_driver;
+	dict->set = map_set;
+
+	if (sql_init_auto(event, &dict->db, error_r) <= 0) {
+		pool_unref(&map_set->pool);
 		pool_unref(&pool);
 		return -1;
 	}
-	i_zero(&sql_set);
-	sql_set.driver = driver->name;
-	sql_set.connect_string = dict->set->connect;
-	sql_set.event_parent = set->event_parent;
-
-	if (sql_db_cache_new(dict_sql_db_cache, &sql_set, &dict->db, error_r) < 0) {
-		pool_unref(&pool);
-		return -1;
-	}
-
 	*dict_r = &dict->dict;
 	return 0;
 }
@@ -131,6 +120,7 @@ static void sql_dict_deinit(struct dict *_dict)
 {
 	struct sql_dict *dict = (struct sql_dict *)_dict;
 
+	pool_unref(&dict->set->pool);
 	sql_unref(&dict->db);
 	pool_unref(&dict->pool);
 }
@@ -231,7 +221,7 @@ sql_dict_find_map(struct sql_dict *dict, const char *path,
 	unsigned int i, count;
 	size_t len;
 
-	t_array_init(pattern_values, dict->set->max_pattern_fields_count);
+	t_array_init(pattern_values, 2);
 	maps = array_get(&dict->set->maps, &count);
 	for (i = 0; i < count; i++) {
 		if (dict_sql_map_match(&maps[i], path, pattern_values,
@@ -688,7 +678,7 @@ sql_dict_iterate_find_next_map(struct sql_dict_iterate_context *ctx,
 	size_t pat_len, path_len;
 	bool recurse = (ctx->flags & DICT_ITERATE_FLAG_RECURSE) != 0;
 
-	t_array_init(pattern_values, dict->set->max_pattern_fields_count);
+	t_array_init(pattern_values, 2);
 	maps = array_get(&dict->set->maps, &count);
 	for (i = ctx->next_map_idx; i < count; i++) {
 		if (dict_sql_map_match(&maps[i], ctx->path,
@@ -1059,6 +1049,9 @@ sql_dict_transaction_commit(struct dict_transaction_context *_ctx, bool async,
 	i_zero(&result);
 	result.ret = DICT_COMMIT_RET_FAILED;
 	result.error = t_strdup(ctx->error);
+
+	if (_ctx->non_atomic)
+		sql_transaction_set_non_atomic(ctx->sql_ctx);
 
 	if (ctx->error != NULL) {
 		sql_transaction_rollback(&ctx->sql_ctx);
@@ -1666,34 +1659,12 @@ static struct dict sql_dict = {
 	}
 };
 
-static struct dict *dict_sql_drivers;
-
 void dict_sql_register(void)
 {
-        const struct sql_db *const *drivers;
-	unsigned int i, count;
-
-	dict_sql_db_cache = sql_db_cache_init(DICT_SQL_MAX_UNUSED_CONNECTIONS);
-
-	/* @UNSAFE */
-	drivers = array_get(&sql_drivers, &count);
-	dict_sql_drivers = i_new(struct dict, count + 1);
-
-	for (i = 0; i < count; i++) {
-		dict_sql_drivers[i] = sql_dict;
-		dict_sql_drivers[i].name = drivers[i]->name;
-
-		dict_driver_register(&dict_sql_drivers[i]);
-	}
+	dict_driver_register(&sql_dict);
 }
 
 void dict_sql_unregister(void)
 {
-	int i;
-
-	for (i = 0; dict_sql_drivers[i].name != NULL; i++)
-		dict_driver_unregister(&dict_sql_drivers[i]);
-	i_free(dict_sql_drivers);
-	sql_db_cache_deinit(&dict_sql_db_cache);
-	dict_sql_settings_deinit();
+	dict_driver_unregister(&sql_dict);
 }

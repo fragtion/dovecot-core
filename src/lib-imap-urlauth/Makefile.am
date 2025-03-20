@@ -7,9 +7,11 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-dict \
 	-I$(top_srcdir)/src/lib-mail \
 	-I$(top_srcdir)/src/lib-index \
+	-I$(top_srcdir)/src/lib-auth-client \
 	-I$(top_srcdir)/src/lib-storage \
 	-I$(top_srcdir)/src/lib-imap \
-	-I$(top_srcdir)/src/lib-imap-storage
+	-I$(top_srcdir)/src/lib-imap-storage \
+	-I$(top_srcdir)/src/lib-var-expand
 
 libimap_urlauth_la_SOURCES = \
 	imap-urlauth.c \

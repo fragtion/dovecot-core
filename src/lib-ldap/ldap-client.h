@@ -1,6 +1,8 @@
 #ifndef LDAP_CLIENT_H
 #define LDAP_CLIENT_H
 
+#include "ldap-settings.h"
+
 enum ldap_scope {
 	LDAP_SEARCH_SCOPE_BASE    = 0x0000,
 	LDAP_SEARCH_SCOPE_ONE     = 0x0001,
@@ -18,23 +20,6 @@ struct ldap_entry;
    callback finishes. */
 typedef void ldap_result_callback_t(struct ldap_result *result, void *context);
 
-struct ldap_client_settings {
-	/* NOTE: when adding here, remember to update
-	   ldap_connection_have_settings() and ldap_connection_init() */
-	const char *uri;
-	const char *bind_dn;
-	const char *password;
-
-	struct event *event_parent;
-	const struct ssl_iostream_settings *ssl_set;
-
-	unsigned int timeout_secs;
-	unsigned int max_idle_time_secs;
-	unsigned int debug;
-	bool require_ssl;
-	bool start_tls;
-};
-
 struct ldap_search_input {
 	const char *base_dn;
 	const char *filter;
@@ -42,8 +27,6 @@ struct ldap_search_input {
 	enum ldap_scope scope;
 
 	unsigned int size_limit;
-
-	unsigned int timeout_secs;
 };
 
 struct ldap_compare_input {
@@ -56,8 +39,8 @@ struct ldap_compare_input {
 
 /* Initialize LDAP. Returns 0 on success, or -1 and error_r if initialization
    failed with the given settings. */
-int ldap_client_init(const struct ldap_client_settings *set,
-		     struct ldap_client **client_r, const char **error_r);
+int ldap_client_init_auto(struct event *event, struct ldap_client **client_r,
+			  const char **error_r);
 void ldap_client_deinit(struct ldap_client **client);
 void ldap_client_switch_ioloop(struct ldap_client *client);
 

@@ -13,8 +13,6 @@ struct mail_user;
 #define QUOTA_NAME_MESSAGES "MESSAGE"
 
 struct quota;
-struct quota_settings;
-struct quota_root_settings;
 struct quota_root;
 struct quota_root_iter;
 struct quota_transaction_context;
@@ -25,7 +23,6 @@ struct quota_param_parser {
 };
 
 extern struct quota_param_parser quota_param_hidden;
-extern struct quota_param_parser quota_param_ignoreunlimited;
 extern struct quota_param_parser quota_param_noenforcing;
 extern struct quota_param_parser quota_param_ns;
 
@@ -47,6 +44,8 @@ enum quota_alloc_result {
 	QUOTA_ALLOC_RESULT_OVER_QUOTA,
 	/* Mail size is larger than even the maximum allowed quota. */
 	QUOTA_ALLOC_RESULT_OVER_QUOTA_LIMIT,
+	/* Maximum number of messages per mailbox was reached */
+	QUOTA_ALLOC_RESULT_OVER_QUOTA_MAILBOX_LIMIT,
 	/* Blocked by ongoing background quota calculation. */
 	QUOTA_ALLOC_RESULT_BACKGROUND_CALC,
 };
@@ -66,26 +65,22 @@ enum quota_get_result {
 	QUOTA_GET_RESULT_UNLIMITED,
 };
 
+struct quota_overrun {
+	struct quota_root *root;
+
+	struct {
+		uoff_t count;
+		uoff_t bytes;
+	} resource;
+};
+
 const char *quota_alloc_result_errstr(enum quota_alloc_result res,
 		struct quota_transaction_context *qt);
 
-int quota_user_read_settings(struct mail_user *user,
-			     struct quota_settings **set_r,
-			     const char **error_r);
-void quota_settings_deinit(struct quota_settings **quota_set);
-
-/* Add a new rule too the quota root. Returns 0 if ok, -1 if rule is invalid. */
-int quota_root_add_rule(struct quota_root_settings *root_set,
-			const char *rule_def, const char **error_r);
-/* Add a new warning rule for the quota root. Returns 0 if ok, -1 if rule is
-   invalid. */
-int quota_root_add_warning_rule(struct quota_root_settings *root_set,
-				const char *rule_def, const char **error_r);
-
 /* Initialize quota for the given user. Returns 0 and quota_r on success,
    -1 and error_r on failure. */
-int quota_init(struct quota_settings *quota_set, struct mail_user *user,
-	       struct quota **quota_r, const char **error_r);
+int quota_init(struct mail_user *user, struct quota **quota_r,
+	       const char **error_r);
 void quota_deinit(struct quota **quota);
 
 /* List all visible quota roots. They don't need to be freed. */
@@ -108,12 +103,9 @@ bool quota_root_is_hidden(struct quota_root *root);
 /* Returns 1 if values were successfully returned, 0 if resource name doesn't
    exist or isn't enabled, -1 if error. */
 enum quota_get_result
-quota_get_resource(struct quota_root *root, const char *mailbox_name,
+quota_get_resource(struct quota_root *root, struct mailbox *box,
 		   const char *name, uint64_t *value_r, uint64_t *limit_r,
 		   const char **error_r);
-/* Returns 0 if OK, -1 if error (eg. permission denied, invalid name). */
-int quota_set_resource(struct quota_root *root, const char *name,
-		       uint64_t value, const char **client_error_r);
 
 /* Start a new quota transaction. */
 struct quota_transaction_context *quota_transaction_begin(struct mailbox *box);
@@ -123,12 +115,20 @@ int quota_transaction_commit(struct quota_transaction_context **ctx);
 void quota_transaction_rollback(struct quota_transaction_context **ctx);
 
 /* Allocate from quota if there's space. error_r is set when result is not
- * QUOTA_ALLOC_RESULT_OK. */
-enum quota_alloc_result quota_try_alloc(struct quota_transaction_context *ctx,
-					struct mail *mail, const char **error_r);
+   QUOTA_ALLOC_RESULT_OK. overruns_r (if not NULL) is set when result is
+   QUOTA_ALLOC_RESULT_OVER_QUOTA. This is a NULL-terminated array of struct
+   quota_overrun which indicates which roots have overruns and how much is used.
+ */
+enum quota_alloc_result
+quota_try_alloc(struct quota_transaction_context *ctx,
+		struct mail *mail, struct mail *expunged_mail,
+		const struct quota_overrun **overruns_r, const char **error_r);
 /* Like quota_try_alloc(), but don't actually allocate anything. */
-enum quota_alloc_result quota_test_alloc(struct quota_transaction_context *ctx,
-					 uoff_t size, const char **error_r);
+enum quota_alloc_result
+quota_test_alloc(struct quota_transaction_context *ctx, uoff_t size,
+		 struct mailbox *expunged_box, uoff_t expunged_size,
+		 const struct quota_overrun **overruns_r, const char **error_r)
+	ATTR_NULL(3);
 /* Update quota by allocating/freeing space used by mail. */
 void quota_alloc(struct quota_transaction_context *ctx, struct mail *mail);
 void quota_free_bytes(struct quota_transaction_context *ctx,
@@ -138,10 +138,6 @@ void quota_recalculate(struct quota_transaction_context *ctx,
 		       enum quota_recalculate recalculate);
 
 /* Execute quota_over_scripts if needed. */
-void quota_over_flag_check_startup(struct quota *quota);
-
-/* Common quota parameters parsing loop */
-int quota_parse_parameters(struct quota_root *root, const char **args, const char **error_r,
-			   const struct quota_param_parser *valid_params, bool fail_on_unknown);
+void quota_over_status_check_startup(struct quota *quota);
 
 #endif

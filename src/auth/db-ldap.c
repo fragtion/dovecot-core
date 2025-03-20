@@ -4,20 +4,22 @@
 
 #if defined(BUILTIN_LDAP) || defined(PLUGIN_BUILD)
 
+#include "safe-memset.h"
 #include "net.h"
 #include "ioloop.h"
 #include "array.h"
 #include "hash.h"
 #include "aqueue.h"
 #include "str.h"
+#include "strescape.h"
 #include "time-util.h"
 #include "env-util.h"
-#include "var-expand.h"
 #include "settings.h"
+#include "ssl-settings.h"
 #include "userdb.h"
 #include "db-ldap.h"
+#include "ldap-utils.h"
 
-#include <stddef.h>
 #include <unistd.h>
 
 #define HAVE_LDAP_SASL
@@ -50,6 +52,7 @@
 #endif
 
 #define DB_LDAP_REQUEST_MAX_ATTEMPT_COUNT 3
+#define DB_LDAP_ATTR_DN "~dn"
 
 static const char *LDAP_ESCAPE_CHARS = "*,\\#+<>;\"()= ";
 
@@ -67,8 +70,8 @@ struct db_ldap_result_iterate_context {
 	pool_t pool;
 
 	struct ldap_request *ldap_request;
-	const ARRAY_TYPE(ldap_field) *attr_map;
-	unsigned int attr_idx;
+	const char *const *attr_next;
+	const char *const *sensitive_attr_names;
 
 	/* attribute name => value */
 	HASH_TABLE(char *, struct db_ldap_value *) ldap_attrs;
@@ -77,7 +80,6 @@ struct db_ldap_result_iterate_context {
 	string_t *var, *debug;
 
 	bool skip_null_values;
-	bool iter_dn_values;
 	LDAPMessage *ldap_msg;
 	LDAP *ld;
 };
@@ -89,80 +91,6 @@ struct db_ldap_sasl_bind_context {
 	const char *authzid;
 };
 
-#define DEF_STR(name) DEF_STRUCT_STR(name, ldap_settings)
-#define DEF_INT(name) DEF_STRUCT_INT(name, ldap_settings)
-#define DEF_BOOL(name) DEF_STRUCT_BOOL(name, ldap_settings)
-
-static struct setting_def setting_defs[] = {
-	DEF_STR(hosts),
-	DEF_STR(uris),
-	DEF_STR(dn),
-	DEF_STR(dnpass),
-	DEF_BOOL(auth_bind),
-	DEF_STR(auth_bind_userdn),
-	DEF_BOOL(tls),
-	DEF_BOOL(sasl_bind),
-	DEF_STR(sasl_mech),
-	DEF_STR(sasl_realm),
-	DEF_STR(sasl_authz_id),
-	DEF_STR(tls_ca_cert_file),
-	DEF_STR(tls_ca_cert_dir),
-	DEF_STR(tls_cert_file),
-	DEF_STR(tls_key_file),
-	DEF_STR(tls_cipher_suite),
-	DEF_STR(tls_require_cert),
-	DEF_STR(deref),
-	DEF_STR(scope),
-	DEF_STR(base),
-	DEF_INT(ldap_version),
-	DEF_STR(debug_level),
-	DEF_STR(ldaprc_path),
-	DEF_STR(user_attrs),
-	DEF_STR(user_filter),
-	DEF_STR(pass_attrs),
-	DEF_STR(pass_filter),
-	DEF_STR(iterate_attrs),
-	DEF_STR(iterate_filter),
-	DEF_STR(default_pass_scheme),
-	DEF_BOOL(blocking),
-
-	{ 0, NULL, 0 }
-};
-
-static struct ldap_settings default_ldap_settings = {
-	.hosts = NULL,
-	.uris = NULL,
-	.dn = NULL,
-	.dnpass = NULL,
-	.auth_bind = FALSE,
-	.auth_bind_userdn = NULL,
-	.tls = FALSE,
-	.sasl_bind = FALSE,
-	.sasl_mech = NULL,
-	.sasl_realm = NULL,
-	.sasl_authz_id = NULL,
-	.tls_ca_cert_file = NULL,
-	.tls_ca_cert_dir = NULL,
-	.tls_cert_file = NULL,
-	.tls_key_file = NULL,
-	.tls_cipher_suite = NULL,
-	.tls_require_cert = NULL,
-	.deref = "never",
-	.scope = "subtree",
-	.base = NULL,
-	.ldap_version = 3,
-	.debug_level = "0",
-	.ldaprc_path = "",
-	.user_attrs = "homeDirectory=home,uidNumber=uid,gidNumber=gid",
-	.user_filter = "(&(objectClass=posixAccount)(uid=%u))",
-	.pass_attrs = "uid=user,userPassword=password",
-	.pass_filter = "(&(objectClass=posixAccount)(uid=%u))",
-	.iterate_attrs = "uid=user",
-	.iterate_filter = "(objectClass=posixAccount)",
-	.default_pass_scheme = "crypt",
-	.blocking = FALSE
-};
-
 static struct ldap_connection *ldap_connections = NULL;
 
 static int db_ldap_bind(struct ldap_connection *conn);
@@ -170,60 +98,12 @@ static void db_ldap_conn_close(struct ldap_connection *conn);
 struct db_ldap_result_iterate_context *
 db_ldap_result_iterate_init_full(struct ldap_connection *conn,
 				 struct ldap_request_search *ldap_request,
-				 LDAPMessage *res, bool skip_null_values,
-				 bool iter_dn_values);
+				 LDAPMessage *res, bool skip_null_values);
 static bool db_ldap_abort_requests(struct ldap_connection *conn,
 				   unsigned int max_count,
 				   unsigned int timeout_secs,
 				   bool error, const char *reason);
 static void db_ldap_request_free(struct ldap_request *request);
-
-static int deref2str(const char *str, int *ref_r)
-{
-	if (strcasecmp(str, "never") == 0)
-		*ref_r = LDAP_DEREF_NEVER;
-	else if (strcasecmp(str, "searching") == 0)
-		*ref_r = LDAP_DEREF_SEARCHING;
-	else if (strcasecmp(str, "finding") == 0)
-		*ref_r = LDAP_DEREF_FINDING;
-	else if (strcasecmp(str, "always") == 0)
-		*ref_r = LDAP_DEREF_ALWAYS;
-	else
-		return -1;
-	return 0;
-}
-
-static int scope2str(const char *str, int *scope_r)
-{
-	if (strcasecmp(str, "base") == 0)
-		*scope_r = LDAP_SCOPE_BASE;
-	else if (strcasecmp(str, "onelevel") == 0)
-		*scope_r = LDAP_SCOPE_ONELEVEL;
-	else if (strcasecmp(str, "subtree") == 0)
-		*scope_r = LDAP_SCOPE_SUBTREE;
-	else
-		return -1;
-	return 0;
-}
-
-#ifdef OPENLDAP_TLS_OPTIONS
-static int tls_require_cert2str(const char *str, int *value_r)
-{
-	if (strcasecmp(str, "never") == 0)
-		*value_r = LDAP_OPT_X_TLS_NEVER;
-	else if (strcasecmp(str, "hard") == 0)
-		*value_r = LDAP_OPT_X_TLS_HARD;
-	else if (strcasecmp(str, "demand") == 0)
-		*value_r = LDAP_OPT_X_TLS_DEMAND;
-	else if (strcasecmp(str, "allow") == 0)
-		*value_r = LDAP_OPT_X_TLS_ALLOW;
-	else if (strcasecmp(str, "try") == 0)
-		*value_r = LDAP_OPT_X_TLS_TRY;
-	else
-		return -1;
-	return 0;
-}
-#endif
 
 static int ldap_get_errno(struct ldap_connection *conn)
 {
@@ -305,8 +185,9 @@ static int ldap_handle_error(struct ldap_connection *conn)
 static int db_ldap_request_bind(struct ldap_connection *conn,
 				struct ldap_request *request)
 {
+	struct auth_request *arequest = request->auth_request;
 	struct ldap_request_bind *brequest =
-		(struct ldap_request_bind *)request;
+		container_of(request, struct ldap_request_bind, request);
 
 	i_assert(request->type == LDAP_REQUEST_TYPE_BIND);
 	i_assert(request->msgid == -1);
@@ -314,12 +195,16 @@ static int db_ldap_request_bind(struct ldap_connection *conn,
 		 conn->conn_state == LDAP_CONN_STATE_BOUND_DEFAULT);
 	i_assert(conn->pending_count == 0);
 
-	request->msgid = ldap_bind(conn->ld, brequest->dn,
-				   request->auth_request->mech_password,
-				   LDAP_AUTH_SIMPLE);
-	if (request->msgid == -1) {
-		e_error(authdb_event(request->auth_request),
-			"ldap_bind(%s) failed: %s",
+	struct berval creds = {
+		.bv_val = arequest->mech_password,
+		.bv_len = strlen(arequest->mech_password)
+	};
+
+	int ret = ldap_sasl_bind(conn->ld, brequest->dn, LDAP_SASL_SIMPLE,
+				 &creds, NULL, NULL, &request->msgid);
+	if (ret != LDAP_SUCCESS) {
+		e_error(authdb_event(arequest),
+			"ldap_sasl_bind(%s) failed: %s",
 			brequest->dn, ldap_get_error(conn));
 		if (ldap_handle_error(conn) < 0) {
 			/* broken request, remove it */
@@ -335,18 +220,18 @@ static int db_ldap_request_search(struct ldap_connection *conn,
 				  struct ldap_request *request)
 {
 	struct ldap_request_search *srequest =
-		(struct ldap_request_search *)request;
+		container_of(request, struct ldap_request_search, request);
 
 	i_assert(conn->conn_state == LDAP_CONN_STATE_BOUND_DEFAULT);
 	i_assert(request->msgid == -1);
 
-	request->msgid =
-		ldap_search(conn->ld, *srequest->base == '\0' ? NULL :
-			    srequest->base, conn->set.ldap_scope,
-			    srequest->filter, srequest->attributes, 0);
+	ldap_search_ext(
+		conn->ld, *srequest->base == '\0' ? NULL : srequest->base,
+		conn->set->parsed_scope, srequest->filter, (char **)srequest->attributes,
+		0, NULL, NULL, 0, 0, &request->msgid);
 	if (request->msgid == -1) {
 		e_error(authdb_event(request->auth_request),
-			"ldap_search(%s) parsing failed: %s",
+			"ldap_search_ext(%s) parsing failed: %s",
 			srequest->filter, ldap_get_error(conn));
 		if (ldap_handle_error(conn) < 0) {
 			/* broken request, remove it */
@@ -478,13 +363,12 @@ static int db_ldap_connect_finish(struct ldap_connection *conn, int ret)
 {
 	if (ret == LDAP_SERVER_DOWN) {
 		e_error(conn->event, "Can't connect to server: %s",
-			conn->set.uris != NULL ?
-			conn->set.uris : conn->set.hosts);
+			conn->set->uris);
 		return -1;
 	}
 	if (ret != LDAP_SUCCESS) {
 		e_error(conn->event, "binding failed (dn %s): %s",
-			conn->set.dn == NULL ? "(none)" : conn->set.dn,
+			*conn->set->auth_dn == '\0' ? "(none)" : conn->set->auth_dn,
 			ldap_get_error(conn));
 		return -1;
 	}
@@ -499,12 +383,20 @@ static int db_ldap_connect_finish(struct ldap_connection *conn, int ret)
 static void db_ldap_default_bind_finished(struct ldap_connection *conn,
 					  struct db_ldap_result *res)
 {
-	int ret;
-
 	i_assert(conn->pending_count == 0);
 	conn->default_bind_msgid = -1;
 
-	ret = ldap_result2error(conn->ld, res->msg, FALSE);
+	int result;
+	int ret = ldap_parse_result(conn->ld, res->msg, &result,
+				    NULL, NULL, NULL, NULL, FALSE);
+	/* ldap_parse_result() itself can fail client-side.
+	   In that case ret already contains our error code... */
+	if (ret == LDAP_SUCCESS) {
+		/* ... on the other hand, the result of a successful parsing
+		   can be itself a server-side error, whose error-code is
+		   stored in result. Pass it into ret and handle it as well. */
+		ret = result;
+	}
 	if (db_ldap_connect_finish(conn, ret) < 0) {
 		/* lost connection, close it */
 		db_ldap_conn_close(conn);
@@ -573,136 +465,6 @@ db_ldap_find_request(struct ldap_connection *conn, int msgid,
 	return NULL;
 }
 
-static int db_ldap_fields_get_dn(struct ldap_connection *conn,
-				 struct ldap_request_search *request,
-				 struct db_ldap_result *res)
-{
-	struct auth_request *auth_request = request->request.auth_request;
-	struct ldap_request_named_result *named_res;
-	struct db_ldap_result_iterate_context *ldap_iter;
-	const char *name, *const *values;
-
-	ldap_iter = db_ldap_result_iterate_init_full(conn, request, res->msg,
-						     TRUE, TRUE);
-	while (db_ldap_result_iterate_next(ldap_iter, &name, &values)) {
-		if (values[1] != NULL) {
-			e_warning(authdb_event(auth_request),
-				  "Multiple values found for '%s', "
-				  "using value '%s'", name, values[0]);
-		}
-		array_foreach_modifiable(&request->named_results, named_res) {
-			if (strcmp(named_res->field->name, name) != 0)
-				continue;
-			/* In future we could also support LDAP URLs here */
-			named_res->dn = p_strdup(auth_request->pool,
-						 values[0]);
-		}
-	}
-	db_ldap_result_iterate_deinit(&ldap_iter);
-	return 0;
-}
-
-struct ldap_field_find_subquery_context {
-	ARRAY_TYPE(string) attr_names;
-	const char *name;
-};
-
-static int
-db_ldap_field_subquery_find(const char *data, void *context,
-			    const char **value_r,
-			    const char **error_r ATTR_UNUSED)
-{
-	struct ldap_field_find_subquery_context *ctx = context;
-	char *ldap_attr;
-	const char *p;
-
-	if (*data != '\0') {
-		data = t_strcut(data, ':');
-		p = strchr(data, '@');
-		if (p != NULL && strcmp(p+1, ctx->name) == 0) {
-			ldap_attr = p_strdup_until(unsafe_data_stack_pool,
-						   data, p);
-			array_push_back(&ctx->attr_names, &ldap_attr);
-		}
-	}
-	*value_r = NULL;
-	return 1;
-}
-
-static int
-ldap_request_send_subquery(struct ldap_connection *conn,
-			   struct ldap_request_search *request,
-			   struct ldap_request_named_result *named_res)
-{
-	const struct ldap_field *field;
-	const char *p, *error;
-	char *name;
-	struct auth_request *auth_request = request->request.auth_request;
-	struct ldap_field_find_subquery_context ctx;
-	const struct var_expand_table *var_expand_table =
-		auth_request_get_var_expand_table(auth_request, NULL);
-	const struct var_expand_func_table *ptr;
-	string_t *tmp_str = t_str_new(64);
-	ARRAY(struct var_expand_func_table) var_funcs_table;
-	t_array_init(&var_funcs_table, 8);
-
-	for(ptr = auth_request_var_funcs_table; ptr->key != NULL; ptr++) {
-		array_push_back(&var_funcs_table, ptr);
-	}
-
-	static struct var_expand_func_table subquery_table[] = {
-		{ "ldap", db_ldap_field_subquery_find },
-		{ "ldap_multi", db_ldap_field_subquery_find },
-		{ "ldap_ptr", db_ldap_field_subquery_find },
-		{ NULL, NULL }
-	};
-
-	for(ptr = subquery_table; ptr->key != NULL; ptr++) {
-		array_push_back(&var_funcs_table, ptr);
-	}
-
-	array_append_zero(&var_funcs_table);
-
-	i_zero(&ctx);
-	t_array_init(&ctx.attr_names, 8);
-	ctx.name = named_res->field->name;
-
-	/* get the attributes names into array (ldapAttr@name -> ldapAttr) */
-	array_foreach(request->attr_map, field) {
-		if (field->ldap_attr_name[0] == '\0') {
-			str_truncate(tmp_str, 0);
-			if (var_expand_with_funcs(tmp_str, field->value,
-						  var_expand_table,
-						  array_front(&var_funcs_table),
-						  &ctx, &error) <= 0) {
-				e_error(authdb_event(auth_request),
-					"Failed to expand subquery %s: %s",
-					field->value, error);
-				return -1;
-			}
-		} else {
-			p = strchr(field->ldap_attr_name, '@');
-			if (p != NULL &&
-			    strcmp(p+1, named_res->field->name) == 0) {
-				name = p_strdup_until(unsafe_data_stack_pool,
-						      field->ldap_attr_name, p);
-				array_push_back(&ctx.attr_names, &name);
-			}
-		}
-	}
-	array_append_zero(&ctx.attr_names);
-
-	request->request.msgid =
-		ldap_search(conn->ld, named_res->dn, LDAP_SCOPE_BASE,
-			    NULL, array_front_modifiable(&ctx.attr_names), 0);
-	if (request->request.msgid == -1) {
-		e_error(authdb_event(auth_request),
-			"ldap_search(dn=%s) failed: %s",
-			named_res->dn, ldap_get_error(conn));
-		return -1;
-	}
-	return 0;
-}
 
 static int db_ldap_search_save_result(struct ldap_request_search *request,
 				      struct db_ldap_result *res)
@@ -724,53 +486,13 @@ static int db_ldap_search_save_result(struct ldap_request_search *request,
 	return 0;
 }
 
-static int db_ldap_search_next_subsearch(struct ldap_connection *conn,
-					 struct ldap_request_search *request,
-					 struct db_ldap_result *res)
-{
-	struct ldap_request_named_result *named_res;
-	const struct ldap_field *field;
-
-	if (request->result != NULL)
-		res = request->result;
-
-	if (!array_is_created(&request->named_results)) {
-		/* see if we need to do more LDAP queries */
-		p_array_init(&request->named_results,
-			     request->request.auth_request->pool, 2);
-		array_foreach(request->attr_map, field) {
-			if (!field->value_is_dn)
-				continue;
-			named_res = array_append_space(&request->named_results);
-			named_res->field = field;
-		}
-		if (db_ldap_fields_get_dn(conn, request, res) < 0)
-			return -1;
-	} else {
-		request->name_idx++;
-	}
-	while (request->name_idx < array_count(&request->named_results)) {
-		/* send the next LDAP query */
-		named_res = array_idx_modifiable(&request->named_results,
-						 request->name_idx);
-		if (named_res->dn != NULL) {
-			if (ldap_request_send_subquery(conn, request,
-						       named_res) < 0)
-				return -1;
-			return 1;
-		}
-		/* dn field wasn't returned, skip this */
-		request->name_idx++;
-	}
-	return 0;
-}
-
 static bool
 db_ldap_handle_request_result(struct ldap_connection *conn,
 			      struct ldap_request *request, unsigned int idx,
 			      struct db_ldap_result *res)
 {
-	struct ldap_request_search *srequest = NULL;
+	struct ldap_request_search *srequest =
+		container_of(request, struct ldap_request_search, request);
 	const struct ldap_request_named_result *named_res;
 	int ret;
 	bool final_result;
@@ -782,7 +504,6 @@ db_ldap_handle_request_result(struct ldap_connection *conn,
 		i_assert(conn->pending_count == 1);
 		conn->conn_state = LDAP_CONN_STATE_BOUND_AUTH;
 	} else {
-		srequest = (struct ldap_request_search *)request;
 		switch (ldap_msgtype(res->msg)) {
 		case LDAP_RES_SEARCH_ENTRY:
 		case LDAP_RES_SEARCH_RESULT:
@@ -801,31 +522,31 @@ db_ldap_handle_request_result(struct ldap_connection *conn,
 		final_result = FALSE;
 	} else {
 		final_result = TRUE;
-		ret = ldap_result2error(conn->ld, res->msg, 0);
+		int result;
+		ret = ldap_parse_result(conn->ld, res->msg, &result,
+					NULL, NULL, NULL, NULL, FALSE);
+		if (ret == LDAP_SUCCESS)
+			ret = result;
 	}
 	/* LDAP_NO_SUCH_OBJECT is returned for nonexistent base */
 	if (ret != LDAP_SUCCESS && ret != LDAP_NO_SUCH_OBJECT &&
 	    request->type == LDAP_REQUEST_TYPE_SEARCH) {
 		/* handle search failures here */
-		struct ldap_request_search *srequest =
-			(struct ldap_request_search *)request;
-
 		if (!array_is_created(&srequest->named_results)) {
 			e_error(authdb_event(request->auth_request),
-				"ldap_search(base=%s filter=%s) failed: %s",
+				"ldap_search_ext(base=%s filter=%s) failed: %s",
 				srequest->base, srequest->filter,
 				ldap_err2string(ret));
 		} else {
 			named_res = array_idx(&srequest->named_results,
 					      srequest->name_idx);
 			e_error(authdb_event(request->auth_request),
-				"ldap_search(base=%s) failed: %s",
+				"ldap_search_ext(base=%s) failed: %s",
 				named_res->dn, ldap_err2string(ret));
 		}
 		res = NULL;
 	}
 	if (ret == LDAP_SUCCESS && srequest != NULL && !srequest->multi_entry) {
-		/* expand any @results */
 		if (!final_result) {
 			if (db_ldap_search_save_result(srequest, res) < 0) {
 				e_error(authdb_event(request->auth_request),
@@ -835,14 +556,6 @@ db_ldap_handle_request_result(struct ldap_connection *conn,
 				/* wait for finish */
 				return FALSE;
 			}
-		} else {
-			ret = db_ldap_search_next_subsearch(conn, srequest, res);
-			if (ret > 0) {
-				/* more LDAP queries left */
-				return FALSE;
-			}
-			if (ret < 0)
-				res = NULL;
 		}
 	}
 	if (res == NULL && !final_result) {
@@ -891,7 +604,7 @@ db_ldap_request_free(struct ldap_request *request)
 {
 	if (request->type == LDAP_REQUEST_TYPE_SEARCH) {
 		struct ldap_request_search *srequest =
-			(struct ldap_request_search *)request;
+			container_of(request, struct ldap_request_search, request);
 		struct ldap_request_named_result *named_res;
 
 		if (srequest->result != NULL)
@@ -1042,15 +755,17 @@ static int db_ldap_bind_sasl(struct ldap_connection *conn)
 	int ret;
 
 	i_zero(&context);
-	context.authcid = conn->set.dn;
-	context.passwd = conn->set.dnpass;
-	context.realm = conn->set.sasl_realm;
-	context.authzid = conn->set.sasl_authz_id;
+	context.authcid = conn->set->auth_dn;
+	context.passwd = conn->set->auth_dn_password;
+	context.realm = conn->set->auth_sasl_realm;
+	context.authzid = conn->set->auth_sasl_authz_id;
+
+	const char *mechs = t_array_const_string_join(
+		&conn->set->auth_sasl_mechanisms, " ");
 
 	/* There doesn't seem to be a way to do SASL binding
 	   asynchronously.. */
-	ret = ldap_sasl_interactive_bind_s(conn->ld, NULL,
-					   conn->set.sasl_mech,
+	ret = ldap_sasl_interactive_bind_s(conn->ld, NULL, mechs,
 					   NULL, NULL, LDAP_SASL_QUIET,
 					   sasl_interact, &context);
 	if (db_ldap_connect_finish(conn, ret) < 0)
@@ -1077,9 +792,14 @@ static int db_ldap_bind_simple(struct ldap_connection *conn)
 	i_assert(conn->default_bind_msgid == -1);
 	i_assert(conn->pending_count == 0);
 
-	msgid = ldap_bind(conn->ld, conn->set.dn, conn->set.dnpass,
-			  LDAP_AUTH_SIMPLE);
-	if (msgid == -1) {
+	struct berval creds = {
+		.bv_val = (char*)conn->set->auth_dn_password,
+		.bv_len = strlen(conn->set->auth_dn_password)
+	};
+
+	int ret = ldap_sasl_bind(conn->ld, conn->set->auth_dn, LDAP_SASL_SIMPLE,
+				 &creds, NULL, NULL, &msgid);
+	if (ret != LDAP_SUCCESS) {
 		i_assert(ldap_get_errno(conn) != LDAP_SUCCESS);
 		if (db_ldap_connect_finish(conn, ldap_get_errno(conn)) < 0) {
 			/* lost connection, close it */
@@ -1099,15 +819,12 @@ static int db_ldap_bind_simple(struct ldap_connection *conn)
 
 static int db_ldap_bind(struct ldap_connection *conn)
 {
-	if (conn->set.sasl_bind) {
-		if (db_ldap_bind_sasl(conn) < 0)
-			return -1;
-	} else {
-		if (db_ldap_bind_simple(conn) < 0)
-			return -1;
-	}
-
-	return 0;
+	int ret;
+	if (array_is_empty(&conn->set->auth_sasl_mechanisms))
+		ret = db_ldap_bind_simple(conn);
+	else
+		ret = db_ldap_bind_sasl(conn);
+	return ret < 0 ? -1 : 0;
 }
 
 static void db_ldap_get_fd(struct ldap_connection *conn)
@@ -1117,124 +834,100 @@ static void db_ldap_get_fd(struct ldap_connection *conn)
 	/* get the connection's fd */
 	ret = ldap_get_option(conn->ld, LDAP_OPT_DESC, (void *)&conn->fd);
 	if (ret != LDAP_SUCCESS) {
-		i_fatal("LDAP %s: Can't get connection fd: %s",
-			conn->config_path, ldap_err2string(ret));
+		i_fatal("%sCan't get connection fd: %s",
+			conn->log_prefix, ldap_err2string(ret));
 	}
 	if (conn->fd <= STDERR_FILENO) {
 		/* Solaris LDAP library seems to be broken */
-		i_fatal("LDAP %s: Buggy LDAP library returned wrong fd: %d",
-			conn->config_path, conn->fd);
+		i_fatal("%sBuggy LDAP library returned wrong fd: %d",
+			conn->log_prefix, conn->fd);
 	}
 	i_assert(conn->fd != -1);
 	net_set_nonblock(conn->fd, TRUE);
 }
 
-static void ATTR_NULL(1)
-db_ldap_set_opt(struct ldap_connection *conn, LDAP *ld, int opt,
-		const void *value, const char *optname, const char *value_str)
+static const char *
+db_ldap_log_callback(struct ldap_connection *conn)
 {
+	return conn->log_prefix;
+}
+
+static int
+db_ldap_add_connection_callback(LDAP *ld ATTR_UNUSED, Sockbuf *sb ATTR_UNUSED,
+				LDAPURLDesc *srv, struct sockaddr *addr ATTR_UNUSED,
+				struct ldap_conncb *ctx)
+{
+	struct ldap_connection *conn = ctx->lc_arg;
+	const char *prefix = t_strdup_printf("ldap(%s://%s:%d): ",
+		srv->lud_scheme, srv->lud_host, srv->lud_port);
+
+	if (strcmp(conn->log_prefix, prefix) != 0) {
+		i_free(conn->log_prefix);
+		conn->log_prefix = i_strdup(prefix);
+	}
+	return LDAP_SUCCESS;
+}
+
+static void
+db_ldap_del_connection_callback(LDAP *ld ATTR_UNUSED, Sockbuf *sb ATTR_UNUSED,
+				struct ldap_conncb *ctx ATTR_UNUSED)
+{
+	/* does nothing, but must exist in struct ldap_conncb */
+}
+
+static void ldap_set_options(struct ldap_connection *conn)
+{
+	const char *error;
 	int ret;
 
-	ret = ldap_set_option(ld, opt, value);
-	if (ret != LDAP_SUCCESS) {
-		i_fatal("LDAP %s: Can't set option %s to %s: %s",
-			conn->config_path, optname, value_str, ldap_err2string(ret));
-	}
-}
-
-static void ATTR_NULL(1)
-db_ldap_set_opt_str(struct ldap_connection *conn, LDAP *ld, int opt,
-		    const char *value, const char *optname)
-{
-	if (value != NULL)
-		db_ldap_set_opt(conn, ld, opt, value, optname, value);
-}
-
-static void db_ldap_set_tls_options(struct ldap_connection *conn)
-{
-#ifdef OPENLDAP_TLS_OPTIONS
-	db_ldap_set_opt_str(conn, NULL, LDAP_OPT_X_TLS_CACERTFILE,
-			    conn->set.tls_ca_cert_file, "tls_ca_cert_file");
-	db_ldap_set_opt_str(conn, NULL, LDAP_OPT_X_TLS_CACERTDIR,
-			    conn->set.tls_ca_cert_dir, "tls_ca_cert_dir");
-	db_ldap_set_opt_str(conn, NULL, LDAP_OPT_X_TLS_CERTFILE,
-			    conn->set.tls_cert_file, "tls_cert_file");
-	db_ldap_set_opt_str(conn, NULL, LDAP_OPT_X_TLS_KEYFILE,
-			    conn->set.tls_key_file, "tls_key_file");
-	db_ldap_set_opt_str(conn, NULL, LDAP_OPT_X_TLS_CIPHER_SUITE,
-			    conn->set.tls_cipher_suite, "tls_cipher_suite");
-	if (conn->set.tls_require_cert != NULL) {
-		db_ldap_set_opt(conn, NULL, LDAP_OPT_X_TLS_REQUIRE_CERT, &conn->set.ldap_tls_require_cert_parsed,
-				"tls_require_cert", conn->set.tls_require_cert);
-	}
-#else
-	if (conn->set.tls_ca_cert_file != NULL ||
-	    conn->set.tls_ca_cert_dir != NULL ||
-	    conn->set.tls_cert_file != NULL ||
-	    conn->set.tls_key_file != NULL ||
-	    conn->set.tls_cipher_suite != NULL) {
-		i_fatal("LDAP %s: tls_* settings aren't supported by your LDAP library - they must not be set",
-			conn->config_path);
-	}
-#endif
-}
-
-static void db_ldap_set_options(struct ldap_connection *conn)
-{
-	unsigned int ldap_version;
-	int value;
+	struct ldap_conncb *cb = p_new(conn->pool, struct ldap_conncb, 1);
+	cb->lc_add = db_ldap_add_connection_callback;
+	cb->lc_del = db_ldap_del_connection_callback;
+	cb->lc_arg = conn;
+	ret = ldap_set_option(conn->ld, LDAP_OPT_CONNECT_CB, cb);
+	if (ret != LDAP_SUCCESS)
+		i_fatal("%sCan't set conn_callbacks: %s",
+			conn->log_prefix, ldap_err2string(ret));
 
 #ifdef LDAP_OPT_NETWORK_TIMEOUT
 	struct timeval tv;
-	int ret;
 
 	tv.tv_sec = DB_LDAP_CONNECT_TIMEOUT_SECS; tv.tv_usec = 0;
 	ret = ldap_set_option(conn->ld, LDAP_OPT_NETWORK_TIMEOUT, &tv);
-	if (ret != LDAP_SUCCESS) {
-		i_fatal("LDAP %s: Can't set network-timeout: %s",
-			conn->config_path, ldap_err2string(ret));
-	}
+	if (ret != LDAP_SUCCESS)
+		i_fatal("%sCan't set network-timeout: %s",
+			conn->log_prefix, ldap_err2string(ret));
 #endif
 
-	db_ldap_set_opt(conn, conn->ld, LDAP_OPT_DEREF, &conn->set.ldap_deref,
-			"deref", conn->set.deref);
+	if (ldap_set_opt(conn->ld, LDAP_OPT_DEREF, &conn->set->parsed_deref,
+			 "ldap_deref", conn->set->deref, &error) < 0)
+		i_fatal("%s%s", conn->log_prefix, error);
 #ifdef LDAP_OPT_DEBUG_LEVEL
-	if (str_to_int(conn->set.debug_level, &value) >= 0 && value != 0) {
-		db_ldap_set_opt(conn, NULL, LDAP_OPT_DEBUG_LEVEL, &value,
-				"debug_level", conn->set.debug_level);
+	if (conn->set->debug_level != 0) {
+		if (ldap_set_opt(NULL, LDAP_OPT_DEBUG_LEVEL, &conn->set->debug_level,
+				"ldap_debug_level", dec2str(conn->set->debug_level), &error) < 0)
+			i_fatal("%s%s", conn->log_prefix, error);
 		event_set_forced_debug(conn->event, TRUE);
 	}
 #endif
 
-	ldap_version = conn->set.ldap_version;
-	db_ldap_set_opt(conn, conn->ld, LDAP_OPT_PROTOCOL_VERSION, &ldap_version,
-			"protocol_version", dec2str(ldap_version));
-	db_ldap_set_tls_options(conn);
+	if (ldap_set_opt(conn->ld, LDAP_OPT_PROTOCOL_VERSION,
+			 &conn->set->version, "ldap_version",
+			 dec2str(conn->set->version), &error) < 0)
+		i_fatal("%s%s", conn->log_prefix, error);
+	if (ldap_set_tls_options(conn->ld, conn->set->starttls,
+				 conn->set->uris, conn->ssl_set, &error) < 0)
+		i_fatal("%s%s", conn->log_prefix, error);
 }
 
 static void db_ldap_init_ld(struct ldap_connection *conn)
 {
-	int ret;
-
-	if (conn->set.uris != NULL) {
-#ifdef LDAP_HAVE_INITIALIZE
-		ret = ldap_initialize(&conn->ld, conn->set.uris);
-		if (ret != LDAP_SUCCESS) {
-			i_fatal("LDAP %s: ldap_initialize() failed with uris %s: %s",
-				conn->config_path, conn->set.uris,
-				ldap_err2string(ret));
-		}
-#else
-		i_unreached(); /* already checked at init */
-#endif
-	} else {
-		conn->ld = ldap_init(conn->set.hosts, LDAP_PORT);
-		if (conn->ld == NULL) {
-			i_fatal("LDAP %s: ldap_init() failed with hosts: %s",
-				conn->config_path, conn->set.hosts);
-		}
+	int ret = ldap_initialize(&conn->ld, conn->set->uris);
+	if (ret != LDAP_SUCCESS) {
+		i_fatal("%sldap_initialize() failed: %s",
+			conn->log_prefix, ldap_err2string(ret));
 	}
-	db_ldap_set_options(conn);
+	ldap_set_options(conn);
 }
 
 int db_ldap_connect(struct ldap_connection *conn)
@@ -1255,31 +948,27 @@ int db_ldap_connect(struct ldap_connection *conn)
 	if (conn->ld == NULL)
 		db_ldap_init_ld(conn);
 
-	if (conn->set.tls) {
-#ifdef LDAP_HAVE_START_TLS_S
+	if (conn->set->starttls) {
 		ret = ldap_start_tls_s(conn->ld, NULL, NULL);
 		if (ret != LDAP_SUCCESS) {
 			if (ret == LDAP_OPERATIONS_ERROR &&
-			    conn->set.uris != NULL &&
-			    str_begins_with(conn->set.uris, "ldaps:")) {
-				i_fatal("LDAP %s: Don't use both tls=yes "
-					"and ldaps URI", conn->config_path);
+			    *conn->set->uris != '\0' &&
+			    str_begins_with(conn->set->uris, "ldaps:")) {
+				i_fatal("%sDon't use both ldap_starttls=yes and ldaps URI",
+					conn->log_prefix);
 			}
 			e_error(conn->event, "ldap_start_tls_s() failed: %s",
 				ldap_err2string(ret));
 			return -1;
 		}
-#else
-		i_unreached(); /* already checked at init */
-#endif
 	}
 
 	if (db_ldap_bind(conn) < 0)
 		return -1;
 
 	i_gettimeofday(&end);
-	int msecs = timeval_diff_msecs(&end, &start);
-	e_debug(conn->event, "LDAP initialization took %d msecs", msecs);
+	e_debug(conn->event, "initialization took %lld msecs",
+		timeval_diff_msecs(&end, &start));
 
 	db_ldap_get_fd(conn);
 	conn->io = io_add(conn->fd, IO_READ, ldap_input, conn);
@@ -1349,7 +1038,7 @@ static void db_ldap_conn_close(struct ldap_connection *conn)
 	}
 
 	if (conn->ld != NULL) {
-		ldap_unbind(conn->ld);
+		ldap_unbind_ext(conn->ld, NULL, NULL);
 		conn->ld = NULL;
 	}
 	conn->fd = -1;
@@ -1364,185 +1053,97 @@ static void db_ldap_conn_close(struct ldap_connection *conn)
 	}
 }
 
-struct ldap_field_find_context {
-	ARRAY_TYPE(string) attr_names;
-	pool_t pool;
-};
-
-static int
-db_ldap_field_find(const char *data, void *context,
-		   const char **value_r,
-		   const char **error_r ATTR_UNUSED)
+static bool
+db_ldap_is_sensitive_field(const char *name)
 {
-	struct ldap_field_find_context *ctx = context;
-	char *ldap_attr;
-
-	if (*data != '\0') {
-		ldap_attr = p_strdup(ctx->pool, t_strcut(data, ':'));
-		if (strchr(ldap_attr, '@') == NULL)
-			array_push_back(&ctx->attr_names, &ldap_attr);
-	}
-	*value_r = NULL;
-	return 1;
+	return strstr(name, "nonce") != NULL ||
+	       strstr(name, "password") != NULL ||
+	       strstr(name, "secret") != NULL ||
+	       str_ends_with(name, "key") ||
+	       str_ends_with(name, "pass");
 }
 
-const char *const *db_ldap_parse_attrs(const char *cstr)
+void db_ldap_get_attribute_names(pool_t pool,
+				 const ARRAY_TYPE(const_string) *attrlist,
+				 const char *const **attr_names_r,
+				 const char *const **sensitive_r,
+				 const char *skip_attr)
 {
-	ARRAY_TYPE(const_string) entries;
-	t_array_init(&entries, 32);
+	unsigned int count = array_is_empty(attrlist) ? 0 : array_count(attrlist);
+	i_assert(count % 2 == 0);
 
-	char *ptr = t_strdup_noconst(cstr);
-	const char *start = ptr;
-	unsigned int nesting = 0;
-	while (*ptr != '\0') {
-		switch (*ptr) {
-		case '{':
-			nesting++;
-			ptr++;
-			break;
-		case '}':
-			if (nesting > 0)
-				nesting--;
-			ptr++;
-			break;
-		case ',':
-			if (nesting > 0)
-				ptr++;
-			else {
-				*ptr = '\0';
-				if (*start != '\0')
-					array_push_back(&entries, &start);
-				start = ++ptr;
+	ARRAY_TYPE(const_string) attr_names;
+	ARRAY_TYPE(const_string) sensitive_attr_names;
+
+	p_array_init(&attr_names, pool, count / 2);
+	p_array_init(&sensitive_attr_names, pool, 2);
+	string_t *tmp_str = t_str_new(128);
+
+	for (unsigned int index = 0; index < count; ) {
+		struct var_expand_program *prog;
+		const char *name = array_idx_elem(attrlist, index++);
+		const char *value = array_idx_elem(attrlist, index++);
+
+		if (skip_attr != NULL && strcmp(skip_attr, name) == 0)
+			continue;
+
+		const char *error ATTR_UNUSED;
+		str_truncate(tmp_str, 0);
+
+		/* Mark the current end of the array before adding the elements
+		   from the expansion of the field expression. This will be
+		   used later to see which elements have been added. */
+		unsigned int index = array_count(&attr_names);
+
+		if (var_expand_program_create(value, &prog, &error) < 0) {
+			e_debug(auth_event, "db-ldap: var_expand_program_create('%s') failed: %s", value, error);
+			continue;
+		}
+
+		const char *const *vars = var_expand_program_variables(prog);
+		for (; *vars != NULL; vars++) {
+			const char *ldap_attr;
+			if (str_begins(*vars, "ldap:", &ldap_attr) ||
+			    str_begins(*vars, "ldap_multi:", &ldap_attr)) {
+				/* when we free program, this name
+				   would be invalid, so dup it here. */
+				ldap_attr = p_strdup(pool, ldap_attr);
+				array_push_back(&attr_names, &ldap_attr);
 			}
-			break;
-		default:
-			ptr++;
-			break;
+		}
+		var_expand_program_free(&prog);
+
+		if (!db_ldap_is_sensitive_field(name))
+			continue;
+
+		/* We want to mark as sensitive ALL the LDAP attributes involved
+		   in the creation of the "password" field. Typically this this
+		   will be a single attribute, but the field value expression
+		   allows for multiple attributes to be used. In this case, we
+		   mark them all. */
+
+		unsigned int count = array_count(&attr_names);
+		/* Now index points to the first attribute newly added to
+		   attr_names, and count points to the end of attr_names. */
+
+		for (; index < count; index++) {
+			const char *const *src = array_idx(&attr_names, index);
+			array_push_back(&sensitive_attr_names, src);
 		}
 	}
-	if (*start != '\0')
-		array_push_back(&entries, &start);
+	array_append_zero(&attr_names);
+	array_append_zero(&sensitive_attr_names);
 
-	unsigned int count ATTR_UNUSED;
-	array_append_zero(&entries);
-	return array_get(&entries, &count);
-}
-
-void db_ldap_set_attrs(struct ldap_connection *conn, const char *attrlist,
-		       char ***attr_names_r, ARRAY_TYPE(ldap_field) *attr_map,
-		       const char *skip_attr)
-{
-	static struct var_expand_func_table var_funcs_table[] = {
-		{ "ldap", db_ldap_field_find },
-		{ "ldap_multi", db_ldap_field_find },
-		{ "ldap_ptr", db_ldap_field_find },
-		{ NULL, NULL }
-	};
-	struct ldap_field_find_context ctx;
-	struct ldap_field *field;
-	string_t *tmp_str;
-	const char *const *attr, *attr_data, *p, *error;
-	char *ldap_attr, *name, *templ;
-	unsigned int i;
-
-	attr = db_ldap_parse_attrs(attrlist);
-	if (*attr == NULL)
-		return;
-
-	tmp_str = t_str_new(128);
-	ctx.pool = conn->pool;
-	p_array_init(&ctx.attr_names, conn->pool, 16);
-	for (i = 0; attr[i] != NULL; i++) {
-		/* allow spaces here so "foo=1, bar=2" works */
-		attr_data = attr[i];
-		while (*attr_data == ' ') attr_data++;
-
-		p = strchr(attr_data, '=');
-		if (p == NULL)
-			ldap_attr = name = p_strdup(conn->pool, attr_data);
-		else if (attr_data[0] == '@') {
-			ldap_attr = "";
-			name = p_strdup(conn->pool, attr_data);
-		} else {
-			ldap_attr = p_strdup_until(conn->pool, attr_data, p);
-			name = p_strdup(conn->pool, p + 1);
-		}
-
-		templ = strchr(name, '=');
-		if (templ == NULL) {
-			if (*ldap_attr == '\0') {
-				/* =foo static value */
-				templ = "";
-			}
-		} else {
-			*templ++ = '\0';
-			str_truncate(tmp_str, 0);
-			if (var_expand_with_funcs(tmp_str, templ, NULL,
-						  var_funcs_table, &ctx, &error) <= 0) {
-				/* This var_expand_with_funcs call fills the
-				 * ldap_field_find_context in ctx, but the
-				 * resulting string_t is not used, and the
-				 * return value or error_r is not checked since
-				 * it gives errors for non-ldap variable
-				 * expansions. */
-			}
-			if (strchr(templ, '%') == NULL) {
-				/* backwards compatibility:
-				   attr=name=prefix means same as
-				   attr=name=prefix%$ when %vars are missing */
-				templ = p_strconcat(conn->pool, templ,
-						    "%$", NULL);
-			}
-		}
-
-		if (*name == '\0')
-			e_error(conn->event, "Invalid attrs entry: %s", attr_data);
-		else if (skip_attr == NULL || strcmp(skip_attr, name) != 0) {
-			field = array_append_space(attr_map);
-			if (name[0] == '@') {
-				/* @name=ldapField */
-				name++;
-				field->value_is_dn = TRUE;
-			} else if (name[0] == '!' && name == ldap_attr) {
-				/* !ldapAttr */
-				name = "";
-				i_assert(ldap_attr[0] == '!');
-				ldap_attr++;
-				field->skip = TRUE;
-			}
-			field->name = name;
-			field->value = templ;
-			field->ldap_attr_name = ldap_attr;
-			if (*ldap_attr != '\0' &&
-			    strchr(ldap_attr, '@') == NULL) {
-				/* root request's attribute */
-				array_push_back(&ctx.attr_names, &ldap_attr);
-			}
-		}
-	}
-	array_append_zero(&ctx.attr_names);
-	*attr_names_r = array_front_modifiable(&ctx.attr_names);
-}
-
-static const struct var_expand_table *
-db_ldap_value_get_var_expand_table(struct auth_request *auth_request,
-				   const char *ldap_value)
-{
-	struct var_expand_table *table;
-	unsigned int count = 1;
-
-	table = auth_request_get_var_expand_table_full(auth_request,
-			auth_request->fields.user, NULL, &count);
-	table[0].key = '$';
-	table[0].value = ldap_value;
-	return table;
+	*attr_names_r = array_front(&attr_names);
+	if (sensitive_r != NULL)
+		*sensitive_r = array_front(&sensitive_attr_names);
 }
 
 #define IS_LDAP_ESCAPED_CHAR(c) \
 	((((unsigned char)(c)) & 0x80) != 0 || strchr(LDAP_ESCAPE_CHARS, (c)) != NULL)
 
 const char *ldap_escape(const char *str,
-			const struct auth_request *auth_request ATTR_UNUSED)
+			void *context ATTR_UNUSED)
 {
 	string_t *ret = NULL;
 
@@ -1561,22 +1162,17 @@ const char *ldap_escape(const char *str,
 }
 
 static bool
-ldap_field_hide_password(struct db_ldap_result_iterate_context *ctx,
-			 const char *attr)
+db_ldap_field_hide_password(struct db_ldap_result_iterate_context *ctx,
+			    const char *attr)
 {
-	const struct ldap_field *field;
-
-	if (ctx->ldap_request->auth_request->set->debug_passwords)
+	struct auth_request *request = ctx->ldap_request->auth_request;
+	if (request->set->debug_passwords)
 		return FALSE;
 
-	array_foreach(ctx->attr_map, field) {
-		if (strcmp(field->ldap_attr_name, attr) == 0) {
-			if (strcmp(field->name, "password") == 0 ||
-			    strcmp(field->name, "password_noscheme") == 0)
-				return TRUE;
-		}
-	}
-	return FALSE;
+	if (ctx->sensitive_attr_names == NULL)
+		return FALSE;
+
+	return str_array_find(ctx->sensitive_attr_names, attr);
 }
 
 static void
@@ -1585,30 +1181,29 @@ get_ldap_fields(struct db_ldap_result_iterate_context *ctx,
 		const char *suffix)
 {
 	struct db_ldap_value *ldap_value;
-	char *attr, **vals;
 	unsigned int i, count;
 	BerElement *ber;
 
-	attr = ldap_first_attribute(conn->ld, entry, &ber);
+	char *attr = ldap_first_attribute(conn->ld, entry, &ber);
 	while (attr != NULL) {
-		vals = ldap_get_values(conn->ld, entry, attr);
+		struct berval **vals = ldap_get_values_len(conn->ld, entry, attr);
 
 		ldap_value = p_new(ctx->pool, struct db_ldap_value, 1);
 		if (vals == NULL) {
 			ldap_value->values = p_new(ctx->pool, const char *, 1);
 			count = 0;
-		} else {
-			for (count = 0; vals[count] != NULL; count++) ;
-		}
+		} else
+			count = ldap_count_values_len(vals);
 
 		ldap_value->values = p_new(ctx->pool, const char *, count + 1);
 		for (i = 0; i < count; i++)
-			ldap_value->values[i] = p_strdup(ctx->pool, vals[i]);
+			ldap_value->values[i] = p_strndup(
+				ctx->pool, vals[i]->bv_val, vals[i]->bv_len);
 
 		str_printfa(ctx->debug, " %s%s=", attr, suffix);
 		if (count == 0)
 			str_append(ctx->debug, "<no values>");
-		else if (ldap_field_hide_password(ctx, attr))
+		else if (db_ldap_field_hide_password(ctx, attr))
 			str_append(ctx->debug, PASSWORD_HIDDEN_STR);
 		else {
 			str_append(ctx->debug, ldap_value->values[0]);
@@ -1621,7 +1216,7 @@ get_ldap_fields(struct db_ldap_result_iterate_context *ctx,
 				  p_strconcat(ctx->pool, attr, suffix, NULL),
 				  ldap_value);
 
-		ldap_value_free(vals);
+		ldap_value_free_len(vals);
 		ldap_memfree(attr);
 		attr = ldap_next_attribute(conn->ld, entry, ber);
 	}
@@ -1631,8 +1226,7 @@ get_ldap_fields(struct db_ldap_result_iterate_context *ctx,
 struct db_ldap_result_iterate_context *
 db_ldap_result_iterate_init_full(struct ldap_connection *conn,
 				 struct ldap_request_search *ldap_request,
-				 LDAPMessage *res, bool skip_null_values,
-				 bool iter_dn_values)
+				 LDAPMessage *res, bool skip_null_values)
 {
 	struct db_ldap_result_iterate_context *ctx;
 	const struct ldap_request_named_result *named_res;
@@ -1643,9 +1237,9 @@ db_ldap_result_iterate_init_full(struct ldap_connection *conn,
 	ctx = p_new(pool, struct db_ldap_result_iterate_context, 1);
 	ctx->pool = pool;
 	ctx->ldap_request = &ldap_request->request;
-	ctx->attr_map = ldap_request->attr_map;
+	ctx->attr_next = ldap_request->attributes;
+	ctx->sensitive_attr_names = ldap_request->sensitive_attr_names;
 	ctx->skip_null_values = skip_null_values;
-	ctx->iter_dn_values = iter_dn_values;
 	hash_table_create(&ctx->ldap_attrs, pool, 0, strcase_hash, strcasecmp);
 	ctx->var = str_new(ctx->pool, 256);
 	ctx->debug = t_str_new(256);
@@ -1671,267 +1265,139 @@ db_ldap_result_iterate_init(struct ldap_connection *conn,
 			    LDAPMessage *res, bool skip_null_values)
 {
 	return db_ldap_result_iterate_init_full(conn, ldap_request, res,
-						skip_null_values, FALSE);
+						skip_null_values);
 }
 
-static const char *db_ldap_field_get_default(const char *data)
+const char *db_ldap_attribute_as_multi(const char *name)
 {
-	const char *p;
-
-	p = i_strchr_to_next(data, ':');
-	if (p == NULL)
-		return "";
-	else {
-		/* default value given */
-		return p;
-	}
+	return t_strconcat(DB_LDAP_ATTR_MULTI_PREFIX, name, NULL);
 }
 
 static int
-db_ldap_field_expand(const char *data, void *context,
-		     const char **value_r, const char **error_r ATTR_UNUSED)
+db_ldap_field_multi_expand(const char *data, const char **value_r,
+			   void *context, const char **error_r)
 {
-	struct db_ldap_result_iterate_context *ctx = context;
-	struct db_ldap_value *ldap_value;
-	const char *field_name = t_strcut(data, ':');
+	struct db_ldap_field_expand_context *ctx = context;
+	struct auth_fields *fields = ctx->fields;
+	const char *field_name = t_str_lcase(data);
 
-	ldap_value = hash_table_lookup(ctx->ldap_attrs, field_name);
-	if (ldap_value == NULL) {
-		/* requested ldap attribute wasn't returned at all */
-		str_printfa(ctx->debug, "; %s missing", field_name);
-		*value_r = db_ldap_field_get_default(data);
-		return 1;
+	const char *value = auth_fields_find(fields,
+					     db_ldap_attribute_as_multi(field_name));
+	if (value == NULL || *value == '\0')
+		value = auth_fields_find(fields, field_name);
+
+	if (value == NULL || *value == '\0') {
+		*error_r = t_strdup_printf("No such attribute '%s'", field_name);
+		return -1;
 	}
-	ldap_value->used = TRUE;
-
-	if (ldap_value->values[0] == NULL) {
-		/* no value for ldap attribute */
-		*value_r = db_ldap_field_get_default(data);
-		return 1;
-	}
-	if (ldap_value->values[1] != NULL) {
-		e_warning(authdb_event(ctx->ldap_request->auth_request),
-			  "Multiple values found for '%s', using value '%s'",
-			  field_name, ldap_value->values[0]);
-	}
-	*value_r = ldap_value->values[0];
-	return 1;
-}
-
-void db_ldap_field_multi_expand_parse_data(
-	const char *data, const char **field_name_r,
-	const char **separator_r, const char **default_r)
-{
-	/* start with the defaults */
-	*separator_r = " ";
-	*default_r = "";
-
-	*field_name_r = t_strcut(data, ':');
-	const char *ptr = i_strchr_to_next(data, ':');
-
-	if (ptr == NULL || ptr[0] == '\0') {
-		/* Handling here the cases:
-		   attrName		-> *sep_r = (default), *default_r = (default)
-		   attrName:		-> *sep_r = (default), *default_r = (default)
-		*/
-		return;
-	}
-
-	if (ptr[0] == ':' && (ptr[1] == '\0' || ptr[1] == ':')) {
-		/* Handling here the cases (exceptions dealing with ':'):
-		   attrName::		-> *sep_r = ":", *default_r = (default)
-		   attrName:::		-> *sep_r = ":", *default_r = (default)
-		   attrName:::defl	-> *sep_r = ":", *default_r = "defl"
-		*/
-		*separator_r = ":";
-
-		/* The current ':' was not a field separator, but just datum.
-		   Advance paste it */
-		if (*++ptr == ':')
-			++ptr;
-	} else {
-		/* Handling here the cases (the normal ones):
-		   attrName::defl       -> *sep_r = (default), *default_r = "defl"
-		   attrName:sep         -> *sep_r = "sep", *default_r = (default)
-		   attrName:sep:defl    -> *sep_r = "sep", *default_r = "defl"
-		*/
-		const char *sep = t_strcut(ptr, ':');
-		ptr = i_strchr_to_next(ptr, ':');
-		if (*sep != '\0')
-			*separator_r = sep;
-	}
-
-	if (ptr == NULL || ptr[0] == '\0')
-		return;
-
-	*default_r = ptr;
+	*value_r = value;
+	return 0;
 }
 
 static int
-db_ldap_field_multi_expand(const char *data, void *context,
-			   const char **value_r, const char **error_r ATTR_UNUSED)
+db_ldap_field_single_expand(const char *data, const char **value_r,
+			    void *context, const char **error_r)
 {
-	struct db_ldap_result_iterate_context *ctx = context;
-	struct db_ldap_value *ldap_value;
+	struct db_ldap_field_expand_context *ctx = context;
+	struct auth_fields *fields = ctx->fields;
+	const char *field_name = t_str_lcase(data);
 
-	const char *field_name;
-	const char *field_separator;
-	const char *field_default;
-
-	db_ldap_field_multi_expand_parse_data(data, &field_name,
-					      &field_separator,
-					      &field_default);
-	*value_r = field_default;
-
-	ldap_value = hash_table_lookup(ctx->ldap_attrs, field_name);
-	if (ldap_value == NULL) {
-		/* requested ldap attribute wasn't returned at all */
-		str_printfa(ctx->debug, "; %s missing", field_name);
-		return 1;
-	}
-	ldap_value->used = TRUE;
-
-	if (ldap_value->values[0] == NULL) {
-		/* no value for ldap attribute */
-		return 1;
+	if (strcmp(field_name, "dn") == 0) {
+		/* DN must be always there */
+		*value_r = auth_fields_find(fields, DB_LDAP_ATTR_DN);
+		i_assert(*value_r != NULL);
+		return 0;
 	}
 
-	*value_r = t_strarray_join(ldap_value->values, field_separator);
-	return 1;
-}
+	*value_r = NULL;
+	if (fields != NULL)
+		*value_r = auth_fields_find(fields, field_name);
 
-static int
-db_ldap_field_ptr_expand(const char *data, void *context,
-			 const char **value_r, const char **error_r)
-{
-	struct db_ldap_result_iterate_context *ctx = context;
-	const char *field_name, *suffix;
-
-	suffix = strchr(t_strcut(data, ':'), '@');
-	if (db_ldap_field_expand(data, ctx, &field_name, error_r) <= 0)
-		i_unreached();
-	if (field_name[0] == '\0') {
-		*value_r = "";
-		return 1;
+	if (*value_r == NULL || **value_r == '\0') {
+		*error_r = t_strdup_printf("No such attribute '%s'", field_name);
+		return -1;
+	} else if (auth_fields_find(fields,
+				  db_ldap_attribute_as_multi(field_name)) != NULL) {
+		e_warning(ctx->event, "Multiple values found for '%s': "
+			              "using value '%s'", field_name, *value_r);
 	}
-	field_name = t_strconcat(field_name, suffix, NULL);
-	return db_ldap_field_expand(field_name, ctx, value_r, error_r);
+
+	return 0;
 }
 
-static int
-db_ldap_field_dn_expand(const char *data ATTR_UNUSED, void *context ATTR_UNUSED,
-			 const char **value_r, const char **error_r ATTR_UNUSED)
-{
-	struct db_ldap_result_iterate_context *ctx = context;
-	char *dn = ldap_get_dn(ctx->ld, ctx->ldap_msg);
-	*value_r = t_strdup(dn);
-	ldap_memfree(dn);
-	return 1;
-}
-
-static struct var_expand_func_table ldap_var_funcs_table[] = {
-	{ "ldap", db_ldap_field_expand },
+const struct var_expand_provider db_ldap_field_expand_fn_table[] = {
+	{ "ldap",       db_ldap_field_single_expand },
 	{ "ldap_multi", db_ldap_field_multi_expand },
-	{ "ldap_ptr", db_ldap_field_ptr_expand },
-	{ "ldap_dn", db_ldap_field_dn_expand },
 	{ NULL, NULL }
 };
 
+struct auth_fields *
+ldap_query_get_fields(pool_t pool,
+		      struct ldap_connection *conn,
+		      struct ldap_request_search *ldap_request,
+		      LDAPMessage *res, bool skip_null_values)
+{
+	struct auth_fields *fields = auth_fields_init(pool);
+	struct db_ldap_result_iterate_context *ldap_iter;
+	const char *name, *const *values;
+
+	char *dn = ldap_get_dn(conn->ld, res);
+	auth_fields_add(fields, DB_LDAP_ATTR_DN, dn, 0);
+	ldap_memfree(dn);
+
+	ldap_iter = db_ldap_result_iterate_init(conn, ldap_request, res,
+						skip_null_values);
+	while (db_ldap_result_iterate_next(ldap_iter, &name, &values)) {
+		/* normalize to lower case, as ldap names are case-insensitive. */
+		name = t_str_lcase(name);
+		auth_fields_add(fields, name, values[0], 0);
+		if (values[0] != NULL && values[1] != NULL) {
+			const char *mname = db_ldap_attribute_as_multi(name);
+			string_t *mvalue = t_str_new(32);
+			for (; *values != NULL; values++) {
+				str_append_tabescaped(mvalue, *values);
+				str_append_c(mvalue, '\t');
+			}
+			/* drop last \t */
+			str_truncate(mvalue, str_len(mvalue) - 1);
+			auth_fields_add(fields, mname, str_c(mvalue), 0);
+		}
+	}
+	db_ldap_result_iterate_deinit(&ldap_iter);
+	return fields;
+}
+
 static const char *const *
 db_ldap_result_return_value(struct db_ldap_result_iterate_context *ctx,
-			    const struct ldap_field *field,
 			    struct db_ldap_value *ldap_value)
 {
-	const struct var_expand_table *var_table;
-	const char *const *values, *error;
+	if (ldap_value != NULL && ldap_value->values[0] != NULL)
+		return ldap_value->values;
 
-	if (ldap_value != NULL)
-		values = ldap_value->values;
-	else {
-		/* LDAP attribute doesn't exist */
-		ctx->val_1_arr[0] = NULL;
-		values = ctx->val_1_arr;
-	}
-
-	if (field->value == NULL) {
-		/* use the LDAP attribute's value */
-	} else {
-		/* template */
-		if (values[0] == NULL && *field->ldap_attr_name != '\0') {
-			/* ldapAttr=key=template%$, but ldapAttr doesn't
-			   exist. */
-			return values;
-		}
-		if (values[0] != NULL && values[1] != NULL) {
-			e_warning(authdb_event(ctx->ldap_request->auth_request),
-				  "Multiple values found for '%s', "
-				  "using value '%s'",
-				  field->name, values[0]);
-		}
-
-		/* do this lookup separately for each expansion, because:
-		   1) the values are allocated from data stack
-		   2) if "user" field is updated, we want %u/%n/%d updated
-		      (and less importantly the same for other variables) */
-		var_table = db_ldap_value_get_var_expand_table(
-			ctx->ldap_request->auth_request, values[0]);
-		if (var_expand_with_funcs(ctx->var, field->value, var_table,
-					  ldap_var_funcs_table, ctx, &error) <= 0) {
-			e_warning(authdb_event(ctx->ldap_request->auth_request),
-				  "Failed to expand template %s: %s",
-				  field->value, error);
-		}
-		ctx->val_1_arr[0] = str_c(ctx->var);
-		values = ctx->val_1_arr;
-	}
-	return values;
+	/* LDAP attribute doesn't exist */
+	ctx->val_1_arr[0] = "";
+	return ctx->val_1_arr;
 }
 
 bool db_ldap_result_iterate_next(struct db_ldap_result_iterate_context *ctx,
 				 const char **name_r,
 				 const char *const **values_r)
 {
-	const struct var_expand_table *tab;
-	const struct ldap_field *field;
-	struct db_ldap_value *ldap_value;
-	unsigned int pos;
-	const char *error;
+	const char *name = *ctx->attr_next;
+	if (name == NULL)
+		return FALSE;
 
-	do {
-		if (ctx->attr_idx == array_count(ctx->attr_map))
-			return FALSE;
-		field = array_idx(ctx->attr_map, ctx->attr_idx++);
-	} while (field->value_is_dn != ctx->iter_dn_values ||
-		 field->skip);
+	ctx->attr_next++;
 
-	ldap_value = *field->ldap_attr_name == '\0' ? NULL :
-		hash_table_lookup(ctx->ldap_attrs, field->ldap_attr_name);
+	struct db_ldap_value *ldap_value = hash_table_lookup(ctx->ldap_attrs, name);
 	if (ldap_value != NULL)
 		ldap_value->used = TRUE;
-	else if (*field->ldap_attr_name != '\0')
-		str_printfa(ctx->debug, "; %s missing", field->ldap_attr_name);
+	else
+		str_printfa(ctx->debug, "; %s missing", name);
 
 	str_truncate(ctx->var, 0);
-	*values_r = db_ldap_result_return_value(ctx, field, ldap_value);
-
-	if (strchr(field->name, '%') == NULL)
-		*name_r = field->name;
-	else {
-		/* expand %variables also for LDAP name fields. we'll use the
-		   same ctx->var, which may already contain the value. */
-		str_append_c(ctx->var, '\0');
-		pos = str_len(ctx->var);
-
-		tab = auth_request_get_var_expand_table(
-			ctx->ldap_request->auth_request, NULL);
-		if (var_expand_with_funcs(ctx->var, field->name, tab,
-					  ldap_var_funcs_table, ctx, &error) <= 0) {
-			e_warning(authdb_event(ctx->ldap_request->auth_request),
-				  "Failed to expand %s: %s", field->name, error);
-		}
-		*name_r = str_c(ctx->var) + pos;
-	}
-
+	*name_r = name;
+	*values_r = db_ldap_result_return_value(ctx, ldap_value);
 	if (ctx->skip_null_values && (*values_r)[0] == NULL) {
 		/* no values. don't confuse the caller with this reply. */
 		return db_ldap_result_iterate_next(ctx, name_r, values_r);
@@ -1951,6 +1417,7 @@ db_ldap_result_finish_debug(struct db_ldap_result_iterate_context *ctx)
 	if (ctx->ldap_request->result_logged)
 		return;
 
+	i_assert(ctx->debug != NULL);
 	orig_len = str_len(ctx->debug);
 	if (orig_len == 0) {
 		e_debug(authdb_event(ctx->ldap_request->auth_request),
@@ -1992,109 +1459,58 @@ void db_ldap_result_iterate_deinit(struct db_ldap_result_iterate_context **_ctx)
 	pool_unref(&ctx->pool);
 }
 
-static const char *parse_setting(const char *key, const char *value,
-				 struct ldap_connection *conn)
+static struct ldap_connection *
+db_ldap_conn_find(const struct ldap_settings *set, const struct ssl_settings *ssl_set)
 {
-	return parse_setting_from_defs(conn->pool, setting_defs,
-				       &conn->set, key, value);
-}
-
-static struct ldap_connection *ldap_conn_find(const char *config_path)
-{
+	/* Note that set->connection_group is implicitly used to control
+	   which settings can chare the same connections. Settings with
+	   different values for set->connection_group will NOT share
+	   the connection. */
 	struct ldap_connection *conn;
-
 	for (conn = ldap_connections; conn != NULL; conn = conn->next) {
-		if (strcmp(conn->config_path, config_path) == 0)
+		if (settings_equal(&ldap_setting_parser_info, set, conn->set, NULL) &&
+		    settings_equal(&ssl_setting_parser_info, ssl_set, conn->ssl_set, NULL))
 			return conn;
 	}
-
 	return NULL;
 }
 
-struct ldap_connection *db_ldap_init(const char *config_path, bool userdb)
+struct ldap_connection *db_ldap_init(struct event *event)
 {
-	struct ldap_connection *conn;
-	const char *str, *error;
-	pool_t pool;
+	const struct ldap_settings *set;
+	const struct ssl_settings *ssl_set;
+	const char *error;
+
+	set     = settings_get_or_fatal(event, &ldap_setting_parser_info);
+	if (ssl_client_settings_get(event, &ssl_set, &error) < 0 ||
+	    ldap_setting_post_check(set, &error) < 0 ||
+	    ldap_set_tls_validate(ssl_set, &error) < 0)
+		i_fatal("%s: %s", set->uris, error);
 
 	/* see if it already exists */
-	conn = ldap_conn_find(config_path);
+	struct ldap_connection *conn = db_ldap_conn_find(set, ssl_set);
 	if (conn != NULL) {
-		if (userdb)
-			conn->userdb_used = TRUE;
+		settings_free(ssl_set);
+		settings_free(set);
 		conn->refcount++;
 		return conn;
 	}
 
-	if (*config_path == '\0')
-		i_fatal("LDAP: Configuration file path not given");
-
-	pool = pool_alloconly_create("ldap_connection", 1024);
+	pool_t pool = pool_alloconly_create("ldap_connection", 1024);
 	conn = p_new(pool, struct ldap_connection, 1);
 	conn->pool = pool;
 	conn->refcount = 1;
 
-	conn->userdb_used = userdb;
+        conn->set = set;
+	conn->ssl_set = ssl_set;
+
 	conn->conn_state = LDAP_CONN_STATE_DISCONNECTED;
 	conn->default_bind_msgid = -1;
 	conn->fd = -1;
-	conn->config_path = p_strdup(pool, config_path);
-	conn->set = default_ldap_settings;
-	if (!settings_read_nosection(config_path, parse_setting, conn, &error))
-		i_fatal("ldap %s: %s", config_path, error);
-
-	if (conn->set.base == NULL)
-		i_fatal("LDAP %s: No base given", config_path);
-
-	if (conn->set.uris == NULL && conn->set.hosts == NULL)
-		i_fatal("LDAP %s: No uris or hosts set", config_path);
-#ifndef LDAP_HAVE_INITIALIZE
-	if (conn->set.uris != NULL) {
-		i_fatal("LDAP %s: uris set, but Dovecot compiled without support for LDAP uris "
-			"(ldap_initialize() not supported by LDAP library)", config_path);
-	}
-#endif
-#ifndef LDAP_HAVE_START_TLS_S
-	if (conn->set.tls)
-		i_fatal("LDAP %s: tls=yes, but your LDAP library doesn't support TLS", config_path);
-#endif
-#ifndef HAVE_LDAP_SASL
-	if (conn->set.sasl_bind)
-		i_fatal("LDAP %s: sasl_bind=yes but no SASL support compiled in", conn->config_path);
-#endif
-	if (conn->set.ldap_version < 3) {
-		if (conn->set.sasl_bind)
-			i_fatal("LDAP %s: sasl_bind=yes requires ldap_version=3", config_path);
-		if (conn->set.tls)
-			i_fatal("LDAP %s: tls=yes requires ldap_version=3", config_path);
-	}
-#ifdef OPENLDAP_TLS_OPTIONS
-	if (conn->set.tls_require_cert != NULL) {
-		if (tls_require_cert2str(conn->set.tls_require_cert,
-					 &conn->set.ldap_tls_require_cert_parsed) < 0)
-			i_fatal("LDAP %s: Unknown tls_require_cert value '%s'",
-				config_path, conn->set.tls_require_cert);
-	}
-#endif
-
-	if (*conn->set.ldaprc_path != '\0') {
-		str = getenv("LDAPRC");
-		if (str != NULL && strcmp(str, conn->set.ldaprc_path) != 0) {
-			i_fatal("LDAP %s: Multiple different ldaprc_path "
-				"settings not allowed (%s and %s)",
-				config_path, str, conn->set.ldaprc_path);
-		}
-		env_put("LDAPRC", conn->set.ldaprc_path);
-	}
-
-        if (deref2str(conn->set.deref, &conn->set.ldap_deref) < 0)
-		i_fatal("LDAP %s: Unknown deref option '%s'", config_path, conn->set.deref);
-	if (scope2str(conn->set.scope, &conn->set.ldap_scope) < 0)
-		i_fatal("LDAP %s: Unknown scope option '%s'", config_path, conn->set.scope);
 
 	conn->event = event_create(auth_event);
-	event_set_append_log_prefix(conn->event, t_strdup_printf(
-		"ldap(%s): ", conn->config_path));
+	conn->log_prefix = i_strdup_printf("ldap(%s): ", set->uris);
+	event_set_log_prefix_callback(conn->event, FALSE, db_ldap_log_callback, conn);
 
 	i_array_init(&conn->request_array, 512);
 	conn->request_queue = aqueue_init(&conn->request_array.arr);
@@ -2131,7 +1547,12 @@ void db_ldap_unref(struct ldap_connection **_conn)
 	array_free(&conn->request_array);
 	aqueue_deinit(&conn->request_queue);
 
+	settings_free(conn->ssl_set);
+	settings_free(conn->set);
+
 	event_unref(&conn->event);
+	i_free(conn->log_prefix);
+
 	pool_unref(&conn->pool);
 }
 

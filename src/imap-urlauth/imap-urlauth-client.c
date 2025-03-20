@@ -12,7 +12,7 @@
 #include "hostpid.h"
 #include "execv-const.h"
 #include "env-util.h"
-#include "var-expand.h"
+#include "settings.h"
 #include "restrict-access.h"
 #include "master-service.h"
 #include "master-interface.h"
@@ -48,6 +48,7 @@ int client_create(const char *service, const char *username,
 
 	client = i_new(struct client, 1);
 	client->set = set;
+	pool_ref(client->set->pool);
 
 	client->event = event_create(NULL);
 	event_set_forced_debug(client->event, set->mail_debug);
@@ -58,14 +59,14 @@ int client_create(const char *service, const char *username,
 	/* determine user's special privileges */
 	i_array_init(&client->access_apps, 4);
 	if (username != NULL) {
-		if (set->imap_urlauth_submit_user != NULL &&
+		if (set->imap_urlauth_submit_user[0] != '\0' &&
 		    strcmp(set->imap_urlauth_submit_user, username) == 0) {
 			e_debug(client->event,
 				"User has URLAUTH submit access");
 			app = "submit+";
 			array_push_back(&client->access_apps, &app);
 		}
-		if (set->imap_urlauth_stream_user != NULL &&
+		if (set->imap_urlauth_stream_user[0] != '\0' &&
 		    strcmp(set->imap_urlauth_stream_user, username) == 0) {
 			e_debug(client->event,
 				"User has URLAUTH stream access");
@@ -131,6 +132,7 @@ void client_destroy(struct client *client, const char *reason)
 
 	connection_deinit(&client->conn);
 	event_unref(&client->event);
+	settings_free(client->set);
 
 	i_free(client->username);
 	i_free(client->service);

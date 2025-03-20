@@ -5,8 +5,9 @@
 #include "mail-namespace.h"
 #include "mail-search.h"
 #include "fts-api-private.h"
-#include "fts-tokenizer.h"
-#include "fts-filter.h"
+#include "lang-tokenizer.h"
+#include "lang-filter.h"
+#include "lang-user.h"
 #include "fts-user.h"
 #include "fts-search-args.h"
 
@@ -53,7 +54,7 @@ fts_search_arg_create_or(const struct mail_search_arg *orig_arg, pool_t pool,
 }
 
 static int
-fts_backend_dovecot_expand_tokens(struct fts_filter *filter,
+fts_backend_dovecot_expand_tokens(struct lang_filter *filter,
 				  pool_t pool,
 				  struct mail_search_arg *parent_arg,
 				  const struct mail_search_arg *orig_arg,
@@ -74,7 +75,7 @@ fts_backend_dovecot_expand_tokens(struct fts_filter *filter,
 	/* add the word filtered */
 	if (filter != NULL) {
 		token2 = t_strdup(token);
-		ret = fts_filter_filter(filter, &token2, &error);
+		ret = lang_filter(filter, &token2, &error);
 		if (ret > 0) {
 			token2 = t_strdup(token2);
 			array_push_back(&tokens, &token2);
@@ -98,7 +99,7 @@ fts_backend_dovecot_expand_tokens(struct fts_filter *filter,
 }
 
 static int
-fts_backend_dovecot_tokenize_lang(struct fts_user_language *user_lang,
+fts_backend_dovecot_tokenize_lang(struct language_user *user_lang,
 				  pool_t pool, struct mail_search_arg *or_arg,
 				  struct mail_search_arg *orig_arg,
 				  const char *orig_token, const char **error_r)
@@ -118,8 +119,8 @@ fts_backend_dovecot_tokenize_lang(struct fts_user_language *user_lang,
 
 	/* reset tokenizer between search args in case there's any state left
 	   from some previous failure */
-	fts_tokenizer_reset(user_lang->search_tokenizer);
-	while ((ret = fts_tokenizer_next(user_lang->search_tokenizer,
+	lang_tokenizer_reset(user_lang->search_tokenizer);
+	while ((ret = lang_tokenizer_next(user_lang->search_tokenizer,
 					 (const void *)orig_token,
 					 orig_token_len, &token, &error)) > 0) {
 		if (fts_backend_dovecot_expand_tokens(user_lang->filter, pool,
@@ -128,7 +129,7 @@ fts_backend_dovecot_tokenize_lang(struct fts_user_language *user_lang,
 			return -1;
 	}
 	while (ret >= 0 &&
-	       (ret = fts_tokenizer_final(user_lang->search_tokenizer, &token, &error)) > 0) {
+	       (ret = lang_tokenizer_final(user_lang->search_tokenizer, &token, &error)) > 0) {
 		if (fts_backend_dovecot_expand_tokens(user_lang->filter, pool,
 						      and_arg, orig_arg, orig_token,
 						      token, error_r) < 0)
@@ -149,8 +150,8 @@ static int fts_search_arg_expand(struct fts_backend *backend, pool_t pool,
 				 struct mail_search_arg **argp)
 {
 	struct event *event = backend->event;
-	const ARRAY_TYPE(fts_user_language) *languages;
-	struct fts_user_language *lang;
+	const ARRAY_TYPE(language_user) *languages;
+	struct language_user *lang;
 	struct mail_search_arg *or_arg, *orig_arg = *argp;
 	const char *error, *orig_token = orig_arg->value.str;
 
@@ -159,9 +160,9 @@ static int fts_search_arg_expand(struct fts_backend *backend, pool_t pool,
 	     (*argp)->type == SEARCH_HEADER_COMPRESS_LWSP) &&
 	    !fts_header_has_language((*argp)->hdr_field_name)) {
 		/* use only the data-language */
-		languages = fts_user_get_data_languages(backend->ns->user);
+		languages = lang_user_get_data_languages(backend->ns->user);
 	} else {
-		languages = fts_user_get_all_languages(backend->ns->user);
+		languages = lang_user_get_all_languages(backend->ns->user);
 	}
 
 	/* OR together all the different expansions for different languages.

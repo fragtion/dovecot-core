@@ -219,16 +219,24 @@ static const struct smtp_command_parse_invalid_test
 		.error_code = SMTP_COMMAND_PARSE_ERROR_BROKEN_COMMAND,
 	},
 	{
+		.command = "FROP \xF1\r\n",
+		.error_code = SMTP_COMMAND_PARSE_ERROR_BAD_COMMAND,
+	},
+	{
 		.command = "FROP \xF1",
 		.error_code = SMTP_COMMAND_PARSE_ERROR_BROKEN_COMMAND,
+	},
+	{
+		.command = "FROP \xF1\x80\r\n",
+		.error_code = SMTP_COMMAND_PARSE_ERROR_BAD_COMMAND,
 	},
 	{
 		.command = "FROP \xF1\x80",
 		.error_code = SMTP_COMMAND_PARSE_ERROR_BROKEN_COMMAND,
 	},
 	{
-		.command = "FROP \xF1\x80\x80",
-		.error_code = SMTP_COMMAND_PARSE_ERROR_BROKEN_COMMAND,
+		.command = "FROP \xF1\x80\x80\r\n",
+		.error_code = SMTP_COMMAND_PARSE_ERROR_BAD_COMMAND,
 	},
 	{
 		.command = "FROP \xF1\x80\x80\x80",
@@ -263,9 +271,9 @@ static void test_smtp_command_parse_invalid(void)
 						  command_text_len);
 		parser = smtp_command_parser_init(input, &test->limits);
 
-		while ((ret = smtp_command_parse_next(
-			parser, &cmd_name, &cmd_params,
-			&error_code, &error)) > 0);
+		ret = smtp_command_parse_next(parser, &cmd_name, &cmd_params,
+					      &error_code, &error);
+		i_assert(ret != 0);
 
 		test_out_reason(t_strdup_printf("parse(\"%s\") [buffer]",
 						str_sanitize(command_text, 28)),
@@ -291,10 +299,11 @@ static void test_smtp_command_parse_invalid(void)
 				&error_code, &error);
 		}
 		test_istream_set_size(input, command_text_len);
-		if (ret >= 0) {
-			while ((ret = smtp_command_parse_next(
+		if (ret == 0) {
+			ret = smtp_command_parse_next(
 				parser, &cmd_name, &cmd_params,
-				&error_code, &error)) > 0);
+				&error_code, &error);
+			i_assert(ret != 0);
 		}
 
 		test_out_reason(t_strdup_printf("parse(\"%s\") [stream]",
@@ -608,9 +617,10 @@ static void test_smtp_auth_response_parse_invalid(void)
 				parser, &line, &error_code, &error);
 		}
 		test_istream_set_size(input, response_text_len);
-		if (ret >= 0) {
-			while ((ret = smtp_command_parse_auth_response(
-				parser, &line, &error_code, &error)) > 0);
+		if (ret == 0) {
+			ret = smtp_command_parse_auth_response(
+				parser, &line, &error_code, &error);
+			i_assert(ret != 0);
 		}
 
 		test_out_reason(t_strdup_printf("parse(\"%s\") [stream]",

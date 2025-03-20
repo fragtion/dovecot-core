@@ -3,12 +3,7 @@
 
 #include "mail-storage-private.h"
 #include "fts-api.h"
-
-enum fts_enforced {
-	FTS_ENFORCED_NO,
-	FTS_ENFORCED_YES,
-	FTS_ENFORCED_BODY,
-};
+#include "fts-settings.h"
 
 struct fts_scores {
 	int refcount;
@@ -31,7 +26,6 @@ struct fts_search_context {
 	struct mailbox_transaction_context *t;
 	struct mail_search_args *args;
 	enum fts_lookup_flags flags;
-	enum fts_enforced enforced;
 
 	pool_t result_pool;
 	ARRAY(struct fts_search_level) levels;
@@ -51,6 +45,7 @@ struct fts_search_context {
 	bool fts_lookup_success:1;
 	bool indexing_timed_out:1;
 	bool virtual_seen_unindexed_gaps:1;
+	bool mailbox_failed:1;
 };
 
 /* Figure out if we want to use full text search indexes and update
@@ -71,4 +66,9 @@ void fts_mail_allocated(struct mail *mail);
 void fts_mail_namespaces_added(struct mail_namespace *ns);
 void fts_mailbox_allocated(struct mailbox *box);
 void fts_mailbox_list_created(struct mailbox_list *list);
+int fts_mailbox_get_status(struct mailbox *box, enum mailbox_status_items items,
+			   struct mailbox_status *status_r);
+
+const struct fts_settings *fts_mailbox_get_settings(struct mailbox *box);
+
 #endif

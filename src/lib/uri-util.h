@@ -12,6 +12,10 @@ enum uri_parse_flags {
 	URI_PARSE_SCHEME_EXTERNAL = BIT(0),
 	/* Allow '#fragment' part in URI */
 	URI_PARSE_ALLOW_FRAGMENT_PART = BIT(1),
+	/* Allow ';param' after host - violates RFC3986 */
+	URI_PARSE_SEMICOLON_PARAMS = BIT(2),
+	/* Allow scheme:host - violates RFC3986 */
+	URI_PARSE_ALLOW_MISSING_SLASHSLASH = BIT(3),
 };
 
 struct uri_host {
@@ -37,6 +41,7 @@ struct uri_parser {
 
 	bool allow_pct_nul:1;
 	bool parse_prefix:1;
+	bool semicolon_params:1;
 };
 
 static inline const char *uri_char_sanitize(unsigned char c)
@@ -51,7 +56,7 @@ static inline const char *uri_char_sanitize(unsigned char c)
    character is returned in ch_r upon success. */
 int uri_parse_pct_encoded(struct uri_parser *parser, unsigned char *ch_r);
 
-/* Parse characters as long as these comply with the the 'unreserved' syntax.
+/* Parse characters as long as these comply with the 'unreserved' syntax.
    Returns 1 if characters were found, 0 if none were found, and -1 if there was
    an error. */
 int uri_parse_unreserved(struct uri_parser *parser, string_t *part);

@@ -41,17 +41,11 @@ void userdb_register_module(struct userdb_module_interface *iface)
 
 void userdb_unregister_module(struct userdb_module_interface *iface)
 {
-	struct userdb_module_interface *const *ifaces;
 	unsigned int idx;
 
-	array_foreach(&userdb_interfaces, ifaces) {
-		if (*ifaces == iface) {
-			idx = array_foreach_idx(&userdb_interfaces, ifaces);
-			array_delete(&userdb_interfaces, idx, 1);
-			return;
-		}
-	}
-	i_panic("userdb_unregister_module(%s): Not registered", iface->name);
+	if (!array_lsearch_ptr_idx(&userdb_interfaces, iface, &idx))
+		i_panic("userdb_unregister_module(%s): Not registered", iface->name);
+	array_delete(&userdb_interfaces, idx, 1);
 }
 
 uid_t userdb_parse_uid(struct auth_request *request, const char *str)
@@ -104,30 +98,14 @@ gid_t userdb_parse_gid(struct auth_request *request, const char *str)
 	}
 }
 
-static struct userdb_module *
-userdb_find(const char *driver, const char *args, unsigned int *idx_r)
-{
-	struct userdb_module *const *userdbs;
-	unsigned int i, count;
-
-	userdbs = array_get(&userdb_modules, &count);
-	for (i = 0; i < count; i++) {
-		if (strcmp(userdbs[i]->iface->name, driver) == 0 &&
-		    strcmp(userdbs[i]->args, args) == 0) {
-			*idx_r = i;
-			return userdbs[i];
-		}
-	}
-	return NULL;
-}
-
 struct userdb_module *
-userdb_preinit(pool_t pool, const struct auth_userdb_settings *set)
+userdb_preinit(pool_t pool, struct event *event,
+	       const struct auth_userdb_settings *set)
 {
 	static unsigned int auth_userdb_id = 0;
 	struct userdb_module_interface *iface;
 	struct userdb_module *userdb;
-	unsigned int idx;
+	const char *error;
 
 	iface = userdb_interface_find(set->driver);
 	if (iface == NULL || iface->lookup == NULL) {
@@ -141,25 +119,16 @@ userdb_preinit(pool_t pool, const struct auth_userdb_settings *set)
 		i_fatal("Support not compiled in for userdb driver '%s'",
 			set->driver);
 	}
-	if (iface->preinit == NULL && iface->init == NULL &&
-	    *set->args != '\0') {
-		i_fatal("userdb %s: No args are supported: %s",
-			set->driver, set->args);
-	}
 
-	userdb = userdb_find(set->driver, set->args, &idx);
-	if (userdb != NULL)
-		return userdb;
-
-	if (iface->preinit == NULL)
+	if (iface->preinit != NULL) {
+		if (iface->preinit(pool, event, &userdb, &error) < 0)
+			i_fatal("userdb %s: %s", set->name, error);
+		userdb->blocking = set->use_worker;
+	} else {
 		userdb = p_new(pool, struct userdb_module, 1);
-	else
-		userdb = iface->preinit(pool, set->args);
+	}
 	userdb->id = ++auth_userdb_id;
 	userdb->iface = iface;
-	userdb->args = p_strdup(pool, set->args);
-	/* NOTE: if anything else than driver & args are added here,
-	   userdb_find() also needs to be updated. */
 	array_push_back(&userdb_modules, &userdb);
 	return userdb;
 }
@@ -173,39 +142,21 @@ void userdb_init(struct userdb_module *userdb)
 
 void userdb_deinit(struct userdb_module *userdb)
 {
-	unsigned int idx;
-
 	i_assert(userdb->init_refcount > 0);
 
 	if (--userdb->init_refcount > 0)
 		return;
 
-	if (userdb_find(userdb->iface->name, userdb->args, &idx) == NULL)
+	unsigned int i;
+	if (!array_lsearch_ptr_idx(&userdb_modules, userdb, &i))
 		i_unreached();
-	array_delete(&userdb_modules, idx, 1);
+	array_delete(&userdb_modules, i, 1);
 
 	if (userdb->iface->deinit != NULL)
 		userdb->iface->deinit(userdb);
 
 	/* make sure userdb isn't accessed again */
 	userdb->iface = &userdb_iface_deinit;
-}
-
-void userdbs_generate_md5(unsigned char md5[STATIC_ARRAY MD5_RESULTLEN])
-{
-	struct md5_context ctx;
-	struct userdb_module *const *userdbs;
-	unsigned int i, count;
-
-	md5_init(&ctx);
-	userdbs = array_get(&userdb_modules, &count);
-	for (i = 0; i < count; i++) {
-		md5_update(&ctx, &userdbs[i]->id, sizeof(userdbs[i]->id));
-		md5_update(&ctx, userdbs[i]->iface->name,
-			   strlen(userdbs[i]->iface->name));
-		md5_update(&ctx, userdbs[i]->args, strlen(userdbs[i]->args));
-	}
-	md5_final(&ctx, md5);
 }
 
 const char *userdb_result_to_string(enum userdb_result result)
@@ -227,7 +178,6 @@ extern struct userdb_module_interface userdb_passwd;
 extern struct userdb_module_interface userdb_passwd_file;
 extern struct userdb_module_interface userdb_ldap;
 extern struct userdb_module_interface userdb_sql;
-extern struct userdb_module_interface userdb_dict;
 #ifdef HAVE_LUA
 extern struct userdb_module_interface userdb_lua;
 #endif
@@ -242,7 +192,6 @@ void userdbs_init(void)
 	userdb_register_module(&userdb_static);
 	userdb_register_module(&userdb_ldap);
 	userdb_register_module(&userdb_sql);
-	userdb_register_module(&userdb_dict);
 #ifdef HAVE_LUA
 	userdb_register_module(&userdb_lua);
 #endif

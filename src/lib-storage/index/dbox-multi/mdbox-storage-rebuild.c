@@ -338,7 +338,7 @@ static void rebuild_apply_map(struct mdbox_storage_rebuild_context *ctx)
 {
 	struct mdbox_map *map = ctx->storage->map;
 	const struct mail_index_header *hdr;
-	struct mdbox_rebuild_msg **pos;
+	struct mdbox_rebuild_msg *const *pos;
 	struct mdbox_rebuild_msg search_msg, *search_msgp = &search_msg;
 	struct dbox_mail_lookup_rec rec;
 	uint32_t seq;
@@ -389,7 +389,7 @@ rebuild_lookup_map_uid(struct mdbox_storage_rebuild_context *ctx,
 		       uint32_t map_uid)
 {
 	struct mdbox_rebuild_msg search_msg, *search_msgp = &search_msg;
-	struct mdbox_rebuild_msg **pos;
+	struct mdbox_rebuild_msg *const *pos;
 
 	search_msg.map_uid = map_uid;
 	pos = array_bsearch(&ctx->msgs, &search_msgp,
@@ -903,8 +903,21 @@ mdbox_storage_rebuild_scan_dir(struct mdbox_storage_rebuild_context *ctx,
 	return ret;
 }
 
+static bool mdbox_mailbox_is_fscked(struct mailbox *box)
+{
+	(void)mail_index_refresh(box->index);
+	struct mail_index_view *view = mail_index_view_open(box->index);
+	const struct mail_index_header *hdr = mail_index_get_header(box->view);
+	bool fscked = (hdr->flags & MAIL_INDEX_HDR_FLAG_FSCKD) != 0;
+	mail_index_view_close(&view);
+	return fscked;
+}
+
 static int
-mdbox_storage_rebuild_scan_prepare(struct mdbox_storage_rebuild_context *ctx)
+mdbox_storage_rebuild_scan_prepare(struct mdbox_storage_rebuild_context *ctx,
+				   struct mailbox *fsckd_box,
+				   enum mdbox_rebuild_reason reason,
+				   const char **reason_string_r)
 {
 	const void *data;
 	size_t data_size;
@@ -917,11 +930,28 @@ mdbox_storage_rebuild_scan_prepare(struct mdbox_storage_rebuild_context *ctx)
 	if (mdbox_map_atomic_lock(ctx->atomic, "mdbox storage rebuild") < 0)
 		return -1;
 
-	/* fsck the map just in case its UIDs are broken */
-	if (mail_index_fsck(ctx->storage->map->index) < 0) {
-		mail_storage_set_index_error(&ctx->storage->storage.storage,
-					     ctx->storage->map->index);
-		return -1;
+	/* get storage rebuild counter after locking */
+	ctx->rebuild_count = mdbox_map_get_rebuild_count(ctx->storage->map);
+
+	if ((reason & MDBOX_REBUILD_REASON_FORCED) != 0)
+		*reason_string_r = "Rebuild forced";
+	else if ((reason & MDBOX_REBUILD_REASON_CORRUPTED) != 0 &&
+		 ctx->rebuild_count == ctx->storage->corrupted_rebuild_count) {
+		i_assert(ctx->storage->corrupted_reason != NULL);
+		*reason_string_r = t_strdup_printf(
+			"Storage was marked corrupted: %s",
+			ctx->storage->corrupted_reason);
+	} else if ((reason & MDBOX_REBUILD_REASON_MAP_FSCKD) != 0 &&
+		   mdbox_map_refresh(ctx->storage->map) == 0 &&
+		   mdbox_map_is_fscked(ctx->storage->map))
+		*reason_string_r = "dovecot.index.map was fsck'd";
+	else if ((reason & MDBOX_REBUILD_REASON_MAILBOX_FSCKD) != 0 &&
+		 mdbox_mailbox_is_fscked(fsckd_box)) {
+		*reason_string_r = t_strdup_printf(
+			"Mailbox %s index was fsck'd", fsckd_box->vname);
+	} else {
+		/* storage was already rebuilt by someone else */
+		return 0;
 	}
 
 	/* get old map header */
@@ -934,21 +964,21 @@ mdbox_storage_rebuild_scan_prepare(struct mdbox_storage_rebuild_context *ctx)
 		       I_MIN(data_size, sizeof(ctx->orig_map_hdr)));
 	}
 	ctx->highest_file_id = ctx->orig_map_hdr.highest_file_id;
-
-	/* get storage rebuild counter after locking */
-	ctx->rebuild_count = mdbox_map_get_rebuild_count(ctx->storage->map);
-	if (ctx->rebuild_count != ctx->storage->corrupted_rebuild_count &&
-	    ctx->storage->corrupted) {
-		/* storage was already rebuilt by someone else */
-		return 0;
-	}
 	return 1;
 }
 
-static int mdbox_storage_rebuild_scan(struct mdbox_storage_rebuild_context *ctx)
+static int mdbox_storage_rebuild_scan(struct mdbox_storage_rebuild_context *ctx,
+				      const char *reason)
 {
 	struct event *event = ctx->storage->storage.storage.event;
-	e_warning(event, "rebuilding indexes");
+	e_warning(event, "rebuilding indexes: %s", reason);
+
+	/* fsck the map just in case its UIDs are broken */
+	if (mail_index_fsck(ctx->storage->map->index) < 0) {
+		mail_storage_set_index_error(&ctx->storage->storage.storage,
+					     ctx->storage->map->index);
+		return -1;
+	}
 
 	if (mdbox_storage_rebuild_scan_dir(ctx, ctx->storage->storage_dir,
 					   FALSE) < 0)
@@ -968,10 +998,14 @@ static int mdbox_storage_rebuild_scan(struct mdbox_storage_rebuild_context *ctx)
 	return 0;
 }
 
-int mdbox_storage_rebuild_in_context(struct mdbox_storage *storage,
-				     struct mdbox_map_atomic_context *atomic)
+static int
+mdbox_storage_rebuild_in_context(struct mdbox_storage *storage,
+				 struct mdbox_map_atomic_context *atomic,
+				 struct mailbox *fsckd_box,
+				 enum mdbox_rebuild_reason rebuild_reason)
 {
 	struct mdbox_storage_rebuild_context *ctx;
+	const char *reason_string;
 	int ret;
 
 	if (dbox_verify_alt_storage(storage->map->root_list) < 0) {
@@ -983,29 +1017,35 @@ int mdbox_storage_rebuild_in_context(struct mdbox_storage *storage,
 	}
 
 	ctx = mdbox_storage_rebuild_init(storage, atomic);
-	if ((ret = mdbox_storage_rebuild_scan_prepare(ctx)) > 0) {
+	if ((ret = mdbox_storage_rebuild_scan_prepare(ctx, fsckd_box,
+						      rebuild_reason,
+						      &reason_string)) > 0) {
 		struct event_reason *reason = event_reason_begin("mdbox:rebuild");
-		ret = mdbox_storage_rebuild_scan(ctx);
+		ret = mdbox_storage_rebuild_scan(ctx, reason_string);
 		event_reason_end(&reason);
 	}
 	mdbox_storage_rebuild_deinit(ctx);
 
 	if (ret == 0) {
-		storage->corrupted = FALSE;
+		i_free(storage->corrupted_reason);
 		storage->corrupted_rebuild_count = 0;
 	}
 	return ret;
 }
 
-int mdbox_storage_rebuild(struct mdbox_storage *storage)
+int mdbox_storage_rebuild(struct mdbox_storage *storage,
+			  struct mailbox *fsckd_box,
+			  enum mdbox_rebuild_reason reason)
 {
 	struct mdbox_map_atomic_context *atomic;
 	int ret;
 
 	atomic = mdbox_map_atomic_begin(storage->map);
-	ret = mdbox_storage_rebuild_in_context(storage, atomic);
+	ret = mdbox_storage_rebuild_in_context(storage, atomic,
+					       fsckd_box, reason);
 	mdbox_map_atomic_set_success(atomic);
 	mdbox_map_atomic_unset_fscked(atomic);
+	(void)mail_index_reset_fscked(storage->map->index);
 	if (mdbox_map_atomic_finish(&atomic) < 0)
 		ret = -1;
 	return ret;

@@ -9,6 +9,7 @@ enum sasl_server_reply {
 	SASL_SERVER_REPLY_AUTH_FAILED,
 	SASL_SERVER_REPLY_AUTH_ABORTED,
 	SASL_SERVER_REPLY_MASTER_FAILED,
+	SASL_SERVER_REPLY_MASTER_FAILED_LIMIT,
 	SASL_SERVER_REPLY_CONTINUE
 };
 
@@ -37,7 +38,7 @@ void sasl_server_auth_begin(struct client *client, const char *mech_name,
 			    enum sasl_server_auth_flags flags,
 			    const char *initial_resp_base64,
 			    sasl_server_callback_t *callback);
-void sasl_server_auth_delayed_final(struct client *client);
+void sasl_server_auth_continue(struct client *client, const char *response);
 void sasl_server_auth_failed(struct client *client, const char *reason,
 	const char *code) ATTR_NULL(3);
 /* Called when client asks for SASL authentication to be aborted by sending

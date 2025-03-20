@@ -1,6 +1,7 @@
 /* Copyright (c) 2004-2018 Dovecot authors, see the included COPYING file */
 
 #include "auth-common.h"
+#include "array.h"
 #include "lib-signals.h"
 #include "hash.h"
 #include "str.h"
@@ -8,7 +9,6 @@
 #include "var-expand.h"
 #include "auth-request.h"
 #include "auth-cache.h"
-#include "auth-common.h"
 
 #include <time.h>
 
@@ -26,42 +26,29 @@ struct auth_cache {
 };
 
 static bool
-auth_request_var_expand_tab_find(const char *key, unsigned int size,
-				 unsigned int *idx_r)
+auth_request_var_expand_tab_find(const char *key, unsigned int *idx_r)
 {
 	const struct var_expand_table *tab = auth_request_var_expand_static_tab;
 	unsigned int i;
 
-	for (i = 0; tab[i].key != '\0' || tab[i].long_key != NULL; i++) {
-		if (size == 1) {
-			if (key[0] == tab[i].key) {
-				*idx_r = i;
-				return TRUE;
-			}
-		} else if (tab[i].long_key != NULL) {
-			if (strncmp(key, tab[i].long_key, size) == 0 &&
-			    tab[i].long_key[size] == '\0') {
-				*idx_r = i;
-				return TRUE;
-			}
+	for (i = 0; tab[i].key != NULL; i++) {
+		if (strcmp(key, tab[i].key) == 0) {
+			*idx_r = i;
+			return TRUE;
 		}
 	}
 	return FALSE;
 }
 
 static void
-auth_cache_key_add_var(string_t *str, const char *data, unsigned int len)
+auth_cache_key_add_var(string_t *str, const char *data)
 {
 	if (str_len(str) > 0)
 		str_append_c(str, '\t');
 	str_append_c(str, '%');
-	if (len == 1)
-		str_append_c(str, data[0]);
-	else {
-		str_append_c(str, '{');
-		str_append_data(str, data, len);
-		str_append_c(str, '}');
-	}
+	str_append_c(str, '{');
+	str_append(str, data);
+	str_append_c(str, '}');
 }
 
 static void auth_cache_key_add_tab_idx(string_t *str, unsigned int i)
@@ -72,62 +59,48 @@ static void auth_cache_key_add_tab_idx(string_t *str, unsigned int i)
 	if (str_len(str) > 0)
 		str_append_c(str, '\t');
 	str_append_c(str, '%');
-	if (tab->key != '\0')
-		str_append_c(str, tab->key);
-	else {
-		str_append_c(str, '{');
-		str_append(str, tab->long_key);
-		str_append_c(str, '}');
-	}
+	str_append_c(str, '{');
+	str_append(str, tab->key);
+	str_append_c(str, '}');
 }
 
-char *auth_cache_parse_key(pool_t pool, const char *query)
+static char *auth_cache_parse_key_exclude(pool_t pool, const char *query,
+					  const char *exclude_driver)
 {
 	string_t *str;
 	bool key_seen[AUTH_REQUEST_VAR_TAB_COUNT];
-	const char *extra_vars;
-	unsigned int i, idx, size, tab_idx;
+	const char *extra_vars, *error ATTR_UNUSED;
+	unsigned int i, tab_idx;
 
 	memset(key_seen, 0, sizeof(key_seen));
 
+	struct var_expand_program *prog;
+	if (var_expand_program_create(query, &prog, &error) < 0) {
+		e_debug(auth_event, "auth-cache: var_expand_program_create('%s') failed: %s",
+			query, error);
+		return p_strdup(pool, "");
+	}
+
+	const char *const *vars = var_expand_program_variables(prog);
 	str = t_str_new(32);
-	for (; *query != '\0'; ) {
-		if (*query != '%') {
-			query++;
+
+	for (; *vars != NULL; vars++) {
+		/* ignore any providers */
+		if (strchr(*vars, ':') != NULL &&
+		    !str_begins_with(*vars, "passdb:") &&
+		    !str_begins_with(*vars, "userdb:")) {
 			continue;
-		}
-
-		var_get_key_range(++query, &idx, &size);
-		if (size == 0) {
-			/* broken %variable ending too early */
-			break;
-		}
-		query += idx;
-
-		if (!auth_request_var_expand_tab_find(query, size, &tab_idx)) {
-			/* just add the key. it would be nice to prevent
-			   duplicates here as well, but that's just too
-			   much trouble and probably very rare. */
-			auth_cache_key_add_var(str, query, size);
+		} else if (!auth_request_var_expand_tab_find(*vars, &tab_idx)) {
+			if (null_strcmp(*vars, exclude_driver) != 0)
+				auth_cache_key_add_var(str, *vars);
 		} else {
 			i_assert(tab_idx < N_ELEMENTS(key_seen));
 			key_seen[tab_idx] = TRUE;
 		}
-		query += size;
-	}
-
-	if (key_seen[AUTH_REQUEST_VAR_TAB_USERNAME_IDX] &&
-	    key_seen[AUTH_REQUEST_VAR_TAB_DOMAIN_IDX]) {
-		/* %n and %d both used -> replace with %u */
-		key_seen[AUTH_REQUEST_VAR_TAB_USER_IDX] = TRUE;
-		key_seen[AUTH_REQUEST_VAR_TAB_USERNAME_IDX] = FALSE;
-		key_seen[AUTH_REQUEST_VAR_TAB_DOMAIN_IDX] = FALSE;
 	}
 
 	/* we rely on these being at the beginning */
 	i_assert(AUTH_REQUEST_VAR_TAB_USER_IDX == 0);
-	i_assert(AUTH_REQUEST_VAR_TAB_USERNAME_IDX == 1);
-	i_assert(AUTH_REQUEST_VAR_TAB_DOMAIN_IDX == 2);
 
 	extra_vars = t_strdup(str_c(str));
 	str_truncate(str, 0);
@@ -142,7 +115,34 @@ char *auth_cache_parse_key(pool_t pool, const char *query)
 		str_append(str, extra_vars);
 	}
 
+	var_expand_program_free(&prog);
+
 	return p_strdup(pool, str_c(str));
+}
+
+char *auth_cache_parse_key(pool_t pool, const char *query)
+{
+	return auth_cache_parse_key_exclude(pool, query, NULL);
+}
+
+char *auth_cache_parse_key_and_fields(pool_t pool, const char *query,
+				      const ARRAY_TYPE(const_string) *fields,
+				      const char *exclude_driver)
+{
+	if (array_is_empty(fields))
+		return auth_cache_parse_key_exclude(pool, query, exclude_driver);
+
+	string_t *full_query = t_str_new(128);
+	str_append(full_query, query);
+
+	unsigned int i, count;
+	const char *const *str = array_get(fields, &count);
+	for (i = 0; i < count; i += 2) {
+		str_append_c(full_query, '\t');
+		str_append(full_query, str[i + 1]);
+	}
+	return auth_cache_parse_key_exclude(pool, str_c(full_query),
+					    exclude_driver);
 }
 
 static void
@@ -346,8 +346,8 @@ auth_request_expand_cache_key(const struct auth_request *request,
 	const char *error;
 
 	/* Uniquely identify the request's passdb/userdb with the P/U prefix
-	   and by "%!", which expands to the passdb/userdb ID number. */
-	key = t_strconcat(request->userdb_lookup ? "U" : "P", "%!",
+	   and by "%{id}", which expands to the passdb/userdb ID number. */
+	key = t_strconcat(request->userdb_lookup ? "U" : "P", "%{id}",
 		request->fields.master_user == NULL ? "" : "+%{master_user}",
 		"\t", key, NULL);
 
@@ -362,7 +362,7 @@ auth_request_expand_cache_key(const struct auth_request *request,
 	unsigned int count = 0;
 	const struct var_expand_table *table =
 		auth_request_get_var_expand_table_full(request,
-			username, auth_cache_escape, &count);
+			username, &count);
 	if (auth_request_var_expand_with_table(value, key, request, table,
 					       auth_cache_escape, &error) < 0 &&
 	    !error_logged) {

@@ -5,25 +5,6 @@
 #include "settings-parser.h"
 #include "service-settings.h"
 
-#include <stddef.h>
-
-/* <settings checks> */
-static struct file_listener_settings config_unix_listeners_array[] = {
-	{
-		.path = "config",
-		.mode = 0600,
-		.user = "",
-		.group = "",
-	},
-};
-static struct file_listener_settings *config_unix_listeners[] = {
-	&config_unix_listeners_array[0]
-};
-static buffer_t config_unix_listeners_buf = {
-	{ { config_unix_listeners, sizeof(config_unix_listeners) } }
-};
-/* </settings checks> */
-
 struct service_settings config_service_settings = {
 	.name = "config",
 	.protocol = "",
@@ -32,20 +13,23 @@ struct service_settings config_service_settings = {
 	.user = "",
 	.group = "",
 	.privileged_group = "",
-	.extra_groups = "",
+	.extra_groups = ARRAY_INIT,
 	.chroot = "",
 
 	.drop_priv_before_exec = FALSE,
 
-	.process_min_avail = 0,
-	.process_limit = 0,
-	.client_limit = 0,
-	.service_count = 0,
-	.idle_kill = UINT_MAX,
-	.vsz_limit = UOFF_T_MAX,
+	.idle_kill_interval = SET_TIME_INFINITE,
 
-	.unix_listeners = { { &config_unix_listeners_buf,
-			      sizeof(config_unix_listeners[0]) } },
+	.unix_listeners = ARRAY_INIT,
 	.fifo_listeners = ARRAY_INIT,
 	.inet_listeners = ARRAY_INIT
+};
+
+const struct setting_keyvalue config_service_settings_defaults[] = {
+	{ "unix_listener", "config" },
+
+	{ "unix_listener/config/path", "config" },
+	{ "unix_listener/config/mode", "0600" },
+
+	{ NULL, NULL }
 };

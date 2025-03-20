@@ -19,7 +19,7 @@ The imap-urlauth service thus consists of three separate stages:
   This is the login service which operates identical to imap-login and
   pop3-login equivalents, except for the fact that only token authentication is
   allowed. It verifies that the connecting client is an IMAP service acting on
-  behaf of an authenticated user.
+  behalf of an authenticated user.
 
 - imap-urlauth:
   Once the client is authenticated, the connection gets passed to the
@@ -54,12 +54,12 @@ The imap-urlauth service thus consists of three separate stages:
 #include "base64.h"
 #include "str.h"
 #include "process-title.h"
+#include "settings.h"
 #include "auth-master.h"
 #include "master-service.h"
 #include "master-service-settings.h"
 #include "login-server.h"
 #include "master-interface.h"
-#include "var-expand.h"
 
 #include <stdio.h>
 #include <unistd.h>
@@ -211,13 +211,7 @@ static void client_connected(struct master_service_connection *conn)
 
 int main(int argc, char *argv[])
 {
-	static const struct setting_parser_info *set_roots[] = {
-		&imap_urlauth_setting_parser_info,
-		NULL
-	};
 	struct login_server_settings login_set;
-	struct master_service_settings_input input;
-	struct master_service_settings_output output;
 	enum master_service_flags service_flags = 0;
 	const char *error = NULL, *username = NULL;
 	const char *auth_socket_path = "auth-master";
@@ -252,16 +246,12 @@ int main(int argc, char *argv[])
 	}
 	master_service_init_log(master_service);
 
-	i_zero(&input);
-	input.roots = set_roots;
-	input.service = "imap-urlauth";
-	if (master_service_settings_read(master_service, &input, &output,
-						&error) < 0)
-		i_fatal("Error reading configuration: %s", error);
+	if (master_service_settings_read_simple(master_service, &error) < 0)
+		i_fatal("%s", error);
 
 	imap_urlauth_settings = 
-		master_service_settings_get_root_set(master_service,
-			&imap_urlauth_setting_parser_info);
+		settings_get_or_fatal(master_service_get_event(master_service),
+				      &imap_urlauth_setting_parser_info);
 
 	if (imap_urlauth_settings->verbose_proctitle)
 		verbose_proctitle = TRUE;
@@ -299,6 +289,7 @@ int main(int argc, char *argv[])
 
 	if (login_server != NULL)
 		login_server_deinit(&login_server);
+	settings_free(imap_urlauth_settings);
 	master_service_deinit(&master_service);
 	return 0;
 }

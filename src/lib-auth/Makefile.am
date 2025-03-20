@@ -1,4 +1,4 @@
-noinst_LTLIBRARIES = libauth.la
+noinst_LTLIBRARIES = libauth-crypt.la libauth.la
 
 AM_CPPFLAGS = \
 	$(LIBSODIUM_CFLAGS) \
@@ -7,20 +7,23 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-otp
 
 libauth_la_SOURCES = \
-	crypt-blowfish.c \
-	mycrypt.c \
 	auth-scram.c \
 	auth-scram-client.c \
 	auth-scram-server.c \
+	crypt-blowfish.c \
 	password-scheme.c \
-	password-scheme-crypt.c \
 	password-scheme-md5crypt.c \
 	password-scheme-scram.c \
 	password-scheme-otp.c \
-	password-scheme-pbkdf2.c \
+	password-scheme-pbkdf2.c
+
+libauth_crypt_la_SOURCES = \
+	mycrypt.c \
+	password-scheme.c \
+	password-scheme-crypt.c \
 	password-scheme-sodium.c
 
-libauth_la_LIBADD = \
+libauth_crypt_la_LIBADD = \
 	$(LIBSODIUM_LIBS) \
 	$(CRYPT_LIBS)
 
@@ -34,7 +37,8 @@ headers = \
 pkginc_libdir=$(pkgincludedir)
 pkginc_lib_HEADERS = $(headers)
 
-noinst_HEADERS = crypt-blowfish.h
+noinst_HEADERS = crypt-blowfish.h \
+	password-scheme-private.h
 
 test_programs = \
 	test-password-scheme \

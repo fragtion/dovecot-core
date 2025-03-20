@@ -20,6 +20,11 @@
 #define DB_LDAP_IDLE_RECONNECT_SECS 60
 
 #include <ldap.h>
+#include "var-expand.h"
+#include "db-ldap-settings.h"
+
+#define DB_LDAP_ATTR_MULTI_PREFIX "+"
+#define DB_LDAP_ATTR_SEPARATOR "\001"
 
 struct auth_request;
 struct ldap_connection;
@@ -28,51 +33,6 @@ struct ldap_request;
 typedef void db_search_callback_t(struct ldap_connection *conn,
 				  struct ldap_request *request,
 				  LDAPMessage *res);
-
-struct ldap_settings {
-	const char *hosts;
-	const char *uris;
-	const char *dn;
-	const char *dnpass;
-	bool auth_bind;
-	const char *auth_bind_userdn;
-
-	bool tls;
-	bool sasl_bind;
-	const char *sasl_mech;
-	const char *sasl_realm;
-	const char *sasl_authz_id;
-
-	const char *tls_ca_cert_file;
-	const char *tls_ca_cert_dir;
-	const char *tls_cert_file;
-	const char *tls_key_file;
-	const char *tls_cipher_suite;
-	const char *tls_require_cert;
-
-	const char *deref;
-	const char *scope;
-	const char *base;
-	unsigned int ldap_version;
-
-	const char *ldaprc_path;
-	const char *debug_level;
-
-	const char *user_attrs;
-	const char *user_filter;
-	const char *pass_attrs;
-	const char *pass_filter;
-	const char *iterate_attrs;
-	const char *iterate_filter;
-
-	const char *default_pass_scheme;
-	bool blocking;
-
-	/* ... */
-	int ldap_deref, ldap_scope, ldap_tls_require_cert_parsed;
-	uid_t uid;
-	gid_t gid;
-};
 
 enum ldap_request_type {
 	LDAP_REQUEST_TYPE_SEARCH,
@@ -87,9 +47,6 @@ struct ldap_field {
 	/* LDAP attribute name, or "" if this is a static field. */
 	const char *ldap_attr_name;
 
-	/* LDAP value contains a DN, which is looked up and used for @name
-	   attributes. */
-	bool value_is_dn;
 	/* This attribute is used internally only via %{ldap_ptr},
 	   it shouldn't be returned in iteration. */
 	bool skip;
@@ -128,8 +85,8 @@ struct ldap_request_search {
 
 	const char *base;
 	const char *filter;
-	char **attributes; /* points to pass_attr_names / user_attr_names */
-	const ARRAY_TYPE(ldap_field) *attr_map;
+	const char *const *attributes; /* points to (pass|user) module attributes */
+	const char *const *sensitive_attr_names;  /* same */
 
 	struct db_ldap_result *result;
 	ARRAY(struct ldap_request_named_result) named_results;
@@ -161,9 +118,10 @@ struct ldap_connection {
 	pool_t pool;
 	int refcount;
 	struct event *event;
+	char *log_prefix;
 
-	char *config_path;
-        struct ldap_settings set;
+        const struct ldap_settings *set;
+	const struct ssl_settings *ssl_set;
 
 	LDAP *ld;
 	enum ldap_connection_state conn_state;
@@ -183,21 +141,27 @@ struct ldap_connection {
 	/* Timestamp when we last received a reply */
 	time_t last_reply_stamp;
 
-	char **pass_attr_names, **user_attr_names, **iterate_attr_names;
-	ARRAY_TYPE(ldap_field) pass_attr_map, user_attr_map, iterate_attr_map;
-	bool userdb_used;
 	bool delayed_connect;
 };
+
+struct db_ldap_field_expand_context {
+	struct event *event;
+	struct auth_fields *fields;
+};
+
+extern const struct var_expand_provider db_ldap_field_expand_fn_table[];
 
 /* Send/queue request */
 void db_ldap_request(struct ldap_connection *conn,
 		     struct ldap_request *request);
 
-void db_ldap_set_attrs(struct ldap_connection *conn, const char *attrlist,
-		       char ***attr_names_r, ARRAY_TYPE(ldap_field) *attr_map,
-		       const char *skip_attr) ATTR_NULL(5);
+void db_ldap_get_attribute_names(pool_t pool,
+				 const ARRAY_TYPE(const_string) *attrlist,
+				 const char *const **attributes_r,
+				 const char *const **sensitive_r,
+				 const char *skip_attr) ATTR_NULL(4,5);
 
-struct ldap_connection *db_ldap_init(const char *config_path, bool userdb);
+struct ldap_connection *db_ldap_init(struct event *event);
 void db_ldap_unref(struct ldap_connection **conn);
 
 int db_ldap_connect(struct ldap_connection *conn);
@@ -205,8 +169,7 @@ void db_ldap_connect_delayed(struct ldap_connection *conn);
 
 void db_ldap_enable_input(struct ldap_connection *conn, bool enable);
 
-const char *ldap_escape(const char *str,
-			const struct auth_request *auth_request);
+const char *ldap_escape(const char *str, void *context);
 const char *ldap_get_error(struct ldap_connection *conn);
 
 struct db_ldap_result_iterate_context *
@@ -217,6 +180,13 @@ bool db_ldap_result_iterate_next(struct db_ldap_result_iterate_context *ctx,
 				 const char **name_r,
 				 const char *const **values_r);
 void db_ldap_result_iterate_deinit(struct db_ldap_result_iterate_context **ctx);
+
+struct auth_fields *
+ldap_query_get_fields(pool_t pool,
+		      struct ldap_connection *conn,
+		      struct ldap_request_search *ldap_request,
+		      LDAPMessage *res, bool skip_null_values);
+const char *db_ldap_attribute_as_multi(const char *name);
 
 /* exposed only for unit tests */
 

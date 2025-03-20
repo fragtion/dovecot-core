@@ -26,7 +26,7 @@ struct oauth2_settings {
 	const char *introspection_url;
 	/* POST refresh here, needs refresh token and client_* settings */
 	const char *refresh_url;
-	/* client identificator for oauth2 server */
+	/* client identifier for oauth2 server */
 	const char *client_id;
 	/* client secret for oauth2 server */
 	const char *client_secret;
@@ -45,7 +45,6 @@ struct oauth2_settings {
 		INTROSPECTION_MODE_POST,
 		INTROSPECTION_MODE_LOCAL,
 	} introspection_mode;
-	unsigned int timeout_msecs;
 	/* Should X-Dovecot-Auth-* headers be sent */
 	bool send_auth_headers;
 	/* Should use grant password mechanism for authentication */
@@ -66,7 +65,7 @@ struct oauth2_request_result {
 
 struct oauth2_request_input {
 	const char *token;
-	const char *service;
+	const char *protocol;
 	struct ip_addr local_ip, real_local_ip, remote_ip, real_remote_ip;
 	in_port_t local_port, real_local_port, remote_port, real_remote_port;
 };
@@ -124,6 +123,20 @@ oauth2_refresh_start(const struct oauth2_settings *set,
 #define oauth2_refresh_start(set, input, callback, context) \
 	oauth2_refresh_start( \
 		set, input - CALLBACK_TYPECHECK( \
+			callback, void(*)(struct oauth2_request_result*, \
+					  typeof(context))), \
+		(oauth2_request_callback_t*)callback, (void*)context);
+
+struct oauth2_request*
+oauth2_client_secret_start(const struct oauth2_settings *set,
+			  const struct oauth2_request_input *input,
+			  const char *resource,
+			  oauth2_request_callback_t *callback,
+			  void *context);
+#define oauth2_client_secret_start(set, input, resource, callback, \
+				   context) \
+	oauth2_client_secret_start( \
+		set, input, resource - CALLBACK_TYPECHECK( \
 			callback, void(*)(struct oauth2_request_result*, \
 					  typeof(context))), \
 		(oauth2_request_callback_t*)callback, (void*)context);

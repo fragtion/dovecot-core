@@ -10,6 +10,7 @@
 #include "istream-raw-mbox.h"
 #include "mbox-file.h"
 #include "mbox-lock.h"
+#include "settings.h"
 
 #include <time.h>
 #include <unistd.h>
@@ -87,14 +88,14 @@ mbox_lock_list(struct mbox_lock_context *ctx, int lock_type,
 static int ATTR_NOWARN_UNUSED_RESULT
 mbox_unlock_files(struct mbox_lock_context *ctx);
 
-static void mbox_read_lock_methods(const char *str, const char *env,
+static void mbox_read_lock_methods(const ARRAY_TYPE(const_string) *list, const char *env,
 				   enum mbox_lock_type *locks)
 {
-        enum mbox_lock_type type;
+	enum mbox_lock_type type;
 	const char *const *lock;
 	int i, dest;
 
-	for (lock = t_strsplit(str, " "), dest = 0; *lock != NULL; lock++) {
+	for (lock = settings_boollist_get(list), dest = 0; *lock != NULL; lock++) {
 		for (type = 0; lock_data[type].name != NULL; type++) {
 			if (strcasecmp(*lock, lock_data[type].name) == 0) {
 				type = lock_data[type].type;
@@ -125,9 +126,9 @@ static void mbox_init_lock_settings(struct mbox_storage *storage)
 	enum mbox_lock_type write_locks[MBOX_LOCK_COUNT+1];
 	int r, w;
 
-	mbox_read_lock_methods(storage->set->mbox_read_locks,
+	mbox_read_lock_methods(&storage->set->mbox_read_locks,
 			       "mbox_read_locks", read_locks);
-	mbox_read_lock_methods(storage->set->mbox_write_locks,
+	mbox_read_lock_methods(&storage->set->mbox_write_locks,
 			       "mbox_write_locks", write_locks);
 
 	/* check that read/write list orders match. write_locks must contain
@@ -155,7 +156,7 @@ static void mbox_init_lock_settings(struct mbox_storage *storage)
 	memcpy(storage->write_locks, write_locks,
 	       sizeof(*storage->write_locks) * (MBOX_LOCK_COUNT+1));
 
-        storage->lock_settings_initialized = TRUE;
+	storage->lock_settings_initialized = TRUE;
 }
 
 static int mbox_file_open_latest(struct mbox_lock_context *ctx, int lock_type)
@@ -195,7 +196,7 @@ static int mbox_file_open_latest(struct mbox_lock_context *ctx, int lock_type)
 
 static bool dotlock_callback(unsigned int secs_left, bool stale, void *context)
 {
-        struct mbox_lock_context *ctx = context;
+	struct mbox_lock_context *ctx = context;
 	enum mbox_lock_type *lock_types;
 	int i;
 
@@ -281,7 +282,7 @@ mbox_dotlock_privileged_op(struct mbox_mailbox *mbox,
 		fname++;
 	}
 	if (op == MBOX_DOTLOCK_OP_LOCK) {
-		if (access(fname, R_OK) < 0) {
+		if (i_faccessat2(AT_FDCWD, fname, R_OK, AT_EACCESS) < 0) {
 			mailbox_set_critical(&mbox->box,
 				"access(%s) failed: %m", box_path);
 			i_close_fd(&orig_dir_fd);
@@ -300,7 +301,7 @@ mbox_dotlock_privileged_op(struct mbox_mailbox *mbox,
 		ret = file_dotlock_create(set, fname, 0, &mbox->mbox_dotlock);
 		if (ret > 0)
 			mbox->mbox_used_privileges = TRUE;
-		else if (ret < 0 && errno == EACCES) {
+		else if (ret < 0 && ENOACCESS(errno)) {
 			const char *errmsg =
 				eacces_error_get_creating("file_dotlock_create",
 							  fname);
@@ -396,14 +397,14 @@ mbox_lock_dotlock_int(struct mbox_lock_context *ctx, int lock_type, bool try)
 						   MBOX_DOTLOCK_OP_UNLOCK);
 			ctx->using_privileges = FALSE;
 		}
-                mbox->mbox_dotlocked = FALSE;
+		mbox->mbox_dotlocked = FALSE;
 		return 1;
 	}
 
 	if (mbox->mbox_dotlocked)
 		return 1;
 
-        ctx->dotlock_last_stale = TRUE;
+	ctx->dotlock_last_stale = TRUE;
 
 	i_zero(&set);
 	set.use_excl_lock = mbox->storage->storage.set->dotlock_use_excl;
@@ -418,18 +419,18 @@ mbox_lock_dotlock_int(struct mbox_lock_context *ctx, int lock_type, bool try)
 				  &mbox->mbox_dotlock);
 	if (ret >= 0) {
 		/* success / timeout */
-	} else if (errno == EACCES && restrict_access_have_priv_gid() &&
+	} else if (ENOACCESS(errno) && restrict_access_have_priv_gid() &&
 		   mbox->mbox_privileged_locking) {
 		/* try again, this time with extra privileges */
 		ret = mbox_dotlock_privileged_op(mbox, &set,
 						 MBOX_DOTLOCK_OP_LOCK);
-	} else if (errno == EACCES)
+	} else if (ENOACCESS(errno))
 		mbox_dotlock_log_eacces_error(mbox, mailbox_get_path(&mbox->box));
 	else
 		mbox_set_syscall_error(mbox, "file_dotlock_create()");
 
 	if (ret < 0) {
-		if ((ENOSPACE(errno) || errno == EACCES) && try)
+		if ((ENOSPACE(errno) || ENOACCESS(errno)) && try)
 			return 1;
 		return -1;
 	}
@@ -552,7 +553,7 @@ static int mbox_lock_lockf(struct mbox_lock_context *ctx, int lock_type,
 
 	while (lockf(ctx->mbox->mbox_fd, lock_type, 0) < 0) {
 		if (errno != EINTR) {
-			if ((errno == EACCES || errno == EAGAIN) &&
+			if ((ENOACCESS(errno) || errno == EAGAIN) &&
 			    max_wait_time == 0) {
 				/* non-blocking lock trying failed */
 				return 0;
@@ -619,7 +620,7 @@ static int mbox_lock_fcntl(struct mbox_lock_context *ctx, int lock_type,
 
 	while (fcntl(ctx->mbox->mbox_fd, wait_type, &fl) < 0) {
 		if (errno != EINTR) {
-			if ((errno == EACCES || errno == EAGAIN) &&
+			if ((ENOACCESS(errno) || errno == EAGAIN) &&
 			    wait_type == F_SETLK) {
 				/* non-blocking lock trying failed */
 				return 0;
@@ -664,7 +665,7 @@ mbox_lock_list(struct mbox_lock_context *ctx, int lock_type,
 	       time_t max_wait_time, int idx)
 {
 	enum mbox_lock_type *lock_types;
-        enum mbox_lock_type type;
+	enum mbox_lock_type type;
 	int i, ret = 0;
 	bool locked_status;
 
@@ -699,10 +700,10 @@ static int mbox_update_locking(struct mbox_mailbox *mbox, int lock_type,
 
 	*fcntl_locked_r = FALSE;
 
-        index_storage_lock_notify_reset(&mbox->box);
+	index_storage_lock_notify_reset(&mbox->box);
 
 	if (!mbox->storage->lock_settings_initialized)
-                mbox_init_lock_settings(mbox->storage);
+		mbox_init_lock_settings(mbox->storage);
 
 	if (mbox->mbox_fd == -1 && mbox->mbox_file_stream != NULL) {
 		/* read-only mbox stream. no need to lock. */
@@ -722,7 +723,7 @@ static int mbox_update_locking(struct mbox_mailbox *mbox, int lock_type,
 		/* dropping to shared lock. first drop those that we
 		   don't remove completely. */
 		const enum mbox_lock_type *read_locks =
-                        mbox->storage->read_locks;
+			mbox->storage->read_locks;
 
 		for (i = 0; i < MBOX_LOCK_COUNT; i++)
 			ctx.locked_status[i] = TRUE;
@@ -749,7 +750,7 @@ static int mbox_update_locking(struct mbox_mailbox *mbox, int lock_type,
 		/* dropping to shared lock: drop the locks that are only
 		   in write list */
 		const enum mbox_lock_type *read_locks =
-                        mbox->storage->read_locks;
+			mbox->storage->read_locks;
 		const enum mbox_lock_type *write_locks =
 			mbox->storage->write_locks;
 

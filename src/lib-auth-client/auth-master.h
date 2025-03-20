@@ -7,11 +7,13 @@ enum auth_master_flags {
 	/* Enable logging debug information */
 	AUTH_MASTER_FLAG_DEBUG			= 0x01,
 	/* Don't disconnect from auth socket when idling */
-	AUTH_MASTER_FLAG_NO_IDLE_TIMEOUT	= 0x02
+	AUTH_MASTER_FLAG_NO_IDLE_TIMEOUT	= 0x02,
+	/* No inner ioloop (testing only) */
+	AUTH_MASTER_FLAG_NO_INNER_IOLOOP	= 0x04,
 };
 
 struct auth_user_info {
-	const char *service;
+	const char *protocol;
 	const char *session_id;
 	const char *local_name;
 	struct ip_addr local_ip, remote_ip, real_local_ip, real_remote_ip;

@@ -7,11 +7,12 @@
 #include "ostream.h"
 #include "safe-memset.h"
 #include "str.h"
+#include "settings.h"
 #include "imap-parser.h"
 #include "imap-id.h"
 #include "imap-resp-code.h"
 #include "master-service.h"
-#include "master-service-ssl-settings.h"
+#include "ssl-settings.h"
 #include "login-client.h"
 #include "imap-login-client.h"
 #include "client-authenticate.h"
@@ -20,6 +21,7 @@
 #include "imap-quote.h"
 #include "imap-login-commands.h"
 #include "imap-login-settings.h"
+#include "imap-util.h"
 
 #if LOGIN_MAX_INBUF_SIZE < 1024+2
 #  error LOGIN_MAX_INBUF_SIZE too short to fit all ID command parameters
@@ -83,34 +85,21 @@ static bool is_login_cmd_disabled(struct client *client)
 	}
 	if (!client->set->auth_allow_cleartext)
 		return TRUE;
-	if (strcmp(client->ssl_set->ssl, "required") == 0)
+	if (strcmp(client->ssl_server_set->ssl, "required") == 0)
 		return TRUE;
 	return FALSE;
 }
 
+static int imap_client_reload_config(struct client *client,
+				     const char **error_r);
+
 static const char *get_capability(struct client *client)
 {
-	struct imap_client *imap_client = (struct imap_client *)client;
+	struct imap_client *imap_client =
+		container_of(client, struct imap_client, common);
 	string_t *cap_str = t_str_new(256);
-	bool explicit_capability = FALSE;
 
-	if (*imap_client->set->imap_capability == '\0')
-		str_append(cap_str, CAPABILITY_BANNER_STRING);
-	else if (*imap_client->set->imap_capability != '+') {
-		explicit_capability = TRUE;
-		str_append(cap_str, imap_client->set->imap_capability);
-	} else {
-		str_append(cap_str, CAPABILITY_BANNER_STRING);
-		str_append_c(cap_str, ' ');
-		str_append(cap_str, imap_client->set->imap_capability + 1);
-	}
-
-	if (!explicit_capability) {
-		if (imap_client->set->imap_literal_minus)
-			str_append(cap_str, " LITERAL-");
-		else
-			str_append(cap_str, " LITERAL+");
-	}
+	imap_write_capability(cap_str, &imap_client->set->imap_capability);
 
 	if (client_is_tls_enabled(client) && !client->connection_tls_secured &&
 	    !client->haproxy_terminated_tls)
@@ -250,7 +239,7 @@ static bool client_handle_input(struct imap_client *client)
 		if (client->skip_line) {
 			if (!client_skip_line(client))
 				return FALSE;
-                        client->skip_line = FALSE;
+			client->skip_line = FALSE;
 		}
 
 		client->cmd_finished = FALSE;
@@ -292,7 +281,8 @@ static bool client_handle_input(struct imap_client *client)
 
 static bool imap_client_input_next_cmd(struct client *_client)
 {
-	struct imap_client *client = (struct imap_client *)_client;
+	struct imap_client *client =
+		container_of(_client, struct imap_client, common);
 	const struct imap_arg *args;
 	bool parsed;
 	int ret;
@@ -338,7 +328,8 @@ static bool imap_client_input_next_cmd(struct client *_client)
 
 static void imap_client_input(struct client *client)
 {
-	struct imap_client *imap_client = (struct imap_client *)client;
+	struct imap_client *imap_client =
+		container_of(client, struct imap_client, common);
 
 	if (!client_read(client))
 		return;
@@ -376,23 +367,50 @@ static struct client *imap_client_alloc(pool_t pool)
 	return &imap_client->common;
 }
 
-static void imap_client_create(struct client *client, void **other_sets)
+static int imap_client_create(struct client *client)
 {
-	struct imap_client *imap_client = (struct imap_client *)client;
+	struct imap_client *imap_client =
+		container_of(client, struct imap_client, common);
+	const char *error;
 
-	imap_client->set = other_sets[0];
+	if (settings_get(client->event, &imap_login_setting_parser_info, 0,
+			 &imap_client->set, &error) < 0) {
+		e_error(client->event, "%s", error);
+		return -1;
+	}
+
 	imap_client->parser =
 		imap_parser_create(imap_client->common.input,
 				   imap_client->common.output,
 				   IMAP_LOGIN_MAX_LINE_LENGTH);
-	if (imap_client->set->imap_literal_minus)
+	struct settings_instance *set_instance = settings_instance_find(client->event);
+	if (set_instance == NULL) {
+		set_instance = settings_instance_new(
+			master_service_get_settings_root(master_service));
+		imap_client->set_instance = set_instance;
+		event_set_ptr(client->event, SETTINGS_EVENT_INSTANCE, set_instance);
+	}
+
+	if (imap_client->set->imap_literal_minus) {
+		settings_override(set_instance,
+				  "imap_capability/LITERAL+",
+				  "no", SETTINGS_OVERRIDE_TYPE_CODE);
 		imap_parser_enable_literal_minus(imap_client->parser);
-	client->io = io_add_istream(client->input, client_input, client);
+	} else
+		settings_override(set_instance,
+				  "imap_capability/LITERAL-",
+				  "no", SETTINGS_OVERRIDE_TYPE_CODE);
+	if (imap_client_reload_config(client, &error) < 0) {
+		e_error(client->event, "%s", error);
+		return -1;
+	}
+	return 0;
 }
 
 static void imap_client_destroy(struct client *client)
 {
-	struct imap_client *imap_client = (struct imap_client *)client;
+	struct imap_client *imap_client =
+		container_of(client, struct imap_client, common);
 
 	/* Prevent memory leak of ID command if client got disconnected before
 	   command was finished. */
@@ -401,8 +419,27 @@ static void imap_client_destroy(struct client *client)
 		cmd_id_free(imap_client);
 	}
 
+	/* The client may live on as proxying, even though the imap-specific
+	   parts get freed. Clear out the settings instance, so it's not
+	   attempted to be used anymore. Alternatively we could delay freeing
+	   it until the client is freed, but that would require more changes. */
+	event_set_ptr(client->event, SETTINGS_EVENT_INSTANCE, NULL);
+	settings_instance_free(&imap_client->set_instance);
+
+	settings_free(imap_client->set);
 	i_free_and_null(imap_client->proxy_backend_capability);
 	imap_parser_unref(&imap_client->parser);
+}
+
+static int
+imap_client_reload_config(struct client *client, const char **error_r)
+{
+	struct imap_client *imap_client =
+		container_of(client, struct imap_client, common);
+
+	settings_free(imap_client->set);
+	return settings_get(client->event, &imap_login_setting_parser_info, 0,
+			    &imap_client->set, error_r);
 }
 
 static void imap_client_notify_auth_ready(struct client *client)
@@ -418,11 +455,14 @@ static void imap_client_notify_auth_ready(struct client *client)
 	client_send_raw(client, str_c(greet));
 
 	client->banner_sent = TRUE;
+	i_assert(client->io == NULL);
+	client->io = io_add_istream(client->input, client_input, client);
 }
 
 static void imap_client_starttls(struct client *client)
 {
-	struct imap_client *imap_client = (struct imap_client *)client;
+	struct imap_client *imap_client =
+		container_of(client, struct imap_client, common);
 
 	imap_parser_unref(&imap_client->parser);
 	imap_client->parser =
@@ -439,7 +479,8 @@ client_send_reply_raw(struct client *client,
 		      const char *prefix, const char *resp_code,
 		      const char *text, bool tagged)
 {
-	struct imap_client *imap_client = (struct imap_client *)client;
+	struct imap_client *imap_client =
+		container_of(client, struct imap_client, common);
 
 	T_BEGIN {
 		string_t *line = t_str_new(256);
@@ -513,7 +554,6 @@ imap_client_notify_disconnect(struct client *client,
 
 static void imap_login_preinit(void)
 {
-	login_set_roots = imap_login_setting_roots;
 }
 
 static const struct imap_login_command imap_login_commands[] = {
@@ -542,6 +582,7 @@ static struct client_vfuncs imap_client_vfuncs = {
 	.alloc = imap_client_alloc,
 	.create = imap_client_create,
 	.destroy = imap_client_destroy,
+	.reload_config = imap_client_reload_config,
 	.notify_auth_ready = imap_client_notify_auth_ready,
 	.notify_disconnect = imap_client_notify_disconnect,
 	.notify_status = imap_client_notify_status,
@@ -551,6 +592,7 @@ static struct client_vfuncs imap_client_vfuncs = {
 	.auth_result = imap_client_auth_result,
 	.proxy_reset = imap_proxy_reset,
 	.proxy_parse_line = imap_proxy_parse_line,
+	.proxy_side_channel_input = imap_proxy_side_channel_input,
 	.proxy_failed = imap_proxy_failed,
 	.proxy_get_state = imap_proxy_get_state,
 	.send_raw_data = client_common_send_raw_data,
@@ -575,6 +617,10 @@ static struct login_binary imap_login_binary = {
 
 	.sasl_support_final_reply = FALSE,
 	.anonymous_login_acceptable = TRUE,
+
+	.application_protocols = (const char *const[]) {
+		"imap", NULL
+	},
 };
 
 int main(int argc, char *argv[])

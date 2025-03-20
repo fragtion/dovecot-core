@@ -5,6 +5,8 @@
 #include "aqueue.h"
 #include "ioloop.h"
 #include "ldap-private.h"
+#include "settings.h"
+#include "ldap-utils.h"
 
 static
 void ldap_connection_read_more(struct ldap_connection *conn);
@@ -34,6 +36,8 @@ void ldap_connection_deinit(struct ldap_connection **_conn)
 				       aqueue_idx(conn->request_queue, i));
 		timeout_remove(&req->to_abort);
 	}
+	settings_free(conn->ssl_set);
+	settings_free(conn->set);
 	event_unref(&conn->event);
 	pool_unref(&conn->pool);
 }
@@ -43,44 +47,30 @@ int ldap_connection_setup(struct ldap_connection *conn, const char **error_r)
 {
 	int ret, opt;
 
-	ret = ldap_initialize(&conn->conn, conn->set.uri);
+	ret = ldap_initialize(&conn->conn, conn->set->uris);
 	if (ret != LDAP_SUCCESS) {
-		*error_r = t_strdup_printf("ldap_initialize(uri=%s) failed: %s",
-					   conn->set.uri, ldap_err2string(ret));
+		*error_r = t_strdup_printf("ldap_initialize(uris=%s) failed: %s",
+					   conn->set->uris, ldap_err2string(ret));
 		return -1;
 	}
 
-	if (conn->ssl_set.verify_remote_cert) {
-		opt = LDAP_OPT_X_TLS_HARD;
-	} else {
-		opt = LDAP_OPT_X_TLS_ALLOW;
-	}
+	if (ldap_set_tls_options(conn->conn, conn->set->starttls,
+				 conn->set->uris, conn->ssl_set, error_r) < 0)
+		return -1;
 
-	ldap_set_option(conn->conn, LDAP_OPT_X_TLS, &opt);
-	ldap_set_option(conn->conn, LDAP_OPT_X_TLS_REQUIRE_CERT, &opt);
 #ifdef LDAP_OPT_X_TLS_PROTOCOL_MIN
 	/* refuse to connect to SSLv2 as it's completely insecure */
 	opt = LDAP_OPT_X_TLS_PROTOCOL_SSL3;
 	ldap_set_option(conn->conn, LDAP_OPT_X_TLS_PROTOCOL_MIN, &opt);
 #endif
-	opt = conn->set.timeout_secs;
+	opt = conn->set->timeout_secs;
 	/* default timeout */
 	ldap_set_option(conn->conn, LDAP_OPT_TIMEOUT, &opt);
 	ldap_set_option(conn->conn, LDAP_OPT_NETWORK_TIMEOUT, &opt);
 	/* timelimit */
 	ldap_set_option(conn->conn, LDAP_OPT_TIMELIMIT, &opt);
 
-	if (conn->ssl_set.ca_file != NULL)
-		ldap_set_option(conn->conn, LDAP_OPT_X_TLS_CACERTFILE, conn->ssl_set.ca_file);
-	if (conn->ssl_set.ca_dir != NULL)
-		ldap_set_option(conn->conn, LDAP_OPT_X_TLS_CACERTDIR, conn->ssl_set.ca_dir);
-
-	if (conn->ssl_set.cert.cert != NULL)
-		ldap_set_option(conn->conn, LDAP_OPT_X_TLS_CERTFILE, conn->ssl_set.cert.cert);
-	if (conn->ssl_set.cert.key != NULL)
-		ldap_set_option(conn->conn, LDAP_OPT_X_TLS_KEYFILE, conn->ssl_set.cert.key);
-
-	opt = conn->set.debug;
+	opt = conn->set->debug_level;
 	ldap_set_option(NULL, LDAP_OPT_DEBUG_LEVEL, &opt);
 
 	opt = LDAP_VERSION3;
@@ -97,84 +87,44 @@ int ldap_connection_setup(struct ldap_connection *conn, const char **error_r)
 }
 
 bool ldap_connection_have_settings(struct ldap_connection *conn,
-				   const struct ldap_client_settings *set)
+				   const struct ldap_client_settings *set,
+				   const struct ssl_settings *ssl_set)
 {
-	const struct ldap_client_settings *conn_set = &conn->set;
-
-	if (strcmp(conn_set->uri, set->uri) != 0)
-		return FALSE;
-	if (null_strcmp(conn_set->bind_dn, set->bind_dn) != 0)
-		return FALSE;
-	if (null_strcmp(conn_set->password, set->password) != 0)
-		return FALSE;
-	if (conn_set->timeout_secs != set->timeout_secs ||
-	    conn_set->max_idle_time_secs != set->max_idle_time_secs ||
-	    conn_set->debug != set->debug ||
-	    conn_set->require_ssl != set->require_ssl ||
-	    conn_set->start_tls != set->start_tls)
+	if (!settings_equal(&ldap_client_setting_parser_info,
+			    conn->set, set, NULL))
 		return FALSE;
 
-	if (set->ssl_set == NULL || !set->start_tls)
-		return TRUE;
+	if (strstr(set->uris, "ldaps://") == NULL && !set->starttls)
+	 	return TRUE;
 
-	/* check SSL settings */
-	if (null_strcmp(conn->ssl_set.min_protocol, set->ssl_set->min_protocol) != 0)
-		return FALSE;
-	if (null_strcmp(conn->ssl_set.cipher_list, set->ssl_set->cipher_list) != 0)
-		return FALSE;
-	if (null_strcmp(conn->ssl_set.ca_file, set->ssl_set->ca_file) != 0)
-		return FALSE;
-	if (null_strcmp(conn->ssl_set.cert.cert, set->ssl_set->cert.cert) != 0)
-		return FALSE;
-	if (null_strcmp(conn->ssl_set.cert.key, set->ssl_set->cert.key) != 0)
-		return FALSE;
-	return TRUE;
+	return settings_equal(&ssl_setting_parser_info,
+			      conn->ssl_set, ssl_set, NULL);
 }
 
 int ldap_connection_init(struct ldap_client *client,
 			 const struct ldap_client_settings *set,
+			 const struct ssl_settings *ssl_set,
 			 struct ldap_connection **conn_r, const char **error_r)
 {
-	i_assert(set->uri != NULL);
-
-	if (set->require_ssl &&
-	    !set->start_tls &&
-	    strncmp("ldaps://",set->uri,8) != 0) {
-		*error_r = t_strdup_printf("ldap_connection_init(uri=%s) failed: %s", set->uri,
-			"uri does not start with ldaps and ssl required without start TLS");
-		return -1;
-	}
+	i_assert(set->uris != NULL && set->uris[0] != '\0');
 
 	pool_t pool = pool_alloconly_create("ldap connection", 1024);
 	struct ldap_connection *conn = p_new(pool, struct ldap_connection, 1);
 	conn->pool = pool;
-	conn->event = event_create(set->event_parent);
-
+	conn->event = event_create(ldap_client_get_event(client));
 	conn->client = client;
-	conn->set = *set;
-	/* deep copy relevant strings */
-	conn->set.uri = p_strdup(pool, set->uri);
-	conn->set.bind_dn = p_strdup(pool, set->bind_dn);
-	if (set->password != NULL) {
-		conn->set.password = p_strdup(pool, set->password);
-		ber_str2bv(conn->set.password, strlen(conn->set.password), 0, &conn->cred);
-	}
-	/* cannot use these */
-	conn->ssl_set.ca = NULL;
-	conn->ssl_set.cert.key_password = NULL;
-	conn->ssl_set.cert_username_field = NULL;
-	conn->ssl_set.crypto_device = NULL;
+	event_set_append_log_prefix(conn->event,
+				    t_strdup_printf("ldap(%s): ", set->uris));
 
-	if (set->ssl_set != NULL) {
-		/* keep in sync with ldap_connection_have_settings() */
-		conn->set.ssl_set = &conn->ssl_set;
-		conn->ssl_set.min_protocol = p_strdup(pool, set->ssl_set->min_protocol);
-		conn->ssl_set.cipher_list = p_strdup(pool, set->ssl_set->cipher_list);
-		conn->ssl_set.ca_file = p_strdup(pool, set->ssl_set->ca_file);
-		conn->ssl_set.cert.cert = p_strdup(pool, set->ssl_set->cert.cert);
-		conn->ssl_set.cert.key = p_strdup(pool, set->ssl_set->cert.key);
-	}
-	i_assert(ldap_connection_have_settings(conn, set));
+	pool_ref(set->pool);
+	pool_ref(ssl_set->pool);
+
+	conn->set = set;
+	conn->ssl_set = ssl_set;
+
+	/* deep copy relevant strings */
+	if (*set->auth_dn_password != '\0')
+		ber_str2bv(conn->set->auth_dn_password, strlen(conn->set->auth_dn_password), 0, &conn->cred);
 
 	if (ldap_connection_setup(conn, error_r) < 0) {
 		ldap_connection_deinit(&conn);
@@ -341,17 +291,15 @@ ldap_connection_connect_parse(struct ldap_connection *conn,
 		}
 		if (ret != 0) {
 			ldap_connection_result_failure(conn, req, ret, t_strdup_printf(
-				"ldap_start_tls(uri=%s) failed: %s",
-				conn->set.uri, ldap_err2string(ret)));
+				"ldap_start_tls(uris=%s) failed: %s",
+				conn->set->uris, ldap_err2string(ret)));
 			return ret;
 		} else if (result_err != 0) {
-			if (conn->set.require_ssl) {
-				ldap_connection_result_failure(conn, req, result_err, t_strdup_printf(
-					"ldap_start_tls(uri=%s) failed: %s",
-					conn->set.uri, result_errmsg));
-				ldap_memfree(result_errmsg);
-				return LDAP_INVALID_CREDENTIALS; /* make sure it disconnects */
-			}
+			ldap_connection_result_failure(conn, req, result_err, t_strdup_printf(
+				"ldap_start_tls(uris=%s) failed: %s",
+				conn->set->uris, result_errmsg));
+			ldap_memfree(result_errmsg);
+			return LDAP_INVALID_CREDENTIALS; /* make sure it disconnects */
 		} else {
 			ret = ldap_parse_extended_result(conn->conn, message, &retoid, NULL, 0);
 			/* retoid can be NULL even if ret == 0 */
@@ -360,20 +308,18 @@ ldap_connection_connect_parse(struct ldap_connection *conn,
 				if (ret != 0) {
 					// if this fails we have to abort
 					ldap_connection_result_failure(conn, req, ret, t_strdup_printf(
-						"ldap_start_tls(uri=%s) failed: %s",
-						conn->set.uri, ldap_err2string(ret)));
+						"ldap_start_tls(uris=%s) failed: %s",
+						conn->set->uris, ldap_err2string(ret)));
 					return LDAP_INVALID_CREDENTIALS;
 				}
 			}
 			if (ret != LDAP_SUCCESS) {
-				if (conn->set.require_ssl) {
-					ldap_connection_result_failure(conn, req, ret, t_strdup_printf(
-						"ldap_start_tls(uri=%s) failed: %s",
-						conn->set.uri, ldap_err2string(ret)));
-					return LDAP_UNAVAILABLE;
-				}
+				ldap_connection_result_failure(conn, req, ret, t_strdup_printf(
+					"ldap_start_tls(uris=%s) failed: %s",
+					conn->set->uris, ldap_err2string(ret)));
+				return LDAP_UNAVAILABLE;
 			} else {
-				if (conn->set.debug > 0)
+				if (conn->set->debug_level > 0)
 					e_debug(conn->event,
 						"Using TLS connection to remote LDAP server");
 			}
@@ -473,13 +419,12 @@ ldap_connect_next_message(struct ldap_connection *conn,
 
 	switch(conn->state) {
 	case LDAP_STATE_DISCONNECT:
-		/* if we should not disable SSL, and the URI is not ldaps:// */
-		if (!conn->set.start_tls || strstr(conn->set.uri, "ldaps://") == NULL) {
+		if (conn->set->starttls && strstr(conn->set->uris, "ldaps://") == NULL) {
 			ret = ldap_start_tls(conn->conn, NULL, NULL, &req->msgid);
 			if (ret != LDAP_SUCCESS) {
 				ldap_connection_result_failure(conn, req, ret, t_strdup_printf(
-					"ldap_start_tls(uri=%s) failed: %s",
-					conn->set.uri, ldap_err2string(ret)));
+					"ldap_start_tls(uris=%s) failed: %s",
+					conn->set->uris, ldap_err2string(ret)));
 				return ret;
 			}
 			conn->state = LDAP_STATE_TLS;
@@ -489,7 +434,7 @@ ldap_connect_next_message(struct ldap_connection *conn,
 		/* fall through */
 	case LDAP_STATE_AUTH:
 		ret = ldap_sasl_bind(conn->conn,
-			conn->set.bind_dn,
+			conn->set->auth_dn,
 			LDAP_SASL_SIMPLE,
 			&conn->cred,
 			NULL,
@@ -497,8 +442,8 @@ ldap_connect_next_message(struct ldap_connection *conn,
 			&req->msgid);
 		if (ret != LDAP_SUCCESS) {
 			ldap_connection_result_failure(conn, req, ret, t_strdup_printf(
-				"ldap_sasl_bind(uri=%s, dn=%s) failed: %s",
-				conn->set.uri, conn->set.bind_dn, ldap_err2string(ret)));
+				"ldap_sasl_bind(uris=%s, dn=%s) failed: %s",
+				conn->set->uris, conn->set->auth_dn, ldap_err2string(ret)));
 			return ret;
 		}
 		break;
@@ -533,7 +478,7 @@ int ldap_connection_connect(struct ldap_connection *conn)
 	req->pool = pool;
 
 	req->internal_response_cb = ldap_connection_connect_parse;
-	req->timeout_secs = conn->set.timeout_secs;
+	req->timeout_secs = conn->set->timeout_secs;
 
 	if (ldap_connect_next_message(conn, req, &finished) != LDAP_SUCCESS ||
 	    conn->conn == NULL) {
@@ -549,8 +494,8 @@ int ldap_connection_connect(struct ldap_connection *conn)
 	ldap_get_option(conn->conn, LDAP_OPT_SOCKBUF, &sb);
 	ber_sockbuf_ctrl(sb, LBER_SB_OPT_GET_FD, &fd);
 	conn->io = io_add(fd, IO_READ, ldap_connection_read_more, conn);
-	if (conn->set.max_idle_time_secs > 0)
-		conn->to_disconnect = timeout_add(conn->set.max_idle_time_secs * 1000, ldap_connection_kill, conn);
+	if (conn->set->max_idle_time_secs > 0)
+		conn->to_disconnect = timeout_add(conn->set->max_idle_time_secs * 1000, ldap_connection_kill, conn);
 	return 0;
 }
 

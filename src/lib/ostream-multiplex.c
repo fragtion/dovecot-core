@@ -4,11 +4,10 @@
 #include "ioloop.h"
 #include "array.h"
 #include "ostream-private.h"
+#include "iostream-multiplex-private.h"
 #include "ostream-multiplex.h"
 
-/* all multiplex packets are [1 byte cid][4 byte length][data] */
-
-struct multiplex_ostream;
+/* See istream-multiplex for description of the stream format. */
 
 struct multiplex_ochannel {
 	struct ostream_private ostream;
@@ -17,7 +16,6 @@ struct multiplex_ochannel {
 	buffer_t *buf;
 	uint64_t last_sent_counter;
 	bool closed:1;
-	bool corked:1;
 };
 
 struct multiplex_ostream {
@@ -27,14 +25,22 @@ struct multiplex_ostream {
 	void *old_flush_context;
 
 	/* channel 0 is main channel */
-	uint8_t cur_channel;
-	unsigned int remain;
+	int cur_channel;
 	size_t bufsize;
+	enum ostream_multiplex_format format;
 	uint64_t send_counter;
 	ARRAY(struct multiplex_ochannel *) channels;
 
+	unsigned int stream_header_bytes_left;
+	buffer_t *pending_buf;
+
+	bool pending_buf_prefix_char1:1;
 	bool destroyed:1;
 };
+
+static unsigned char ostream_multiplex_header[IOSTREAM_MULTIPLEX_HEADER_SIZE] =
+	"\xFF\xFF\xFF\xFF\xFF\x00\x02"
+        IOSTREAM_MULTIPLEX_CHANNEL_SWITCH_PREFIX;
 
 static struct multiplex_ochannel *
 get_channel(struct multiplex_ostream *mstream, uint8_t cid)
@@ -48,12 +54,21 @@ get_channel(struct multiplex_ostream *mstream, uint8_t cid)
 	return NULL;
 }
 
-static void propagate_error(struct multiplex_ostream *mstream, int stream_errno)
+static void propagate_error(struct multiplex_ostream *mstream)
 {
 	struct multiplex_ochannel *channel;
-	array_foreach_elem(&mstream->channels, channel)
-		if (channel != NULL)
+	int stream_errno = mstream->parent->stream_errno;
+
+	i_assert(stream_errno != 0);
+
+	const char *error = o_stream_get_error(mstream->parent);
+	array_foreach_elem(&mstream->channels, channel) {
+		if (channel != NULL) {
 			channel->ostream.ostream.stream_errno = stream_errno;
+			io_stream_set_error(&channel->ostream.iostream,
+					    "%s", error);
+		}
+	}
 }
 
 static struct multiplex_ochannel *get_next_channel(struct multiplex_ostream *mstream)
@@ -73,42 +88,180 @@ static struct multiplex_ochannel *get_next_channel(struct multiplex_ostream *mst
 	return oldest_channel;
 }
 
-static bool
+static ssize_t
+o_stream_multiplex_send_packet(struct multiplex_ostream *mstream,
+			       struct multiplex_ochannel *channel)
+{
+	/* check parent stream capacity */
+	size_t tmp = o_stream_get_buffer_avail_size(mstream->parent) - 5;
+	/* ensure it fits into 32 bit int */
+	size_t amt = I_MIN(UINT_MAX, I_MIN(tmp, channel->buf->used));
+	/* delay corking here now that we are going to send something */
+	if (!o_stream_is_corked(mstream->parent))
+		o_stream_cork(mstream->parent);
+	uint32_t len = cpu32_to_be(amt);
+	const struct const_iovec vec[] = {
+		{ &channel->cid, 1 },
+		{ &len, 4 },
+		{ channel->buf->data, amt }
+	};
+	ssize_t ret;
+	if ((ret = o_stream_sendv(mstream->parent, vec, N_ELEMENTS(vec))) < 0) {
+		propagate_error(mstream);
+		return -1;
+	}
+	i_assert((size_t)ret == 1 + 4 + amt);
+	return amt;
+}
+
+static ssize_t
+o_stream_multiplex_send_stream(struct multiplex_ostream *mstream,
+			       struct multiplex_ochannel *channel)
+{
+	if (mstream->cur_channel != channel->cid) {
+		buffer_append(mstream->pending_buf,
+			      IOSTREAM_MULTIPLEX_CHANNEL_SWITCH_PREFIX,
+			      IOSTREAM_MULTIPLEX_CHANNEL_SWITCH_PREFIX_LEN);
+		buffer_append_c(mstream->pending_buf,
+				MULTIPLEX_ISTREAM_SWITCH_TYPE_CHANNEL_ID);
+		buffer_append_c(mstream->pending_buf, channel->cid);
+		mstream->cur_channel = channel->cid;
+	}
+
+	const unsigned char *p, *data = channel->buf->data;
+	size_t skip, size = channel->buf->used;
+	size_t total_sent = 0;
+
+	/* Handle escaping switch-prefix at the beginning of data.
+	   Also if there is only a single byte left, escape that byte so the
+	   stream won't end with the istream not knowing whether it's part of
+	   an escape sequence or not. */
+again:
+	if ((size >= IOSTREAM_MULTIPLEX_CHANNEL_SWITCH_PREFIX_LEN &&
+	     memcmp(data, IOSTREAM_MULTIPLEX_CHANNEL_SWITCH_PREFIX,
+		    IOSTREAM_MULTIPLEX_CHANNEL_SWITCH_PREFIX_LEN) == 0) ||
+	    (size == 1 &&
+	     data[0] == IOSTREAM_MULTIPLEX_CHANNEL_SWITCH_PREFIX[0])) {
+		/* escape prefix's first byte */
+		buffer_append(mstream->pending_buf,
+			      IOSTREAM_MULTIPLEX_CHANNEL_SWITCH_PREFIX,
+			      IOSTREAM_MULTIPLEX_CHANNEL_SWITCH_PREFIX_LEN);
+		buffer_append_c(mstream->pending_buf,
+				MULTIPLEX_ISTREAM_SWITCH_TYPE_PREFIX_CHAR1);
+		i_assert(!mstream->pending_buf_prefix_char1);
+		mstream->pending_buf_prefix_char1 = TRUE;
+		data++; size--;
+		skip = 0;
+	} else {
+		skip = 1;
+	}
+
+	while (skip < size) {
+		p = memchr(data + skip,
+			   IOSTREAM_MULTIPLEX_CHANNEL_SWITCH_PREFIX[0],
+			   size - skip);
+		if (p == NULL) {
+			skip = size;
+			break;
+		}
+		skip = p - data;
+		if (skip + 1 == size ||
+		    (char)data[skip + 1] == IOSTREAM_MULTIPLEX_CHANNEL_SWITCH_PREFIX[1]) {
+			/* escaping needed */
+			break;
+		}
+		skip++;
+	}
+
+	if (!o_stream_is_corked(mstream->parent))
+		o_stream_cork(mstream->parent);
+	const struct const_iovec vec[] = {
+		{ mstream->pending_buf->data, mstream->pending_buf->used },
+		{ data, skip }
+	};
+	ssize_t ret;
+	if ((ret = o_stream_sendv(mstream->parent, vec, N_ELEMENTS(vec))) < 0) {
+		propagate_error(mstream);
+		return -1;
+	}
+
+	if ((size_t)ret < mstream->pending_buf->used) {
+		buffer_delete(mstream->pending_buf, 0, ret);
+		return total_sent;
+	}
+
+	/* At least pending_buf was fully sent. It doesn't contain any actual
+	   input data, except possibly the first character of the switch
+	   prefix. */
+	ret -= mstream->pending_buf->used;
+	i_assert((size_t)ret <= skip);
+	data += ret;
+	size -= ret;
+	if (mstream->pending_buf_prefix_char1) {
+		mstream->pending_buf_prefix_char1 = FALSE;
+		ret++;
+	}
+	total_sent += ret;
+	buffer_set_used_size(mstream->pending_buf, 0);
+
+	if (size > 0)
+		goto again;
+	i_assert(total_sent > 0);
+	return total_sent;
+}
+
+static int
+o_stream_multiplex_send_header(struct multiplex_ostream *mstream)
+{
+	size_t pos = IOSTREAM_MULTIPLEX_HEADER_SIZE -
+		mstream->stream_header_bytes_left;
+
+	ssize_t ret = o_stream_send(mstream->parent,
+				    ostream_multiplex_header + pos,
+				    mstream->stream_header_bytes_left);
+	if (ret < 0) {
+		propagate_error(mstream);
+		return -1;
+	}
+	i_assert(ret <= mstream->stream_header_bytes_left);
+	mstream->stream_header_bytes_left -= ret;
+	return mstream->stream_header_bytes_left == 0 ? 1 : 0;
+}
+
+static int
 o_stream_multiplex_sendv(struct multiplex_ostream *mstream)
 {
 	struct multiplex_ochannel *channel;
-	ssize_t ret = 0;
-	bool all_sent = TRUE;
+	ssize_t ret;
+	int all_sent = 1;
+
+	if (mstream->stream_header_bytes_left > 0) {
+		if ((ret = o_stream_multiplex_send_header(mstream)) <= 0)
+			return ret;
+	}
 
 	while((channel = get_next_channel(mstream)) != NULL) {
 		if (channel->buf->used == 0)
 			continue;
 		if (o_stream_get_buffer_avail_size(mstream->parent) < 6) {
-			all_sent = FALSE;
+			all_sent = 0;
 			break;
 		}
-		/* check parent stream capacity */
-		size_t tmp = o_stream_get_buffer_avail_size(mstream->parent) - 5;
-		/* ensure it fits into 32 bit int */
-		size_t amt = I_MIN(UINT_MAX, I_MIN(tmp, channel->buf->used));
-		/* ensure amt fits */
-		if (tmp == 0)
+
+		switch (mstream->format) {
+		case OSTREAM_MULTIPLEX_FORMAT_PACKET:
+			ret = o_stream_multiplex_send_packet(mstream, channel);
 			break;
-		/* delay corking here now that we are going to send something */
-		if (!o_stream_is_corked(mstream->parent))
-			o_stream_cork(mstream->parent);
-		uint32_t len = cpu32_to_be(amt);
-		const struct const_iovec vec[] = {
-			{ &channel->cid, 1 },
-			{ &len, 4 },
-			{ channel->buf->data, amt }
-		};
-		if ((ret = o_stream_sendv(mstream->parent, vec, N_ELEMENTS(vec))) < 0) {
-			propagate_error(mstream, mstream->parent->stream_errno);
+		case OSTREAM_MULTIPLEX_FORMAT_STREAM:
+		case OSTREAM_MULTIPLEX_FORMAT_STREAM_CONTINUE:
+			ret = o_stream_multiplex_send_stream(mstream, channel);
 			break;
 		}
-		i_assert((size_t)ret == 1 + 4 + amt);
-		buffer_delete(channel->buf, 0, amt);
+		if (ret <= 0) {
+			all_sent = ret;
+			break;
+		}
+		buffer_delete(channel->buf, 0, ret);
 		channel->last_sent_counter = ++mstream->send_counter;
 	}
 	if (o_stream_is_corked(mstream->parent))
@@ -120,8 +273,8 @@ static int o_stream_multiplex_flush(struct multiplex_ostream *mstream)
 {
 	int ret = o_stream_flush(mstream->parent);
 	if (ret >= 0) {
-		if (!o_stream_multiplex_sendv(mstream))
-			return 0;
+		if ((ret = o_stream_multiplex_sendv(mstream)) <= 0)
+			return ret;
 	}
 
 	/* a) Everything is flushed. See if one of the callbacks' flush
@@ -153,12 +306,13 @@ static int o_stream_multiplex_ochannel_flush(struct ostream_private *stream)
 	/* flush parent stream always, so there is room for more. */
 	if ((ret = o_stream_flush(mstream->parent)) <= 0) {
 		if (ret == -1)
-			propagate_error(mstream, mstream->parent->stream_errno);
+			propagate_error(mstream);
 		return ret;
 	}
 
 	/* send all channels */
-	o_stream_multiplex_sendv(mstream);
+	if (o_stream_multiplex_sendv(mstream) < 0)
+		return -1;
 
 	if (channel->buf->used > 0)
 		return 0;
@@ -167,13 +321,11 @@ static int o_stream_multiplex_ochannel_flush(struct ostream_private *stream)
 
 static void o_stream_multiplex_ochannel_cork(struct ostream_private *stream, bool set)
 {
-	struct multiplex_ochannel *channel =
-		container_of(stream, struct multiplex_ochannel, ostream);
-	if (channel->corked != set && !set) {
+	if (stream->corked != set && !set) {
 		/* flush */
 		(void)o_stream_multiplex_ochannel_flush(stream);
 	}
-	channel->corked = set;
+	stream->corked = set;
 }
 
 static ssize_t
@@ -188,8 +340,14 @@ o_stream_multiplex_ochannel_sendv(struct ostream_private *stream,
 	for (unsigned int i = 0; i < iov_count; i++)
 		total += iov[i].iov_len;
 
+	if (avail < total && channel->buf->used < IO_BLOCK_SIZE) {
+		/* ostream buffer size is too small for us - keep it always at
+		   least at IO_BLOCK_SIZE. */
+		avail = IO_BLOCK_SIZE - channel->buf->used;
+	}
 	if (avail < total) {
-		o_stream_multiplex_sendv(channel->mstream);
+		if (o_stream_multiplex_sendv(channel->mstream) < 0)
+			return -1;
 		avail = o_stream_get_buffer_avail_size(&stream->ostream);
 		if (avail == 0)
 			return 0;
@@ -210,10 +368,11 @@ o_stream_multiplex_ochannel_sendv(struct ostream_private *stream,
 	stream->ostream.offset += total;
 
 	/* will send later */
-	if (channel->corked && channel->buf->used < optimal_size)
+	if (stream->corked && channel->buf->used < optimal_size)
 		return total;
 
-	o_stream_multiplex_sendv(channel->mstream);
+	if (o_stream_multiplex_sendv(channel->mstream) < 0)
+		return -1;
 	return total;
 }
 
@@ -242,12 +401,31 @@ o_stream_multiplex_ochannel_get_buffer_avail_size(const struct ostream_private *
 {
 	const struct multiplex_ochannel *channel =
 		container_of(stream, const struct multiplex_ochannel, ostream);
+	struct multiplex_ostream *mstream = channel->mstream;
 	size_t max_avail = I_MIN(channel->mstream->bufsize,
 				 o_stream_get_buffer_avail_size(stream->parent));
+	size_t overhead_bytes;
 
-	/* There is 5-byte overhead per message, so take that into account */
-	return max_avail <= (channel->buf->used + 5) ? 0 :
-		max_avail - (channel->buf->used + 5);
+	switch (mstream->format) {
+	case OSTREAM_MULTIPLEX_FORMAT_PACKET:
+		/* There is 5-byte overhead per message, so take that into
+		   account */
+		overhead_bytes = 5;
+		break;
+	case OSTREAM_MULTIPLEX_FORMAT_STREAM:
+	case OSTREAM_MULTIPLEX_FORMAT_STREAM_CONTINUE:
+		/* Get the maximum overhead that may be necessary for the
+		   initial message. However, this doesn't include the potential
+		   escaping that may be necessary. */
+		overhead_bytes = mstream->stream_header_bytes_left +
+			IOSTREAM_MULTIPLEX_CHANNEL_SWITCH_PREFIX_LEN + 2;
+		break;
+	default:
+		i_unreached();
+	}
+	return max_avail <= (channel->buf->used + overhead_bytes) ? 0 :
+		max_avail - (channel->buf->used + overhead_bytes);
+	i_unreached();
 }
 
 static void
@@ -274,13 +452,15 @@ static void o_stream_multiplex_try_destroy(struct multiplex_ostream *mstream)
 		if (channel != NULL)
 			return;
 
-	i_assert(mstream->parent->real_stream->callback ==
-		 (stream_flush_callback_t *)o_stream_multiplex_flush);
-	o_stream_set_flush_callback(mstream->parent,
-				    *mstream->old_flush_callback,
-				    mstream->old_flush_context);
+	if (mstream->parent->real_stream->callback ==
+	    (stream_flush_callback_t *)o_stream_multiplex_flush) {
+		o_stream_set_flush_callback(mstream->parent,
+					    *mstream->old_flush_callback,
+					    mstream->old_flush_context);
+	}
 	o_stream_unref(&mstream->parent);
 	array_free(&mstream->channels);
+	buffer_free(&mstream->pending_buf);
 	i_free(mstream);
 }
 
@@ -342,12 +522,26 @@ struct ostream *o_stream_multiplex_add_channel(struct ostream *stream, uint8_t c
 	return o_stream_add_channel_real(chan->mstream, cid);
 }
 
-struct ostream *o_stream_create_multiplex(struct ostream *parent, size_t bufsize)
+struct ostream *o_stream_create_multiplex(struct ostream *parent, size_t bufsize,
+					  enum ostream_multiplex_format format)
 {
 	struct multiplex_ostream *mstream;
 
 	mstream = i_new(struct multiplex_ostream, 1);
 	mstream->parent = parent;
+	mstream->format = format;
+	switch (format) {
+	case OSTREAM_MULTIPLEX_FORMAT_PACKET:
+		break;
+	case OSTREAM_MULTIPLEX_FORMAT_STREAM:
+		mstream->stream_header_bytes_left =
+			IOSTREAM_MULTIPLEX_HEADER_SIZE;
+		break;
+	case OSTREAM_MULTIPLEX_FORMAT_STREAM_CONTINUE:
+		mstream->cur_channel = -1;
+		break;
+	}
+	mstream->pending_buf = buffer_create_dynamic(default_pool, 16);
 	mstream->bufsize = bufsize;
 	mstream->old_flush_callback = parent->real_stream->callback;
 	mstream->old_flush_context = parent->real_stream->context;

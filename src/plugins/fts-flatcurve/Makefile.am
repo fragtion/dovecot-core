@@ -8,9 +8,10 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-settings \
 	-I$(top_srcdir)/src/lib-storage \
 	-I$(top_srcdir)/src/lib-doveadm \
+	-I$(top_srcdir)/src/lib-var-expand \
 	-I$(top_srcdir)/src/doveadm \
 	-I$(top_srcdir)/src/plugins/fts \
-	$(XAPIAN_CXXFLAGS)
+	$(XAPIAN_CFLAGS)
 
 AM_CXXFLAGS = \
 	$(XAPIAN_CXXFLAGS)
@@ -30,12 +31,14 @@ lib21_fts_flatcurve_plugin_la_LIBADD = \
 
 lib21_fts_flatcurve_plugin_la_SOURCES = \
 	fts-flatcurve-plugin.c \
+	fts-flatcurve-settings.c \
 	fts-backend-flatcurve.c \
 	fts-backend-flatcurve-xapian.cc
 
 noinst_HEADERS = \
 	doveadm-dump-flatcurve.h \
 	fts-flatcurve-plugin.h \
+	fts-flatcurve-settings.h \
 	fts-backend-flatcurve.h \
 	fts-backend-flatcurve-xapian.h
 

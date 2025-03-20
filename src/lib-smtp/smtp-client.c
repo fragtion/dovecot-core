@@ -9,6 +9,7 @@
 #include "istream.h"
 #include "ostream.h"
 #include "connection.h"
+#include "settings.h"
 #include "dns-lookup.h"
 #include "iostream-rawlog.h"
 #include "iostream-ssl.h"
@@ -47,9 +48,10 @@ struct smtp_client *smtp_client_init(const struct smtp_client_settings *set)
 	client->set.rawlog_dir = p_strdup_empty(pool, set->rawlog_dir);
 
 	if (set->ssl != NULL) {
-		client->set.ssl =
-			ssl_iostream_settings_dup(client->pool, set->ssl);
+		client->set.ssl = set->ssl;
+		pool_ref(client->set.ssl->pool);
 	}
+	client->set.ssl_allow_invalid_cert = set->ssl_allow_invalid_cert;
 
 	client->set.master_user = p_strdup_empty(pool, set->master_user);
 	client->set.username = p_strdup_empty(pool, set->username);
@@ -96,6 +98,7 @@ void smtp_client_deinit(struct smtp_client **_client)
 
 	connection_list_deinit(&client->conn_list);
 
+	settings_free(client->set.ssl);
 	if (client->ssl_ctx != NULL)
 		ssl_iostream_context_unref(&client->ssl_ctx);
 	event_unref(&client->event);
@@ -118,22 +121,27 @@ void smtp_client_switch_ioloop(struct smtp_client *client)
 
 int smtp_client_init_ssl_ctx(struct smtp_client *client, const char **error_r)
 {
-	const char *error;
+	const struct ssl_settings *ssl_set;
+	const struct ssl_iostream_settings *set = NULL;
 
 	if (client->ssl_ctx != NULL)
 		return 0;
 
-	if (client->set.ssl == NULL) {
-		*error_r = "Requested SSL connection, but no SSL settings given";
-		return -1;
+	if (client->set.ssl != NULL) {
+		return ssl_iostream_client_context_cache_get(client->set.ssl,
+			&client->ssl_ctx, error_r);
 	}
-	if (ssl_iostream_client_context_cache_get(client->set.ssl,
-		&client->ssl_ctx, &error) < 0) {
-		*error_r = t_strdup_printf("Couldn't initialize SSL context: %s",
-					   error);
+	/* no ssl settings given via smtp_client_settings -
+	   look them up automatically */
+	if (ssl_client_settings_get(client->event, &ssl_set, error_r) < 0)
 		return -1;
-	}
-	return 0;
+	ssl_client_settings_to_iostream_set(ssl_set, &set);
+
+	int ret = ssl_iostream_client_context_cache_get(set, &client->ssl_ctx,
+							error_r);
+	settings_free(set);
+	settings_free(ssl_set);
+	return ret;
 }
 
 // FIXME: Implement smtp_client_run()

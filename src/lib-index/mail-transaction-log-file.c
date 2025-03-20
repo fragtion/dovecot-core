@@ -360,6 +360,7 @@ mail_transaction_log_file_undotlock(struct mail_transaction_log_file *file)
 
 int mail_transaction_log_file_lock(struct mail_transaction_log_file *file)
 {
+	struct mail_index *index = file->log->index;
 	unsigned int lock_timeout_secs;
 	int ret;
 
@@ -371,20 +372,21 @@ int mail_transaction_log_file_lock(struct mail_transaction_log_file *file)
 		return 0;
 	}
 
-	if (file->log->index->set.lock_method == FILE_LOCK_METHOD_DOTLOCK)
-		return mail_transaction_log_file_dotlock(file);
-
-	if (file->log->index->readonly) {
-		mail_index_set_error(file->log->index,
+	if (index->readonly) {
+		mail_index_set_error_code(
+			index, MAIL_INDEX_ERROR_CODE_NO_ACCESS,
 			"Index is read-only, can't write-lock %s",
 			file->filepath);
 		return -1;
 	}
 
+	if (index->set.lock_method == FILE_LOCK_METHOD_DOTLOCK)
+		return mail_transaction_log_file_dotlock(file);
+
 	i_assert(file->file_lock == NULL);
 	lock_timeout_secs = I_MIN(MAIL_TRANSACTION_LOG_LOCK_TIMEOUT,
-				  file->log->index->set.max_lock_timeout_secs);
-	ret = mail_index_lock_fd(file->log->index, file->filepath, file->fd,
+				  index->set.max_lock_timeout_secs);
+	ret = mail_index_lock_fd(index, file->filepath, file->fd,
 				 F_WRLCK, lock_timeout_secs,
 				 &file->file_lock);
 	if (ret > 0) {
@@ -397,11 +399,11 @@ int mail_transaction_log_file_lock(struct mail_transaction_log_file *file)
 		return -1;
 	}
 
-	mail_index_set_error(file->log->index,
+	mail_index_set_error(index,
 		"Timeout (%us) while waiting for lock for "
 		"transaction log file %s%s",
 		lock_timeout_secs, file->filepath,
-		file_lock_find(file->fd, file->log->index->set.lock_method, F_WRLCK));
+		file_lock_find(file->fd, index->set.lock_method, F_WRLCK));
 	return -1;
 }
 
@@ -570,14 +572,31 @@ mail_transaction_log_file_read_hdr(struct mail_transaction_log_file *file,
 		return 0;
 	}
 	if (file->hdr.indexid != file->log->index->indexid) {
-		if (file->log->index->indexid != 0 &&
-		    !file->log->index->initial_create) {
-			/* index file was probably just rebuilt and we don't
-			   know about it yet */
+		if (file->log->index->indexid == 0 ||
+		    file->log->index->initial_create)
+			;
+		else if (strcmp(file->filepath, file->log->filepath2) == 0) {
+			/* .log.2 has a different indexid. This is rather
+			   unlikely situation to notice. We'll handle it by
+			   deleting the .log.2 so a permanently wrong indexid
+			   gets fixed automatically. Since .log.2 doesn't
+			   contain anything critical, it's not so bad even if
+			   the deletion wasn't really necessary. */
 			mail_transaction_log_file_set_corrupted(file,
-				"indexid changed: %u -> %u",
+				"indexid changed: %u -> %u - deleting",
 				file->log->index->indexid, file->hdr.indexid);
 			return 0;
+		} else {
+			/* Index was just rebuilt, possibly because the whole
+			   mailbox was recreated under us. Handle it the same
+			   as if the mailbox directory had been deleted. */
+			e_debug(file->log->index->event,
+				"Transaction log file %s indexid changed: %u -> %u",
+				file->filepath,
+				file->log->index->indexid, file->hdr.indexid);
+			file->log->index->index_deleted = TRUE;
+			errno = ENOENT;
+			return -1;
 		}
 
 		/* creating index file. since transaction log is created
@@ -906,7 +925,7 @@ int mail_transaction_log_file_open(struct mail_transaction_log_file *file,
 		} else {
 			file->fd = nfs_safe_open(file->filepath, O_RDONLY);
 		}
-		if (file->fd == -1 && errno == EACCES) {
+		if (file->fd == -1 && ENOACCESS(errno)) {
 			file->fd = nfs_safe_open(file->filepath, O_RDONLY);
 			index->readonly = TRUE;
 		}

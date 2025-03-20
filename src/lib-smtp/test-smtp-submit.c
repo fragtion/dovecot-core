@@ -733,7 +733,6 @@ static void test_server_denied_second_rcpt(unsigned int index)
 static void test_smtp_submit_input_init(struct smtp_submit_input *smtp_input_r)
 {
 	i_zero(smtp_input_r);
-	smtp_input_r->allow_root = TRUE;
 }
 
 static bool
@@ -1314,7 +1313,10 @@ static void test_successful_delivery_input(struct server_connection *conn)
 				int fd;
 
 				ctx->dot_input =
-					i_stream_create_dot(conn->conn.input, TRUE);
+					i_stream_create_dot(
+						conn->conn.input,
+						ISTREAM_DOT_NO_TRIM |
+						ISTREAM_DOT_LOOSE_EOT);
 				ctx->file_path = p_strdup_printf(
 					conn->pool, "%s/message-%u.eml",
 					test_tmp_dir_get(), server_port);
@@ -1898,7 +1900,7 @@ static void server_connection_init(int fd)
 
 	net_set_nonblock(fd, TRUE);
 
-	pool = pool_alloconly_create("server connection", 256);
+	pool = pool_alloconly_create("server connection", 512);
 	conn = p_new(pool, struct server_connection, 1);
 	conn->pool = pool;
 

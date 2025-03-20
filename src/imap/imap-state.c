@@ -7,6 +7,7 @@
 #include "ostream.h"
 #include "str.h"
 #include "str-sanitize.h"
+#include "compression.h"
 #include "imap-util.h"
 #include "mail-search-build.h"
 #include "mail-storage-private.h"
@@ -19,6 +20,7 @@
 
 enum imap_state_type_public {
 	IMAP_STATE_TYPE_MAILBOX			= 'B',
+	IMAP_STATE_TYPE_COMPRESS		= 'C',
 	IMAP_STATE_TYPE_ENABLED_FEATURE		= 'F',
 	IMAP_STATE_TYPE_SEARCHRES		= '1',
 };
@@ -257,8 +259,9 @@ int imap_state_export_base(struct client *client, bool internal,
 		*error_r = "NOTIFY not supported currently";
 		return 0;
 	}
-	if (client->compress_handler != NULL && internal) {
-		*error_r = "COMPRESS enabled";
+	if (client->compress_handler != NULL &&
+	    client->multiplex_output == NULL && internal) {
+		*error_r = "COMPRESS enabled without multiplex ostream";
 		return 0;
 	}
 
@@ -289,6 +292,12 @@ int imap_state_export_base(struct client *client, bool internal,
 	    array_count(&client->search_saved_uidset) > 0) {
 		buffer_append_c(dest, IMAP_STATE_TYPE_SEARCHRES);
 		export_seq_range(dest, &client->search_saved_uidset);
+	}
+	/* COMPRESS extension */
+	if (client->compress_handler != NULL) {
+		buffer_append_c(dest, IMAP_STATE_TYPE_COMPRESS);
+		buffer_append(dest, client->compress_handler->name,
+			      strlen(client->compress_handler->name) + 1);
 	}
 	return 1;
 }
@@ -700,6 +709,24 @@ import_state_mailbox(struct client *client, const unsigned char *data,
 }
 
 static ssize_t
+import_state_compress(struct client *client, const unsigned char *data,
+		      size_t size, const char **error_r)
+{
+	const unsigned char *p = data, *end = data + size;
+	const char *name;
+
+	if (import_string(&p, end, &name) < 0) {
+		*error_r = "COMPRESS name truncated";
+		return 0;
+	}
+	if (compression_lookup_handler(name, &client->compress_handler) <= 0) {
+		*error_r = t_strdup_printf("Unknown COMPRESS handler %s", name);
+		return 0;
+	}
+	return p - data;
+}
+
+static ssize_t
 import_state_enabled_feature(struct client *client, const unsigned char *data,
 			     size_t size, const char **error_r)
 {
@@ -715,7 +742,11 @@ import_state_enabled_feature(struct client *client, const unsigned char *data,
 		*error_r = t_strdup_printf("Unknown feature '%s'", name);
 		return 0;
 	}
-	client_enable(client, feature_idx);
+	if (!client_enable(client, feature_idx)) {
+		*error_r = t_strdup_printf("Feature '%s' couldn't be enabled",
+					   name);
+		return 0;
+	}
 	return p - data;
 }
 
@@ -758,7 +789,7 @@ void imap_state_import_idle_cmd_tag(struct client *client, const char *tag)
 	if (client->state_import_idle_continue) {
 		/* IDLE command continues */
 		struct client_command_context *cmd;
-		struct command *command;
+		const struct command *command;
 
 		cmd = client_command_alloc(client);
 		cmd->tag = p_strdup(cmd->pool, tag);
@@ -793,6 +824,7 @@ static struct {
 			  size_t size, const char **error_r);
 } imap_states_public[] = {
 	{ IMAP_STATE_TYPE_MAILBOX, import_state_mailbox },
+	{ IMAP_STATE_TYPE_COMPRESS, import_state_compress },
 	{ IMAP_STATE_TYPE_ENABLED_FEATURE, import_state_enabled_feature },
 	{ IMAP_STATE_TYPE_SEARCHRES, import_state_searchres }
 };

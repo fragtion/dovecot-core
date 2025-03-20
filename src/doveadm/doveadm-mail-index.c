@@ -7,7 +7,7 @@
 #include "istream.h"
 #include "ostream.h"
 #include "mail-namespace.h"
-#include "mail-storage.h"
+#include "mail-storage-private.h"
 #include "mail-search-build.h"
 #include "mailbox-list-iter.h"
 #include "doveadm-settings.h"
@@ -28,8 +28,8 @@ struct index_cmd_context {
 	bool have_wildcards:1;
 };
 
-static int cmd_index_box_precache(struct doveadm_mail_cmd_context *dctx,
-				  struct mailbox *box)
+static int cmd_index_box_precache_real(struct doveadm_mail_cmd_context *dctx,
+				       struct mailbox *box)
 {
 	struct event *event = dctx->cctx->event;
 	struct mailbox_status status;
@@ -38,17 +38,10 @@ static int cmd_index_box_precache(struct doveadm_mail_cmd_context *dctx,
 	struct mail_search_context *ctx;
 	struct mail *mail;
 	struct mailbox_metadata metadata;
-	uint32_t seq;
 	unsigned int counter = 0, max;
 	int ret = 0;
 
-	if (mailbox_get_metadata(box, MAILBOX_METADATA_PRECACHE_FIELDS,
-				 &metadata) < 0) {
-		e_error(event, "Mailbox %s: Precache-fields lookup failed: %s",
-			mailbox_get_vname(box),
-			mailbox_get_last_internal_error(box, NULL));
-	}
-	if (mailbox_get_status(box, STATUS_MESSAGES | STATUS_LAST_CACHED_SEQ,
+	if (mailbox_get_status(box, STATUS_MESSAGES | STATUS_FTS_LAST_INDEXED_UID,
 			       &status) < 0) {
 		e_error(event, "Mailbox %s: Status lookup failed: %s",
 			mailbox_get_vname(box),
@@ -56,14 +49,26 @@ static int cmd_index_box_precache(struct doveadm_mail_cmd_context *dctx,
 		return -1;
 	}
 
-	seq = status.last_cached_seq + 1;
-	if (seq > status.messages) {
-		if (doveadm_verbose) {
-			e_info(event, "%s: Cache is already up to date",
-			       mailbox_get_vname(box));
-		}
+	if (status.fts_last_indexed_uid >= status.uidnext - 1) {
+		e_info(event, "Mailbox %s: Index is already up to date",
+		       mailbox_get_vname(box));
 		return 0;
 	}
+
+	if (mailbox_get_metadata(box, MAILBOX_METADATA_PRECACHE_FIELDS,
+				 &metadata) < 0) {
+		e_error(event, "Mailbox %s: Precache-fields lookup failed: %s",
+			mailbox_get_vname(box),
+			mailbox_get_last_internal_error(box, NULL));
+		return -1;
+	}
+
+	uint32_t seq = 0, unused ATTR_UNUSED;
+	if (status.fts_last_indexed_uid > 0)
+		mailbox_get_seq_range(box, 1, status.fts_last_indexed_uid,
+				      &unused, &seq);
+	seq++;
+
 	if (doveadm_verbose) {
 		e_info(event, "%s: Caching mails seq=%u..%u",
 		       mailbox_get_vname(box), seq, status.messages);
@@ -77,7 +82,7 @@ static int cmd_index_box_precache(struct doveadm_mail_cmd_context *dctx,
 				  metadata.precache_fields, NULL);
 	mail_search_args_unref(&search_args);
 
-	max = status.messages - seq + 1;
+	max = status.messages + 1 - seq;
 	while (mailbox_search_next(ctx, &mail)) {
 		if (mail_precache(mail) < 0) {
 			e_error(event,
@@ -107,6 +112,31 @@ static int cmd_index_box_precache(struct doveadm_mail_cmd_context *dctx,
 		ret = -1;
 	}
 	return ret;
+}
+
+static int cmd_index_box_precache(struct doveadm_mail_cmd_context *dctx,
+				  struct mailbox *box);
+
+static int cmd_index_box_precache_virtual(struct doveadm_mail_cmd_context *dctx,
+					  struct mailbox *box)
+{
+	ARRAY_TYPE(mailboxes) mailboxes;
+	t_array_init(&mailboxes, 8);
+	box->virtual_vfuncs->get_virtual_backend_boxes(box, &mailboxes, TRUE);
+
+	struct mailbox *bbox;
+	array_foreach_elem(&mailboxes, bbox)
+		if (cmd_index_box_precache(dctx, bbox) < 0)
+			return -1;
+	return 0;
+}
+
+static int cmd_index_box_precache(struct doveadm_mail_cmd_context *dctx,
+				  struct mailbox *box)
+{
+	return box->virtual_vfuncs == NULL ?
+	       cmd_index_box_precache_real(dctx, box) :
+	       cmd_index_box_precache_virtual(dctx, box);
 }
 
 static int

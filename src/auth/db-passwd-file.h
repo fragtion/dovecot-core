@@ -3,16 +3,13 @@
 
 #include "hash.h"
 
-#define PASSWD_FILE_DEFAULT_USERNAME_FORMAT "%u"
-#define PASSWD_FILE_DEFAULT_SCHEME "CRYPT"
-
 struct passwd_user {
 	uid_t uid;
 	gid_t gid;
 
-	char *home;
-        char *password;
-        char **extra_fields;
+	const char *home;
+	const char *password;
+	const char *const *extra_fields;
 };
 
 struct passwd_file {
@@ -37,6 +34,7 @@ struct db_passwd_file {
 	struct event *event;
 
 	char *path;
+	struct var_expand_program *prog;
 	HASH_TABLE(char *, struct passwd_file *) files;
         struct passwd_file *default_file;
 
@@ -45,6 +43,17 @@ struct db_passwd_file {
 	bool userdb_warn_missing:1;
 };
 
+struct passwd_file_settings {
+	pool_t pool;
+	const char *passwd_file_path;
+};
+
+extern const struct setting_parser_info passwd_file_setting_parser_info;
+
+extern const struct var_expand_provider db_passwd_file_var_expand_fn[];
+
+int db_passwd_fix_path(const char *path, const char **path_r,
+		       const char *orig_path, const char **error_r);
 int db_passwd_file_lookup(struct db_passwd_file *db,
 			  struct auth_request *request,
 			  const char *username_format,

@@ -158,6 +158,7 @@ struct smtp_server_connection {
 	unsigned int proxy_timeout_secs;
 	char *proxy_helo;
 	char *client_transport;
+	char *local_name;
 
 	struct smtp_server_helo_data helo, *pending_helo;
 	char *helo_domain, *username;
@@ -168,7 +169,6 @@ struct smtp_server_connection {
 	struct timeout *to_idle;
 	struct istream *raw_input;
 	struct ostream *raw_output;
-	struct ssl_iostream_context *ssl_ctx;
 	struct ssl_iostream *ssl_iostream;
 	struct smtp_command_parser *smtp_parser;
 
@@ -195,6 +195,7 @@ struct smtp_server_connection {
 	bool handling_input:1;
 	bool rawlog_checked:1;
 	bool rawlog_enabled:1;
+	bool connect_succeeded:1;
 };
 
 struct smtp_server {
@@ -203,7 +204,6 @@ struct smtp_server {
 	struct smtp_server_settings set;
 
 	struct event *event;
-	struct ssl_iostream_context *ssl_ctx;
 
 	ARRAY(struct smtp_server_command_reg) commands_reg;
 
@@ -336,9 +336,6 @@ int smtp_server_connection_ssl_init(struct smtp_server_connection *conn);
 
 void smtp_server_connection_clear(struct smtp_server_connection *conn);
 
-struct smtp_server_transaction *
-smtp_server_connection_get_transaction(struct smtp_server_connection *conn);
-
 /*
  * Recipient
  */
@@ -397,6 +394,5 @@ void smtp_server_transaction_finished(struct smtp_server_transaction *trans,
  */
 
 void smtp_server_event_init(struct smtp_server *server, struct event *event);
-int smtp_server_init_ssl_ctx(struct smtp_server *server, const char **error_r);
 
 #endif

@@ -24,39 +24,25 @@ static void acl_user_deinit(struct mail_user *user)
 	auser->module_ctx.super.deinit(user);
 }
 
-static void acl_mail_user_create(struct mail_user *user, const char *env)
+void acl_mail_user_created(struct mail_user *user)
 {
 	struct mail_user_vfuncs *v = user->vlast;
 	struct acl_user *auser;
+	const char *error;
+	int ret;
 
 	auser = p_new(user->pool, struct acl_user, 1);
 	auser->module_ctx.super = *v;
 	user->vlast = &auser->module_ctx.super;
 	v->deinit = acl_user_deinit;
-	auser->acl_lookup_dict = acl_lookup_dict_init(user);
-
-	auser->acl_env = env;
-	auser->acl_user = mail_user_plugin_getenv(user, "acl_user");
-	if (auser->acl_user == NULL)
-		auser->acl_user = mail_user_plugin_getenv(user, "master_user");
-
-	env = mail_user_plugin_getenv(user, "acl_groups");
-	if (env != NULL) {
-		auser->groups =
-			(const char *const *)p_strsplit(user->pool, env, ",");
+	if ((ret = acl_lookup_dict_init(user, &auser->acl_lookup_dict, &error)) < 0) {
+		e_error(user->event, "acl: dict_init() failed: %s", error);
+		user->error = p_strdup(user->pool, error);
+	} else if (ret == 0) {
+		e_debug(user->event, "acl: Shared mailbox listing disabled: %s", error);
+	} else {
+		e_debug(user->event, "acl: Shared mailbox listing enabled");
 	}
 
 	MODULE_CONTEXT_SET(user, acl_user_module, auser);
-}
-
-void acl_mail_user_created(struct mail_user *user)
-{
-	const char *env;
-
-	env = mail_user_plugin_getenv(user, "acl");
-	if (env != NULL && *env != '\0')
-		acl_mail_user_create(user, env);
-	else {
-		e_debug(user->event, "acl: No acl setting - ACLs are disabled");
-	}
 }

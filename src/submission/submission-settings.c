@@ -4,40 +4,15 @@
 #include "hostpid.h"
 #include "buffer.h"
 #include "settings-parser.h"
+#include "master-service-settings.h"
 #include "service-settings.h"
 #include "mail-storage-settings.h"
 #include "submission-settings.h"
 
-#include <stddef.h>
 #include <unistd.h>
 
 static bool submission_settings_verify(void *_set, pool_t pool,
 				       const char **error_r);
-
-/* <settings checks> */
-static struct file_listener_settings submission_unix_listeners_array[] = {
-	{
-		.path = "login/submission",
-		.mode = 0666,
-		.user = "",
-		.group = "",
-	},
-	{
-		.path = "srv.submission/%{pid}",
-		.type = "admin",
-		.mode = 0600,
-		.user = "",
-		.group = "",
-	},
-};
-static struct file_listener_settings *submission_unix_listeners[] = {
-	&submission_unix_listeners_array[0],
-	&submission_unix_listeners_array[1],
-};
-static buffer_t submission_unix_listeners_buf = {
-	{ { submission_unix_listeners, sizeof(submission_unix_listeners) } }
-};
-/* </settings checks> */
 
 struct service_settings submission_service_settings = {
 	.name = "submission",
@@ -47,22 +22,36 @@ struct service_settings submission_service_settings = {
 	.user = "",
 	.group = "",
 	.privileged_group = "",
-	.extra_groups = "$default_internal_group",
 	.chroot = "",
 
 	.drop_priv_before_exec = FALSE,
 
-	.process_min_avail = 0,
 	.process_limit = 1024,
 	.client_limit = 1,
-	.service_count = 1,
-	.idle_kill = 0,
-	.vsz_limit = UOFF_T_MAX,
+#ifdef DOVECOT_PRO_EDITION
+	.restart_request_count = 1000,
+#else
+	.restart_request_count = 1,
+#endif
 
-	.unix_listeners = { { &submission_unix_listeners_buf,
-			      sizeof(submission_unix_listeners[0]) } },
+	.unix_listeners = ARRAY_INIT,
 	.fifo_listeners = ARRAY_INIT,
 	.inet_listeners = ARRAY_INIT
+};
+
+const struct setting_keyvalue submission_service_settings_defaults[] = {
+	{ "unix_listener", "login\\ssubmission srv.submission\\s%{pid}" },
+
+	{ "unix_listener/login\\ssubmission/path", "login/submission" },
+	{ "unix_listener/login\\ssubmission/mode", "0666" },
+
+	{ "unix_listener/srv.submission\\s%{pid}/path", "srv.submission/%{pid}" },
+	{ "unix_listener/srv.submission\\s%{pid}/type", "admin" },
+	{ "unix_listener/srv.submission\\s%{pid}/mode", "0600" },
+
+	{ "service_extra_groups", "$SET:default_internal_group" },
+
+	{ NULL, NULL }
 };
 
 #undef DEF
@@ -71,22 +60,23 @@ struct service_settings submission_service_settings = {
 
 static const struct setting_define submission_setting_defines[] = {
 	DEF(BOOL, verbose_proctitle),
-	DEF(STR_VARS, rawlog_dir),
+	DEF(STR, rawlog_dir),
 
 	DEF(STR, hostname),
 
-	DEF(STR, login_greeting),
-	DEF(STR, login_trusted_networks),
+	DEF(STR_HIDDEN, login_greeting),
+	DEF(BOOLLIST, login_trusted_networks),
 
 	DEF(STR, recipient_delimiter),
 
 	DEF(SIZE, submission_max_mail_size),
 	DEF(UINT, submission_max_recipients),
-	DEF(STR, submission_client_workarounds),
-	DEF(STR, submission_logout_format),
+	DEF(BOOLLIST, submission_client_workarounds),
+	DEF(STR_NOVARS, submission_logout_format),
 	DEF(BOOL, submission_add_received_header),
+	DEF(BOOL, mail_utf8_extensions),
 
-	DEF(STR, submission_backend_capabilities),
+	DEF(BOOLLIST, submission_backend_capabilities),
 
 	DEF(STR, submission_relay_host),
 	DEF(IN_PORT, submission_relay_port),
@@ -99,7 +89,7 @@ static const struct setting_define submission_setting_defines[] = {
 	DEF(ENUM, submission_relay_ssl),
 	DEF(BOOL, submission_relay_ssl_verify),
 
-	DEF(STR_VARS, submission_relay_rawlog_dir),
+	DEF(STR, submission_relay_rawlog_dir),
 	DEF(TIME, submission_relay_max_idle_time),
 
 	DEF(TIME_MSECS, submission_relay_connect_timeout),
@@ -112,23 +102,24 @@ static const struct setting_define submission_setting_defines[] = {
 };
 
 static const struct submission_settings submission_default_settings = {
-	.verbose_proctitle = FALSE,
+	.verbose_proctitle = VERBOSE_PROCTITLE_DEFAULT,
 	.rawlog_dir = "",
 
 	.hostname = "",
 
 	.login_greeting = PACKAGE_NAME" ready.",
-	.login_trusted_networks = "",
+	.login_trusted_networks = ARRAY_INIT,
 
 	.recipient_delimiter = "+",
 
 	.submission_max_mail_size = 40*1024*1024,
 	.submission_max_recipients = 0,
-	.submission_client_workarounds = "",
-	.submission_logout_format = "in=%i out=%o",
+	.submission_client_workarounds = ARRAY_INIT,
+	.submission_logout_format = "in=%{input} out=%{output}",
 	.submission_add_received_header = TRUE,
+	.mail_utf8_extensions = FALSE,
 
-	.submission_backend_capabilities = NULL,
+	.submission_backend_capabilities = ARRAY_INIT,
 
 	.submission_relay_host = "",
 	.submission_relay_port = 25,
@@ -151,23 +142,23 @@ static const struct submission_settings submission_default_settings = {
 	.imap_urlauth_port = 143,
 };
 
-static const struct setting_parser_info *submission_setting_dependencies[] = {
-	&mail_user_setting_parser_info,
-	NULL
+static const struct setting_keyvalue submission_default_settings_keyvalue[] = {
+#ifdef DOVECOT_PRO_EDITION
+	{ "service/submission/process_shutdown_filter", "event=mail_user_session_finished AND rss > 20MB" },
+#endif
+	{ NULL, NULL },
 };
 
 const struct setting_parser_info submission_setting_parser_info = {
-	.module_name = "submission",
+	.name = "submission",
+
 	.defines = submission_setting_defines,
 	.defaults = &submission_default_settings,
+	.default_settings = submission_default_settings_keyvalue,
 
-	.type_offset = SIZE_MAX,
 	.struct_size = sizeof(struct submission_settings),
-
-	.parent_offset = SIZE_MAX,
-
+	.pool_offset1 = 1 + offsetof(struct submission_settings, pool),
 	.check_func = submission_settings_verify,
-	.dependencies = submission_setting_dependencies
 };
 
 /* <settings checks> */
@@ -196,10 +187,10 @@ submission_settings_parse_workarounds(struct submission_settings *set,
 				const char **error_r)
 {
 	enum submission_client_workarounds client_workarounds = 0;
-        const struct submission_client_workaround_list *list;
+	const struct submission_client_workaround_list *list;
 	const char *const *str;
 
-        str = t_strsplit_spaces(set->submission_client_workarounds, " ,");
+	str = settings_boollist_get(&set->submission_client_workarounds);
 	for (; *str != NULL; str++) {
 		list = submission_client_workaround_list;
 		for (; list->name != NULL; list++) {
@@ -223,6 +214,13 @@ static bool
 submission_settings_verify(void *_set, pool_t pool ATTR_UNUSED, const char **error_r)
 {
 	struct submission_settings *set = _set;
+
+#ifndef EXPERIMENTAL_MAIL_UTF8
+	if (set->mail_utf8_extensions) {
+		*error_r = "Dovecot not built with --enable-experimental-mail-utf8";
+		return FALSE;
+	}
+#endif
 
 	if (submission_settings_parse_workarounds(set, error_r) < 0)
 		return FALSE;

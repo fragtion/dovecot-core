@@ -61,17 +61,11 @@ static void drop_privileges(void)
 	struct restrict_access_settings set;
 	const char *error;
 
+	if (master_service_settings_read_simple(master_service, &error) < 0)
+		i_fatal("%s", error);
+
 	/* by default we don't drop any privileges, but keep running as root. */
 	restrict_access_get_env(&set);
-	/* open config connection before dropping privileges */
-	struct master_service_settings_input input;
-	struct master_service_settings_output output;
-
-	i_zero(&input);
-	input.service = "lmtp";
-	if (master_service_settings_read(master_service,
-					 &input, &output, &error) < 0)
-		i_fatal("Error reading configuration: %s", error);
 	restrict_access_by_env(RESTRICT_ACCESS_FLAG_ALLOW_ROOT, NULL);
 }
 
@@ -114,12 +108,6 @@ static void main_deinit(void)
 
 int main(int argc, char *argv[])
 {
-	const struct setting_parser_info *set_roots[] = {
-		&smtp_submit_setting_parser_info,
-		&lda_setting_parser_info,
-		&lmtp_setting_parser_info,
-		NULL
-	};
 	enum master_service_flags service_flags =
 		MASTER_SERVICE_FLAG_HAVE_STARTTLS;
 	enum mail_storage_service_flags storage_service_flags =
@@ -155,7 +143,7 @@ int main(int argc, char *argv[])
 	drop_privileges();
 	master_service_init_log_with_pid(master_service);
 
-	storage_service = mail_storage_service_init(master_service, set_roots,
+	storage_service = mail_storage_service_init(master_service,
 						    storage_service_flags);
 	restrict_access_allow_coredumps(TRUE);
 

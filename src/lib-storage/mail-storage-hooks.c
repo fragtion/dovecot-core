@@ -91,17 +91,10 @@ void mail_storage_hooks_add_internal(const struct mail_storage_hooks *hooks)
 
 void mail_storage_hooks_remove_internal(const struct mail_storage_hooks *hooks)
 {
-	const struct mail_storage_hooks *const *old_hooks;
-	unsigned int idx = UINT_MAX;
+	unsigned int idx;
 
-	array_foreach(&internal_hooks, old_hooks) {
-		if (*old_hooks == hooks) {
-			idx = array_foreach_idx(&internal_hooks, old_hooks);
-			break;
-		}
-	}
-	i_assert(idx != UINT_MAX);
-
+	if (!array_lsearch_ptr_idx(&internal_hooks, hooks, &idx))
+		i_unreached();
 	array_delete(&internal_hooks, idx, 1);
 }
 
@@ -127,15 +120,16 @@ static void mail_user_add_plugin_hooks(struct mail_user *user)
 {
 	const struct mail_storage_module_hooks *module_hook;
 	ARRAY(struct mail_storage_module_hooks) tmp_hooks;
-	const char *const *plugins, *name;
+	const char *name;
 
 	/* first get all hooks wanted by the user */
 	t_array_init(&tmp_hooks, array_count(&module_hooks));
-	plugins = t_strsplit_spaces(user->set->mail_plugins, ", ");
 	array_foreach(&module_hooks, module_hook) {
 		if (!module_hook->forced) {
 			name = module_get_plugin_name(module_hook->module);
-			if (!str_array_find(plugins, name))
+			if (!array_is_created(&user->set->mail_plugins) ||
+			    array_lsearch(&user->set->mail_plugins, &name,
+					  i_strcmp_p) == NULL)
 				continue;
 		}
 		array_push_back(&tmp_hooks, module_hook);
@@ -166,6 +160,8 @@ void hook_mail_user_created(struct mail_user *user)
 			hooks->mail_user_created(user);
 			hook_build_update(ctx, user->vlast);
 		} T_END;
+		if (user->error != NULL)
+			break;
 	}
 	user->vlast = NULL;
 	hook_build_deinit(&ctx);

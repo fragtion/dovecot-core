@@ -42,6 +42,8 @@ static void service_process_idle_kill_timeout(struct service_process *process)
 	e_error(process->service->event, "Process %s is ignoring idle SIGINT",
 		dec2str(process->pid));
 
+	timeout_remove(&process->to_idle_kill);
+
 	/* assume this process is busy */
 	i_zero(&status);
 	service_status_more(process, &status);
@@ -70,8 +72,8 @@ static void service_kill_idle(struct service *service)
 
 	   (It's actually not important which processes get killed. A better
 	   way could be to kill the oldest processes since they might have to
-	   be restarted anyway soon due to reaching service_count, but we'd
-	   have to use priority queue for tracking that, which is more
+	   be restarted anyway soon due to reaching restart_request_count, but
+	   we'd have to use priority queue for tracking that, which is more
 	   expensive and probably not worth it.) */
 	for (; processes_to_kill > 0; processes_to_kill--) {
 		struct service_process *process = service->idle_processes_head;
@@ -89,7 +91,7 @@ static void service_kill_idle(struct service *service)
 		}
 		process->last_kill_sent = ioloop_time;
 		process->to_idle_kill =
-			timeout_add(service->idle_kill * 1000,
+			timeout_add(service->idle_kill_interval * 1000,
 				    service_process_idle_kill_timeout, process);
 
 		/* Move it to the end of the list, so it's not tried to be
@@ -114,6 +116,7 @@ static void service_status_more(struct service_process *process,
 		process->idle_start = 0;
 
 		i_assert(service->process_idling > 0);
+		i_assert(service->process_idling <= service->process_avail);
 		service->process_idling--;
 		service->process_idling_lowwater_since_kills =
 			I_MIN(service->process_idling_lowwater_since_kills,
@@ -128,6 +131,7 @@ static void service_status_more(struct service_process *process,
 	/* process used up all of its clients */
 	i_assert(service->process_avail > 0);
 	service->process_avail--;
+	i_assert(service->process_idling <= service->process_avail);
 
 	if (service->type == SERVICE_TYPE_LOGIN &&
 	    service->process_avail == 0 &&
@@ -150,6 +154,7 @@ static void service_check_idle(struct service_process *process)
 		/* busy process started idling */
 		DLLIST_REMOVE(&service->busy_processes, process);
 		service->process_idling++;
+		i_assert(service->process_idling <= service->process_avail);
 	} else {
 		/* Idling process updated its status again to be idling. Maybe
 		   it was busy for a little bit? Update its idle_start time. */
@@ -162,11 +167,11 @@ static void service_check_idle(struct service_process *process)
 
 	if (service->process_avail > service->set->process_min_avail &&
 	    service->to_idle == NULL &&
-	    service->idle_kill != UINT_MAX) {
+	    service->idle_kill_interval != UINT_MAX) {
 		/* We have more processes than we really need. Start a timer
-		   to trigger idle_kill. */
+		   to trigger idle_kill_interval. */
 		service->to_idle =
-			timeout_add(service->idle_kill * 1000,
+			timeout_add(service->idle_kill_interval * 1000,
 				    service_kill_idle, service);
 	}
 }
@@ -277,9 +282,9 @@ static void service_log_drop_warning(struct service *service)
 		if (service->process_limit > 1) {
 			limit_name = "process_limit";
 			limit = service->process_limit;
-		} else if (service->set->service_count == 1) {
+		} else if (service->set->restart_request_count == 1) {
 			i_assert(service->client_limit == 1);
-			limit_name = "client_limit/service_count";
+			limit_name = "client_limit/restart_request_count";
 			limit = 1;
 		} else {
 			limit_name = "client_limit";
@@ -513,7 +518,7 @@ static int service_login_create_notify_fd(struct service *service)
 		string_t *prefix = t_str_new(128);
 		const char *path;
 
-		str_append(prefix, service->set->master_set->base_dir);
+		str_append(prefix, service->list->set->base_dir);
 		str_append(prefix, "/login-master-notify");
 
 		fd = safe_mkstemp(prefix, 0600, (uid_t)-1, (gid_t)-1);
@@ -819,7 +824,7 @@ service_process_failure(struct service_process *process, int status)
 		   processes that were already running for a while.
 		   Try to avoid failure storms at Dovecot startup by throttling
 		   the service if it only keeps failing rapidly. This is no
-		   longer done after the service looks to be generailly working,
+		   longer done after the service looks to be generally working,
 		   in case an attacker finds a way to quickly crash their own
 		   session. */
 		if (service->exit_failure_last != ioloop_time) {

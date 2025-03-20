@@ -12,6 +12,7 @@
 #include "mail-user.h"
 #include "fts-parser.h"
 #include "fts-api.h"
+#include "fts-user.h"
 
 #define SCRIPT_USER_CONTEXT(obj) \
 	MODULE_CONTEXT(obj, fts_parser_script_user_module)
@@ -47,16 +48,15 @@ static MODULE_CONTEXT_DEFINE_INIT(fts_parser_script_user_module,
 static int
 script_connect(struct mail_user *user, const char **path_r, struct event *event)
 {
-	const char *path;
-	int fd;
-
-	path = mail_user_plugin_getenv(user, "fts_decoder");
-	if (path == NULL)
+	const struct fts_settings *set = fts_user_get_settings(user);
+	if (set->parsed_decoder_driver != FTS_DECODER_SCRIPT)
 		return -1;
+
+	const char *path = set->decoder_script_socket_path;
 
 	if (*path != '/')
 		path = t_strconcat(user->set->base_dir, "/", path, NULL);
-	fd = net_connect_unix_with_retries(path, 1000);
+	int fd = net_connect_unix_with_retries(path, 1000);
 	if (fd == -1)
 		e_error(event, "net_connect_unix(%s) failed: %m", path);
 	else
@@ -165,7 +165,7 @@ static void parse_content_disposition(const char *content_disposition,
 				      const char **filename_r)
 {
 	struct rfc822_parser_context parser;
-	const char *const *results, *filename2;
+	const char *const *results;
 	string_t *str;
 
 	*filename_r = NULL;
@@ -185,19 +185,11 @@ static void parse_content_disposition(const char *content_disposition,
 	}
 
 	rfc2231_parse(&parser, &results);
-	filename2 = NULL;
 	for (; *results != NULL; results += 2) {
 		if (strcasecmp(results[0], "filename") == 0) {
 			*filename_r = results[1];
 			break;
 		}
-		if (strcasecmp(results[0], "filename*") == 0)
-			filename2 = results[1];
-	}
-	if (*filename_r == NULL) {
-		/* RFC 2231 style non-ascii filename. we don't really care
-		   much about the filename actually, just about its extension */
-		*filename_r = filename2;
 	}
 	rfc822_parser_deinit(&parser);
 }

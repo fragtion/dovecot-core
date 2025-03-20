@@ -123,7 +123,7 @@ enum fs_op {
 	FS_OP_COUNT
 };
 
-struct fs_settings {
+struct fs_parameters {
 	/* Username and session ID are mainly used for debugging/logging,
 	   but may also be useful for other purposes if they exist (they
 	   may be NULL). */
@@ -135,8 +135,6 @@ struct fs_settings {
 	/* Directory where temporary files can be created at any time
 	   (e.g. /tmp or mail_temp_dir) */
 	const char *temp_dir;
-	/* SSL client settings. */
-	const struct ssl_iostream_settings *ssl_client_set;
 
 	/* Automatically try to rmdir() directories up to this path when
 	   deleting files. */
@@ -148,15 +146,17 @@ struct fs_settings {
 	   them. */
 	struct dns_client *dns_client;
 
-	/* Parent event to use, unless overridden by
-	   fs_file_init_with_event() */
-	struct event *event_parent;
-
-	/* Enable debugging */
-	bool debug;
 	/* Enable timing statistics */
 	bool enable_timing;
 };
+
+struct fs_settings {
+	pool_t pool;
+	const char *fs_name;
+	const char *fs_driver;
+	ARRAY_TYPE(const_string) fs;
+};
+extern const struct setting_parser_info fs_setting_parser_info;
 
 struct fs_stats {
 	/* Number of fs_prefetch() calls. Counted only if fs_read*() hasn't
@@ -194,7 +194,7 @@ struct fs_stats {
 	uint64_t write_bytes;
 
 	/* Cumulative sum of usecs spent on calls - set only if
-	   fs_settings.enable_timing=TRUE */
+	   fs_parameters.enable_timing=TRUE */
 	struct stats_dist *timings[FS_OP_COUNT];
 };
 
@@ -206,13 +206,12 @@ ARRAY_DEFINE_TYPE(fs_metadata, struct fs_metadata);
 
 typedef void fs_file_async_callback_t(void *context);
 
-int fs_init(const char *driver, const char *args,
-	    const struct fs_settings *set,
-	    struct fs **fs_r, const char **error_r);
-/* helper for fs_init, accepts a filesystem string
-   that can come directly from config */
-int fs_init_from_string(const char *str, const struct fs_settings *set,
-			struct fs **fs_r, const char **error_r);
+/* Initialize the fs by pulling settings automatically using the event.
+   The event parameter is used as the parent event. Returns 1 if ok, 0 if
+   fs { .. } named list filter is missing (error_r is also set), -1 if settings
+   lookup or driver initialization failed. */
+int fs_init_auto(struct event *event, const struct fs_parameters *params,
+		 struct fs **fs_r, const char **error_r);
 /* same as fs_unref() */
 void fs_deinit(struct fs **fs);
 
@@ -224,6 +223,8 @@ void fs_unref(struct fs **fs);
 struct fs *fs_get_parent(struct fs *fs);
 /* Returns the filesystem's driver name. */
 const char *fs_get_driver(struct fs *fs);
+/* Returns the root fs (bypassing all wrapper fses) */
+struct fs *fs_get_root_fs(struct fs *fs);
 /* Returns the root fs's driver name (bypassing all wrapper fses) */
 const char *fs_get_root_driver(struct fs *fs);
 /* Returns the fs's event. */

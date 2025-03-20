@@ -31,17 +31,17 @@
 	struct foo *foo = array_idx(foos, 0);
    }
    struct foo_manager {
-        ARRAY_TYPE(foo) foos; // pedantically, ARRAY(struct foo) is a different type
+	ARRAY_TYPE(foo) foos; // pedantically, ARRAY(struct foo) is a different type
    };
    // ...
-        do_foo(&my_foo_manager->foos); // No compiler warning about mismatched types
+	do_foo(&my_foo_manager->foos); // No compiler warning about mismatched types
 
 */
 #include "array-decl.h"
 #include "buffer.h"
 
 #define p_array_init(array, pool, init_count) \
-	array_create(array, pool, sizeof(**(array)->v), init_count)
+	array_create(array, pool, sizeof(**(array)->v), init_count) // NOLINT(bugprone-sizeof-expression)
 #define i_array_init(array, init_count) \
 	p_array_init(array, default_pool, init_count)
 #define t_array_init(array, init_count) \
@@ -109,6 +109,7 @@
    } */
 #define array_foreach_elem(array, elem) \
 	for (const void *_foreach_end = \
+		/* NOLINTBEGIN(bugprone-sizeof-expression) */ \
 		CONST_PTR_OFFSET(*(array)->v, (array)->arr.buffer->used), \
 	     *_foreach_ptr = CONST_PTR_OFFSET(*(array)->v, ARRAY_TYPE_CHECK(array, &elem) + \
 		COMPILE_ERROR_IF_TRUE(sizeof(elem) > sizeof(void *))) \
@@ -116,7 +117,8 @@
 	     (_foreach_ptr != _foreach_end &&		\
 	     (memcpy(&elem, _foreach_ptr, sizeof(elem)), TRUE)) \
 		;							\
-	     _foreach_ptr = CONST_PTR_OFFSET(_foreach_ptr, sizeof(elem)))
+	     _foreach_ptr = CONST_PTR_OFFSET(_foreach_ptr, sizeof(elem))) \
+	     /* NOLINTEND(bugprone-sizeof-expression) */ \
 
 
 #define array_ptr_to_idx(array, elem) \
@@ -200,9 +202,9 @@ array_count_i(const struct array *array)
 	array_count_i(&(array)->arr)
 /* No need for the real count if all we're doing is comparing against 0 */
 #define array_is_empty(array) \
-	((array)->arr.buffer->used == 0)
+	((!array_is_created(array)) || ((array)->arr.buffer->used == 0))
 #define array_not_empty(array) \
-	((array)->arr.buffer->used > 0)
+	((array_is_created(array)) && ((array)->arr.buffer->used > 0))
 
 static inline void
 array_append_i(struct array *array, const void *data, unsigned int count)
@@ -400,14 +402,28 @@ void array_sort_i(struct array *array, int (*cmp)(const void *, const void *));
 					typeof(*(array)->v))), \
 	array_sort_i(&(array)->arr, (int (*)(const void *, const void *))cmp))
 
-void *array_bsearch_i(struct array *array, const void *key,
-		      int (*cmp)(const void *, const void *));
-#define array_bsearch(array, key, cmp) \
+#define ARRAY_SEARCH_CALL(func, array, key, cmp) \
 	TYPE_CHECKS(void *, \
-	CALLBACK_TYPECHECK(cmp, int (*)(typeof(const typeof(*key) *), \
-					typeof(*(array)->v))), \
-	ARRAY_TYPE_CAST_MODIFIABLE(array)array_bsearch_i(&(array)->arr, \
-		(const void *)key, (int (*)(const void *, const void *))cmp))
+		CALLBACK_TYPECHECK(cmp, int (*)(typeof(const typeof(*key) *), \
+						typeof(*(array)->v))), \
+		array_##func##_i( \
+			&(array)->arr, (const void *)key, \
+			(int (*)(const void *, const void *))cmp))
+
+const void *array_bsearch_i(const struct array *array, const void *key,
+		            int (*cmp)(const void *, const void *));
+static inline void *array_bsearch_modifiable_i(struct array *array, const void *key,
+					       int (*cmp)(const void *, const void *))
+{
+	return (void *)array_bsearch_i(array, key, cmp);
+}
+
+#define array_bsearch(array, key, cmp) \
+	ARRAY_TYPE_CAST_CONST(array) \
+	ARRAY_SEARCH_CALL(bsearch, array, key, cmp)
+#define array_bsearch_modifiable(array, key, cmp) \
+	ARRAY_TYPE_CAST_MODIFIABLE(array) \
+	ARRAY_SEARCH_CALL(bsearch_modifiable, array, key, cmp)
 
 /* Returns pointer to first element for which cmp(key,elem)==0, or NULL */
 const void *array_lsearch_i(const struct array *array, const void *key,
@@ -417,16 +433,28 @@ static inline void *array_lsearch_modifiable_i(struct array *array, const void *
 {
 	return (void *)array_lsearch_i(array, key, cmp);
 }
-#define ARRAY_LSEARCH_CALL(modifiable, array, key, cmp) \
-	TYPE_CHECKS(void *, \
-	CALLBACK_TYPECHECK(cmp, int (*)(typeof(const typeof(*key) *), \
-					typeof(*(array)->v))), \
-	array_lsearch##modifiable##i( \
-		&(array)->arr, (const void *)key, \
-		(int (*)(const void *, const void *))cmp))
-#define array_lsearch(array, key, cmp)					\
-	ARRAY_TYPE_CAST_CONST(array)ARRAY_LSEARCH_CALL(_, array, key, cmp)
-#define array_lsearch_modifiable(array, key, cmp)			\
-	ARRAY_TYPE_CAST_MODIFIABLE(array)ARRAY_LSEARCH_CALL(_modifiable_, array, key, cmp)
+
+#define array_lsearch(array, key, cmp) \
+	ARRAY_TYPE_CAST_CONST(array) \
+	ARRAY_SEARCH_CALL(lsearch, array, key, cmp)
+#define array_lsearch_modifiable(array, key, cmp) \
+	ARRAY_TYPE_CAST_MODIFIABLE(array) \
+	ARRAY_SEARCH_CALL(lsearch_modifiable, array, key, cmp)
+
+/* Search a pointer from an array */
+const void *array_lsearch_ptr_i(const struct array *array, const void *key);
+#define array_lsearch_ptr(array, key) \
+	TYPE_CHECKS(const void *, \
+	COMPILE_ERROR_IF_TYPES_NOT_COMPATIBLE(***(array)->v, *(key)), \
+	array_lsearch_ptr_i(&(array)->arr, key))
+#define array_lsearch_ptr_modifiable(array, key) \
+	(void *)array_lsearch_ptr(array, key)
+
+bool array_lsearch_ptr_idx_i(const struct array *array, const void *key,
+			     unsigned int *idx_r);
+#define array_lsearch_ptr_idx(array, key, idx_r) \
+	TYPE_CHECKS(bool, \
+	COMPILE_ERROR_IF_TYPES_NOT_COMPATIBLE(***(array)->v, *(key)), \
+	array_lsearch_ptr_idx_i(&(array)->arr, key, idx_r))
 
 #endif

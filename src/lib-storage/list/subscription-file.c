@@ -33,7 +33,7 @@ static const char version2_header[] = "V\t2\n\n";
 static void subsread_set_syscall_error(struct mailbox_list *list,
 				       const char *function, const char *path)
 {
-	if (errno == EACCES && !event_want_debug_log(list->ns->user->event)) {
+	if (ENOACCESS(errno) && !event_want_debug_log(list->event)) {
 		mailbox_list_set_error(list, MAIL_ERROR_PERM,
 				       "No permission to read subscriptions");
 	} else {
@@ -46,7 +46,7 @@ static void subsread_set_syscall_error(struct mailbox_list *list,
 static void subswrite_set_syscall_error(struct mailbox_list *list,
 					const char *function, const char *path)
 {
-	if (errno == EACCES && !event_want_debug_log(list->ns->user->event)) {
+	if (ENOACCESS(errno) && !event_want_debug_log(list->event)) {
 		mailbox_list_set_error(list, MAIL_ERROR_PERM,
 				       "No permission to modify subscriptions");
 	} else {
@@ -146,7 +146,7 @@ int subsfile_set_subscribed(struct mailbox_list *list, const char *path,
 					 perm.file_create_gid_origin, &dotlock);
 	if (fd_out == -1 && errno == ENOENT) {
 		/* directory hasn't been created yet. */
-		type = list->set.control_dir != NULL ?
+		type = list->mail_set->mail_control_path[0] != '\0' ?
 			MAILBOX_LIST_PATH_TYPE_CONTROL :
 			MAILBOX_LIST_PATH_TYPE_DIR;
 		fname = strrchr(path, '/');

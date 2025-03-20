@@ -21,6 +21,10 @@ static const char *test_user_key_id;
 static const char *test_box_key_id;
 
 static struct mail_crypt_user mail_crypt_user;
+static struct crypt_settings mail_crypt_settings = {
+	.crypt_user_key_curve = "prime256v1",
+	.crypt_user_key_password = "",
+};
 
 struct mail_crypt_user *mail_crypt_get_mail_crypt_user(struct mail_user *user ATTR_UNUSED)
 {
@@ -371,8 +375,9 @@ static void test_setup(void)
 	test_ctx = test_mail_storage_init();
 	const char *username = "mcp_test@example.com";
 	const char *const extra_input[] = {
-		t_strdup_printf("mail_crypt_curve=prime256v1"),
-		t_strdup_printf("mail_attribute_dict=file:%s/%s/dovecot-attributes",
+		"mail_attribute/dict=file",
+		"mail_attribute/dict/file/driver=file",
+		t_strdup_printf("dict_file_path=%s/%s/dovecot-attributes",
 				test_ctx->home_root, username),
 		NULL
 	};
@@ -383,6 +388,7 @@ static void test_setup(void)
 		.extra_input = extra_input,
 	};
 	test_mail_storage_init_user(test_ctx, &storage_set);
+	mail_crypt_user.set = &mail_crypt_settings;
 
 	mail_crypt_key_register_mailbox_internal_attributes();
 }

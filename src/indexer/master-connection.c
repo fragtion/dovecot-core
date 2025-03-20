@@ -40,7 +40,7 @@ static void ATTR_NULL(1, 2)
 indexer_worker_refresh_proctitle(const char *username, const char *mailbox,
 				 uint32_t seq1, uint32_t seq2)
 {
-	if (!master_service_settings_get(master_service)->verbose_proctitle)
+	if (!master_service_get_service_settings(master_service)->verbose_proctitle)
 		return;
 
 	if (username == NULL)
@@ -64,7 +64,7 @@ get_attempt_error(unsigned int counter, uint32_t first_uid, uint32_t last_uid)
 }
 
 static int
-index_mailbox_precache(struct master_connection *conn, struct mailbox *box)
+index_mailbox_precache_real(struct master_connection *conn, struct mailbox *box)
 {
 	struct mail_storage *storage = mailbox_get_storage(box);
 	const char *username = mail_storage_get_user(storage)->username;
@@ -77,10 +77,26 @@ index_mailbox_precache(struct master_connection *conn, struct mailbox *box)
 	struct mail_search_context *ctx;
 	struct mail *mail;
 	struct mailbox_metadata metadata;
-	uint32_t seq, first_uid = 0, last_uid = 0;
 	int ret = 0;
 	struct event *index_event = event_create(box->event);
 	event_add_category(index_event, &event_category_indexer_worker);
+
+	if (mailbox_get_status(box, STATUS_MESSAGES | STATUS_FTS_LAST_INDEXED_UID,
+			       &status) < 0) {
+		e_error(index_event, "Status lookup failed: %s",
+			mailbox_get_last_internal_error(box, NULL));
+		event_unref(&index_event);
+		return -1;
+	}
+
+	if (status.fts_last_indexed_uid >= status.uidnext - 1) {
+		e_debug(index_event,
+			"Index is already up to date "
+			"(last_indexed_uid=%u, uidnext=%u)",
+			status.fts_last_indexed_uid, status.uidnext);
+		event_unref(&index_event);
+		return 0;
+	}
 
 	if (mailbox_get_metadata(box, MAILBOX_METADATA_PRECACHE_FIELDS,
 				 &metadata) < 0) {
@@ -89,14 +105,11 @@ index_mailbox_precache(struct master_connection *conn, struct mailbox *box)
 		event_unref(&index_event);
 		return -1;
 	}
-	if (mailbox_get_status(box, STATUS_MESSAGES | STATUS_LAST_CACHED_SEQ,
-			       &status) < 0) {
-		e_error(index_event, "Status lookup failed: %s",
-			mailbox_get_last_internal_error(box, NULL));
-		event_unref(&index_event);
-		return -1;
-	}
-	seq = status.last_cached_seq + 1;
+	uint32_t seq = 0, unused ATTR_UNUSED;
+	if (status.fts_last_indexed_uid > 0)
+		mailbox_get_seq_range(box, 1, status.fts_last_indexed_uid,
+				      &unused, &seq);
+	seq++;
 
 	trans = mailbox_transaction_begin(box, MAILBOX_TRANSACTION_FLAG_NO_CACHE_DEC,
 					  "indexing");
@@ -112,6 +125,7 @@ index_mailbox_precache(struct master_connection *conn, struct mailbox *box)
 	/* otherwise the client doesn't receive the updates timely */
 	o_stream_uncork(conn->conn.output);
 
+	uint32_t first_uid = 0, last_uid = 0;
 	unsigned int counter = 0;
 	unsigned int percentage_sent = 0;
 	unsigned int goal = status.messages + 1 - seq;
@@ -182,6 +196,32 @@ index_mailbox_precache(struct master_connection *conn, struct mailbox *box)
 	}
 	event_unref(&index_event);
 	return ret;
+}
+
+static int
+index_mailbox_precache(struct master_connection *conn, struct mailbox *box);
+
+static int
+index_mailbox_precache_virtual(struct master_connection *conn, struct mailbox *box)
+{
+	ARRAY_TYPE(mailboxes) mailboxes;
+	t_array_init(&mailboxes, 8);
+	box->virtual_vfuncs->get_virtual_backend_boxes(box, &mailboxes, TRUE);
+
+	struct mailbox *bbox;
+	array_foreach_elem(&mailboxes, bbox)
+		if (index_mailbox_precache(conn, bbox) < 0)
+			return -1;
+
+	return 0;
+}
+
+static int
+index_mailbox_precache(struct master_connection *conn, struct mailbox *box)
+{
+	return box->virtual_vfuncs == NULL ?
+	       index_mailbox_precache_real(conn, box) :
+	       index_mailbox_precache_virtual(conn, box);
 }
 
 static int

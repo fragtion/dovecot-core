@@ -66,7 +66,7 @@ store_parse_modifiers(struct imap_store_context *ctx,
 							  "Invalid modseq");
 				return FALSE;
 			}
-			client_enable(ctx->cmd->client, imap_feature_condstore);
+			(void)client_enable(ctx->cmd->client, imap_feature_condstore);
 		} else {
 			client_send_command_error(ctx->cmd,
 						  "Unknown STORE modifier");
@@ -220,14 +220,14 @@ bool cmd_store(struct client_command_context *cmd)
 	ret = mailbox_search_deinit(&search_ctx);
 	if (ret < 0)
 		mailbox_transaction_rollback(&t);
-	 else
+	else
 		ret = mailbox_transaction_commit(&t);
 	if (ret < 0) {
 		array_free(&modified_set);
 		client_send_box_error(cmd, client->mailbox);
 		return TRUE;
 	}
-	client->deleted_count += deleted_count;
+	client->logout_stats.deleted_count += deleted_count;
 
 	if (array_count(&modified_set) == 0)
 		tagged_reply = "OK Store completed.";

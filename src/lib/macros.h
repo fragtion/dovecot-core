@@ -47,21 +47,13 @@
    #error "VA_COPY not defined"
 #endif
 
-/* Provide convenience macros for handling structure
- * fields through their offsets.
- */
-#define STRUCT_MEMBER_P(struct_p, struct_offset) \
-	((void *) ((char *) (struct_p) + (long) (struct_offset)))
-#define CONST_STRUCT_MEMBER_P(struct_p, struct_offset) \
-	((const void *) ((const char *) (struct_p) + (long) (struct_offset)))
-
 /* Provide simple macro statement wrappers:
    STMT_START { statements; } STMT_END;
    can be used as a single statement, as in
    if (x) STMT_START { ... } STMT_END; else ... */
 #if !(defined (STMT_START) && defined (STMT_END))
-#  define STMT_START do
-#  define STMT_END while (0)
+#  define STMT_START do // NOLINT(readability-braces-around-statements)
+#  define STMT_END while (0) // NOLINT(readability-braces-around-statements)
 #endif
 
 /* Provide macros to feature the GCC function attribute. */
@@ -176,13 +168,16 @@
 
 #if (__GNUC__ > 3 || (__GNUC__ == 3 && __GNUC_MINOR__ > 0)) && \
 	!defined(__cplusplus) && !defined(STATIC_CHECKER)
+/* NOLINTBEGIN(bugprone-branch-clone,bugprone-sizeof-expression) */
 #  define COMPILE_ERROR_IF_TRUE(condition) \
 	(sizeof(char[1 - 2 * ((condition) ? 1 : 0)]) > 0 ? FALSE : FALSE)
+/* NOLINTEND(bugprone-branch-clone,bugprone-sizeof-expression) */
 #else
 #  define COMPILE_ERROR_IF_TRUE(condition) FALSE
 #endif
 
 #ifdef HAVE_TYPE_CHECKS
+/* NOLINTBEGIN(bugprone-sizeof-expression) */
 #  define COMPILE_ERROR_IF_TYPES_NOT_COMPATIBLE(_a, _b) \
 	COMPILE_ERROR_IF_TRUE( \
 		!__builtin_types_compatible_p(typeof(_a), typeof(_b)))
@@ -192,6 +187,7 @@
 		!__builtin_types_compatible_p(typeof(_a2), typeof(_b)))
 #  define TYPE_CHECKS(return_type, checks, func) \
 	(FALSE ? (return_type)(checks) : (func))
+/* NOLINTEND(bugprone-sizeof-expression) */
 #else
 #  define COMPILE_ERROR_IF_TYPES_NOT_COMPATIBLE(_a, _b) 0
 #  define COMPILE_ERROR_IF_TYPES2_NOT_COMPATIBLE(_a1, _a2, _b) 0
@@ -245,8 +241,10 @@
    // This will give compiler error (or zero only the first element):
    char arr[5]; i_zero(arr);
 */
+/* NOLINTBEGIN(bugprone-sizeof-expression) */
 #define i_zero(p) \
 	memset(p, 0 + COMPILE_ERROR_IF_TRUE(sizeof(p) > sizeof(void *)), sizeof(*(p)))
+/* NOLINTEND(bugprone-sizeof-expression) */
 #define i_zero_safe(p) \
 	safe_memset(p, 0 + COMPILE_ERROR_IF_TRUE(sizeof(p) > sizeof(void *)), sizeof(*(p)))
 
@@ -284,8 +282,10 @@
 
 /* negate enumeration flags in a way that avoids implicit conversion */
 #ifndef STATIC_CHECKER
+/* NOLINTBEGIN(bugprone-sizeof-expression) */
 #  define ENUM_NEGATE(x) \
 	((unsigned int)(~(x)) + COMPILE_ERROR_IF_TRUE(sizeof((x)) > sizeof(int) || (x) < 0 || (x) > INT_MAX))
+/* NOLINTEND(bugprone-sizeof-expression) */
 #else
 /* clang scan-build keeps complaining about x > 2147483647 case, so disable the
    sizeof check. */

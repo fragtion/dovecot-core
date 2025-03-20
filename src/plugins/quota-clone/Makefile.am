@@ -1,9 +1,11 @@
 AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib \
+	-I$(top_srcdir)/src/lib-settings \
 	-I$(top_srcdir)/src/lib-dict \
 	-I$(top_srcdir)/src/lib-mail \
 	-I$(top_srcdir)/src/lib-index \
 	-I$(top_srcdir)/src/lib-storage \
+	-I$(top_srcdir)/src/lib-var-expand \
 	-I$(top_srcdir)/src/plugins/quota
 
 NOPLUGIN_LDFLAGS =
@@ -13,7 +15,9 @@ module_LTLIBRARIES = \
 	lib20_quota_clone_plugin.la
 
 lib20_quota_clone_plugin_la_SOURCES = \
-	quota-clone-plugin.c
+	quota-clone-plugin.c \
+	quota-clone-settings.c
 
 noinst_HEADERS = \
-	quota-clone-plugin.h
+	quota-clone-plugin.h \
+	quota-clone-settings.h

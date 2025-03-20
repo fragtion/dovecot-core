@@ -46,7 +46,7 @@ static bool acl_list_get_root_dir(struct acl_backend_vfile *backend,
 	const char *rootdir, *maildir;
 	enum mailbox_list_path_type type;
 
-	if (backend->backend.globals_only)
+	if (backend->backend.set->acl_globals_only)
 		return FALSE;
 
 	storage = mailbox_list_get_namespace(backend->backend.list)->storage;
@@ -253,7 +253,7 @@ acl_backend_vfile_acllist_try_rebuild(struct acl_backend_vfile *backend)
 					perm.file_create_gid_origin);
 	}
 	if (fd == -1) {
-		if (errno == EACCES) {
+		if (ENOACCESS(errno)) {
 			/* Ignore silently if we can't create it */
 			return 0;
 		}

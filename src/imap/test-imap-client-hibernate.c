@@ -39,8 +39,9 @@ static struct mail_storage_service_ctx *storage_service;
 void imap_refresh_proctitle(void) { }
 void imap_refresh_proctitle_delayed(void) { }
 int client_create_from_input(const struct mail_storage_service_input *input ATTR_UNUSED,
+			     const struct imap_logout_stats *stats ATTR_UNUSED,
 			     int fd_in ATTR_UNUSED, int fd_out ATTR_UNUSED,
-			     bool unhibernated ATTR_UNUSED,
+			     enum client_create_flags flags ATTR_UNUSED,
 			     struct client **client_r ATTR_UNUSED,
 			     const char **error_r ATTR_UNUSED) { return -1; }
 
@@ -144,7 +145,7 @@ static void test_imap_client_hibernate(void)
 	struct test_imap_client_hibernate ctx;
 	const char *error;
 
-	storage_service = mail_storage_service_init(master_service, NULL,
+	storage_service = mail_storage_service_init(master_service,
 		MAIL_STORAGE_SERVICE_FLAG_ALLOW_ROOT |
 		MAIL_STORAGE_SERVICE_FLAG_NO_LOG_INIT |
 		MAIL_STORAGE_SERVICE_FLAG_NO_CHDIR |
@@ -152,7 +153,10 @@ static void test_imap_client_hibernate(void)
 
 	const char *const input_userdb[] = {
 		"mailbox_list_index=no",
-		t_strdup_printf("mail=mbox:%s/mbox", tmpdir),
+		"mail_driver=mbox",
+		t_strdup_printf("mail_path=%s/mbox", tmpdir),
+		t_strdup_printf("base_dir=%s", tmpdir),
+		"mail_log_prefix="EVILSTR"%u",
 		NULL
 	};
 	struct mail_storage_service_input input = {
@@ -160,20 +164,18 @@ static void test_imap_client_hibernate(void)
 		.local_port = 1234,
 		.remote_port = 5678,
 		.userdb_fields = input_userdb,
+		.session_id = EVILSTR"session",
 	};
 	test_assert(net_addr2ip("127.0.0.1", &input.local_ip) == 0);
 	test_assert(net_addr2ip("127.0.0.2", &input.remote_ip) == 0);
 	test_assert(mail_storage_service_lookup_next(storage_service, &input,
 						     &mail_user, &error) == 1);
-	mail_user->set->base_dir = tmpdir;
-	mail_user->set->mail_log_prefix = EVILSTR"%u";
-	mail_user->session_id = EVILSTR"session";
 	i_zero(&smtp_set);
 	i_zero(&ctx);
 
 	struct event *event = event_create(NULL);
 	int client_fd = dup(dev_null_fd);
-	client = client_create(client_fd, client_fd, FALSE, event, mail_user,
+	client = client_create(client_fd, client_fd, 0, event, mail_user,
 			       imap_setting_parser_info.defaults, &smtp_set);
 	ctx.client = client;
 

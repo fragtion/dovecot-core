@@ -8,9 +8,11 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib \
 	-I$(top_srcdir)/src/lib-settings \
 	-I$(top_srcdir)/src/lib-master \
+	-I$(top_srcdir)/src/lib-json \
 	-I$(top_srcdir)/src/lib-http \
 	-I$(top_srcdir)/src/lib-ssl-iostream \
 	-I$(top_srcdir)/src/lib-test \
+	-I$(top_srcdir)/src/lib-var-expand \
 	$(BINARY_CFLAGS)
 
 stats_LDADD = \
@@ -35,6 +37,7 @@ libstats_local_la_SOURCES = \
 	client-reader.c \
 	client-writer.c \
 	client-http.c \
+	event-exporter.c \
 	event-exporter-fmt.c \
 	event-exporter-fmt-json.c \
 	event-exporter-fmt-none.c \
@@ -42,6 +45,7 @@ libstats_local_la_SOURCES = \
 	event-exporter-transport-drop.c \
 	event-exporter-transport-http-post.c \
 	event-exporter-transport-log.c \
+	event-exporter-transport-file.c \
 	$(stats_services) \
 	stats-service.c \
 	stats-event-category.c \

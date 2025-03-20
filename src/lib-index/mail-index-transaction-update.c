@@ -157,7 +157,7 @@ void mail_index_update_day_headers(struct mail_index_transaction *t,
 void mail_index_append(struct mail_index_transaction *t, uint32_t uid,
 		       uint32_t *seq_r)
 {
-        struct mail_index_record *rec;
+	struct mail_index_record *rec;
 
 	i_assert(!t->no_appends);
 
@@ -1017,7 +1017,7 @@ void mail_index_update_ext(struct mail_index_transaction *t, uint32_t seq,
 			   uint32_t ext_id, const void *data, void *old_data_r)
 {
 	struct mail_index *index = t->view->index;
-        const struct mail_index_registered_ext *rext;
+	const struct mail_index_registered_ext *rext;
 	const struct mail_transaction_ext_intro *intro;
 	uint16_t record_size;
 	ARRAY_TYPE(seq_array) *array;
@@ -1331,7 +1331,7 @@ void mail_index_reset(struct mail_index_transaction *t)
 void mail_index_unset_fscked(struct mail_index_transaction *t)
 {
 	struct mail_index_header new_hdr =
-		*mail_index_get_header(t->view);
+		t->view->index->map->hdr;
 
 	i_assert(t->view->index->log_sync_locked);
 

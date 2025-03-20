@@ -2,8 +2,15 @@
 #define IMAPC_CLIENT_PRIVATE_H
 
 #include "imapc-client.h"
+#include "imapc-settings.h"
 
 #define IMAPC_CLIENT_IDLE_SEND_DELAY_MSECS 100
+
+enum imapc_client_ssl_mode {
+	IMAPC_CLIENT_SSL_MODE_NONE,
+	IMAPC_CLIENT_SSL_MODE_IMMEDIATE,
+	IMAPC_CLIENT_SSL_MODE_STARTTLS
+};
 
 struct imapc_client_connection {
 	struct imapc_connection *conn;
@@ -16,8 +23,9 @@ struct imapc_client {
 	int refcount;
 
 	struct event *event;
-	struct imapc_client_settings set;
-	struct ssl_iostream_context *ssl_ctx;
+	const struct imapc_settings *set;
+	struct imapc_parameters params;
+	enum imapc_client_ssl_mode ssl_mode;
 
 	imapc_untagged_callback_t *untagged_callback;
 	void *untagged_context;
@@ -33,6 +41,12 @@ struct imapc_client {
 
 	struct ioloop *ioloop;
 	bool stop_on_state_finish;
+
+	/* Set to imapc_settings attributes with possible override by the
+	   imapc_parameters. */
+	const char *dns_client_socket_path;
+	const char *imapc_rawlog_dir;
+	const char *password;
 };
 
 struct imapc_client_mailbox {

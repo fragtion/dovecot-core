@@ -22,6 +22,7 @@
 #include "index-attachment.h"
 #include "index-thread-private.h"
 #include "index-mailbox-size.h"
+#include "settings-parser.h"
 
 #include <time.h>
 #include <unistd.h>
@@ -33,7 +34,7 @@ struct index_storage_module index_storage_module =
 	MODULE_CONTEXT_INIT(&mail_storage_module_register);
 
 static void set_cache_decisions(struct mailbox *box,
-				const char *set, const char *fields,
+				const char *set, const ARRAY_TYPE(const_string) *fields,
 				enum mail_cache_decision_type dec)
 {
 	struct mail_cache *cache = box->cache;
@@ -41,10 +42,7 @@ static void set_cache_decisions(struct mailbox *box,
 	const char *const *arr;
 	unsigned int idx;
 
-	if (fields == NULL || *fields == '\0')
-		return;
-
-	for (arr = t_strsplit_spaces(fields, " ,"); *arr != NULL; arr++) {
+	for (arr = settings_boollist_get(fields); *arr != NULL; arr++) {
 		const char *name = *arr;
 
 		idx = mail_cache_register_lookup(cache, name);
@@ -89,21 +87,21 @@ static void index_cache_register_defaults(struct mailbox *box)
 				   MAIL_INDEX_CACHE_FIELD_COUNT,
 				   MAIL_CACHE_TRUNCATE_NAME_FAIL);
 
-	if (strcmp(set->mail_never_cache_fields, "*") == 0) {
+	if (str_array_find(settings_boollist_get(&set->mail_never_cache_fields), "*")) {
 		/* all caching disabled for now */
 		box->mail_cache_disabled = TRUE;
 		return;
 	}
 
 	set_cache_decisions(box, "mail_cache_fields",
-			    set->mail_cache_fields,
+			    &set->mail_cache_fields,
 			    MAIL_CACHE_DECISION_TEMP);
 	set_cache_decisions(box, "mail_always_cache_fields",
-			    set->mail_always_cache_fields,
+			    &set->mail_always_cache_fields,
 			    MAIL_CACHE_DECISION_YES |
 			    MAIL_CACHE_DECISION_FORCED);
 	set_cache_decisions(box, "mail_never_cache_fields",
-			    set->mail_never_cache_fields,
+			    &set->mail_never_cache_fields,
 			    MAIL_CACHE_DECISION_NO |
 			    MAIL_CACHE_DECISION_FORCED);
 }
@@ -216,7 +214,8 @@ int index_storage_mailbox_exists_full(struct mailbox *box, const char *subdir,
 		return 0;
 	}
 
-	ret = (subdir != NULL || !box->list->set.iter_from_index_dir) ? 0 :
+	ret = (subdir != NULL ||
+	       !box->list->mail_set->mailbox_list_iter_from_index_dir) ? 0 :
 		mailbox_get_path_to(box, MAILBOX_LIST_PATH_TYPE_INDEX, &index_path);
 	if (ret > 0 && strcmp(path, index_path) != 0) {
 		/* index directory is different - prefer looking it up first
@@ -408,7 +407,7 @@ void index_storage_mailbox_alloc(struct mailbox *box, const char *vname,
 	box->flags = flags;
 	box->index_prefix = p_strdup(box->pool, index_prefix);
 	box->event = mail_storage_mailbox_create_event(box->storage->event,
-						       box->vname);
+						       box->list, box->vname);
 
 	p_array_init(&box->search_results, box->pool, 16);
 	array_create(&box->module_contexts,
@@ -660,7 +659,7 @@ int index_storage_mailbox_create(struct mailbox *box, bool directory)
 
 	if ((ret = mailbox_mkdir(box, path, type)) < 0)
 		return -1;
-	if (box->list->set.iter_from_index_dir) {
+	if (box->list->mail_set->mailbox_list_iter_from_index_dir) {
 		/* need to also create the directory to index path or
 		   iteration won't find it. */
 		int ret2;
@@ -680,7 +679,7 @@ int index_storage_mailbox_create(struct mailbox *box, bool directory)
 		/* directory already exists */
 		if (create_parent_dir)
 			return 1;
-		if (!directory && *box->list->set.mailbox_dir_name == '\0') {
+		if (!directory && *box->list->mail_set->mailbox_root_directory_name == '\0') {
 			/* For example: layout=fs, path=~/Maildir/foo
 			   might itself exist, but does it have the
 			   cur|new|tmp subdirs? */
@@ -1201,8 +1200,12 @@ int index_storage_expunged_sync_begin(struct mailbox *box,
 	ret = mail_index_sync_begin(box->index, ctx_r, view_r,
 				    trans_r, flags);
 	if (ret <= 0) {
-		if (ret < 0)
+		if (ret < 0) {
+			if (box->index->last_error.code ==
+			    MAIL_INDEX_ERROR_CODE_NO_ACCESS)
+		    		return 0;
 			mailbox_set_index_error(box);
+		}
 		index_storage_expunging_deinit(box);
 		return ret;
 	}
@@ -1282,10 +1285,11 @@ int index_mailbox_fix_inconsistent_existence(struct mailbox *box,
 	const char *index_path;
 	struct stat st;
 
-	/* Could be a race condition or could be because ITERINDEX is used
-	   and the index directory exists, but the storage directory doesn't.
-	   Handle the existence inconsistency by creating this directory if
-	   the index directory exists (don't bother checking if ITERINDEX is
+	/* Could be a race condition or could be because
+	   mailbox_list_iter_from_index_dir=yes is used and the index directory
+	   exists, but the storage directory doesn't. Handle the existence
+	   inconsistency by creating this directory if the index directory
+	   exists (don't bother checking if mailbox_list_iter_from_index_dir is
 	   set or not - it doesn't matter since either both dirs should exist
 	   or not). */
 	if (mailbox_get_path_to(box, MAILBOX_LIST_PATH_TYPE_INDEX,

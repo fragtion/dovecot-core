@@ -17,11 +17,12 @@ extern struct mailbox raw_mailbox;
 
 struct mail_user *
 raw_storage_create_from_set(struct mail_storage_service_ctx *ctx,
-			    struct setting_parser_context *unexpanded_set_parser)
+			    struct settings_instance *set_instance)
 {
 	struct mail_user *user;
 	struct mail_namespace *ns;
 	struct mail_namespace_settings *ns_set;
+	struct mail_storage *storage;
 	struct event *event;
 	const char *error;
 
@@ -34,10 +35,12 @@ raw_storage_create_from_set(struct mail_storage_service_ctx *ctx,
 	event_disable_callbacks(event);
 
 	const struct master_service_settings *service_set =
-		master_service_settings_get(master_service);
-	const char *const userdb_fields[] = {
+		master_service_get_service_settings(master_service);
+	const char *const code_override_fields[] = {
+		"mail_driver=raw",
+		"mailbox_list_layout=none",
 		/* use unwritable home directory */
-		t_strdup_printf("home=%s/empty", service_set->base_dir),
+		t_strdup_printf("mail_home=%s/empty", service_set->base_dir),
 		/* absolute paths are ok with raw storage */
 		"mail_full_filesystem_access=yes",
 		NULL,
@@ -45,10 +48,10 @@ raw_storage_create_from_set(struct mail_storage_service_ctx *ctx,
 	struct mail_storage_service_input input = {
 		.event_parent = event,
 		.username = "raw-mail-user",
-		.unexpanded_set_parser = unexpanded_set_parser,
+		.set_instance = set_instance,
 		.autocreated = TRUE,
 		.no_userdb_lookup = TRUE,
-		.userdb_fields = userdb_fields,
+		.code_override_fields = code_override_fields,
 		.flags_override_add =
 			MAIL_STORAGE_SERVICE_FLAG_NO_RESTRICT_ACCESS |
 			MAIL_STORAGE_SERVICE_FLAG_NO_CHDIR |
@@ -63,7 +66,6 @@ raw_storage_create_from_set(struct mail_storage_service_ctx *ctx,
 
 	ns_set = p_new(user->pool, struct mail_namespace_settings, 1);
 	ns_set->name = "raw-storage";
-	ns_set->location = ":LAYOUT=none";
 	ns_set->separator = "/";
 
 	ns = mail_namespaces_init_empty(user);
@@ -73,7 +75,7 @@ raw_storage_create_from_set(struct mail_storage_service_ctx *ctx,
 	ns->flags |= NAMESPACE_FLAG_NOQUOTA | NAMESPACE_FLAG_NOACL;
 	ns->set = ns_set;
 
-	if (mail_storage_create(ns, "raw", 0, &error) < 0)
+	if (mail_storage_create(ns, user->event, 0, &storage, &error) < 0)
 		i_fatal("Couldn't create internal raw storage: %s", error);
 	if (mail_namespaces_init_finish(ns, &error) < 0)
 		i_fatal("Couldn't create internal raw namespace: %s", error);
@@ -141,16 +143,6 @@ static struct mail_storage *raw_storage_alloc(void)
 	storage->storage = raw_storage;
 	storage->storage.pool = pool;
 	return &storage->storage;
-}
-
-static void
-raw_storage_get_list_settings(const struct mail_namespace *ns ATTR_UNUSED,
-			      struct mailbox_list_settings *set)
-{
-	if (set->layout == NULL)
-		set->layout = MAILBOX_LIST_NAME_FS;
-	if (set->subscription_fname == NULL)
-		set->subscription_fname = RAW_SUBSCRIPTION_FILE_NAME;
 }
 
 static struct mailbox *
@@ -235,15 +227,14 @@ struct mail_storage raw_storage = {
 	.name = RAW_STORAGE_NAME,
 	.class_flags = MAIL_STORAGE_CLASS_FLAG_MAILBOX_IS_FILE |
 		MAIL_STORAGE_CLASS_FLAG_OPEN_STREAMS |
+		MAIL_STORAGE_CLASS_FLAG_NO_ROOT |
 		MAIL_STORAGE_CLASS_FLAG_BINARY_DATA,
 
 	.v = {
-		NULL,
 		raw_storage_alloc,
 		NULL,
 		index_storage_destroy,
 		NULL,
-		raw_storage_get_list_settings,
 		NULL,
 		raw_mailbox_alloc,
 		NULL,

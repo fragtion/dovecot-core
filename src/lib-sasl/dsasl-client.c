@@ -34,6 +34,11 @@ const char *dsasl_client_mech_get_name(const struct dsasl_client_mech *mech)
 	return mech->name;
 }
 
+bool dsasl_client_mech_uses_password(const struct dsasl_client_mech *mech)
+{
+	return (mech->flags & DSASL_MECH_SEC_NO_PASSWORD) == 0;
+}
+
 void dsasl_client_mech_register(const struct dsasl_client_mech *mech)
 {
 	unsigned int idx;
@@ -83,6 +88,16 @@ void dsasl_client_free(struct dsasl_client **_client)
 	if (client->password != NULL)
 		safe_memset(client->password, 0, strlen(client->password));
 	pool_unref(&client->pool);
+}
+
+void dsasl_client_enable_channel_binding(
+	struct dsasl_client *client,
+	enum ssl_iostream_protocol_version channel_version,
+	dsasl_client_channel_binding_callback_t *callback, void *context)
+{
+	client->channel_version = channel_version;
+	client->cbinding_callback = callback;
+	client->cbinding_context = context;
 }
 
 int dsasl_client_input(struct dsasl_client *client,
@@ -136,14 +151,17 @@ void dsasl_clients_init(void)
 	if (init_refcount++ > 0)
 		return;
 
-	i_array_init(&dsasl_mechanisms, 8);
+	i_array_init(&dsasl_mechanisms, 16);
+	dsasl_client_mech_register(&dsasl_client_mech_anonymous);
 	dsasl_client_mech_register(&dsasl_client_mech_external);
 	dsasl_client_mech_register(&dsasl_client_mech_plain);
 	dsasl_client_mech_register(&dsasl_client_mech_login);
 	dsasl_client_mech_register(&dsasl_client_mech_oauthbearer);
 	dsasl_client_mech_register(&dsasl_client_mech_xoauth2);
 	dsasl_client_mech_register(&dsasl_client_mech_scram_sha_1);
+	dsasl_client_mech_register(&dsasl_client_mech_scram_sha_1_plus);
 	dsasl_client_mech_register(&dsasl_client_mech_scram_sha_256);
+	dsasl_client_mech_register(&dsasl_client_mech_scram_sha_256_plus);
 }
 
 void dsasl_clients_deinit(void)

@@ -87,6 +87,8 @@ const char *rfc_uri_tests[] = {
 	"ftp://myname@host.dom//etc/motd",
 	"ftp://info.cern.ch/pub/www/doc;type=d",
 	"http://ds.internic.net/instructions/overview.html#WARNING",
+	"http://[2001:db8::7]/test",
+	"http://[2001:db8::7]:8080/test",
 	/* from RFC 2056 */
 	"z39.50s://melvyl.ucop.edu/cat",
 	"z39.50r://melvyl.ucop.edu/mags?elecworld.v30.n19",
@@ -217,7 +219,7 @@ const char *rfc_uri_tests[] = {
 	"sip:bob@biloxi.com;transport=udp",
 	"sip:bob@engineering.biloxi.com",
 	"sip:bob@phone21.boxesbybob.com",
-	"sip:c8oqz84zk7z@privacy.org>;tag=hyh8",
+	"sip:c8oqz84zk7z@privacy.org",
 	"sip:callee@domain.com",
 	"sip:callee@gateway.leftprivatespace.com",
 	"sip:callee@u2.domain.com",
@@ -243,7 +245,7 @@ const char *rfc_uri_tests[] = {
 	"sips:alice@atlanta.com?subject=project%20x&priority=urgent",
 	"sip:server10.biloxi.com;lr",
 	"sip:ss1.carrier.com",
-	"sip:user@host?Subject=foo&Call-Info=<http://www.foo.com>",
+	"sip:user@host?Subject=foo&Call-Info=%3Chttp://www.foo.com%3E",
 	"sip:watson@bell-telephone.com",
 	"sip:watson@worcester.bell-telephone.com",
 #endif
@@ -425,7 +427,6 @@ const char *rfc_uri_tests[] = {
 		"%3E%3F%40%5B%5C%5D%5E_%60%7B%7C%7D~resource",
 	"xmpp:ji%C5%99i@%C4%8Dechy.example/v%20Praze",
 	/* from RFC 5456 */
-#if 0 // these don't comply with RFC 3986
 	"iax:example.com/alice",
 	"iax:example.com:4569/alice",
 	"iax:example.com:4570/alice?friends",
@@ -440,7 +441,6 @@ const char *rfc_uri_tests[] = {
 	"iax:alice@AtLaNtA.com:4569/ALicE",
 	"iax:ALICE@atlanta.com/alice",
 	"iax:alice@atlanta.com/alice",
-#endif
 	/* from RFC 5724 */
 	"sms:+15105550101",
 	"sms:+15105550101,+15105550102",
@@ -505,14 +505,12 @@ const char *rfc_uri_tests[] = {
 	/* from RFC 6694 */
 	"about:blank",
 	/* from RFC 6733 */
-#if 0 // these don't comply with RFC 3986
 	"aaa://host.example.com;transport=tcp",
 	"aaa://host.example.com:6666;transport=tcp",
 	"aaa://host.example.com;protocol=diameter",
 	"aaa://host.example.com:6666;protocol=diameter",
 	"aaa://host.example.com:6666;transport=tcp;protocol=diameter",
 	"aaa://host.example.com:1813;transport=udp;protocol=radius",
-#endif
 	/* from RFC 6787 */
 	"session:request1@form-level.store",
 	"session:help@root-level.store",
@@ -619,7 +617,7 @@ static void test_uri_rfc(void)
 
 		ret = uri_check(uri_in, URI_PARSE_ALLOW_FRAGMENT_PART, &error);
 		test_out_quiet(
-			t_strdup_printf("parse [%d] <%s>", i, str_sanitize(uri_in, 64)),
+			t_strdup_printf("parse [%d] <%s>: %s", i, str_sanitize(uri_in, 64), error),
 			ret >= 0);
 	} T_END;
 	test_end();
@@ -798,10 +796,70 @@ static void test_uri_escape(void)
 	test_end();
 }
 
+static void test_uri_aaa(void)
+{
+	test_begin("uri aaa");
+
+	const char *uri = "aaa://host.example.com:6666;transport=tcp;protocol=diameter";
+	struct uri_parser parser;
+	uri_parser_init(&parser, pool_datastack_create(), uri);
+	parser.semicolon_params = TRUE;
+
+	const char *scheme;
+	struct uri_authority auth;
+	const char *query;
+	int ret;
+	ret = uri_parse_scheme(&parser, &scheme);
+	test_assert(ret > 0);
+	test_assert_strcmp(scheme, "aaa");
+	ret = uri_parse_slashslash_host_authority(&parser, &auth);
+	test_assert(ret > 0);
+	test_assert_strcmp(auth.host.name, "host.example.com");
+	test_assert_ucmp(auth.port, ==, 6666);
+	ret = uri_parse_query(&parser, &query);
+	test_assert(ret > 0);
+	test_assert_strcmp(query, "transport=tcp;protocol=diameter");
+	test_end();
+}
+
+static void test_uri_iax(void)
+{
+	test_begin("uri iax");
+	const char *uri = "iax:[2001:db8::1]:4569/alice?friend";
+	struct uri_parser parser;
+	uri_parser_init(&parser, pool_datastack_create(), uri);
+
+	const char *scheme;
+	struct uri_authority auth;
+	int relative;
+	const char *const *path;
+	const char *query;
+	int ret;
+	ret = uri_parse_scheme(&parser, &scheme);
+	test_assert(ret > 0);
+	test_assert_strcmp(scheme, "iax");
+	ret = uri_parse_host_authority(&parser, &auth);
+	test_assert(ret > 0);
+	test_assert_strcmp(auth.host.name, "[2001:db8::1]");
+	test_assert_ucmp(auth.port, ==, 4569);
+	ret = uri_parse_path(&parser, &relative, &path);
+	test_assert(ret > 0);
+	test_assert(relative == 0);
+	test_assert_strcmp(path[0], "alice");
+	test_assert(path[1] == NULL);
+	ret = uri_parse_query(&parser, &query);
+	test_assert(ret > 0);
+	test_assert_strcmp(query, "friend");
+	test_end();
+}
+
+
 void test_uri(void)
 {
 	test_uri_valid();
 	test_uri_invalid();
 	test_uri_rfc();
 	test_uri_escape();
+	test_uri_aaa();
+	test_uri_iax();
 }

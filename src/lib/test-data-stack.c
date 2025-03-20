@@ -98,9 +98,9 @@ static void test_ds_get_bytes_available(void)
 			if (i > 0)
 				t_malloc_no0(i);
 			avail1 = t_get_bytes_available();
-			t_malloc_no0(avail1);
+			(void)t_malloc_no0(avail1);
 			test_assert_idx(t_get_bytes_available() == 0, i);
-			t_malloc_no0(1);
+			(void)t_malloc_no0(1);
 			test_assert_idx(t_get_bytes_available() > 0, i);
 		} T_END;
 		T_BEGIN {
@@ -186,9 +186,8 @@ static void test_ds_buffers(void)
 	test_begin("data-stack buffer interruption");
 	T_BEGIN {
 		void *b = t_buffer_get(1000);
-		void *a = t_malloc_no0(1);
+		(void)t_malloc_no0(1);
 		void *b2 = t_buffer_get(1001);
-		test_assert(a == b); /* expected, not guaranteed */
 		test_assert(b2 != b);
 	} T_END;
 	test_end();

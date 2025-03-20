@@ -4,19 +4,25 @@ endif
 if HAVE_LUA
 LIB_LUA=lib-lua
 endif
+if BUILD_IMAP_HIBERNATE
+IMAP_HIBERNATE=imap-hibernate
+endif
 
 LIBDOVECOT_SUBDIRS = \
 	lib-test \
 	lib \
+	lib-var-expand \
+	lib-dns \
 	lib-settings \
 	lib-otp \
 	lib-auth \
 	lib-auth-client \
-	lib-dns \
+	lib-dns-client \
 	lib-ssl-iostream \
 	lib-master \
 	lib-login \
 	lib-charset \
+	lib-json \
 	lib-dcrypt \
 	lib-dict \
 	lib-sasl \
@@ -29,7 +35,8 @@ LIBDOVECOT_SUBDIRS = \
 	lib-imap \
 	lib-imap-storage \
 	lib-oauth2 \
-	lib-doveadm
+	lib-doveadm \
+	lib-var-expand-crypt
 
 SUBDIRS = \
 	$(LIBDOVECOT_SUBDIRS) \
@@ -37,7 +44,7 @@ SUBDIRS = \
 	lib-dovecot \
 	$(LIB_LDAP) \
 	$(LIB_LUA) \
-	lib-fts \
+	lib-language \
 	lib-imap-client \
 	lib-imap-urlauth \
 	lib-compression \
@@ -53,7 +60,7 @@ SUBDIRS = \
 	indexer \
 	master \
 	login-common \
-	imap-hibernate \
+	$(IMAP_HIBERNATE) \
 	imap-login \
 	imap \
 	imap-urlauth \

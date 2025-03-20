@@ -9,6 +9,7 @@
 #include "strescape.h"
 
 #include <unistd.h>
+#include <stdio.h>
 
 static const struct connection_settings client_set =
 {
@@ -155,9 +156,9 @@ test_connection_no_input_input(struct connection *conn)
 	i_stream_set_blocking(is, FALSE);
 	while ((input = i_stream_read_next_line(is)) != NULL) {
 		const char *const *args = t_strsplit_tabescaped(input);
-		if (!conn->handshake_received) {
+		if (!connection_handshake_received(conn)) {
 			if (connection_handshake_args_default(conn, args) > -1)
-				conn->handshake_received = TRUE;
+				connection_set_handshake_ready(conn);
 			continue;
 		}
 		if (strcmp(args[0], "QUIT") == 0) {
@@ -205,7 +206,7 @@ static int test_connection_custom_handshake_args(struct connection *conn,
 			return -1;
 		return 0;
 	}
-	if (!conn->handshake_received) {
+	if (!connection_handshake_received(conn)) {
 		if (strcmp(args[0], "HANDSHAKE") == 0 &&
 		    strcmp(args[1], "FRIEND") == 0) {
 			if (!conn->list->set.client)
@@ -725,6 +726,157 @@ static void test_connection_no_version(void)
 
 /* END NO VERSION TEST */
 
+static void test_connection_is_valid_dns_name(void)
+{
+	test_begin("connection is valid DNS name");
+
+	struct test_case {
+		const char *input;
+		bool valid;
+	} test_cases[] = {
+		{ "", FALSE }, /* empty string is not valid */
+		{ "valid.hostname", TRUE },
+		{ "xn--land-poa.island", TRUE },
+		{ "dns_server.name", TRUE },
+		{ "127.0.0.1", TRUE },
+		{ "fe80::1", TRUE },
+		{ "hello world domain", FALSE }, /* spaces are not valid */
+		{ "hello\tworld\tdomain", FALSE }, /* tabs are not valid */
+		{ "hello,world,domain", FALSE }, /* commas are not valid */
+		{ "hello..world..domain", FALSE }, /* double-dot is not valid */
+		{ "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+		  "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+		  "xxxxxxx.yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+		  "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+		  "yyyyyyyyyyyyyyy", TRUE }, /* 255 bytes long */
+		{ "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+		  "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+		  "xxxxxxxx.yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+		  "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+		  "yyyyyyyyyyyyyyyy", FALSE }, /* 256 bytes long */
+	};
+
+	/* first, ensure everything not allowed is rejected as first byte. */
+	for (int c = 0; c <= UCHAR_MAX; c++) T_BEGIN {
+		bool valid = TRUE;
+		/* is it valid? */
+		if ((c < '0' || c > '9') &&
+		    (c < 'A' || c > 'Z') &&
+		    (c < 'a' || c > 'z') &&
+		    c != '.' && c != '-' &&
+		    c != '_' && c != ':')
+			valid = FALSE;
+
+		const char *name = t_strdup_printf("%c", (unsigned char)c);
+		test_assert(connection_is_valid_dns_name(name) == valid);
+	} T_END;
+
+	/* then test special cases */
+	for (size_t i = 0; i < N_ELEMENTS(test_cases); i++) {
+		const struct test_case *tc = &test_cases[i];
+		test_assert_idx(connection_is_valid_dns_name(tc->input) == tc->valid, i);
+	}
+
+	test_end();
+}
+
+/* BEGIN OUTPUT THROTTLE TEST */
+
+static const struct connection_settings output_throttle_client_set = {
+	.major_version = 0,
+	.minor_version = 0,
+	.client = TRUE,
+	.input_max_size = SIZE_MAX,
+	.output_max_size = SIZE_MAX,
+	.dont_send_version = TRUE,
+};
+
+static const struct connection_settings output_throttle_server_set = {
+	.major_version = 0,
+	.minor_version = 0,
+	.input_max_size = SIZE_MAX,
+	.output_max_size = SIZE_MAX,
+	.output_throttle_size = 1024,
+	.dont_send_version = TRUE,
+};
+
+static int output_throttle_counter = 0;
+static bool output_throttle_cb_set = FALSE;
+
+static int output_throttle_flush_callback(struct connection *conn)
+{
+	if (conn->flush_callback != NULL)
+		output_throttle_counter++;
+	return o_stream_flush(conn->output);
+}
+
+static int
+output_throttle_client_input_line(struct connection *conn, const char *line ATTR_UNUSED)
+{
+	test_assert_cmp(output_throttle_counter, >=, 1);
+	o_stream_nsend_str(conn->output, "QUIT\n");
+	return -1;
+}
+
+static int
+output_throttle_server_input_line(struct connection *conn, const char *line)
+{
+	if (!output_throttle_cb_set) {
+		int ret;
+		/* set the send buffer artificially small to cause buffering */
+		ret = net_set_send_buffer_size(conn->fd_out, 1);
+		test_assert(ret == 0);
+		o_stream_set_flush_callback(conn->output,
+					    output_throttle_flush_callback, conn);
+		output_throttle_cb_set = TRUE;
+	}
+	if (strcmp(line, "QUIT") == 0)
+		return -1;
+
+	/* helper for making much data */
+	#define BLOCK(b) b b b b b b b b b b
+	const char *block = BLOCK(BLOCK(BLOCK(BLOCK(BLOCK("1234567890"))))) "\n";
+
+	o_stream_nsend_str(conn->output, block);
+
+	return 1;
+}
+
+static void
+test_connection_output_throttle_client_connected(struct connection *conn, bool success)
+{
+	test_assert(success);
+	output_throttle_counter = 0;
+	output_throttle_cb_set = FALSE;
+	/* bootstrap */
+	o_stream_nsend_str(conn->output, "DATA\n");
+}
+
+static const struct connection_vfuncs output_throttle_client_v = {
+	.client_connected = test_connection_output_throttle_client_connected,
+	.input = connection_input_default,
+	.input_line = output_throttle_client_input_line,
+	.destroy = test_connection_simple_destroy,
+};
+
+static const struct connection_vfuncs output_throttle_server_v = {
+	.input_line = output_throttle_server_input_line,
+	.destroy = test_connection_simple_destroy,
+};
+
+static void test_connection_output_throttle(void)
+{
+	test_begin("connection output throttle");
+
+	test_connection_run(&output_throttle_server_set, &output_throttle_client_set,
+			    &output_throttle_server_v, &output_throttle_client_v,
+			    10);
+
+	test_end();
+}
+
+/* END OUTPUT THROTTLE TEST */
+
 void test_connection(void)
 {
 	test_connection_simple();
@@ -741,4 +893,6 @@ void test_connection(void)
 	test_connection_handshake_failed_input();
 	test_connection_input_error_reason();
 	test_connection_no_version();
+	test_connection_is_valid_dns_name();
+	test_connection_output_throttle();
 }

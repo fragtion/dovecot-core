@@ -3,31 +3,13 @@
 #include "lib.h"
 #include "buffer.h"
 #include "settings-parser.h"
+#include "master-service-settings.h"
 #include "service-settings.h"
 #include "mail-storage-settings.h"
 #include "imap-urlauth-worker-common.h"
 #include "imap-urlauth-worker-settings.h"
 
-#include <stddef.h>
 #include <unistd.h>
-
-/* <settings checks> */
-static struct file_listener_settings imap_urlauth_worker_unix_listeners_array[] = {
-	{
-		.path = IMAP_URLAUTH_WORKER_SOCKET,
-		.mode = 0600,
-		.user = "$default_internal_user",
-		.group = "",
-	},
-};
-static struct file_listener_settings *imap_urlauth_worker_unix_listeners[] = {
-	&imap_urlauth_worker_unix_listeners_array[0]
-};
-static buffer_t imap_urlauth_worker_unix_listeners_buf = {
-	{ { imap_urlauth_worker_unix_listeners,
-	    sizeof(imap_urlauth_worker_unix_listeners) } }
-};
-/* </settings checks> */
 
 struct service_settings imap_urlauth_worker_service_settings = {
 	.name = "imap-urlauth-worker",
@@ -37,22 +19,29 @@ struct service_settings imap_urlauth_worker_service_settings = {
 	.user = "",
 	.group = "",
 	.privileged_group = "",
-	.extra_groups = "$default_internal_group",
 	.chroot = "",
 
 	.drop_priv_before_exec = FALSE,
 
-	.process_min_avail = 0,
 	.process_limit = 1024,
 	.client_limit = 1,
-	.service_count = 1,
-	.idle_kill = 0,
-	.vsz_limit = UOFF_T_MAX,
+	.restart_request_count = 1,
 
-	.unix_listeners = { { &imap_urlauth_worker_unix_listeners_buf,
-			      sizeof(imap_urlauth_worker_unix_listeners[0]) } },
+	.unix_listeners = ARRAY_INIT,
 	.fifo_listeners = ARRAY_INIT,
 	.inet_listeners = ARRAY_INIT
+};
+
+const struct setting_keyvalue imap_urlauth_worker_service_settings_defaults[] = {
+	{ "unix_listener", IMAP_URLAUTH_WORKER_SOCKET },
+
+	{ "unix_listener/"IMAP_URLAUTH_WORKER_SOCKET"/path", IMAP_URLAUTH_WORKER_SOCKET },
+	{ "unix_listener/"IMAP_URLAUTH_WORKER_SOCKET"/mode", "0600" },
+	{ "unix_listener/"IMAP_URLAUTH_WORKER_SOCKET"/user", "$SET:default_internal_user" },
+
+	{ "service_extra_groups", "$SET:default_internal_group" },
+
+	{ NULL, NULL }
 };
 
 #undef DEF
@@ -69,26 +58,18 @@ static const struct setting_define imap_urlauth_worker_setting_defines[] = {
 };
 
 const struct imap_urlauth_worker_settings imap_urlauth_worker_default_settings = {
-	.verbose_proctitle = FALSE,
+	.verbose_proctitle = VERBOSE_PROCTITLE_DEFAULT,
 
 	.imap_urlauth_host = "",
 	.imap_urlauth_port = 143
 };
 
-static const struct setting_parser_info *imap_urlauth_worker_setting_dependencies[] = {
-	&mail_user_setting_parser_info,
-	NULL
-};
-
 const struct setting_parser_info imap_urlauth_worker_setting_parser_info = {
-	.module_name = "imap-urlauth-worker",
+	.name = "imap_urlauth_worker",
+
 	.defines = imap_urlauth_worker_setting_defines,
 	.defaults = &imap_urlauth_worker_default_settings,
 
-	.type_offset = SIZE_MAX,
 	.struct_size = sizeof(struct imap_urlauth_worker_settings),
-
-	.parent_offset = SIZE_MAX,
-
-	.dependencies = imap_urlauth_worker_setting_dependencies
+	.pool_offset1 = 1 + offsetof(struct imap_urlauth_worker_settings, pool),
 };

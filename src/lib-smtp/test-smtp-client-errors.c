@@ -45,6 +45,7 @@ struct server_connection {
 	struct connection conn;
 	void *context;
 
+	struct ssl_iostream_settings ssl_set;
 	struct ssl_iostream *ssl_iostream;
 
 	enum server_connection_state state;
@@ -112,193 +113,6 @@ test_run_client_server(const struct smtp_client_settings *client_set,
 		       test_dns_init_t dns_test) ATTR_NULL(3);
 
 /*
- * Unconfigured SSL
- */
-
-/* server */
-
-static void
-test_server_unconfigured_ssl_input(struct server_connection *conn ATTR_UNUSED)
-{
-	/* nothing */
-}
-
-static void test_server_unconfigured_ssl(unsigned int index)
-{
-	i_sleep_intr_secs(100);
-	test_server_input = test_server_unconfigured_ssl_input;
-	test_server_run(index);
-}
-
-/* client */
-
-struct _unconfigured_ssl {
-	unsigned int count;
-};
-
-static void
-test_client_unconfigured_ssl_reply(const struct smtp_reply *reply,
-				   void *context)
-{
-	struct _unconfigured_ssl *ctx = (struct _unconfigured_ssl *)context;
-
-	if (debug)
-		i_debug("REPLY: %s", smtp_reply_log(reply));
-
-	test_assert(reply->status == SMTP_CLIENT_COMMAND_ERROR_CONNECT_FAILED);
-
-	if (--ctx->count == 0) {
-		i_free(ctx);
-		io_loop_stop(ioloop);
-	}
-}
-
-static bool
-test_client_unconfigured_ssl(const struct smtp_client_settings *client_set)
-{
-	struct smtp_client_connection *sconn;
-	struct _unconfigured_ssl *ctx;
-
-	test_expect_errors(2);
-
-	ctx = i_new(struct _unconfigured_ssl, 1);
-	ctx->count = 2;
-
-	smtp_client = smtp_client_init(client_set);
-
-	sconn = smtp_client_connection_create(
-		smtp_client, SMTP_PROTOCOL_SMTP, "127.0.0.1", bind_ports[0],
-		SMTP_CLIENT_SSL_MODE_IMMEDIATE, NULL);
-	smtp_client_connection_connect(sconn,
-		test_client_unconfigured_ssl_reply, ctx);
-
-	sconn = smtp_client_connection_create(
-		smtp_client, SMTP_PROTOCOL_SMTP, "127.0.0.1", bind_ports[0],
-		SMTP_CLIENT_SSL_MODE_IMMEDIATE, NULL);
-	smtp_client_connection_connect(
-		sconn, test_client_unconfigured_ssl_reply, ctx);
-
-	return TRUE;
-}
-
-/* test */
-
-static void test_unconfigured_ssl(void)
-{
-	struct smtp_client_settings smtp_client_set;
-
-	test_client_defaults(&smtp_client_set);
-
-	test_begin("unconfigured ssl");
-	test_run_client_server(&smtp_client_set,
-			       test_client_unconfigured_ssl,
-			       test_server_unconfigured_ssl, 1, NULL);
-	test_end();
-}
-
-/*
- * Unconfigured SSL abort
- */
-
-/* server */
-
-static void
-test_server_unconfigured_ssl_abort_input(
-	struct server_connection *conn ATTR_UNUSED)
-{
-	/* nothing */
-}
-
-static void test_server_unconfigured_ssl_abort(unsigned int index)
-{
-	i_sleep_intr_secs(100);
-	test_server_input = test_server_unconfigured_ssl_abort_input;
-	test_server_run(index);
-}
-
-/* client */
-
-struct _unconfigured_ssl_abort {
-	unsigned int count;
-};
-
-static void
-test_client_unconfigured_ssl_abort_reply1(
-	const struct smtp_reply *reply,
-	struct _unconfigured_ssl_abort *ctx ATTR_UNUSED)
-{
-	if (debug)
-		i_debug("REPLY: %s", smtp_reply_log(reply));
-
-	test_out_quiet("inappropriate callback", FALSE);
-}
-
-static void
-test_client_unconfigured_ssl_abort_reply2(const struct smtp_reply *reply,
-					  struct _unconfigured_ssl_abort *ctx)
-{
-	if (debug)
-		i_debug("REPLY: %s", smtp_reply_log(reply));
-
-	test_assert(reply->status == SMTP_CLIENT_COMMAND_ERROR_CONNECT_FAILED);
-
-	i_free(ctx);
-	io_loop_stop(ioloop);
-}
-
-static bool
-test_client_unconfigured_ssl_abort(
-	const struct smtp_client_settings *client_set)
-{
-	struct smtp_client_connection *sconn;
-	struct smtp_client_command *scmd;
-	struct _unconfigured_ssl_abort *ctx;
-
-	test_expect_errors(2);
-
-	ctx = i_new(struct _unconfigured_ssl_abort, 1);
-	ctx->count = 1;
-
-	smtp_client = smtp_client_init(client_set);
-
-	sconn = smtp_client_connection_create(
-		smtp_client, SMTP_PROTOCOL_SMTP, "127.0.0.1", bind_ports[0],
-		SMTP_CLIENT_SSL_MODE_IMMEDIATE, NULL);
-	smtp_client_connection_connect(sconn, NULL, NULL);
-	scmd = smtp_client_command_new(
-		sconn, 0, test_client_unconfigured_ssl_abort_reply1, ctx);
-	smtp_client_command_write(scmd, "FROP");
-	smtp_client_command_submit(scmd);
-	smtp_client_command_abort(&scmd);
-
-	sconn = smtp_client_connection_create(
-		smtp_client, SMTP_PROTOCOL_SMTP, "127.0.0.1", bind_ports[0],
-		SMTP_CLIENT_SSL_MODE_IMMEDIATE, NULL);
-	smtp_client_connection_connect(sconn, NULL, NULL);
-	scmd = smtp_client_command_new(
-		sconn, 0, test_client_unconfigured_ssl_abort_reply2, ctx);
-	smtp_client_command_write(scmd, "FROP");
-	smtp_client_command_submit(scmd);
-
-	return TRUE;
-}
-
-/* test */
-
-static void test_unconfigured_ssl_abort(void)
-{
-	struct smtp_client_settings smtp_client_set;
-
-	test_client_defaults(&smtp_client_set);
-
-	test_begin("unconfigured ssl abort");
-	test_run_client_server(&smtp_client_set,
-			       test_client_unconfigured_ssl_abort,
-			       test_server_unconfigured_ssl_abort, 1, NULL);
-	test_end();
-}
-
-/*
  * Host lookup failed
  */
 
@@ -339,7 +153,7 @@ test_client_host_lookup_failed(const struct smtp_client_settings *client_set)
 	smtp_client = smtp_client_init(client_set);
 
 	sconn = smtp_client_connection_create(
-		smtp_client, SMTP_PROTOCOL_SMTP, "host.in-addr.arpa", 465,
+		smtp_client, SMTP_PROTOCOL_SMTP, "test.invalid.", 465,
 		SMTP_CLIENT_SSL_MODE_IMMEDIATE, NULL);
 	smtp_client_connection_connect(sconn, NULL, NULL);
 	scmd = smtp_client_command_new(
@@ -348,7 +162,7 @@ test_client_host_lookup_failed(const struct smtp_client_settings *client_set)
 	smtp_client_command_submit(scmd);
 
 	sconn = smtp_client_connection_create(
-		smtp_client, SMTP_PROTOCOL_SMTP, "host.in-addr.arpa", 465,
+		smtp_client, SMTP_PROTOCOL_SMTP, "test.invalid.", 465,
 		SMTP_CLIENT_SSL_MODE_IMMEDIATE, NULL);
 	smtp_client_connection_connect(sconn, NULL, NULL);
 	scmd = smtp_client_command_new(
@@ -1673,7 +1487,7 @@ test_client_premature_reply_login_cb(const struct smtp_reply *reply,
 	case 5:
 		test_assert(reply->status ==
 			    SMTP_CLIENT_COMMAND_ERROR_BAD_REPLY);
-		/* Don't bother continueing with this test. Second try after
+		/* Don't bother continuing with this test. Second try after
 		   smtp_client_transaction_start() will have the same result. */
 		smtp_client_transaction_abort(pctx->trans);
 		break;
@@ -2138,7 +1952,13 @@ test_client_early_data_reply_noop_cb(const struct smtp_reply *reply,
 
 	pctx->trans = NULL;
 	timeout_remove(&pctx->to);
-	o_stream_destroy(&pctx->output);
+	if (pctx->output != NULL) {
+		if (o_stream_finish(pctx->output) < 0) {
+			i_error("Failed to finish output: %s",
+				o_stream_get_error(pctx->output));
+		}
+		o_stream_destroy(&pctx->output);
+	}
 	smtp_client_connection_unref(&pctx->conn);
 	i_free(pctx);
 }
@@ -2822,7 +2642,7 @@ test_client_dns_service_failure(const struct smtp_client_settings *client_set)
 	smtp_client = smtp_client_init(client_set);
 
 	sconn = smtp_client_connection_create(
-		smtp_client, SMTP_PROTOCOL_SMTP, "host.in-addr.arpa", 465,
+		smtp_client, SMTP_PROTOCOL_SMTP, "test.invalid.", 465,
 		SMTP_CLIENT_SSL_MODE_IMMEDIATE, NULL);
 	smtp_client_connection_connect(sconn, NULL, NULL);
 	scmd = smtp_client_command_new(
@@ -2831,7 +2651,7 @@ test_client_dns_service_failure(const struct smtp_client_settings *client_set)
 	smtp_client_command_submit(scmd);
 
 	sconn = smtp_client_connection_create(
-		smtp_client, SMTP_PROTOCOL_SMTP, "host.in-addr.arpa", 465,
+		smtp_client, SMTP_PROTOCOL_SMTP, "test.invalid.", 465,
 		SMTP_CLIENT_SSL_MODE_IMMEDIATE, NULL);
 	smtp_client_connection_connect(sconn, NULL, NULL);
 	scmd = smtp_client_command_new(
@@ -3821,7 +3641,6 @@ static void test_invalid_ssl_certificate(void)
 
 	/* ssl settings */
 	ssl_iostream_test_settings_client(&ssl_set);
-	ssl_set.verbose = debug;
 
 	test_client_defaults(&smtp_client_set);
 	smtp_client_set.dns_client_socket_path = "./dns-test";
@@ -3832,6 +3651,7 @@ static void test_invalid_ssl_certificate(void)
 			       test_client_invalid_ssl_certificate,
 			       test_server_invalid_ssl_certificate, 1,
 			       test_dns_invalid_ssl_certificate);
+	ssl_iostream_context_cache_free();
 	test_end();
 }
 
@@ -3840,8 +3660,6 @@ static void test_invalid_ssl_certificate(void)
  */
 
 static void (*const test_functions[])(void) = {
-	test_unconfigured_ssl,
-	test_unconfigured_ssl_abort,
 	test_host_lookup_failed,
 	test_connection_refused,
 	test_connection_lost_prematurely,
@@ -3926,7 +3744,6 @@ test_client_run(test_client_init_t client_test,
 static int
 server_connection_init_ssl(struct server_connection *conn)
 {
-	struct ssl_iostream_settings ssl_set;
 	const char *error;
 
 	if (!test_server_ssl)
@@ -3934,17 +3751,16 @@ server_connection_init_ssl(struct server_connection *conn)
 
 	connection_input_halt(&conn->conn);
 
-	ssl_iostream_test_settings_server(&ssl_set);
-	ssl_set.verbose = debug;
+	ssl_iostream_test_settings_server(&conn->ssl_set);
 
 	if (server_ssl_ctx == NULL &&
-	    ssl_iostream_context_init_server(&ssl_set, &server_ssl_ctx,
+	    ssl_iostream_context_init_server(&conn->ssl_set, &server_ssl_ctx,
 					     &error) < 0) {
 		i_error("SSL context initialization failed: %s", error);
 		return -1;
 	}
 
-	if (io_stream_create_ssl_server(server_ssl_ctx, &ssl_set, conn->conn.event,
+	if (io_stream_create_ssl_server(server_ssl_ctx, conn->conn.event,
 					&conn->conn.input, &conn->conn.output,
 					&conn->ssl_iostream, &error) < 0) {
 		i_error("SSL init failed: %s", error);
@@ -3980,7 +3796,8 @@ server_connection_input(struct connection *_conn)
 
 			if (conn->dot_input == NULL) {
 				conn->dot_input = i_stream_create_dot(
-					conn->conn.input, TRUE);
+					conn->conn.input, ISTREAM_DOT_NO_TRIM |
+							  ISTREAM_DOT_LOOSE_EOT);
 			}
 			while ((ret = i_stream_read_more(conn->dot_input,
 							 &data, &size)) > 0) {
@@ -4079,7 +3896,7 @@ static void server_connection_init(int fd)
 
 	net_set_nonblock(fd, TRUE);
 
-	pool = pool_alloconly_create("server connection", 256);
+	pool = pool_alloconly_create("server connection", 512);
 	conn = p_new(pool, struct server_connection, 1);
 	conn->pool = pool;
 
@@ -4173,6 +3990,7 @@ static void test_server_run(unsigned int index)
 
 	if (server_ssl_ctx != NULL)
 		ssl_iostream_context_unref(&server_ssl_ctx);
+	ssl_iostream_context_cache_free();
 }
 
 /*

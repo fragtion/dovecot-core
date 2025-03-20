@@ -11,8 +11,40 @@
 #include "ostream.h"
 #include "stats-dist.h"
 #include "time-util.h"
+#include "settings.h"
 #include "istream-fs-stats.h"
 #include "fs-api-private.h"
+
+static bool fs_settings_check(void *_set, pool_t pool, const char **error_r);
+
+#undef DEF
+#define DEF(type, name) \
+	SETTING_DEFINE_STRUCT_##type(#name, name, struct fs_settings)
+static const struct setting_define fs_setting_defines[] = {
+	DEF(STR, fs_name),
+	DEF(STR, fs_driver),
+	{ .type = SET_FILTER_ARRAY, .key = "fs",
+	  .offset = offsetof(struct fs_settings, fs),
+	  .filter_array_field_name = "fs_name", },
+
+	SETTING_DEFINE_LIST_END
+};
+static const struct fs_settings fs_default_settings = {
+	.fs_name = "",
+	.fs_driver = "",
+	.fs = ARRAY_INIT,
+};
+const struct setting_parser_info fs_setting_parser_info = {
+	.name = "fs",
+
+	.defines = fs_setting_defines,
+	.defaults = &fs_default_settings,
+
+	.struct_size = sizeof(struct fs_settings),
+	.pool_offset1 = 1 + offsetof(struct fs_settings, pool),
+
+	.check_func = fs_settings_check,
+};
 
 static struct event_category event_category_fs = {
 	.name = "fs"
@@ -34,39 +66,6 @@ static struct event *fs_create_event(struct fs *fs, struct event *parent)
 	event_set_append_log_prefix(event,
 		t_strdup_printf("fs-%s: ", fs->name));
 	return event;
-}
-
-static int
-fs_alloc(const struct fs *fs_class, const char *args,
-	 const struct fs_settings *set, struct fs **fs_r, const char **error_r)
-{
-	struct fs *fs;
-	const char *error;
-	int ret;
-
-	fs = fs_class->v.alloc();
-	fs->refcount = 1;
-	fs->set.debug = set->debug;
-	fs->set.enable_timing = set->enable_timing;
-	i_array_init(&fs->module_contexts, 5);
-	fs->event = fs_create_event(fs, set->event_parent);
-	event_set_forced_debug(fs->event, fs->set.debug);
-
-	T_BEGIN {
-		ret = fs_class->v.init(fs, args, set, &error);
-	} T_END_PASS_STR_IF(ret < 0, &error);
-	if (ret < 0) {
-		/* a bit kludgy way to allow data stack frame usage in normal
-		   conditions but still be able to return error message from
-		   data stack. */
-		*error_r = t_strdup_printf("%s: %s", fs_class->name, error);
-		fs_unref(&fs);
-		return -1;
-	}
-	fs->username = i_strdup(set->username);
-	fs->session_id = i_strdup(set->session_id);
-	*fs_r = fs;
-	return 0;
 }
 
 void fs_class_register(const struct fs *fs_class)
@@ -120,8 +119,10 @@ static const char *fs_driver_module_name(const char *driver)
 
 static void fs_class_try_load_plugin(const char *driver)
 {
-	const char *module_name =
-		t_strdup_printf("fs_%s", fs_driver_module_name(driver));
+	const char *module_names[] = {
+		t_strdup_printf("fs_%s", fs_driver_module_name(driver)),
+		NULL
+	};
 	struct module *module;
 	struct module_dir_load_settings mod_set;
 	const struct fs *fs_class;
@@ -131,10 +132,10 @@ static void fs_class_try_load_plugin(const char *driver)
 	mod_set.ignore_missing = TRUE;
 
 	fs_modules = module_dir_load_missing(fs_modules, MODULE_DIR,
-					     module_name, &mod_set);
+					     module_names, &mod_set);
 	module_dir_init(fs_modules);
 
-	module = module_dir_find(fs_modules, module_name);
+	module = module_dir_find(fs_modules, module_names[0]);
 	fs_class = module == NULL ? NULL :
 		module_get_symbol(module, t_strdup_printf(
 			"fs_class_%s", fs_driver_module_name(driver)));
@@ -144,12 +145,14 @@ static void fs_class_try_load_plugin(const char *driver)
 	lib_atexit(fs_class_deinit_modules);
 }
 
-int fs_init(const char *driver, const char *args,
-	    const struct fs_settings *set,
-	    struct fs **fs_r, const char **error_r)
+static int
+fs_alloc(const char *driver, struct event *event_parent,
+	 const struct fs_parameters *params,
+	 struct fs **fs_r, const char **error_r)
 {
 	const struct fs *fs_class;
-	const char *temp_file_prefix;
+	struct fs *fs;
+	const char *temp_dir, *temp_file_prefix;
 
 	fs_class = fs_class_find(driver);
 	if (fs_class == NULL) {
@@ -162,30 +165,164 @@ int fs_init(const char *driver, const char *args,
 		*error_r = t_strdup_printf("Unknown fs driver: %s", driver);
 		return -1;
 	}
-	if (fs_alloc(fs_class, args, set, fs_r, error_r) < 0)
-		return -1;
-	event_set_ptr((*fs_r)->event, FS_EVENT_FIELD_FS, *fs_r);
 
-	temp_file_prefix = set->temp_file_prefix != NULL ?
-		set->temp_file_prefix : ".temp.dovecot";
-	if(set->temp_dir == NULL)
-		(*fs_r)->temp_path_prefix = i_strconcat("/tmp/",
-						temp_file_prefix, NULL);
-	else
-		(*fs_r)->temp_path_prefix = i_strconcat(set->temp_dir, "/",
-						temp_file_prefix, NULL);
+	fs = fs_class->v.alloc();
+	fs->refcount = 1;
+	fs->enable_timing = params->enable_timing;
+	fs->username = i_strdup(params->username);
+	fs->session_id = i_strdup(params->session_id);
+	i_array_init(&fs->module_contexts, 5);
+	fs->event = fs_create_event(fs, event_parent);
+	event_set_ptr(fs->event, FS_EVENT_FIELD_FS, fs);
+
+	temp_dir = params->temp_dir != NULL ? params->temp_dir : "/tmp";
+	temp_file_prefix = params->temp_file_prefix != NULL ?
+		params->temp_file_prefix : ".temp.dovecot";
+	fs->temp_path_prefix = i_strconcat(temp_dir, "/", temp_file_prefix, NULL);
+
+	*fs_r = fs;
 	return 0;
 }
 
-int fs_init_from_string(const char *str, const struct fs_settings *set,
-			struct fs **fs_r, const char **error_r)
+static bool fs_settings_check(void *_set, pool_t pool ATTR_UNUSED,
+			      const char **error_r ATTR_UNUSED)
 {
-	const char *args = strpbrk(str, " :");
-	if (args == NULL)
-		args = "";
-	else
-		str = t_strdup_until(str, args++);
-	return fs_init(str, args, set, fs_r, error_r);
+	struct fs_settings *set = _set;
+
+	if (set->fs_driver[0] == '\0' && set->fs_name[0] != '\0') {
+		/* default an empty fs_driver to fs_name, so it's possible to
+		   configure simply: fs driver { .. }, but to still allow the
+		   same driver to be used multiple times if necessary. */
+		set->fs_driver = set->fs_name;
+	}
+	return TRUE;
+}
+
+static int fs_init(struct event *event,
+		   const struct fs_parameters *params,
+		   const ARRAY_TYPE(const_string) *fs_list,
+		   unsigned int fs_list_idx,
+		   unsigned int *init_fs_last_list_idx,
+		   struct fs **fs_r, const char **error_r)
+{
+	const struct fs_settings *fs_set;
+	struct fs *fs;
+	const char *fs_name, *error;
+	int ret;
+
+	fs_name = array_idx_elem(fs_list, fs_list_idx);
+	if (settings_get_filter(event, "fs", fs_name, &fs_setting_parser_info,
+				0, &fs_set, error_r) < 0)
+		return -1;
+
+	if (fs_set->fs_driver[0] == '\0') {
+		*error_r = "fs_driver is empty";
+		settings_free(fs_set);
+		return -1;
+	}
+
+	event_add_str(event, "fs", fs_name);
+	settings_event_add_list_filter_name(event, "fs", fs_name);
+
+	ret = fs_alloc(fs_set->fs_driver, event, params, &fs, error_r);
+	settings_free(fs_set);
+	if (ret < 0)
+		return -1;
+
+	fs->init_fs_list = fs_list;
+	fs->init_fs_list_idx = fs_list_idx;
+	fs->init_fs_last_list_idx = init_fs_last_list_idx;
+	*init_fs_last_list_idx = fs_list_idx;
+	T_BEGIN {
+		ret = fs->v.init(fs, params, &error);
+	} T_END_PASS_STR_IF(ret < 0, &error);
+	if (ret < 0) {
+		*error_r = t_strdup_printf("%s: %s", fs->name, error);
+		fs_unref(&fs);
+		return -1;
+	}
+	/* fs's parent event points to the fs parent's event. This is normally
+	   wanted. However, we don't want the parent fs's settings to be read
+	   for this fs. We don't expect settings to be read anymore after
+	   init(). Drop settings_filter_name so if settings are attempted to be
+	   read later on, it will be obvious enough that it's not using any
+	   fs settings. */
+	event_set_ptr(event, SETTINGS_EVENT_FILTER_NAME, NULL);
+	fs->init_fs_list = NULL;
+	*fs_r = fs;
+	return 0;
+}
+
+int fs_init_auto(struct event *event, const struct fs_parameters *params,
+		 struct fs **fs_r, const char **error_r)
+{
+	const struct fs_settings *fs_set;
+	struct fs *fs;
+	unsigned int last_list_idx;
+	int ret;
+
+	if (settings_get(event, &fs_setting_parser_info, 0,
+			 &fs_set, error_r) < 0)
+		return -1;
+	if (array_is_empty(&fs_set->fs)) {
+		settings_free(fs_set);
+		*error_r = "fs { .. } named list filter is missing";
+		return 0;
+	}
+
+	event = event_create(event);
+	ret = fs_init(event, params, &fs_set->fs, 0,
+		      &last_list_idx, &fs, error_r);
+	event_unref(&event);
+
+	if (ret == 0 && last_list_idx + 1 < array_count(&fs_set->fs)) {
+		const char *fs_name_last =
+			array_idx_elem(&fs_set->fs, last_list_idx);
+		const char *fs_name_extra =
+			array_idx_elem(&fs_set->fs, last_list_idx + 1);
+		*error_r = t_strdup_printf(
+			"Extra fs %s { .. } named list filter - "
+			"the parent fs %s { .. } doesn't support a child fs",
+			fs_name_extra, fs_name_last);
+		settings_free(fs_set);
+		fs_unref(&fs);
+		return -1;
+	}
+	settings_free(fs_set);
+	if (ret < 0)
+		return -1;
+	*fs_r = fs;
+	return 1;
+}
+
+int fs_init_parent(struct fs *fs, const struct fs_parameters *params,
+		   const char **error_r)
+{
+	if (fs->init_fs_list_idx + 1 >= array_count(fs->init_fs_list)) {
+		*error_r = "Next fs { .. } named list filter is missing";
+		return -1;
+	}
+
+	/* Remove the parent fs's settings_filter_name while initializing a
+	   child fs, so the parent settings won't be attempted to be read. */
+	char *old_filter = event_get_ptr(event_get_parent(fs->event),
+					 SETTINGS_EVENT_FILTER_NAME);
+	event_set_ptr(event_get_parent(fs->event),
+		      SETTINGS_EVENT_FILTER_NAME, NULL);
+
+	struct event *event = event_create(fs->event);
+	/* Drop the parent "fs-name: " prefix */
+	event_drop_parent_log_prefixes(event, 1);
+	int ret = fs_init(event, params,
+			  fs->init_fs_list, fs->init_fs_list_idx + 1,
+			  fs->init_fs_last_list_idx,
+			  &fs->parent, error_r);
+	event_unref(&event);
+	/* Restore the old settings_filter_name, since the caller's init()
+	   could still need it. */
+	event_set_ptr(event_get_parent(fs->event),
+		      SETTINGS_EVENT_FILTER_NAME, old_filter);
+	return ret;
 }
 
 void fs_deinit(struct fs **fs)
@@ -252,11 +389,16 @@ const char *fs_get_driver(struct fs *fs)
 	return fs->name;
 }
 
-const char *fs_get_root_driver(struct fs *fs)
+struct fs *fs_get_root_fs(struct fs *fs)
 {
 	while (fs->parent != NULL)
 		fs = fs->parent;
-	return fs->name;
+	return fs;
+}
+
+const char *fs_get_root_driver(struct fs *fs)
+{
+	return fs_get_root_fs(fs)->name;
 }
 
 struct fs_file *fs_file_init(struct fs *fs, const char *path, int mode_flags)
@@ -459,7 +601,7 @@ void fs_set_metadata(struct fs_file *file, const char *key, const char *value)
 
 static void fs_file_timing_start(struct fs_file *file, enum fs_op op)
 {
-	if (!file->fs->set.enable_timing)
+	if (!file->fs->enable_timing)
 		return;
 	if (file->timing_start[op].tv_sec == 0)
 		i_gettimeofday(&file->timing_start[op]);
@@ -483,7 +625,7 @@ fs_timing_end(struct stats_dist **timing, const struct timeval *start_tv)
 
 void fs_file_timing_end(struct fs_file *file, enum fs_op op)
 {
-	if (!file->fs->set.enable_timing || file->timing_start[op].tv_sec == 0)
+	if (!file->fs->enable_timing || file->timing_start[op].tv_sec == 0)
 		return;
 
 	fs_timing_end(&file->fs->stats.timings[op], &file->timing_start[op]);
@@ -566,7 +708,7 @@ struct event *fs_file_event(struct fs_file *file)
 
 static struct fs_file *fs_file_get_error_file(struct fs_file *file)
 {
-	/* the error is always kept in the parentmost file */
+	/* the error is always kept in the parent-most file */
 	while (file->parent != NULL)
 		file = file->parent;
 	return file;
@@ -757,7 +899,7 @@ struct istream *fs_read_stream(struct fs_file *file, size_t max_buffer_size)
 		fs_file_timing_end(file, FS_OP_READ);
 		return input;
 	}
-	if (file->fs->set.enable_timing) {
+	if (file->fs->enable_timing) {
 		struct istream *input2 = i_stream_create_fs_stats(input, file);
 
 		i_stream_unref(&input);
@@ -1241,19 +1383,19 @@ fs_iter_init_with_event(struct fs *fs, struct event *event,
 		 (fs_get_properties(fs) & FS_PROPERTY_OBJECTIDS) != 0);
 
 	fs->stats.iter_count++;
-	if (fs->set.enable_timing)
+	if (fs->enable_timing)
 		i_gettimeofday(&now);
-	if (fs->v.iter_init == NULL) {
+	if (fs->v.iter_init == NULL)
 		iter = i_new(struct fs_iter, 1);
-		iter->fs = fs;
-	} else T_BEGIN {
+	else
 		iter = fs->v.iter_alloc();
-		iter->fs = fs;
+	iter->fs = fs;
+	iter->event = fs_create_event(fs, event);
+	event_set_ptr(iter->event, FS_EVENT_FIELD_FS, fs);
+	event_set_ptr(iter->event, FS_EVENT_FIELD_ITER, iter);
+	if (fs->v.iter_init != NULL) T_BEGIN {
 		iter->flags = flags;
 		iter->path = i_strdup(path);
-		iter->event = fs_create_event(fs, event);
-		event_set_ptr(iter->event, FS_EVENT_FIELD_FS, fs);
-		event_set_ptr(iter->event, FS_EVENT_FIELD_ITER, iter);
 		fs->v.iter_init(iter, path, flags);
 	} T_END;
 	iter->start_time = now;

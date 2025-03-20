@@ -16,12 +16,19 @@ struct message_size;
 /* If some operation is taking long, call notify_ok every n seconds. */
 #define MAIL_STORAGE_NOTIFY_INTERVAL_SECS 10
 
-/* Expunge transactions are to be commited after
+/* Expunge transactions are to be committed after
    every MAIL_EXPUNGE_BATCH_SIZE mails */
 #define MAIL_EXPUNGE_BATCH_SIZE 1000
 
 #define MAIL_KEYWORD_HAS_ATTACHMENT "$HasAttachment"
 #define MAIL_KEYWORD_HAS_NO_ATTACHMENT "$HasNoAttachment"
+
+/* <settings checks> */
+/* The "namespace" event field contains the namespace containing mailbox.
+   For dynamic namespaces, the name is the one specified in configuration
+   for the template namespace. */
+#define SETTINGS_EVENT_NAMESPACE_NAME "namespace"
+/* </settings checks> */
 
 enum mail_storage_flags {
 	/* Remember message headers' MD5 sum */
@@ -34,7 +41,10 @@ enum mail_storage_flags {
 	MAIL_STORAGE_FLAG_NO_AUTOCREATE		= 0x04,
 	/* Don't verify existence or accessibility of any directories.
 	   Create the storage in any case. */
-	MAIL_STORAGE_FLAG_NO_AUTOVERIFY		= 0x08
+	MAIL_STORAGE_FLAG_NO_AUTOVERIFY		= 0x08,
+	/* Shared namespace root, under which new user-specific namespaces are
+	   created. */
+	MAIL_STORAGE_FLAG_SHARED_DYNAMIC	= 0x10,
 };
 
 enum mailbox_flags {
@@ -84,6 +94,7 @@ enum mailbox_flags {
 enum mailbox_feature {
 	/* Enable tracking modsequences */
 	MAILBOX_FEATURE_CONDSTORE	= 0x01,
+	MAILBOX_FEATURE_UTF8ACCEPT	= 0x02,
 };
 
 enum mailbox_existence {
@@ -93,23 +104,23 @@ enum mailbox_existence {
 };
 
 enum mailbox_status_items {
-	STATUS_MESSAGES		= 0x01,
-	STATUS_RECENT		= 0x02,
-	STATUS_UIDNEXT		= 0x04,
-	STATUS_UIDVALIDITY	= 0x08,
-	STATUS_UNSEEN		= 0x10,
-	STATUS_FIRST_UNSEEN_SEQ	= 0x20,
-	STATUS_KEYWORDS		= 0x40,
-	STATUS_HIGHESTMODSEQ	= 0x80,
-	STATUS_PERMANENT_FLAGS	= 0x200,
-	STATUS_FIRST_RECENT_UID	= 0x400,
-	STATUS_LAST_CACHED_SEQ	= 0x800,
-	STATUS_CHECK_OVER_QUOTA	= 0x1000, /* return error if over quota */
-	STATUS_HIGHESTPVTMODSEQ	= 0x2000,
+	STATUS_MESSAGES			= 0x01,
+	STATUS_RECENT			= 0x02,
+	STATUS_UIDNEXT			= 0x04,
+	STATUS_UIDVALIDITY		= 0x08,
+	STATUS_UNSEEN			= 0x10,
+	STATUS_FIRST_UNSEEN_SEQ		= 0x20,
+	STATUS_KEYWORDS			= 0x40,
+	STATUS_HIGHESTMODSEQ		= 0x80,
+	STATUS_PERMANENT_FLAGS		= 0x200,
+	STATUS_FIRST_RECENT_UID		= 0x400,
+	STATUS_FTS_LAST_INDEXED_UID	= 0x800,
+	STATUS_CHECK_OVER_QUOTA		= 0x1000, /* return error if over quota */
+	STATUS_HIGHESTPVTMODSEQ		= 0x2000,
 	/* status items that must not be looked up with
 	   mailbox_get_open_status(), because they can return failure. */
 #define MAILBOX_STATUS_FAILING_ITEMS \
-	(STATUS_LAST_CACHED_SEQ | STATUS_CHECK_OVER_QUOTA)
+	(STATUS_FTS_LAST_INDEXED_UID | STATUS_CHECK_OVER_QUOTA)
 };
 
 enum mailbox_metadata_items {
@@ -216,8 +227,6 @@ enum mailbox_transaction_flags {
 enum mailbox_sync_flags {
 	/* Make sure we sync all external changes done to mailbox */
 	MAILBOX_SYNC_FLAG_FULL_READ		= 0x01,
-	/* Make sure we write all our internal changes into the mailbox */
-	MAILBOX_SYNC_FLAG_FULL_WRITE		= 0x02,
 	/* If it's not too much trouble, check if there are some changes */
 	MAILBOX_SYNC_FLAG_FAST			= 0x04,
 
@@ -261,7 +270,7 @@ struct mailbox_status {
 
 	uint32_t first_unseen_seq; /* STATUS_FIRST_UNSEEN_SEQ */
 	uint32_t first_recent_uid; /* STATUS_FIRST_RECENT_UID */
-	uint32_t last_cached_seq; /* STATUS_LAST_CACHED_SEQ */
+	uint32_t fts_last_indexed_uid; /* STATUS_FTS_LAST_INDEXED_UID */
 	uint64_t highest_modseq; /* STATUS_HIGHESTMODSEQ */
 	/* 0 if no private index (STATUS_HIGHESTPVTMODSEQ) */
 	uint64_t highest_pvt_modseq;
@@ -398,6 +407,14 @@ enum mail_access_type {
 	MAIL_ACCESS_TYPE_SORT,
 };
 
+struct mail_binary_properties {
+	uoff_t size;
+	unsigned int lines;
+
+	bool binary;
+	bool converted;
+};
+
 struct mail {
 	/* always set */
 	struct mailbox *box;
@@ -479,17 +496,10 @@ void mail_storage_class_unregister(struct mail_storage *storage_class);
 /* Find mail storage class by name */
 struct mail_storage *mail_storage_find_class(const char *name);
 
-/* Create a new instance of registered mail storage class with given
-   storage-specific data. If driver is NULL, it's tried to be autodetected
-   from ns location. If ns location is NULL, it uses the first storage that
-   exists. The storage is put into ns->storage. */
-int mail_storage_create(struct mail_namespace *ns, const char *driver,
-			enum mail_storage_flags flags, const char **error_r)
-	ATTR_NULL(2);
-int mail_storage_create_full(struct mail_namespace *ns, const char *driver,
-			     const char *data, enum mail_storage_flags flags,
-			     struct mail_storage **storage_r,
-			     const char **error_r) ATTR_NULL(2);
+/* Create a storage for the namespace. */
+int mail_storage_create(struct mail_namespace *ns, struct event *event,
+			enum mail_storage_flags flags,
+			struct mail_storage **storage_r, const char **error_r);
 void mail_storage_unref(struct mail_storage **storage);
 
 /* Returns the mail storage settings. */
@@ -569,6 +579,11 @@ int mailbox_open_stream(struct mailbox *box, struct istream *input);
 void mailbox_close(struct mailbox *box);
 /* Close and free the mailbox. */
 void mailbox_free(struct mailbox **box);
+/* Create path's directory with proper permissions. The root directory is also
+   created if necessary. Returns 1 if created, 0 if it already existed,
+   -1 if error. */
+int mailbox_mkdir(struct mailbox *box, const char *path,
+		  enum mailbox_list_path_type type);
 
 /* Returns TRUE if box1 points to the same mailbox as ns2/vname2. */
 bool mailbox_equals(const struct mailbox *box1,
@@ -626,12 +641,9 @@ struct mail_storage *mailbox_get_storage(const struct mailbox *box) ATTR_PURE;
 /* Return namespace of given mailbox. */
 struct mail_namespace *
 mailbox_get_namespace(const struct mailbox *box) ATTR_PURE;
-/* Returns the storage's settings. */
-const struct mail_storage_settings *
-mailbox_get_settings(struct mailbox *box) ATTR_PURE;
-/* Returns the mailbox's settings, or NULL if there are none. */
+/* Returns the mailbox's settings. */
 const struct mailbox_settings *
-mailbox_settings_find(struct mail_namespace *ns, const char *vname);
+mailbox_get_settings(struct mailbox *box) ATTR_PURE;
 
 /* Returns the (virtual) name of the given mailbox. */
 const char *mailbox_get_vname(const struct mailbox *box) ATTR_PURE;
@@ -863,6 +875,13 @@ struct mail *mailbox_save_get_dest_mail(struct mail_save_context *ctx);
    i_stream_read() and calling mailbox_save_continue() as long as there's
    more input. */
 int mailbox_save_begin(struct mail_save_context **ctx, struct istream *input);
+/* Begin saving the message that replaces the provided mail (which may reside
+   in another mailbox altogether). The replaced mail is expunged implicitly
+   when saving the message succeeds at mailbox_save_finish(). In all other
+   respects this function behaves the same as mailbox_save_begin(). */
+int mailbox_save_begin_replace(struct mail_save_context **ctx,
+			       struct istream *input,
+			       struct mail *replaced);
 int mailbox_save_continue(struct mail_save_context *ctx);
 int mailbox_save_finish(struct mail_save_context **ctx);
 void mailbox_save_cancel(struct mail_save_context **ctx);
@@ -992,13 +1011,14 @@ int mail_get_hdr_stream_because(struct mail *mail,
    children are returned decoded. Note that the returned stream must be
    unreferenced, unlike mail_get_*stream*() which automatically free it. */
 int mail_get_binary_stream(struct mail *mail, const struct message_part *part,
-			   bool include_hdr, uoff_t *size_r,
-			   bool *binary_r, struct istream **stream_r);
-/* Like mail_get_binary_stream(), but only return the size. */
-int mail_get_binary_size(struct mail *mail, const struct message_part *part,
-			 bool include_hdr, uoff_t *size_r,
-			 unsigned int *lines_r);
-
+			   bool include_hdr,
+			   struct mail_binary_properties *bprops_r,
+			   struct istream **stream_r);
+/* Like mail_get_binary_stream(), but only return the properties. */
+int mail_get_binary_properties(struct mail *mail,
+			       const struct message_part *part,
+			       bool include_hdr,
+			       struct mail_binary_properties *bprops_r);
 /* Get any of the "special" fields. Unhandled specials are returned as "". */
 int mail_get_special(struct mail *mail, enum mail_fetch_field field,
 		     const char **value_r);

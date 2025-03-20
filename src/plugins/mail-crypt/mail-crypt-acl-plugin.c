@@ -5,8 +5,8 @@
 #include "str.h"
 #include "sha2.h"
 #include "module-dir.h"
-#include "var-expand.h"
 #include "hex-binary.h"
+#include "settings.h"
 #include "mail-namespace.h"
 #include "mail-storage-hooks.h"
 #include "mail-storage-service.h"
@@ -22,7 +22,8 @@
 
 struct mail_crypt_acl_mailbox_list {
 	union mailbox_list_module_context module_ctx;
-	struct acl_backend_vfuncs acl_vprev;
+	const struct acl_backend_vfuncs *acl_vprev;
+	struct acl_backend_vfuncs v;
 };
 
 static MODULE_CONTEXT_DEFINE_INIT(mail_crypt_acl_mailbox_list_module,
@@ -146,18 +147,15 @@ mail_crypt_acl_user_create(struct mail_user *user, const char *dest_username,
 	const struct mail_storage_service_input *old_input;
 	struct mail_storage_service_input input;
 	struct mail_storage_service_ctx *service_ctx;
-	struct ioloop_context *cur_ioloop_ctx;
 
 	int ret;
 
 	service_ctx = mail_storage_service_user_get_service_ctx(user->service_user);
 	old_input = mail_storage_service_user_get_input(user->service_user);
 
-	if ((cur_ioloop_ctx = io_loop_get_current_context(current_ioloop)) != NULL)
-		io_loop_context_deactivate(cur_ioloop_ctx);
-
 	i_zero(&input);
 	input.service = old_input->service;
+	input.protocol = old_input->protocol;
 	input.username = dest_username;
 	input.session_id_prefix = user->session_id;
 	input.flags_override_add = MAIL_STORAGE_SERVICE_FLAG_NO_PLUGINS |
@@ -240,6 +238,7 @@ static int mail_crypt_acl_object_update(struct acl_object *aclobj,
 	const char *error;
 	struct mail_crypt_acl_mailbox_list *mlist =
 		MAIL_CRYPT_ACL_LIST_CONTEXT(aclobj->backend->list);
+	const struct crypt_acl_settings *set;
 	struct event *event = aclobj->backend->event;
 	const char *username;
 	struct mail_user *dest_user;
@@ -247,12 +246,16 @@ static int mail_crypt_acl_object_update(struct acl_object *aclobj,
 	bool have_rights;
 	int ret = 0;
 
-	if (mlist->acl_vprev.object_update(aclobj, update) < 0)
+	if (mlist->acl_vprev->object_update(aclobj, update) < 0)
 		return -1;
 
-	bool disallow_insecure =
-		mail_user_plugin_getenv_bool(aclobj->backend->list->ns->user,
-					     MAIL_CRYPT_ACL_SECURE_SHARE_SETTING);
+	if (settings_get(event, &crypt_acl_setting_parser_info, 0,
+			 &set, &error) < 0) {
+		e_error(event, "%s", error);
+		return -1;
+	}
+	bool disallow_insecure = set->crypt_acl_require_secure_key_sharing;
+	settings_free(set);
 
 	const char *box_name = mailbox_list_get_vname(aclobj->backend->list,
 						      aclobj->name);
@@ -276,13 +279,6 @@ static int mail_crypt_acl_object_update(struct acl_object *aclobj,
 
 		ret = mail_crypt_acl_user_create(aclobj->backend->list->ns->user,
 						 username, &dest_user, &error);
-
-		/* to make sure we get correct logging context */
-		if (ret > 0)
-			mail_storage_service_io_deactivate_user(dest_user->service_user);
-		mail_storage_service_io_activate_user(
-			aclobj->backend->list->ns->user->service_user
-		);
 
 		if (ret <= 0) {
 			e_error(event,
@@ -308,12 +304,6 @@ static int mail_crypt_acl_object_update(struct acl_object *aclobj,
 			}
 		}
 
-		/* logging context swap again */
-		mail_storage_service_io_deactivate_user(
-			aclobj->backend->list->ns->user->service_user
-		);
-		mail_storage_service_io_activate_user(dest_user->service_user);
-
 		mail_user_deinit(&dest_user);
 
 		if ((cur_ioloop_ctx = io_loop_get_current_context(current_ioloop)) != NULL)
@@ -332,8 +322,7 @@ static int mail_crypt_acl_object_update(struct acl_object *aclobj,
 		if (disallow_insecure) {
 			e_error(event, "mail-crypt-acl-plugin: "
 				"Secure key sharing is enabled -"
-				"Remove or set plugin { %s = no }",
-				MAIL_CRYPT_ACL_SECURE_SHARE_SETTING);
+				"Remove or set crypt_acl_require_secure_key_sharing=no");
 			ret = -1;
 			break;
 		}
@@ -382,7 +371,9 @@ mail_crypt_acl_mail_namespace_storage_added(struct mail_namespace *ns)
 	   ACL core code would need some changing to make it work correctly. */
 	backend = alist->rights.backend;
 	mlist->acl_vprev = backend->v;
-	backend->v.object_update = mail_crypt_acl_object_update;
+	mlist->v = *backend->v;
+	mlist->v.object_update = mail_crypt_acl_object_update;
+	backend->v = &mlist->v;
 }
 
 static void mail_crypt_acl_mailbox_list_deinit(struct mailbox_list *list)

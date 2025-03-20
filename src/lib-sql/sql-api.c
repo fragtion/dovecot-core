@@ -6,6 +6,8 @@
 #include "hash.h"
 #include "str.h"
 #include "time-util.h"
+#include "settings.h"
+#include "settings-parser.h"
 #include "sql-api-private.h"
 
 #include <time.h>
@@ -14,17 +16,58 @@ struct event_category event_category_sql = {
 	.name = "sql",
 };
 
+#undef DEF
+#define DEF(type, name) \
+	SETTING_DEFINE_STRUCT_##type(#name, name, struct sql_settings)
+static const struct setting_define sql_setting_defines[] = {
+	DEF(STR, sql_driver),
+
+	SETTING_DEFINE_LIST_END
+};
+static const struct sql_settings sql_default_settings = {
+	.sql_driver = "",
+};
+const struct setting_parser_info sql_setting_parser_info = {
+	.name = "sql",
+
+	.defines = sql_setting_defines,
+	.defaults = &sql_default_settings,
+
+	.struct_size = sizeof(struct sql_settings),
+	.pool_offset1 = 1 + offsetof(struct sql_settings, pool),
+};
+
 struct sql_db_module_register sql_db_module_register = { 0 };
 ARRAY_TYPE(sql_drivers) sql_drivers;
 
-void sql_drivers_init(void)
+void sql_drivers_init_without_drivers(void)
 {
 	i_array_init(&sql_drivers, 8);
 }
 
-void sql_drivers_deinit(void)
+void sql_drivers_deinit_without_drivers(void)
 {
 	array_free(&sql_drivers);
+}
+
+extern struct sql_db driver_sqlpool_db;
+
+void sql_drivers_init(void)
+{
+	/* Access driver-sqlpool in some way to avoid dropping the .o entirely
+	   when linking libsql.a to auth process when sql drivers are built as
+	   plugins. */
+	if (driver_sqlpool_db.v.init != NULL)
+		i_unreached();
+
+	sql_drivers_init_without_drivers();
+	sql_drivers_init_all();
+}
+
+void sql_drivers_deinit(void)
+{
+	sql_drivers_deinit_all();
+	sql_drivers_deinit_without_drivers();
 }
 
 static const struct sql_db *sql_driver_lookup(const char *name)
@@ -51,62 +94,52 @@ void sql_driver_register(const struct sql_db *driver)
 
 void sql_driver_unregister(const struct sql_db *driver)
 {
-	const struct sql_db *const *drivers;
-	unsigned int i, count;
+	unsigned int i;
 
-	drivers = array_get(&sql_drivers, &count);
-	for (i = 0; i < count; i++) {
-		if (drivers[i] == driver) {
-			array_delete(&sql_drivers, i, 1);
-			break;
-		}
-	}
+	if (!array_lsearch_ptr_idx(&sql_drivers, driver, &i))
+		i_unreached();
+	array_delete(&sql_drivers, i, 1);
 }
 
-struct sql_db *sql_init(const char *db_driver, const char *connect_string)
-{
-	const char *error;
-	struct sql_db *db;
-	struct sql_settings set = {
-		.driver = db_driver,
-		.connect_string = connect_string,
-	};
-
-	if (sql_init_full(&set, &db, &error) < 0)
-		i_fatal("%s", error);
-	return db;
-}
-
-int sql_init_full(const struct sql_settings *set, struct sql_db **db_r,
+int sql_init_auto(struct event *event, struct sql_db **db_r,
 		  const char **error_r)
 {
 	const struct sql_db *driver;
 	struct sql_db *db;
-	int ret = 0;
+	struct sql_settings *sql_set;
+	const char *error;
 
-	i_assert(set->connect_string != NULL);
+	i_assert(event != NULL);
 
-	driver = sql_driver_lookup(set->driver);
+	if (settings_get(event, &sql_setting_parser_info, 0,
+			 &sql_set, error_r) < 0)
+		return -1;
+
+	if (sql_set->sql_driver[0] == '\0') {
+		*error_r = "sql_driver setting is empty";
+		settings_free(sql_set);
+		return 0;
+	}
+	driver = sql_driver_lookup(sql_set->sql_driver);
 	if (driver == NULL) {
-		*error_r = t_strdup_printf("Unknown database driver '%s'", set->driver);
+		*error_r = t_strdup_printf("Unknown database driver '%s'",
+					   sql_set->sql_driver);
+		settings_free(sql_set);
 		return -1;
 	}
 
-	if ((driver->flags & SQL_DB_FLAG_POOLED) == 0) {
-		if (driver->v.init_full == NULL) {
-			db = driver->v.init(set->connect_string);
-		} else
-			ret = driver->v.init_full(set, &db, error_r);
-	} else
-		ret = driver_sqlpool_init_full(set, driver, &db, error_r);
-
-	if (ret < 0)
+	if (driver->v.init(event, &db, &error) < 0) {
+		*error_r = t_strdup_printf("sql %s: %s",
+					   sql_set->sql_driver, error);
+		settings_free(sql_set);
 		return -1;
+	}
 
-	sql_init_common(db);
+	settings_free(sql_set);
 	*db_r = db;
-	return 0;
+	return 1;
 }
+
 
 void sql_init_common(struct sql_db *db)
 {
@@ -572,8 +605,7 @@ static void sql_result_fetch(struct sql_result *result)
 			continue;
 
 		value = sql_result_get_field_value(result, i);
-		ptr = STRUCT_MEMBER_P(result->fetch_dest,
-				      result->map[i].offset);
+		ptr = PTR_OFFSET(result->fetch_dest, result->map[i].offset);
 
 		switch (result->map[i].type) {
 		case SQL_TYPE_STR: {
@@ -718,6 +750,11 @@ struct sql_transaction_context *sql_transaction_begin(struct sql_db *db)
 	return db->v.transaction_begin(db);
 }
 
+void sql_transaction_set_non_atomic(struct sql_transaction_context *ctx)
+{
+	ctx->non_atomic = TRUE;
+}
+
 #undef sql_transaction_commit
 void sql_transaction_commit(struct sql_transaction_context **_ctx,
 			    sql_commit_callback_t *callback, void *context)
@@ -829,7 +866,7 @@ struct event_passthrough *
 sql_query_finished_event(struct sql_db *db, struct event *event, const char *query,
 			 bool success, int *duration_r)
 {
-	int diff;
+	long long diff;
 	struct timeval tv;
 	event_get_create_time(event, &tv);
 	struct event_passthrough *e = event_create_passthrough(event)->
@@ -847,7 +884,8 @@ sql_query_finished_event(struct sql_db *db, struct event *event, const char *que
 		e->add_str("slow_query", "y");
 		db->slow_queries++;
 	}
-	*duration_r = diff;
+	i_assert(diff <= INT_MAX);
+	*duration_r = (int)diff;
 
 	return e;
 }

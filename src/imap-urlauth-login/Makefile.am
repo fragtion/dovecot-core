@@ -9,6 +9,7 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-auth-client \
 	-I$(top_srcdir)/src/lib-master \
 	-I$(top_srcdir)/src/lib-login \
+	-I$(top_srcdir)/src/lib-var-expand \
 	$(BINARY_CFLAGS)
 
 imap_urlauth_login_CPPFLAGS = \
@@ -28,6 +29,3 @@ imap_urlauth_login_DEPENDENCIES = \
 imap_urlauth_login_SOURCES = \
 	imap-urlauth-login.c \
 	imap-urlauth-login-settings.c
-
-noinst_HEADERS = \
-	imap-urlauth-login-settings.h

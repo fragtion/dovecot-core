@@ -109,10 +109,9 @@ int main(int argc, char *argv[])
 	if (master_getopt(master_service) > 0)
 		return FATAL_DEFAULT;
 
-	if (master_service_settings_read_simple(master_service, NULL,
-						&error) < 0)
-		i_fatal("Error reading configuration: %s", error);
-	set = master_service_settings_get(master_service);
+	if (master_service_settings_read_simple(master_service, &error) < 0)
+		i_fatal("%s", error);
+	set = master_service_get_service_settings(master_service);
 
 	master_service_init_log(master_service);
 	restrict_access_by_env(RESTRICT_ACCESS_FLAG_ALLOW_ROOT, NULL);

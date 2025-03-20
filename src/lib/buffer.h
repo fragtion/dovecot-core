@@ -24,11 +24,15 @@ void buffer_create_from_const_data(buffer_t *buffer,
 				   const void *data, size_t size);
 #define buffer_create_from_data(b,d,s) \
 	TYPE_CHECKS(void, \
+	/* NOLINTBEGIN(bugprone-sizeof-expression) */ \
 	COMPILE_ERROR_IF_TRUE(__builtin_object_size((d),1) < ((s)>0?(s):1)), \
+	/* NOLINTEND(bugprone-sizeof-expression) */ \
 	buffer_create_from_data((b), (d), (s)))
 #define buffer_create_from_const_data(b,d,s) \
 	TYPE_CHECKS(void, \
+	/* NOLINTBEGIN(bugprone-sizeof-expression) */ \
 	COMPILE_ERROR_IF_TRUE(__builtin_object_size((d),1) < ((s)>0?(s):1)), \
+	/* NOLINTEND(bugprone-sizeof-expression) */ \
 	buffer_create_from_const_data((b), (d), (s)))
 
 /* Creates a dynamically growing buffer. Whenever write would exceed the
@@ -91,6 +95,26 @@ void buffer_copy(buffer_t *dest, size_t dest_pos,
    copy the rest of the used data in buffer. */
 void buffer_append_buf(buffer_t *dest, const buffer_t *src,
 		       size_t src_pos, size_t copy_size);
+
+/* Clone source buffer onto specified pool. Allocate extra_space extra space. */
+static inline buffer_t *
+buffer_clone(pool_t pool, const buffer_t *src, size_t extra_space)
+{
+	buffer_t *buf = buffer_create_dynamic(pool, src->used + extra_space);
+
+	buffer_append_buf(buf, src, 0, SIZE_MAX);
+	return buf;
+}
+/* Clone source buffer onto datastack. Allocate extra_space extra space. */
+static inline buffer_t *
+t_buffer_clone(const buffer_t *src, size_t extra_space)
+{
+	buffer_t *buf = buffer_create_dynamic(pool_datastack_create(),
+					      src->used + extra_space);
+
+	buffer_append_buf(buf, src, 0, SIZE_MAX);
+	return buf;
+}
 
 /* Returns pointer to specified position in buffer. WARNING: The returned
    address may become invalid if you add more data to buffer. */

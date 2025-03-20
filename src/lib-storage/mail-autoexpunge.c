@@ -2,6 +2,7 @@
 
 #include "lib.h"
 #include "ioloop.h"
+#include "settings.h"
 #include "mailbox-list-iter.h"
 #include "mail-storage-private.h"
 #include "mail-namespace.h"
@@ -206,7 +207,7 @@ mailbox_autoexpunge_wildcards(struct mail_namespace *ns,
 					expunged_count);
 	} T_END;
 	if (mailbox_list_iter_deinit(&iter) < 0) {
-		e_error(ns->user->event,
+		e_error(mailbox_list_get_event(ns->list),
 			"Failed to iterate autoexpunge mailboxes '%s': %s",
 			iter_name, mailbox_list_get_last_internal_error(ns->list, NULL));
 	}
@@ -214,7 +215,7 @@ mailbox_autoexpunge_wildcards(struct mail_namespace *ns,
 
 static void
 mailbox_autoexpunge_name(struct mail_namespace *ns,
-			 struct mailbox_settings *box_set,
+			 const struct mailbox_settings *box_set,
 			 unsigned int *expunged_count)
 {
 	const char *vname;
@@ -237,20 +238,19 @@ static bool
 mail_namespace_autoexpunge(struct mail_namespace *ns, struct file_lock **lock,
 			   unsigned int *expunged_count)
 {
-	struct mailbox_settings *box_set;
+	const struct mailbox_settings *box_set;
 
-	if (!array_is_created(&ns->set->mailboxes))
+	if (!array_is_created(&ns->set->parsed_mailboxes))
 		return TRUE;
 
-	array_foreach_elem(&ns->set->mailboxes, box_set) {
+	array_foreach_elem(&ns->set->parsed_mailboxes, box_set) {
 		if (box_set->autoexpunge == 0 &&
-		    box_set->autoexpunge_max_mails == 0)
-			continue;
-
-		if (!mailbox_autoexpunge_lock(ns->user, lock))
+		    box_set->autoexpunge_max_mails == 0) {
+			/* no autoexpunging needed */
+		} else if (!mailbox_autoexpunge_lock(ns->user, lock)) {
+			/* another process is already autoexpunging */
 			return FALSE;
-
-		T_BEGIN {
+		} else T_BEGIN {
 			mailbox_autoexpunge_name(ns, box_set, expunged_count);
 		} T_END;
 	}

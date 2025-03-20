@@ -91,6 +91,8 @@ auth_server_input_mech(struct auth_client_connection *conn,
 			mech_desc.flags |= MECH_SEC_FORWARD_SECRECY;
 		else if (strcmp(*args, "mutual-auth") == 0)
 			mech_desc.flags |= MECH_SEC_MUTUAL_AUTH;
+		else if (strcmp(*args, "channel-binding") == 0)
+			mech_desc.flags |= MECH_SEC_CHANNEL_BINDING;
 	}
 	array_push_back(&conn->available_auth_mechs, &mech_desc);
 	return 0;
@@ -188,7 +190,8 @@ auth_client_connection_handshake_line(struct connection *_conn,
 		return auth_server_input_done(conn);
 	}
 
-	e_error(conn->conn.event, "Auth server sent unknown handshake: %s", line);
+	e_error(conn->conn.event,
+		"Auth server sent unknown handshake: %s", line);
 	return -1;
 }
 
@@ -196,6 +199,19 @@ static void auth_client_connection_handshake_ready(struct connection *_conn)
 {
 	struct auth_client_connection *conn =
 		container_of(_conn, struct auth_client_connection, conn);
+
+	struct auth_mech_desc *mech_desc;
+	array_foreach_modifiable(&conn->client->available_auth_mechs,
+				 mech_desc) {
+		i_free(mech_desc->name);
+	}
+	array_clear(&conn->client->available_auth_mechs);
+	array_foreach_modifiable(&conn->available_auth_mechs, mech_desc) {
+		struct auth_mech_desc *dup_desc =
+			array_append_space(&conn->client->available_auth_mechs);
+		*dup_desc = *mech_desc;
+		dup_desc->name = i_strdup(mech_desc->name);
+	}
 
 	timeout_remove(&conn->to);
 	if (conn->client->connect_notify_callback != NULL) {
@@ -206,7 +222,7 @@ static void auth_client_connection_handshake_ready(struct connection *_conn)
 
 static int
 auth_server_lookup_request(struct auth_client_connection *conn,
-			   const char *id_arg, bool remove,
+			   const char *id_arg, bool server_finished,
 			   struct auth_client_request **request_r)
 {
 	struct auth_client_request *request;
@@ -224,8 +240,13 @@ auth_server_lookup_request(struct auth_client_connection *conn,
 			"Authentication server sent unknown id %u", id);
 		return 0;
 	}
-	if (remove || auth_client_request_is_aborted(request))
-		hash_table_remove(conn->requests, POINTER_CAST(id));
+	if (request->server_finished) {
+		e_error(conn->conn.event,
+			"Authentication server sent finished id %u", id);
+		return 0;
+	}
+	if (server_finished)
+		request->server_finished = TRUE;
 
 	*request_r = request;
 	return 1;
@@ -238,15 +259,17 @@ auth_server_input_ok(struct auth_client_connection *conn,
 	struct auth_client_request *request;
 	int ret;
 
-	if ((ret = auth_server_lookup_request(conn, args[0], TRUE, &request)) <= 0)
+	ret = auth_server_lookup_request(conn, args[0], TRUE, &request);
+	if (ret <= 0)
 		return ret;
-	auth_client_request_server_input(request, AUTH_REQUEST_STATUS_OK,
+	auth_client_request_server_input(&request, AUTH_REQUEST_STATUS_OK,
 					 args + 1);
 	return 0;
 }
 
-static int auth_server_input_cont(struct auth_client_connection *conn,
-				  const char *const *args)
+static int
+auth_server_input_cont(struct auth_client_connection *conn,
+		       const char *const *args)
 {
 	struct auth_client_request *request;
 	int ret;
@@ -257,22 +280,25 @@ static int auth_server_input_cont(struct auth_client_connection *conn,
 		return -1;
 	}
 
-	if ((ret = auth_server_lookup_request(conn, args[0], FALSE, &request)) <= 0)
+	ret = auth_server_lookup_request(conn, args[0], FALSE, &request);
+	if (ret <= 0)
 		return ret;
-	auth_client_request_server_input(request, AUTH_REQUEST_STATUS_CONTINUE,
+	auth_client_request_server_input(&request, AUTH_REQUEST_STATUS_CONTINUE,
 					 args + 1);
 	return 0;
 }
 
-static int auth_server_input_fail(struct auth_client_connection *conn,
-				  const char *const *args)
+static int
+auth_server_input_fail(struct auth_client_connection *conn,
+		       const char *const *args)
 {
 	struct auth_client_request *request;
 	int ret;
 
-	if ((ret = auth_server_lookup_request(conn, args[0], TRUE, &request)) <= 0)
+	ret = auth_server_lookup_request(conn, args[0], TRUE, &request);
+	if (ret <= 0)
 		return ret;
-	auth_client_request_server_input(request, AUTH_REQUEST_STATUS_FAIL,
+	auth_client_request_server_input(&request, AUTH_REQUEST_STATUS_FAIL,
 					 args + 1);
 	return 0;
 }
@@ -367,7 +393,7 @@ auth_client_connection_remove_requests(struct auth_client_connection *conn,
 				oldest = created;
 		}
 
-		auth_client_request_server_input(request,
+		auth_client_request_server_input(&request,
 			AUTH_REQUEST_STATUS_INTERNAL_FAIL,
 			temp_failure_args);
 	}
@@ -384,7 +410,7 @@ auth_client_connection_remove_requests(struct auth_client_connection *conn,
 }
 
 void auth_client_connection_disconnect(struct auth_client_connection *conn,
-				       const char *reason) ATTR_NULL(2)
+				       const char *reason)
 {
 	if (reason == NULL)
 		reason = "Disconnected from auth server, aborting";
@@ -435,7 +461,7 @@ static void auth_client_connection_destroy(struct connection *_conn)
 	}
 }
 
-static void auth_server_reconnect_timeout(struct auth_client_connection *conn)
+void auth_server_reconnect_timeout(struct auth_client_connection *conn)
 {
 	(void)auth_client_connection_connect(conn);
 }
@@ -458,6 +484,8 @@ void auth_client_connection_deinit(struct auth_client_connection **_conn)
 {
         struct auth_client_connection *conn = *_conn;
 
+	if (conn == NULL)
+		return;
 	*_conn = NULL;
 
 	auth_client_connection_disconnect(conn, "deinitializing");
@@ -471,7 +499,8 @@ void auth_client_connection_deinit(struct auth_client_connection **_conn)
 
 static void auth_client_handshake_timeout(struct auth_client_connection *conn)
 {
-	e_error(conn->conn.event, "Timeout waiting for handshake from auth server. "
+	e_error(conn->conn.event,
+		"Timeout waiting for handshake from auth server. "
 		"my pid=%u, input bytes=%"PRIuUOFF_T,
 		conn->client->client_pid, conn->conn.input->v_offset);
 	auth_client_connection_reconnect(conn, "auth server timeout");
@@ -535,7 +564,7 @@ auth_client_connection_add_request(struct auth_client_connection *conn,
 {
 	unsigned int id;
 
-	i_assert(conn->conn.handshake_received);
+	i_assert(connection_handshake_received(&conn->conn));
 
 	id = ++conn->client->request_id_counter;
 	if (id == 0) {
@@ -548,8 +577,11 @@ auth_client_connection_add_request(struct auth_client_connection *conn,
 }
 
 void auth_client_connection_remove_request(struct auth_client_connection *conn,
-					   unsigned int id)
+					   struct auth_client_request *request)
 {
-	i_assert(conn->conn.handshake_received);
-	hash_table_remove(conn->requests, POINTER_CAST(id));
+	if (request->removed)
+		return;
+	i_assert(connection_handshake_received(&conn->conn));
+	hash_table_remove(conn->requests, POINTER_CAST(request->id));
+	request->removed = TRUE;
 }

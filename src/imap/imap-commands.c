@@ -27,15 +27,14 @@ static const struct command imap4rev1_commands[] = {
 						 COMMAND_FLAG_BREAKS_MAILBOX },
 	{ "EXAMINE",		cmd_examine,     COMMAND_FLAG_BREAKS_MAILBOX },
 	{ "CREATE",		cmd_create,      0 },
-	{ "DELETE",		cmd_delete,      COMMAND_FLAG_BREAKS_MAILBOX |
-						 COMMAND_FLAG_USE_NONEXISTENT },
-	{ "RENAME",		cmd_rename,      COMMAND_FLAG_USE_NONEXISTENT },
+	{ "DELETE",		cmd_delete,      COMMAND_FLAG_BREAKS_MAILBOX },
+	{ "RENAME",		cmd_rename,      0 },
 	{ "LIST",		cmd_list,        0 },
 	{ "LSUB",		cmd_lsub,        0 },
 	{ "SELECT",		cmd_select,      COMMAND_FLAG_BREAKS_MAILBOX },
 	{ "STATUS",		cmd_status,      0 },
 	{ "SUBSCRIBE",		cmd_subscribe,   0 },
-	{ "UNSUBSCRIBE",	cmd_unsubscribe, COMMAND_FLAG_USE_NONEXISTENT },
+	{ "UNSUBSCRIBE",	cmd_unsubscribe, 0 },
 
 	{ "CHECK",		cmd_check,       COMMAND_FLAG_BREAKS_SEQS },
 	{ "CLOSE",		cmd_close,       COMMAND_FLAG_BREAKS_MAILBOX },
@@ -81,7 +80,16 @@ static const struct command imap_ext_commands[] = {
 	/* IMAP URLAUTH (RFC4467): */
 	{ "GENURLAUTH",		cmd_genurlauth,  0 },
 	{ "RESETKEY",		cmd_resetkey,    0 },
-	{ "URLFETCH",		cmd_urlfetch,    0 }
+	{ "URLFETCH",		cmd_urlfetch,    0 },
+	/* IMAP REPLACE (RFC8508): */
+	{ "REPLACE",		cmd_replace,     COMMAND_FLAG_USES_SEQS |
+						 COMMAND_FLAG_BREAKS_SEQS |
+						 /* finish syncing and sending
+						    all tagged commands before
+						    we wait for REPLACE input */
+						 COMMAND_FLAG_BREAKS_MAILBOX },
+	{ "UID REPLACE",	cmd_replace,     COMMAND_FLAG_BREAKS_SEQS |
+						 COMMAND_FLAG_BREAKS_MAILBOX },
 };
 #define IMAP_EXT_COMMANDS_COUNT N_ELEMENTS(imap_ext_commands)
 
@@ -219,7 +227,7 @@ static int command_bsearch(const char *name, const struct command *cmd)
 	return strcasecmp(name, cmd->name);
 }
 
-struct command *command_find(const char *name)
+const struct command *command_find(const char *name)
 {
 	if (commands_unsorted) {
 		array_sort(&imap_commands, command_cmp);

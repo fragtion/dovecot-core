@@ -126,7 +126,7 @@ static bool try_get_mailbox_name(struct mail_storage_list_index_rebuild_ctx *ctx
 		e_debug(ctx->storage->event, "Cannot open mailbox index at %s: Not found", path);
 	} else if (rc < 0) {
 		e_debug(ctx->storage->event, "Cannot open mailbox index at %s: %s",
-			path, mail_index_get_error_message(index));
+			path, mail_index_get_last_error(index, NULL));
 	}
 	mail_index_free(&index);
 	return ret;
@@ -153,8 +153,8 @@ static const char *get_box_name(struct mail_storage_list_index_rebuild_ctx *ctx,
 					     "but could not recover mailbox name",
 			guid_128_to_string(box->guid), path);
 		box_name = t_strdup_printf("%s%s",
-					   ctx->storage->lost_mailbox_prefix,
-					   guid_128_to_string(box->guid));
+			ctx->storage->set->mailbox_list_lost_mailbox_prefix,
+			guid_128_to_string(box->guid));
 	}
 	return box_name;
 }
@@ -205,14 +205,14 @@ mail_storage_list_remove_duplicate(struct mail_storage_list_index_rebuild_ctx *c
 	const char *delete_name, *keep_name;
 
 	if (strcmp(box->list->name, MAILBOX_LIST_NAME_INDEX) != 0) {
-		/* we're not using LAYOUT=index. not really supported now,
-		   but just ignore that in here. */
+		/* we're not using mailbox_list_layout=index. not really
+		   supported now, but just ignore that in here. */
 		return 0;
 	}
 	/* we'll need to delete one of these entries. if one of them begins with
 	   "lost-", remove it. otherwise just pick one of them randomly. */
-	if (strncmp(box->name, ctx->storage->lost_mailbox_prefix,
-		    strlen(ctx->storage->lost_mailbox_prefix)) == 0) {
+	if (strncmp(box->name, ctx->storage->set->mailbox_list_lost_mailbox_prefix,
+		    strlen(ctx->storage->set->mailbox_list_lost_mailbox_prefix)) == 0) {
 		delete_name = box->name;
 		keep_name = rebuild_box->index_name;
 	} else {
@@ -342,6 +342,14 @@ mail_storage_list_mailbox_create(struct mailbox *box,
 	return -1;
 }
 
+static const char *mailbox_name_add_random_suffix(const char *name)
+{
+	unsigned char randomness[8];
+	random_fill(randomness, sizeof(randomness));
+	return t_strconcat(name, "-",
+			   binary_to_hex(randomness, sizeof(randomness)), NULL);
+}
+
 static int
 mail_storage_list_index_try_create(struct mail_storage_list_index_rebuild_ctx *ctx,
 				   struct mailbox_list *list,
@@ -352,21 +360,16 @@ mail_storage_list_index_try_create(struct mail_storage_list_index_rebuild_ctx *c
 	struct mail_storage *storage = ctx->storage;
 	struct mailbox *box;
 	struct mailbox_update update;
-	string_t *name = t_str_new(128);
-	unsigned char randomness[8];
+	const char *name;
 	int ret;
 
 	i_zero(&update);
 	guid_128_copy(update.mailbox_guid, guid_p);
 
-	str_append(name, boxname);
-	if (retry) {
-		random_fill(randomness, sizeof(randomness));
-		str_append_c(name, '-');
-		binary_to_hex_append(name, randomness, sizeof(randomness));
-	}
+	name = !retry ? boxname : mailbox_name_add_random_suffix(boxname);
+
 	/* ignore ACLs to avoid interference */
-	box = mailbox_alloc(list, str_c(name), MAILBOX_FLAG_IGNORE_ACLS);
+	box = mailbox_alloc(list, name, MAILBOX_FLAG_IGNORE_ACLS);
 	e_debug(box->event, "Mailbox GUID %s exists in storage, but not in list index",
 		guid_128_to_string(guid_p));
 
@@ -376,23 +379,23 @@ mail_storage_list_index_try_create(struct mail_storage_list_index_rebuild_ctx *c
 	else if (mailbox_sync(box, MAILBOX_SYNC_FLAG_FORCE_RESYNC) < 0) {
 		mail_storage_set_critical(storage,
 			"List rebuild: Couldn't force resync on created mailbox %s: %s",
-			str_c(name), mailbox_get_last_internal_error(box, NULL));
+			name, mailbox_get_last_internal_error(box, NULL));
 		ret = -1;
 	}
 	mailbox_free(&box);
 
-	if (ret < 0)
+	if (ret <= 0)
 		return ret;
 
 	/* open a second time to rename the mailbox to its original name,
 	   ignore ACLs to avoid interference. */
-	box = mailbox_alloc(list, str_c(name), MAILBOX_FLAG_IGNORE_ACLS);
+	box = mailbox_alloc(list, name, MAILBOX_FLAG_IGNORE_ACLS);
 	e_debug(box->event, "Attempting to recover original name");
 	if (mailbox_open(box) < 0 &&
 	    mailbox_get_last_mail_error(box) != MAIL_ERROR_NOTFOUND) {
 		mail_storage_set_critical(storage,
 			"List rebuild: Couldn't open recovered mailbox %s: %s",
-			str_c(name), mailbox_get_last_internal_error(box, NULL));
+			name, mailbox_get_last_internal_error(box, NULL));
 		ret = -1;
 	}
 	mailbox_free(&box);
@@ -426,13 +429,14 @@ mail_storage_list_index_create(struct mail_storage_list_index_rebuild_ctx *ctx,
 struct mailbox_sort_node {
 	struct mailbox_node node;
 	struct mail_storage_list_index_rebuild_mailbox *box;
+	bool seen;
 };
 
 static int mail_storage_list_index_add_missing(struct mail_storage_list_index_rebuild_ctx *ctx)
 {
 	struct hash_iterate_context *iter;
 	struct mail_storage_list_index_rebuild_mailbox *box;
-	char *key ATTR_UNUSED;
+	char *key;
 	struct mailbox_node *_node;
 	unsigned int num_created = 0;
 	char sep = mail_namespaces_get_root_sep(ctx->storage->user->namespaces);
@@ -445,19 +449,39 @@ static int mail_storage_list_index_add_missing(struct mail_storage_list_index_re
 	e_debug(ctx->storage->event, "Sorting mailbox tree");
 	struct mailbox_tree_context *tree =
 		mailbox_tree_init_size(sep, sizeof(struct mailbox_sort_node));
-	while (hash_table_iterate(iter, ctx->mailboxes, &key, &box)) T_BEGIN {
+	while (ret == 0 &&
+	       hash_table_iterate(iter, ctx->mailboxes, &key, &box)) T_BEGIN {
 		bool created;
 		const char *name = box->index_name;
 		if (name == NULL)
 			name = get_box_name(ctx, box);
-		const char *vname =
+		const char *orig_vname =
 			t_strconcat(box->list->ns->prefix, name, NULL);
-		_node =	mailbox_tree_get(tree, vname, &created);
-		struct mailbox_sort_node *node =
-			container_of(_node, struct mailbox_sort_node, node);
-		node->box = box;
+		const char *vname = orig_vname;
+		for (unsigned int i = 0; ; i++) {
+			_node =	mailbox_tree_get(tree, vname, &created);
+			struct mailbox_sort_node *node =
+				container_of(_node, struct mailbox_sort_node, node);
+			if (!node->seen) {
+				node->box = box;
+				node->seen = TRUE;
+				break;
+			}
+
+			if (i == 100) {
+				mail_storage_set_critical(ctx->storage,
+					"List rebuild: Failed to create a new mailbox name for GUID %s - "
+					"everything seems to exist?", key);
+				ret = -1;
+				break;
+			}
+			/* duplicate mailbox name - try a different one */
+			vname = mailbox_name_add_random_suffix(orig_vname);
+		}
 	} T_END;
 	hash_table_iterate_deinit(&iter);
+	if (ret < 0)
+		return -1;
 
 	mailbox_tree_sort(tree);
 
@@ -498,8 +522,8 @@ static int mail_storage_list_index_rebuild_ctx(struct mail_storage_list_index_re
 
 	array_foreach_modifiable(&ctx->rebuild_namespaces, rebuild_ns) {
 		e_debug(ctx->storage->event,
-			"Rebuilding list index for namespace '%s'",
-			rebuild_ns->ns->prefix);
+			"Rebuilding list index for namespace %s",
+			rebuild_ns->ns->set->name);
 		if (mail_storage_list_index_fill_storage_mailboxes(ctx, rebuild_ns->ns->list) < 0)
 			return -1;
 		if (mail_storage_list_index_find_indexed_mailboxes(ctx, rebuild_ns) < 0)

@@ -28,6 +28,7 @@ void mailbox_list_index_set_index_error(struct mailbox_list *list)
 	struct mailbox_list_index *ilist = INDEX_LIST_CONTEXT_REQUIRE(list);
 
 	mailbox_list_set_internal_error(list);
+	mail_index_get_last_error(ilist->index, &ilist->index_error_code);
 	mail_index_reset_error(ilist->index);
 }
 
@@ -58,6 +59,7 @@ int mailbox_list_index_index_open(struct mailbox_list *list)
 	const struct mail_storage_settings *set = list->mail_set;
 	enum mail_index_open_flags index_flags;
 	unsigned int lock_timeout;
+	int ret;
 
 	if (ilist->opened)
 		return 0;
@@ -69,8 +71,8 @@ int mailbox_list_index_index_open(struct mailbox_list *list)
 
 	index_flags = mail_storage_settings_to_index_flags(set);
 	if (strcmp(list->name, MAILBOX_LIST_NAME_INDEX) == 0) {
-		/* LAYOUT=index. this is the only location for the mailbox
-		   data, so we must never move it into memory. */
+		/* mailbox_list_layout=index. This is the only location for
+		   the mailbox data, so we must never move it into memory. */
 		index_flags |= MAIL_INDEX_OPEN_FLAG_NEVER_IN_MEMORY;
 	}
 	lock_timeout = set->mail_max_lock_timeout == 0 ? UINT_MAX :
@@ -97,11 +99,11 @@ int mailbox_list_index_index_open(struct mailbox_list *list)
 	mail_index_set_fsync_mode(ilist->index, set->parsed_fsync_mode, 0);
 	mail_index_set_lock_method(ilist->index, set->parsed_lock_method,
 				   lock_timeout);
-	if (mail_index_open_or_create(ilist->index, index_flags) < 0) {
+	if ((ret = mail_index_open_or_create(ilist->index, index_flags)) < 0) {
 		if (mail_index_move_to_memory(ilist->index) < 0) {
 			/* try opening once more. it should be created
 			   directly into memory now, except if it fails with
-			   LAYOUT=index backend. */
+			   mailbox_list_layout=index backend. */
 			if (mail_index_open_or_create(ilist->index,
 						      index_flags) < 0) {
 				mailbox_list_set_internal_error(list);
@@ -109,6 +111,8 @@ int mailbox_list_index_index_open(struct mailbox_list *list)
 			}
 		}
 	}
+	if (ret == 1)
+		ilist->index_created = TRUE;
 	ilist->opened = TRUE;
 	return 0;
 }
@@ -118,7 +122,8 @@ mailbox_list_index_node_find_sibling(const struct mailbox_list *list,
 				     struct mailbox_list_index_node *node,
 				     const char *name)
 {
-	mailbox_list_name_unescape(&name, list->set.storage_name_escape_char);
+	mailbox_list_name_unescape(&name,
+		list->mail_set->mailbox_list_storage_escape_char[0]);
 
 	while (node != NULL) {
 		if (strcmp(node->raw_name, name) == 0)
@@ -398,7 +403,7 @@ static int mailbox_list_index_parse_records(struct mailbox_list_index *ilist,
 	}
 
 	/* do a second scan to create the actual mailbox tree hierarchy.
-	   this is needed because the parent_uid may be smaller or higher than
+	   this is needed because the parent_uid may be greater than or less than
 	   the current node's uid */
 	if (*error_r != NULL && ilist->has_backing_store)
 		count = 0;
@@ -531,10 +536,10 @@ mailbox_name_hdr_encode(struct mailbox_list *list, const char *storage_name,
 	};
 	const char **name_parts =
 		(const char **)p_strsplit(unsafe_data_stack_pool, storage_name, sep);
-	if (list->set.storage_name_escape_char != '\0') {
+	if (list->mail_set->mailbox_list_storage_escape_char[0] != '\0') {
 		for (unsigned int i = 0; name_parts[i] != NULL; i++) {
 			mailbox_list_name_unescape(&name_parts[i],
-				list->set.storage_name_escape_char);
+				list->mail_set->mailbox_list_storage_escape_char[0]);
 		}
 	}
 
@@ -555,7 +560,7 @@ mailbox_name_hdr_decode_storage_name(struct mailbox_list *list,
 				     size_t name_hdr_size)
 {
 	const char list_sep = mailbox_list_get_hierarchy_sep(list);
-	const char escape_char = list->set.storage_name_escape_char;
+	const char escape_char = list->mail_set->mailbox_list_storage_escape_char[0];
 	string_t *storage_name = t_str_new(name_hdr_size);
 	while (name_hdr_size > 0) {
 		const unsigned char *p = memchr(name_hdr, '\0', name_hdr_size);
@@ -577,7 +582,7 @@ mailbox_name_hdr_decode_storage_name(struct mailbox_list *list,
 			str_append(storage_name,
 				   mailbox_list_escape_name_params(name_part,
 					"", '\0', list_sep, escape_char,
-					list->set.maildir_name));
+					list->mail_set->mailbox_directory_name));
 		}
 
 		if (p != NULL) {
@@ -646,6 +651,10 @@ int mailbox_list_index_refresh_force(struct mailbox_list *list)
 			/* I/O failure - don't try to handle corruption,
 			   since we don't have the latest state. */
 			handle_corruption = FALSE;
+			if (ilist->index_error_code == MAIL_INDEX_ERROR_CODE_NO_ACCESS)
+				ret = mail_index_refresh(ilist->index);
+			if (ret >= 0)
+				ret = mailbox_list_index_parse(list, view, FALSE);
 		}
 	} else {
 		ret = mailbox_list_index_parse(list, view, FALSE);
@@ -654,12 +663,9 @@ int mailbox_list_index_refresh_force(struct mailbox_list *list)
 
 	if (handle_corruption &&
 	    mailbox_list_index_handle_corruption(list) < 0) {
-		const char *errstr;
-		enum mail_error error;
-
-		errstr = mailbox_list_get_last_internal_error(list, &error);
-		mailbox_list_set_error(list, error, t_strdup_printf(
-			"Failed to rebuild mailbox list index: %s", errstr));
+		mailbox_list_set_critical(list,
+			"Failed to rebuild mailbox list index: %s",
+			mailbox_list_get_last_internal_error(list, NULL));
 		ret = -1;
 	}
 	ilist->last_refresh_timeval = ioloop_timeval;
@@ -725,7 +731,7 @@ list_handle_corruption_locked(struct mailbox_list *list,
 			continue;
 
 		if (storage->v.list_index_rebuild(storage, reason) < 0) {
-			errstr = mail_storage_get_last_internal_error(storage, &error);
+			errstr = mail_storage_get_last_error(storage, &error);
 			mailbox_list_set_error(list, error, errstr);
 			return -1;
 		} else {
@@ -1067,8 +1073,7 @@ static bool mailbox_list_index_is_enabled(struct mailbox_list *list)
 	    (list->props & MAILBOX_LIST_PROP_NO_LIST_INDEX) != 0)
 		return FALSE;
 
-	i_assert(list->set.list_index_fname != NULL);
-	if (list->set.list_index_fname[0] == '\0')
+	if (list->mail_set->parsed_list_index_fname[0] == '\0')
 		return FALSE;
 	return TRUE;
 }
@@ -1140,11 +1145,11 @@ static void mailbox_list_index_init_finish(struct mailbox_list *list)
 	}
 	i_assert(ilist->has_backing_store || dir != NULL);
 
-	i_assert(list->set.list_index_fname != NULL);
 	ilist->path = dir == NULL ? "(in-memory mailbox list index)" :
-		p_strdup_printf(list->pool, "%s/%s", dir, list->set.list_index_fname);
-	ilist->index = mail_index_alloc(list->ns->user->event,
-					dir, list->set.list_index_fname);
+		p_strdup_printf(list->pool, "%s/%s", dir,
+				list->mail_set->parsed_list_index_fname);
+	ilist->index = mail_index_alloc(list->event, dir,
+					list->mail_set->parsed_list_index_fname);
 	ilist->rebuild_on_missing_inbox = !ilist->has_backing_store &&
 		(list->ns->flags & NAMESPACE_FLAG_INBOX_ANY) != 0;
 

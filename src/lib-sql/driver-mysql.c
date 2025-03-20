@@ -7,6 +7,10 @@
 #include "str.h"
 #include "net.h"
 #include "time-util.h"
+#include "settings.h"
+#include "settings-parser.h"
+#include "settings.h"
+#include "ssl-settings.h"
 #include "sql-api-private.h"
 
 #ifdef BUILD_MYSQL
@@ -27,23 +31,106 @@
 #define MYSQL_DEFAULT_READ_TIMEOUT_SECS 30
 #define MYSQL_DEFAULT_WRITE_TIMEOUT_SECS 30
 
+/* <settings checks> */
+#define MYSQL_SQLPOOL_SET_NAME "mysql"
+/* </settings checks> */
+
+struct mysql_settings {
+	pool_t pool;
+
+	ARRAY_TYPE(const_string) sqlpool_hosts;
+	unsigned int connection_limit;
+
+	const char *host;
+	in_port_t port;
+	const char *user;
+	const char *password;
+	const char *dbname;
+
+	bool ssl;
+	const char *option_file;
+	const char *option_group;
+	unsigned int client_flags;
+
+	unsigned int connect_timeout_secs;
+	unsigned int read_timeout_secs;
+	unsigned int write_timeout_secs;
+};
+
+#undef DEF
+#define DEF(type, name) \
+	SETTING_DEFINE_STRUCT_##type("mysql_"#name, name, struct mysql_settings)
+#undef DEF_SECS
+#define DEF_SECS(type, name) \
+	SETTING_DEFINE_STRUCT_##type("mysql_"#name, name##_secs, struct mysql_settings)
+static const struct setting_define mysql_setting_defines[] = {
+	{ .type = SET_FILTER_ARRAY, .key = MYSQL_SQLPOOL_SET_NAME,
+	  .offset = offsetof(struct mysql_settings, sqlpool_hosts),
+	  .filter_array_field_name = "mysql_host", },
+	DEF(UINT, connection_limit),
+
+	DEF(STR, host),
+	DEF(IN_PORT, port),
+	DEF(STR, user),
+	DEF(STR, password),
+	DEF(STR, dbname),
+
+	DEF(BOOL, ssl),
+	DEF(STR, option_file),
+	DEF(STR, option_group),
+	DEF(UINT, client_flags),
+
+	DEF_SECS(TIME, connect_timeout),
+	DEF_SECS(TIME, read_timeout),
+	DEF_SECS(TIME, write_timeout),
+
+	SETTING_DEFINE_LIST_END
+};
+
+static struct mysql_settings mysql_default_settings = {
+	.sqlpool_hosts = ARRAY_INIT,
+	.connection_limit = SQL_DEFAULT_CONNECTION_LIMIT,
+
+	.host = "",
+	.port = 0,
+	.user = "",
+	.password = "",
+	.dbname = "",
+
+	.ssl = FALSE,
+	.option_file = "",
+	.option_group = "client",
+	.client_flags = 0,
+
+	.connect_timeout_secs = SQL_CONNECT_TIMEOUT_SECS,
+	.read_timeout_secs = MYSQL_DEFAULT_READ_TIMEOUT_SECS,
+	.write_timeout_secs = MYSQL_DEFAULT_WRITE_TIMEOUT_SECS,
+};
+
+const struct setting_parser_info mysql_setting_parser_info = {
+	.name = "mysql",
+#ifdef SQL_DRIVER_PLUGINS
+	.plugin_dependency = "libdriver_mysql",
+#endif
+
+	.defines = mysql_setting_defines,
+	.defaults = &mysql_default_settings,
+
+	.struct_size = sizeof(struct mysql_settings),
+	.pool_offset1 = 1 + offsetof(struct mysql_settings, pool),
+};
+
 struct mysql_db {
 	struct sql_db api;
 
 	pool_t pool;
-	const char *user, *password, *dbname, *host, *unix_socket;
-	const char *ssl_cert, *ssl_key, *ssl_ca, *ssl_ca_path, *ssl_cipher;
-	int ssl_verify_server_cert;
-	const char *option_file, *option_group;
-	in_port_t port;
-	unsigned int client_flags;
-	unsigned int connect_timeout, read_timeout, write_timeout;
+	const struct mysql_settings *set;
+	const struct ssl_settings *ssl_set;
+
 	time_t last_success;
 
 	MYSQL *mysql;
 	unsigned int next_query_connection;
-
-	bool ssl_set:1;
 };
 
 struct mysql_result {
@@ -69,9 +156,19 @@ struct mysql_transaction_context {
 	bool commit_started:1;
 };
 
+struct mysql_db_cache {
+	/* Contains the sqlpool connection */
+	struct sql_db *db;
+
+	const struct mysql_settings *set;
+	const struct ssl_settings *ssl_set;
+};
+
 extern const struct sql_db driver_mysql_db;
 extern const struct sql_result driver_mysql_result;
 extern const struct sql_result driver_mysql_error_result;
+
+static ARRAY(struct mysql_db_cache) mysql_db_cache;
 
 static struct event_category event_category_mysql = {
 	.parent = &event_category_sql,
@@ -82,71 +179,85 @@ static int driver_mysql_connect(struct sql_db *_db)
 {
 	struct mysql_db *db = container_of(_db, struct mysql_db, api);
 	const char *unix_socket, *host;
-	unsigned long client_flags = db->client_flags;
+	unsigned long client_flags = db->set->client_flags;
 	unsigned int secs_used;
 	time_t start_time;
 	bool failed;
 
 	i_assert(db->api.state == SQL_DB_STATE_DISCONNECTED);
 
-	sql_db_set_state(&db->api, SQL_DB_STATE_CONNECTING);
-
-	if (db->host == NULL) {
+	if (db->set->host[0] == '\0') {
 		/* assume option_file overrides the host, or if not we'll just
 		   connect to localhost */
 		unix_socket = NULL;
 		host = NULL;
-	} else if (*db->host == '/') {
-		unix_socket = db->host;
+	} else if (*db->set->host == '/') {
+		unix_socket = db->set->host;
 		host = NULL;
 	} else {
 		unix_socket = NULL;
-		host = db->host;
+		host = db->set->host;
 	}
 
-	if (db->option_file != NULL) {
+	if (db->set->option_file[0] != '\0') {
 		mysql_options(db->mysql, MYSQL_READ_DEFAULT_FILE,
-			      db->option_file);
+			      db->set->option_file);
 	}
 
-	if (db->host != NULL)
-		event_set_append_log_prefix(_db->event, t_strdup_printf("mysql(%s): ", db->host));
+	mysql_options(db->mysql, MYSQL_OPT_CONNECT_TIMEOUT, &db->set->connect_timeout_secs);
+	mysql_options(db->mysql, MYSQL_OPT_READ_TIMEOUT, &db->set->read_timeout_secs);
+	mysql_options(db->mysql, MYSQL_OPT_WRITE_TIMEOUT, &db->set->write_timeout_secs);
+	mysql_options(db->mysql, MYSQL_READ_DEFAULT_GROUP, db->set->option_group);
 
-	e_debug(_db->event, "Connecting");
-
-	mysql_options(db->mysql, MYSQL_OPT_CONNECT_TIMEOUT, &db->connect_timeout);
-	mysql_options(db->mysql, MYSQL_OPT_READ_TIMEOUT, &db->read_timeout);
-	mysql_options(db->mysql, MYSQL_OPT_WRITE_TIMEOUT, &db->write_timeout);
-	mysql_options(db->mysql, MYSQL_READ_DEFAULT_GROUP,
-		      db->option_group != NULL ? db->option_group : "client");
-
-	if (!db->ssl_set && (db->ssl_ca != NULL || db->ssl_ca_path != NULL)) {
+	if (db->set->ssl) {
 #ifdef HAVE_MYSQL_SSL
-		mysql_ssl_set(db->mysql, db->ssl_key, db->ssl_cert,
-			      db->ssl_ca, db->ssl_ca_path
+		struct settings_file key_file, cert_file, ca_file;
+		settings_file_get(db->ssl_set->ssl_client_key_file,
+				  unsafe_data_stack_pool, &key_file);
+		settings_file_get(db->ssl_set->ssl_client_cert_file,
+				  unsafe_data_stack_pool, &cert_file);
+		settings_file_get(db->ssl_set->ssl_client_ca_file,
+				  unsafe_data_stack_pool, &ca_file);
+		mysql_ssl_set(db->mysql,
+			      key_file.path[0] == '\0' ? NULL : key_file.path,
+			      cert_file.path[0] == '\0' ? NULL : cert_file.path,
+			      ca_file.path[0] == '\0' ? NULL : ca_file.path,
+			      (db->ssl_set->ssl_client_ca_dir[0] != '\0' ?
+			       db->ssl_set->ssl_client_ca_dir : NULL)
 #ifdef HAVE_MYSQL_SSL_CIPHER
-			      , db->ssl_cipher
+			      , db->ssl_set->ssl_cipher_list
 #endif
 			     );
 #ifdef HAVE_MYSQL_SSL_VERIFY_SERVER_CERT
+		int ssl_verify_server_cert =
+			ssl_set->ssl_client_require_valid_cert ? 1 : 0;
+
 		mysql_options(db->mysql, MYSQL_OPT_SSL_VERIFY_SERVER_CERT,
-			      (void *)&db->ssl_verify_server_cert);
+			      (void *)&ssl_verify_server_cert);
 #endif
-		db->ssl_set = TRUE;
 #else
-		i_fatal("mysql: SSL support not compiled in "
-			"(remove ssl_ca and ssl_ca_path settings)");
+		const char *error = "mysql: SSL support not compiled in "
+			"(remove ssl_client_ca_file and ssl_client_ca_dir settings)";
+		i_free(_db->last_connect_error);
+		_db->last_connect_error = i_strdup(error);
+		e_error(_db->event, "%s", error);
+		return -1;
 #endif
 	}
+
+	sql_db_set_state(&db->api, SQL_DB_STATE_CONNECTING);
+	e_debug(_db->event, "Connecting");
 
 #ifdef CLIENT_MULTI_RESULTS
 	client_flags |= CLIENT_MULTI_RESULTS;
 #endif
 	/* CLIENT_MULTI_RESULTS allows the use of stored procedures */
 	start_time = time(NULL);
-	failed = mysql_real_connect(db->mysql, host, db->user, db->password,
-				    db->dbname, db->port, unix_socket,
-				    client_flags) == NULL;
+	failed = mysql_real_connect(db->mysql, host,
+		db->set->user[0] == '\0' ? NULL : db->set->user,
+		db->set->password[0] == '\0' ? NULL : db->set->password,
+		db->set->dbname, db->set->port,
+		unix_socket, client_flags) == NULL;
 	secs_used = time(NULL) - start_time;
 	if (failed) {
 		/* connecting could have taken a while. make sure that any
@@ -159,7 +270,8 @@ static int driver_mysql_connect(struct sql_db *_db)
 		sql_db_set_state(&db->api, SQL_DB_STATE_DISCONNECTED);
 		e_error(_db->event, "Connect failed to database (%s): %s - "
 			"waiting for %u seconds before retry",
-			db->dbname, mysql_error(db->mysql), db->api.connect_delay);
+			db->set->dbname, mysql_error(db->mysql),
+			db->api.connect_delay);
 		i_free(_db->last_connect_error);
 		_db->last_connect_error = i_strdup(mysql_error(db->mysql));
 		sql_disconnect(&db->api);
@@ -178,136 +290,125 @@ static void driver_mysql_disconnect(struct sql_db *_db)
 		mysql_close(db->mysql);
 }
 
-static int driver_mysql_parse_connect_string(struct mysql_db *db,
-					     const char *connect_string,
-					     const char **error_r)
+static struct mysql_db_cache *
+driver_mysql_db_cache_find(const struct mysql_settings *set,
+			   const struct ssl_settings *ssl_set)
 {
-	const char *const *args, *name, *value;
-	const char **field;
+	struct mysql_db_cache *cache;
 
-	db->ssl_cipher = "HIGH";
-	db->ssl_verify_server_cert = 1;
-	db->connect_timeout = SQL_CONNECT_TIMEOUT_SECS;
-	db->read_timeout = MYSQL_DEFAULT_READ_TIMEOUT_SECS;
-	db->write_timeout = MYSQL_DEFAULT_WRITE_TIMEOUT_SECS;
-
-	args = t_strsplit_spaces(connect_string, " ");
-	for (; *args != NULL; args++) {
-		value = strchr(*args, '=');
-		if (value == NULL) {
-			*error_r = t_strdup_printf("Missing value in connect string: %s",
-						   *args);
-			return -1;
-		}
-		name = t_strdup_until(*args, value);
-		value++;
-
-		field = NULL;
-		if (strcmp(name, "host") == 0 ||
-		    strcmp(name, "hostaddr") == 0)
-			field = &db->host;
-		else if (strcmp(name, "user") == 0)
-			field = &db->user;
-		else if (strcmp(name, "password") == 0)
-			field = &db->password;
-		else if (strcmp(name, "dbname") == 0)
-			field = &db->dbname;
-		else if (strcmp(name, "port") == 0) {
-			if (net_str2port(value, &db->port) < 0) {
-				*error_r = t_strdup_printf("Invalid port number: %s", value);
-				return -1;
-			}
-		} else if (strcmp(name, "client_flags") == 0) {
-			if (str_to_uint(value, &db->client_flags) < 0) {
-				*error_r = t_strdup_printf("Invalid client flags: %s", value);
-				return -1;
-			}
-		} else if (strcmp(name, "connect_timeout") == 0) {
-			if (str_to_uint(value, &db->connect_timeout) < 0) {
-				*error_r = t_strdup_printf("Invalid read_timeout: %s", value);
-				return -1;
-			}
-		} else if (strcmp(name, "read_timeout") == 0) {
-			if (str_to_uint(value, &db->read_timeout) < 0) {
-				*error_r = t_strdup_printf("Invalid read_timeout: %s", value);
-				return -1;
-			}
-		} else if (strcmp(name, "write_timeout") == 0) {
-			if (str_to_uint(value, &db->write_timeout) < 0) {
-				*error_r = t_strdup_printf("Invalid read_timeout: %s", value);
-				return -1;
-			}
-		} else if (strcmp(name, "ssl_cert") == 0)
-			field = &db->ssl_cert;
-		else if (strcmp(name, "ssl_key") == 0)
-			field = &db->ssl_key;
-		else if (strcmp(name, "ssl_ca") == 0)
-			field = &db->ssl_ca;
-		else if (strcmp(name, "ssl_ca_path") == 0)
-			field = &db->ssl_ca_path;
-		else if (strcmp(name, "ssl_cipher") == 0)
-			field = &db->ssl_cipher;
-		else if (strcmp(name, "ssl_verify_server_cert") == 0) {
-			if (strcmp(value, "yes") == 0)
-				db->ssl_verify_server_cert = 1;
-			else if (strcmp(value, "no") == 0)
-				db->ssl_verify_server_cert = 0;
-			else {
-				*error_r = t_strdup_printf("Invalid boolean: %s", value);
-				return -1;
-			}
-		} else if (strcmp(name, "option_file") == 0)
-			field = &db->option_file;
-		else if (strcmp(name, "option_group") == 0)
-			field = &db->option_group;
-		else {
-			*error_r = t_strdup_printf("Unknown connect string: %s", name);
-			return -1;
-		}
-		if (field != NULL)
-			*field = p_strdup(db->pool, value);
+	array_foreach_modifiable(&mysql_db_cache, cache) {
+		if (settings_equal(&mysql_setting_parser_info,
+				   set, cache->set, NULL) &&
+		    (!set->ssl ||
+		     settings_equal(&ssl_setting_parser_info,
+				    ssl_set, cache->ssl_set, NULL)))
+			return cache;
 	}
-
-	if (db->host == NULL && db->option_file == NULL) {
-		*error_r = "No hosts given in connect string";
-		return -1;
-	}
-	if (db->mysql == NULL) {
-		db->mysql = p_new(db->pool, MYSQL, 1);
-		MYSQL *ptr = mysql_init(db->mysql);
-		if (ptr == NULL)
-			i_fatal_status(FATAL_OUTOFMEM, "mysql_init() failed");
-	}
-	return 0;
+	return NULL;
 }
 
-static int driver_mysql_init_full_v(const struct sql_settings *set,
-				    struct sql_db **db_r, const char **error_r)
+static struct sql_db *
+driver_mysql_init_from_set(pool_t pool, struct event *event_parent,
+			   const struct mysql_settings *set,
+			   const struct ssl_settings *ssl_set)
 {
 	struct mysql_db *db;
-	const char *error = NULL;
-	pool_t pool;
-	int ret;
 
-	pool = pool_alloconly_create("mysql driver", 1024);
 	db = p_new(pool, struct mysql_db, 1);
 	db->pool = pool;
 	db->api = driver_mysql_db;
-	db->api.event = event_create(set->event_parent);
+	db->api.event = event_create(event_parent);
+	db->set = set;
+	db->ssl_set = ssl_set;
 	event_add_category(db->api.event, &event_category_mysql);
-	event_set_append_log_prefix(db->api.event, "mysql: ");
-	T_BEGIN {
-		ret = driver_mysql_parse_connect_string(db, set->connect_string, &error);
-		error = p_strdup(db->pool, error);
-	} T_END;
-
-	if (ret < 0) {
-		*error_r = t_strdup(error);
-		pool_unref(&db->pool);
-		return ret;
+	event_add_str(db->api.event, "sql_driver", "mysql");
+	if (set->host[0] != '\0') {
+		event_set_append_log_prefix(db->api.event, t_strdup_printf(
+			"mysql(%s): ", set->host));
+	} else {
+		event_set_append_log_prefix(db->api.event, "mysql: ");
 	}
 
-	*db_r = &db->api;
+	db->mysql = p_new(db->pool, MYSQL, 1);
+	if (mysql_init(db->mysql) == NULL)
+		i_fatal_status(FATAL_OUTOFMEM, "mysql_init() failed");
+	return &db->api;
+}
+
+static int
+driver_mysql_init_v(struct event *event, struct sql_db **db_r,
+		    const char **error_r)
+{
+	const struct mysql_settings *set;
+	const struct ssl_settings *ssl_set = NULL;
+
+	*error_r = NULL;
+
+	if (settings_get(event, &mysql_setting_parser_info, 0,
+			 &set, error_r) < 0)
+		return -1;
+	if (array_is_empty(&set->sqlpool_hosts)) {
+		*error_r = "mysql { .. } named list filter is missing";
+		settings_free(set);
+		return -1;
+	}
+
+	if (set->ssl) {
+		if (ssl_client_settings_get(event, &ssl_set, error_r) < 0) {
+			settings_free(set);
+			return -1;
+		}
+		/* Verify that inline SSL certs/keys aren't attempted
+		   to be used */
+		if (ssl_set->ssl_client_key_file[0] != '\0' &&
+		    !settings_file_has_path(ssl_set->ssl_client_key_file))
+			*error_r = "MySQL doesn't support inline content for ssl_client_key_file";
+		else if (ssl_set->ssl_client_cert_file[0] != '\0' &&
+			 !settings_file_has_path(ssl_set->ssl_client_cert_file))
+			*error_r = "MySQL doesn't support inline content for ssl_client_cert_file";
+		else if (ssl_set->ssl_client_ca_file[0] != '\0' &&
+			 !settings_file_has_path(ssl_set->ssl_client_ca_file))
+			*error_r = "MySQL doesn't support inline content for ssl_client_ca_file";
+
+		if (*error_r != NULL) {
+			settings_free(set);
+			settings_free(ssl_set);
+			return -1;
+		}
+	}
+
+	if (event_get_ptr(event, SQLPOOL_EVENT_PTR) == NULL) {
+		/* See if there is already such a database */
+		struct mysql_db_cache *cache =
+			driver_mysql_db_cache_find(set, ssl_set);
+		if (cache != NULL) {
+			settings_free(set);
+			settings_free(ssl_set);
+		} else {
+			/* Use sqlpool for managing multiple connections.
+			   Leave an extra reference to it, so it won't be freed
+			   while it's still in the cache array. */
+			struct sql_db *db =
+				driver_sqlpool_init(&driver_mysql_db, event,
+						    MYSQL_SQLPOOL_SET_NAME,
+						    &set->sqlpool_hosts,
+						    set->connection_limit);
+			cache = array_append_space(&mysql_db_cache);
+			cache->db = db;
+			cache->set = set;
+			cache->ssl_set = ssl_set;
+		}
+		sql_ref(cache->db);
+		*db_r = cache->db;
+		return 0;
+	}
+	/* We're being initialized by sqlpool - create a real mysql
+	 connection. */
+
+	pool_t pool = pool_alloconly_create("mysql driver", 1024);
+	*db_r = driver_mysql_init_from_set(pool, event, set, ssl_set);
+	event_drop_parent_log_prefixes((*db_r)->event, 1);
+	sql_init_common(*db_r);
 	return 0;
 }
 
@@ -321,6 +422,8 @@ static void driver_mysql_deinit_v(struct sql_db *_db)
 	driver_mysql_disconnect(_db);
 
 	sql_connection_log_finished(_db);
+	settings_free(db->set);
+	settings_free(db->ssl_set);
 	event_unref(&_db->event);
 	array_free(&_db->module_contexts);
 	pool_unref(&db->pool);
@@ -659,7 +762,7 @@ static int driver_mysql_try_commit_s(struct mysql_transaction_context *ctx)
 	struct sql_transaction_context *_ctx = &ctx->ctx;
 	bool multi = _ctx->head != NULL && _ctx->head->next != NULL;
 
-	/* wrap in BEGIN/COMMIT only if transaction has mutiple statements. */
+	/* wrap in BEGIN/COMMIT only if transaction has multiple statements. */
 	if (multi && transaction_send_query(ctx, "BEGIN", NULL) < 0) {
 		if (_ctx->db->state != SQL_DB_STATE_DISCONNECTED)
 			return -1;
@@ -778,7 +881,7 @@ const struct sql_db driver_mysql_db = {
 		 SQL_DB_FLAG_ON_DUPLICATE_KEY,
 
 	.v = {
-		.init_full = driver_mysql_init_full_v,
+		.init = driver_mysql_init_v,
 		.deinit = driver_mysql_deinit_v,
 		.connect = driver_mysql_connect,
 		.disconnect = driver_mysql_disconnect,
@@ -830,16 +933,22 @@ const struct sql_result driver_mysql_error_result = {
 
 const char *driver_mysql_version = DOVECOT_ABI_VERSION;
 
-void driver_mysql_init(void);
-void driver_mysql_deinit(void);
-
 void driver_mysql_init(void)
 {
+	i_array_init(&mysql_db_cache, 4);
 	sql_driver_register(&driver_mysql_db);
 }
 
 void driver_mysql_deinit(void)
 {
+	struct mysql_db_cache *cache;
+
+	array_foreach_modifiable(&mysql_db_cache, cache) {
+		settings_free(cache->set);
+		settings_free(cache->ssl_set);
+		sql_unref(&cache->db);
+	}
+	array_free(&mysql_db_cache);
 	sql_driver_unregister(&driver_mysql_db);
 }
 

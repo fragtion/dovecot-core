@@ -10,6 +10,7 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-ldap \
 	-I$(top_srcdir)/src/lib-sql \
 	-I$(top_srcdir)/src/lib-settings \
+	-I$(top_srcdir)/src/lib-var-expand \
 	$(SQL_CFLAGS)
 
 NOPLUGIN_LDFLAGS =
@@ -24,6 +25,12 @@ libdict_backend_la_SOURCES = \
 	dict-sql-settings.c \
 	$(ldap_sources)
 libdict_backend_la_LIBADD =
+
+BUILT_SOURCES = \
+	dict-drivers-register.c
+
+DISTCLEANFILES = \
+	dict-drivers-register.c
 
 nodist_libdict_backend_la_SOURCES = \
 	dict-drivers-register.c
@@ -43,15 +50,13 @@ libdict_ldap_la_CPPFLAGS = $(AM_CPPFLAGS) -DPLUGIN_BUILD
 libdict_ldap_la_SOURCES = $(ldap_sources)
 else
 if HAVE_LDAP
-libdict_backend_la_LIBADD += $(LIBDOVECOT_LDAP)
+libdict_backend_la_LIBADD += ../lib-ldap/libdldap.la
 dict_drivers += ldap
 endif
 endif
 
 module_dict_LTLIBRARIES = \
 	$(LIBDICT_LDAP)
-
-EXTRA_DIST = dict.conf
 
 dict-drivers-register.c: Makefile $(top_builddir)/config.h
 	$(AM_V_GEN)rm -f $@; \
@@ -87,9 +92,6 @@ dict-drivers-register.c: Makefile $(top_builddir)/config.h
 	done; \
 	echo '}' >>$@
 
-distclean-generic:
-	rm -f Makefile dict-drivers-register.c
-
 test_programs = \
 	test-dict-sql
 
@@ -103,12 +105,12 @@ test_dict_sql_LDADD = \
 	$(DICT_LIBS) \
 	../lib-sql/libdriver_test.la \
 	../lib-sql/libsql.la \
-	../lib-dovecot/libdovecot.la
+	$(LIBDOVECOT)
 test_dict_sql_DEPENDENCIES = \
 	$(noinst_LTLIBRARIES) \
 	../lib-sql/libdriver_test.la \
 	../lib-sql/libsql.la \
-	../lib-dovecot/libdovecot.la
+	$(LIBDOVECOT_DEPS)
 
 check-local:
 	for bin in $(test_programs) $(check_PROGRAMS); do \

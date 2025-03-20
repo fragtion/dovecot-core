@@ -18,8 +18,7 @@
 #include "smtp-dovecot.h"
 #include "auth-proxy.h"
 #include "auth-master.h"
-#include "master-service-settings.h"
-#include "master-service-ssl-settings.h"
+#include "settings.h"
 #include "mail-storage-service.h"
 #include "lda-settings.h"
 #include "lmtp-recipient.h"
@@ -126,6 +125,7 @@ lmtp_proxy_init(struct client *client,
 					      &lmtp_set.proxy_data);
 	lmtp_set.proxy_data.source_ip = client->remote_ip;
 	lmtp_set.proxy_data.source_port = client->remote_port;
+	lmtp_set.proxy_data.local_name = client->local_name;
 	bool end_client_tls_secured =
 		client->end_client_tls_secured_set ?
 		client->end_client_tls_secured :
@@ -193,33 +193,6 @@ static void lmtp_proxy_connection_finish(struct lmtp_proxy_connection *conn)
 	conn->lmtp_trans = NULL;
 }
 
-static void
-lmtp_proxy_connection_init_ssl(struct lmtp_proxy_connection *conn,
-			       struct ssl_iostream_settings *ssl_set_r,
-			       enum smtp_client_connection_ssl_mode *ssl_mode_r)
-{
-	const struct master_service_ssl_settings *master_ssl_set;
-
-	*ssl_mode_r = SMTP_CLIENT_SSL_MODE_NONE;
-
-	if ((conn->set.set.ssl_flags & AUTH_PROXY_SSL_FLAG_YES) == 0) {
-		i_zero(ssl_set_r);
-		return;
-	}
-
-	master_ssl_set = master_service_settings_get_root_set(master_service,
-			&master_service_ssl_setting_parser_info);
-	master_service_ssl_client_settings_to_iostream_set(
-		master_ssl_set, pool_datastack_create(), ssl_set_r);
-	if ((conn->set.set.ssl_flags & AUTH_PROXY_SSL_FLAG_ANY_CERT) != 0)
-		ssl_set_r->allow_invalid_cert = TRUE;
-
-	if ((conn->set.set.ssl_flags & AUTH_PROXY_SSL_FLAG_STARTTLS) == 0)
-		*ssl_mode_r = SMTP_CLIENT_SSL_MODE_IMMEDIATE;
-	else
-		*ssl_mode_r = SMTP_CLIENT_SSL_MODE_STARTTLS;
-}
-
 static bool
 lmtp_proxy_connection_has_rcpt_forward(struct lmtp_proxy_connection *conn)
 {
@@ -245,7 +218,6 @@ lmtp_proxy_get_connection(struct lmtp_proxy *proxy,
 	struct client *client = proxy->client;
 	struct lmtp_proxy_connection *conn;
 	enum smtp_client_connection_ssl_mode ssl_mode;
-	struct ssl_iostream_settings ssl_set;
 
 	i_assert(set->set.timeout_msecs > 0);
 
@@ -272,11 +244,17 @@ lmtp_proxy_get_connection(struct lmtp_proxy *proxy,
 	conn->set.set.timeout_msecs = set->set.timeout_msecs;
 	array_push_back(&proxy->connections, &conn);
 
-	lmtp_proxy_connection_init_ssl(conn, &ssl_set, &ssl_mode);
+	if ((set->set.ssl_flags & AUTH_PROXY_SSL_FLAG_YES) == 0)
+		ssl_mode = SMTP_CLIENT_SSL_MODE_NONE;
+	else if ((set->set.ssl_flags & AUTH_PROXY_SSL_FLAG_STARTTLS) == 0)
+		ssl_mode = SMTP_CLIENT_SSL_MODE_IMMEDIATE;
+	else
+		ssl_mode = SMTP_CLIENT_SSL_MODE_STARTTLS;
 
 	i_zero(&lmtp_set);
 	lmtp_set.my_ip = conn->set.set.source_ip;
-	lmtp_set.ssl = &ssl_set;
+	lmtp_set.ssl_allow_invalid_cert =
+		(set->set.ssl_flags & AUTH_PROXY_SSL_FLAG_ANY_CERT) != 0;
 	lmtp_set.peer_trusted = !conn->set.set.remote_not_trusted;
 	lmtp_set.forced_capabilities = SMTP_CAPABILITY__ORCPT;
 	lmtp_set.mail_send_broken_path = TRUE;
@@ -659,7 +637,7 @@ lmtp_proxy_rcpt_init_auth_user_info(struct lmtp_recipient *lrcpt,
 	struct client *client = lrcpt->client;
 
 	i_zero(info_r);
-	info_r->service = master_service_get_name(master_service);
+	info_r->protocol = master_service_get_name(master_service);
 	info_r->local_ip = client->local_ip;
 	info_r->real_local_ip = client->real_local_ip;
 	info_r->remote_ip = client->remote_ip;
@@ -669,6 +647,7 @@ lmtp_proxy_rcpt_init_auth_user_info(struct lmtp_recipient *lrcpt,
 	info_r->remote_port = client->remote_port;
 	info_r->real_remote_port = client->real_remote_port;
 	info_r->forward_fields = lrcpt->forward_fields;
+	info_r->local_name = client->local_name;
 }
 
 static void
@@ -1059,7 +1038,7 @@ lmtp_proxy_data_cb(const struct smtp_reply *proxy_reply,
 		str_append(msg, "Sent message to");
 	else
 		str_append(msg, "Failed to send message to");
-	str_printfa(msg, " <%s> at %s:%u: %s (%u/%u at %u ms)",
+	str_printfa(msg, " <%s> at %s:%u: %s (%u/%u at %lld ms)",
 		    smtp_address_encode(address),
 		    conn->set.set.host, conn->set.set.port,
 		    smtp_reply_log(proxy_reply),

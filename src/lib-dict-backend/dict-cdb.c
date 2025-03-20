@@ -4,6 +4,8 @@
 #include "buffer.h"
 
 #ifdef BUILD_CDB
+#include "settings.h"
+#include "settings-parser.h"
 #include "dict-private.h"
 
 #include <string.h>
@@ -32,19 +34,52 @@ struct cdb_dict_iterate_context {
 	char *error;
 };
 
+struct dict_cdb_settings {
+	pool_t pool;
+
+	const char *cdb_path;
+};
+
+#undef DEF
+#define DEF(type, name) \
+	SETTING_DEFINE_STRUCT_##type(#name, name, struct dict_cdb_settings)
+static const struct setting_define cdb_setting_defines[] = {
+	DEF(STR, cdb_path),
+
+	SETTING_DEFINE_LIST_END
+};
+static const struct dict_cdb_settings cdb_default_settings = {
+	.cdb_path = "",
+};
+const struct setting_parser_info cdb_setting_parser_info = {
+	.name = "dict_cdb",
+
+	.defines = cdb_setting_defines,
+	.defaults = &cdb_default_settings,
+
+	.struct_size = sizeof(struct dict_cdb_settings),
+	.pool_offset1 = 1 + offsetof(struct dict_cdb_settings, pool),
+};
+
 static void cdb_dict_deinit(struct dict *_dict);
 
 static int
-cdb_dict_init(struct dict *driver, const char *uri,
-	      const struct dict_settings *set ATTR_UNUSED,
+cdb_dict_init(const struct dict *dict_driver, struct event *event,
 	      struct dict **dict_r, const char **error_r)
 {
+	const struct dict_cdb_settings *set;
+
+	if (settings_get(event, &cdb_setting_parser_info, 0,
+			 &set, error_r) < 0)
+		return -1;
+
 	struct cdb_dict *dict;
 
 	dict = i_new(struct cdb_dict, 1);
-	dict->dict = *driver;
-	dict->path = i_strdup(uri);
+	dict->dict = *dict_driver;
+	dict->path = i_strdup(set->cdb_path);
 	dict->flag = CDB_WITH_NULL | CDB_WITHOUT_NULL;
+	settings_free(set);
 
 	/* initialize cdb to 0 (unallocated) */
 	i_zero(&dict->cdb);
@@ -69,6 +104,7 @@ cdb_dict_init(struct dict *driver, const char *uri,
 	*dict_r = &dict->dict;
 	return 0;
 }
+
 
 static void cdb_dict_deinit(struct dict *_dict)
 {

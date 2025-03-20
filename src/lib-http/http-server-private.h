@@ -126,6 +126,7 @@ struct http_server_request {
 struct http_server_connection {
 	struct connection conn;
 	struct http_server *server;
+	const struct http_server_settings *set;
 	struct ioloop *ioloop, *ioloop_switching;
 	struct event *event;
 	unsigned int refcount;
@@ -181,11 +182,11 @@ struct http_server_resource {
 struct http_server {
 	pool_t pool;
 
-	struct http_server_settings set;
+	const struct http_server_settings *set;
+	const struct ssl_iostream_settings *ssl_set;
 
 	struct ioloop *ioloop;
 	struct event *event;
-	struct ssl_iostream_context *ssl_ctx;
 
 	struct connection_list *conn_list;
 
@@ -347,11 +348,5 @@ int http_server_resource_find(struct http_server *server, const char *path,
 			      const char **sub_path_r) ATTR_NULL(2);
 
 bool http_server_resource_callback(struct http_server_request *req);
-
-/*
- * Server
- */
-
-int http_server_init_ssl_ctx(struct http_server *server, const char **error_r);
 
 #endif

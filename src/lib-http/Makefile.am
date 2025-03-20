@@ -3,9 +3,11 @@ noinst_LTLIBRARIES = libhttp.la
 AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib \
 	-I$(top_srcdir)/src/lib-test \
-	-I$(top_srcdir)/src/lib-dns \
+	-I$(top_srcdir)/src/lib-settings \
+	-I$(top_srcdir)/src/lib-dns-client \
 	-I$(top_srcdir)/src/lib-ssl-iostream \
 	-I$(top_srcdir)/src/lib-master \
+	-I$(top_srcdir)/src/lib-var-expand \
 	-DPKG_RUNDIR=\""$(rundir)"\"
 
 libhttp_la_SOURCES = \
@@ -26,12 +28,14 @@ libhttp_la_SOURCES = \
 	http-client-peer.c \
 	http-client-queue.c \
 	http-client-host.c \
+	http-client-settings.c \
 	http-client.c \
 	http-server-ostream.c \
 	http-server-response.c \
 	http-server-request.c \
 	http-server-connection.c \
 	http-server-resource.c \
+	http-server-settings.c \
 	http-server.c
 
 headers = \
@@ -76,6 +80,9 @@ test_nocheck_programs = \
 noinst_PROGRAMS = $(test_programs) $(test_nocheck_programs)
 
 test_libs = \
+	../lib-settings/libsettings.la \
+	../lib-dns/libdns.la \
+	../lib-var-expand/libvar_expand.la \
 	../lib-test/libtest.la \
 	../lib/liblib.la \
 	$(MODULE_LIBS)
@@ -83,6 +90,9 @@ test_libs = \
 test_deps = \
 	$(noinst_LTLIBRARIES) \
 	../lib-test/libtest.la \
+	../lib-settings/libsettings.la \
+	../lib-dns/libdns.la \
+	../lib-var-expand/libvar_expand.la \
 	../lib/liblib.la
 
 test_http_url_SOURCES = test-http-url.c
@@ -140,19 +150,19 @@ test_http_request_parser_DEPENDENCIES = $(test_deps)
 
 test_http_libs = \
 	libhttp.la \
+	../lib-dns-client/libdns-client.la  \
 	../lib-dns/libdns.la \
 	../lib-ssl-iostream/libssl_iostream.la \
 	../lib-master/libmaster.la \
 	../lib-auth-client/libauth-client.la \
-	../lib-settings/libsettings.la \
 	$(test_libs)
 test_http_deps = \
 	libhttp.la \
+	../lib-dns-client/libdns-client.la  \
 	../lib-dns/libdns.la \
 	../lib-ssl-iostream/libssl_iostream.la \
 	../lib-master/libmaster.la \
 	../lib-auth-client/libauth-client.la \
-	../lib-settings/libsettings.la \
 	$(test_deps)
 
 test_http_libs_ssl = ../lib-ssl-iostream/libssl_iostream_openssl.la

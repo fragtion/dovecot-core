@@ -11,7 +11,7 @@
 #include "str.h"
 #include "str-sanitize.h"
 #include "auth-client.h"
-#include "master-service-ssl-settings.h"
+#include "ssl-settings.h"
 #include "client.h"
 #include "client-authenticate.h"
 #include "submission-proxy.h"
@@ -35,7 +35,7 @@ static void cmd_helo_reply(struct submission_client *subm_client,
 			smtp_server_reply_ehlo_add(reply, "8BITMIME");
 
 		if (client->connection_secured ||
-			strcmp(client->ssl_set->ssl, "required") != 0) {
+			strcmp(client->ssl_server_set->ssl, "required") != 0) {
 			const struct auth_mech_desc *mechs;
 			unsigned int count, i;
 			string_t *param = t_str_new(128);
@@ -51,6 +51,9 @@ static void cmd_helo_reply(struct submission_client *subm_client,
 				"AUTH", "%s", str_c(param));
 		}
 
+		if ((backend_caps & SMTP_CAPABILITY_SMTPUTF8) != 0 &&
+		    subm_client->set->mail_utf8_extensions)
+			smtp_server_reply_ehlo_add(reply, "SMTPUTF8");
 		if ((backend_caps & SMTP_CAPABILITY_BINARYMIME) != 0 &&
 		    (backend_caps & SMTP_CAPABILITY_CHUNKING) != 0)
 			smtp_server_reply_ehlo_add(reply, "BINARYMIME");
@@ -268,11 +271,6 @@ int cmd_auth_continue(void *conn_ctx,
 {
 	struct submission_client *subm_client = conn_ctx;
 	struct client *client = &subm_client->common;
-
-	if (strcmp(response, "*") == 0) {
-		client_auth_abort(client);
-		return 0;
-	}
 
 	client_auth_respond(client, response);
 	return 0;

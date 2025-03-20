@@ -4,8 +4,7 @@
 #include "array.h"
 #include "ioloop.h"
 #include "mkdir-parents.h"
-#include "master-service.h"
-#include "settings-parser.h"
+#include "settings.h"
 #include "mail-index-modseq.h"
 #include "mail-index-alloc-cache.h"
 #include "mailbox-log.h"
@@ -46,25 +45,27 @@ int mdbox_storage_create(struct mail_storage *_storage,
 	struct mdbox_storage *storage = MDBOX_STORAGE(_storage);
 	const char *dir;
 
-	storage->set = settings_parser_get_root_set(_storage->user->set_parser,
-		mdbox_get_setting_parser_info());
+	if (settings_get(_storage->event, &mdbox_setting_parser_info, 0,
+			 &storage->set, error_r) < 0)
+		return -1;
+
 	storage->preallocate_space = storage->set->mdbox_preallocate_space;
 
-	if (*ns->list->set.mailbox_dir_name == '\0') {
-		*error_r = "mdbox: MAILBOXDIR must not be empty";
+	if (*ns->list->mail_set->mailbox_root_directory_name == '\0') {
+		*error_r = "mdbox: mailbox_root_directory_name must not be empty";
 		return -1;
 	}
 
 	_storage->unique_root_dir =
-		p_strdup(_storage->pool, ns->list->set.root_dir);
+		p_strdup(_storage->pool, ns->list->mail_set->mail_path);
 
 	dir = mailbox_list_get_root_forced(ns->list, MAILBOX_LIST_PATH_TYPE_DIR);
 	storage->storage_dir = p_strconcat(_storage->pool, dir,
 					   "/"MDBOX_GLOBAL_DIR_NAME, NULL);
-	if (ns->list->set.alt_dir != NULL) {
+	if (ns->list->mail_set->mail_alt_path[0] != '\0') {
 		storage->alt_storage_dir = p_strconcat(_storage->pool,
-							ns->list->set.alt_dir,
-							"/"MDBOX_GLOBAL_DIR_NAME, NULL);
+			ns->list->mail_set->mail_alt_path,
+			"/"MDBOX_GLOBAL_DIR_NAME, NULL);
 	}
 
 	event_set_append_log_prefix(_storage->event, t_strdup_printf(
@@ -89,6 +90,8 @@ void mdbox_storage_destroy(struct mail_storage *_storage)
 	if (array_is_created(&storage->move_to_alt_map_uids))
 		array_free(&storage->move_to_alt_map_uids);
 	array_free(&storage->open_files);
+	i_free(storage->corrupted_reason);
+	settings_free(storage->set);
 	dbox_storage_destroy(_storage);
 }
 
@@ -101,7 +104,7 @@ mdbox_storage_find_root_dir(const struct mail_namespace *ns)
 	if (ns->owner != NULL &&
 	    mail_user_get_home(ns->owner, &home) > 0) {
 		path = t_strconcat(home, "/mdbox", NULL);
-		if (access(path, R_OK|W_OK|X_OK) == 0) {
+		if (i_faccessat2(AT_FDCWD, path, R_OK | W_OK | X_OK, AT_EACCESS) == 0) {
 			e_debug(event,
 				"mdbox autodetect: root exists (%s)", path);
 			return path;
@@ -112,15 +115,18 @@ mdbox_storage_find_root_dir(const struct mail_namespace *ns)
 	return NULL;
 }
 
-static bool mdbox_storage_autodetect(const struct mail_namespace *ns,
-				     struct mailbox_list_settings *set)
+static bool
+mdbox_storage_autodetect(const struct mail_namespace *ns,
+			 const struct mail_storage_settings *mail_set,
+			 const char **root_path_r,
+			 const char **inbox_path_r ATTR_UNUSED)
 {
 	struct event *event = ns->user->event;
 	struct stat st;
 	const char *path, *root_dir;
 
-	if (set->root_dir != NULL)
-		root_dir = set->root_dir;
+	if (mail_set->mail_path[0] != '\0')
+		root_dir = mail_set->mail_path;
 	else {
 		root_dir = mdbox_storage_find_root_dir(ns);
 		if (root_dir == NULL) {
@@ -141,8 +147,7 @@ static bool mdbox_storage_autodetect(const struct mail_namespace *ns,
 		return FALSE;
 	}
 
-	set->root_dir = root_dir;
-	dbox_storage_get_list_settings(ns, set);
+	*root_path_r = root_dir;
 	return TRUE;
 }
 
@@ -201,8 +206,11 @@ static void mdbox_mailbox_close(struct mailbox *box)
 {
 	struct mdbox_storage *mstorage = MDBOX_STORAGE(box->storage);
 
-	if (mstorage->corrupted && !mstorage->rebuilding_storage)
-		(void)mdbox_storage_rebuild(mstorage);
+	if (mstorage->corrupted_reason != NULL &&
+	    !mstorage->rebuilding_storage) {
+		(void)mdbox_storage_rebuild(mstorage, box,
+					    MDBOX_REBUILD_REASON_CORRUPTED);
+	}
 
 	dbox_mailbox_close(box);
 }
@@ -219,10 +227,8 @@ int mdbox_read_header(struct mdbox_mailbox *mbox,
 				  &data, &data_size);
 	if (data_size < MDBOX_INDEX_HEADER_MIN_SIZE &&
 	    (!mbox->creating || data_size != 0)) {
-		mailbox_set_critical(&mbox->box,
-			"mdbox: Invalid dbox header size: %zu",
-			data_size);
-		mdbox_storage_set_corrupted(mbox->storage);
+		mdbox_set_mailbox_corrupted(&mbox->box, t_strdup_printf(
+			"Invalid mdbox header size: %zu", data_size));
 		return -1;
 	}
 	i_zero(hdr);
@@ -350,14 +356,23 @@ int mdbox_mailbox_create_indexes(struct mailbox *box,
 	return ret;
 }
 
-void mdbox_storage_set_corrupted(struct mdbox_storage *storage)
+void mdbox_storage_set_corrupted(struct mdbox_storage *storage,
+				 const char *reason, ...)
 {
-	if (storage->corrupted) {
+	const char *reason_str;
+	va_list args;
+
+	va_start(args, reason);
+	reason_str = t_strdup_vprintf(reason, args);
+	va_end(args);
+
+	mail_storage_set_critical(&storage->storage.storage, "%s", reason_str);
+	if (storage->corrupted_reason != NULL) {
 		/* already set it corrupted (possibly recursing back here) */
 		return;
 	}
 
-	storage->corrupted = TRUE;
+	storage->corrupted_reason = i_strdup(reason_str);
 	storage->corrupted_rebuild_count = (uint32_t)-1;
 
 	if (mdbox_map_open(storage->map) > 0 &&
@@ -373,18 +388,19 @@ mdbox_get_attachment_path_suffix(struct dbox_file *file ATTR_UNUSED)
 	return "";
 }
 
-void mdbox_set_mailbox_corrupted(struct mailbox *box)
+void mdbox_set_mailbox_corrupted(struct mailbox *box, const char *reason)
 {
 	struct mdbox_storage *mstorage = MDBOX_STORAGE(box->storage);
 
-	mdbox_storage_set_corrupted(mstorage);
+	mdbox_storage_set_corrupted(mstorage, "Mailbox %s: %s",
+				    box->vname, reason);
 }
 
-void mdbox_set_file_corrupted(struct dbox_file *file)
+void mdbox_set_file_corrupted(struct dbox_file *file, const char *reason)
 {
 	struct mdbox_storage *mstorage = MDBOX_DBOX_STORAGE(file->storage);
 
-	mdbox_storage_set_corrupted(mstorage);
+	mdbox_storage_set_corrupted(mstorage, "%s", reason);
 }
 
 static int
@@ -457,14 +473,13 @@ struct mail_storage mdbox_storage = {
 		MAIL_STORAGE_CLASS_FLAG_HAVE_MAIL_SAVE_GUIDS |
 		MAIL_STORAGE_CLASS_FLAG_BINARY_DATA,
 	.event_category = &event_category_mdbox,
+	.set_info = &mdbox_setting_parser_info,
 
 	.v = {
-                mdbox_get_setting_parser_info,
 		mdbox_storage_alloc,
 		mdbox_storage_create,
 		mdbox_storage_destroy,
 		NULL,
-		dbox_storage_get_list_settings,
 		mdbox_storage_autodetect,
 		mdbox_mailbox_alloc,
 		mdbox_purge,

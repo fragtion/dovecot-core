@@ -60,7 +60,7 @@ struct auth_request_fields {
 	/* realm for the request, may be specified by some auth mechanisms */
 	const char *realm;
 
-	const char *service, *mech_name, *session_id, *local_name, *client_id;
+	const char *protocol, *mech_name, *session_id, *local_name, *client_id;
 	struct ip_addr local_ip, remote_ip, real_local_ip, real_remote_ip;
 	in_port_t local_port, remote_port, real_local_port, real_remote_port;
 	const char *ssl_ja3_hash;
@@ -79,6 +79,10 @@ struct auth_request_fields {
 	size_t delayed_credentials_size;
 
 	enum auth_request_conn_secured conn_secured;
+	struct {
+		const char *type;
+		buffer_t *data;
+	} channel_binding;
 
 	/* Authentication was successfully finished, including policy checks
 	   and such. There may still be some final delay or final SASL
@@ -90,8 +94,22 @@ struct auth_request_fields {
 	   the result_* rules. */
 	bool skip_password_check:1;
 
-	/* flags received from auth client: */
+	/* Flags received from auth client: */
+
+	/* If this flag is set, the auth client (e.g. login service) handles the
+	   data in the final success or failure response from the SASL
+	   mechanism. In case of failure or a protocol that doesn't allow
+	   sending data in the success response, the auth client will add
+	   another SASL interaction cycle in which the server sends a final
+	   challenge and expects the user client to send a dummy response. If
+	   this flag is not set, this additional SASL cycle is created by the
+	   auth service instead, which is less efficient. This is why Dovecot
+	   auth clients always set this flag. Unfortunately, external auth
+	   clients like Postfix and Exim likely will not be updated to change
+	   their behavior and set this flag for some time, which is why this
+	   flag is retained for now. */
 	bool final_resp_ok:1;
+
 	bool no_penalty:1;
 	bool valid_client_cert:1;
 	bool cert_username:1;
@@ -115,6 +133,10 @@ struct auth_request {
 	enum passdb_result passdb_result;
 
 	const struct mech_module *mech;
+	/* Protocol-specific settings */
+	const struct auth_settings *protocol_set;
+	/* Currently active settings. May be the same as protocol_set, but
+	   changes to passdb and userdb specific settings. */
 	const struct auth_settings *set;
         struct auth_passdb *passdb;
         struct auth_userdb *userdb;
@@ -122,9 +144,6 @@ struct auth_request {
 	/* passdb lookups have a handler, userdb lookups don't */
 	struct auth_request_handler *handler;
         struct auth_master_connection *master;
-
-	/* FIXME: Remove this once mech-oauth2 correctly does the processing */
-	const char *openid_config_url;
 
 	unsigned int connect_uid;
 	unsigned int client_pid;
@@ -193,9 +212,9 @@ struct auth_request {
 	bool in_delayed_failure_queue:1;
 	bool removed_from_handler:1;
 	bool snapshot_have_userdb_prefetch_set:1;
-	/* username was changed by this passdb/userdb lookup. Used by
-	   auth-workers to determine whether to send back a changed username. */
-	bool user_changed_by_lookup:1;
+	/* The last passdb/userdb lookup returned a username field. This may
+	   or may not have changed the current username. */
+	bool user_returned_by_lookup:1;
 	/* each passdb lookup can update the current success-status using the
 	   result_* rules. the authentication succeeds only if this is TRUE
 	   at the end. mechanisms that don't require passdb, but do a passdb
@@ -213,6 +232,13 @@ struct auth_request {
 	bool stats_sent:1;
 	bool policy_refusal:1;
 	bool policy_processed:1;
+	/* "nodelay" passdb extra field: Disable delay if auth fails. This
+	   needs to be tracked outside regular extra fields, because they get
+	   rolled back on passdb failure. */
+	bool failure_nodelay:1;
+	/* Sent final response (challenge). Waiting for dummy client response.
+	 */
+	bool final_resp_sent:1;
 
 	bool event_finished_sent:1;
 
@@ -222,10 +248,6 @@ struct auth_request {
 typedef void auth_request_proxy_cb_t(bool success, struct auth_request *);
 
 extern unsigned int auth_request_state_count[AUTH_REQUEST_STATE_MAX];
-
-extern const char auth_default_subsystems[2];
-#define AUTH_SUBSYS_DB &auth_default_subsystems[0]
-#define AUTH_SUBSYS_MECH &auth_default_subsystems[1]
 
 struct auth_request *
 auth_request_new(const struct mech_module *mech, struct event *parent_event);
@@ -242,7 +264,8 @@ void auth_request_unref(struct auth_request **request);
 void auth_request_success(struct auth_request *request,
 			  const void *data, size_t data_size);
 void auth_request_fail_with_reply(struct auth_request *request,
-				  const void *final_data, size_t final_data_size);
+				  const void *final_data,
+				  size_t final_data_size);
 void auth_request_fail(struct auth_request *request);
 void auth_request_internal_failure(struct auth_request *request);
 
@@ -253,6 +276,8 @@ bool auth_request_import_info(struct auth_request *request,
 			      const char *key, const char *value);
 bool auth_request_import_auth(struct auth_request *request,
 			      const char *key, const char *value);
+void auth_request_import_continue(struct auth_request *request,
+				  const char *key, const char *value);
 bool auth_request_import_master(struct auth_request *request,
 				const char *key, const char *value);
 
@@ -268,6 +293,11 @@ void auth_request_lookup_credentials(struct auth_request *request,
 				     lookup_credentials_callback_t *callback);
 void auth_request_lookup_user(struct auth_request *request,
 			      userdb_callback_t *callback);
+
+void auth_request_start_channel_binding(struct auth_request *request,
+					const char *type);
+int auth_request_accept_channel_binding(struct auth_request *request,
+					buffer_t **data_r);
 
 bool auth_request_set_username(struct auth_request *request,
 			       const char *username, const char **error_r);
@@ -293,64 +323,83 @@ void auth_request_set_delayed_credentials(struct auth_request *request,
 void auth_request_set_field(struct auth_request *request,
 			    const char *name, const char *value,
 			    const char *default_scheme) ATTR_NULL(4);
-void auth_request_set_null_field(struct auth_request *request, const char *name);
+void auth_request_set_null_field(struct auth_request *request,
+				 const char *name);
 void auth_request_set_field_keyvalue(struct auth_request *request,
 				     const char *field,
 				     const char *default_scheme) ATTR_NULL(3);
 void auth_request_set_fields(struct auth_request *request,
 			     const char *const *fields,
 			     const char *default_scheme) ATTR_NULL(3);
+void auth_request_set_strlist(struct auth_request *request,
+			      const ARRAY_TYPE(const_string) *strlist,
+			      const char *default_scheme);
 
-void auth_request_init_userdb_reply(struct auth_request *request,
-				    bool add_default_fields);
+int auth_request_set_passdb_fields(struct auth_request *request,
+				   struct auth_fields *fields);
+int auth_request_set_passdb_fields_ex(struct auth_request *request, void *context,
+				      const char *default_password_scheme,
+				      const struct var_expand_provider *fn_table);
+
+int auth_request_set_userdb_fields(struct auth_request *request,
+				   struct auth_fields *fields);
+int auth_request_set_userdb_fields_ex(struct auth_request *request, void *context,
+				      const struct var_expand_provider *fn_table);
+
+void auth_request_init_userdb_reply(struct auth_request *request);
 void auth_request_set_userdb_field(struct auth_request *request,
 				   const char *name, const char *value);
 void auth_request_set_userdb_field_values(struct auth_request *request,
 					  const char *name,
 					  const char *const *values);
+void auth_request_set_userdb_strlist(struct auth_request *request,
+				     const ARRAY_TYPE(const_string) *strlist);
 /* returns -1 = failed, 0 = callback is called later, 1 = finished */
 int auth_request_proxy_finish(struct auth_request *request,
 			      auth_request_proxy_cb_t *callback);
 void auth_request_proxy_finish_failure(struct auth_request *request);
 
-void auth_request_log_password_mismatch(struct auth_request *request,
-					const char *subsystem);
 enum passdb_result
 auth_request_password_verify(struct auth_request *request,
+			     struct event *event,
 			     const char *plain_password,
 			     const char *crypted_password,
-			     const char *scheme, const char *subsystem)
+			     const char *scheme)
 			     ATTR_WARN_UNUSED_RESULT;
 enum passdb_result
 auth_request_password_verify_log(struct auth_request *request,
+				 struct event *event,
 				 const char *plain_password,
 				 const char *crypted_password,
-				 const char *scheme, const char *subsystem,
+				 const char *scheme,
 				 bool log_password_mismatch)
 				 ATTR_WARN_UNUSED_RESULT;
+enum passdb_result
+auth_request_db_password_verify(struct auth_request *request,
+				const char *plain_password,
+				const char *crypted_password,
+				const char *scheme)
+				ATTR_WARN_UNUSED_RESULT;
+enum passdb_result
+auth_request_db_password_verify_log(struct auth_request *request,
+				    const char *plain_password,
+				    const char *crypted_password,
+				    const char *scheme,
+				    bool log_password_mismatch)
+				    ATTR_WARN_UNUSED_RESULT;
 enum passdb_result auth_request_password_missing(struct auth_request *request);
 
-void auth_request_get_log_prefix(string_t *str, struct auth_request *auth_request,
-				 const char *subsystem);
-
-void auth_request_log_debug(struct auth_request *auth_request,
-			    const char *subsystem,
-			    const char *format, ...) ATTR_FORMAT(3, 4);
-void auth_request_log_info(struct auth_request *auth_request,
-			   const char *subsystem,
-			   const char *format, ...) ATTR_FORMAT(3, 4);
-void auth_request_log_warning(struct auth_request *auth_request,
-			      const char *subsystem,
-			      const char *format, ...) ATTR_FORMAT(3, 4);
-void auth_request_log_error(struct auth_request *auth_request,
-			    const char *subsystem,
-			    const char *format, ...) ATTR_FORMAT(3, 4);
+void auth_request_log_password_mismatch(struct auth_request *request,
+					struct event *event);
 void auth_request_log_unknown_user(struct auth_request *auth_request,
-				   const char *subsystem);
-
+				   struct event *event);
 void auth_request_log_login_failure(struct auth_request *request,
-				    const char *subsystem,
-				    const char *message);
+				    struct event *event, const char *message);
+void auth_request_db_log_password_mismatch(struct auth_request *auth_request);
+void auth_request_db_log_unknown_user(struct auth_request *auth_request);
+void auth_request_db_log_login_failure(struct auth_request *request,
+				       const char *message);
+
 void
 auth_request_verify_plain_callback_finish(enum passdb_result result,
                                           struct auth_request *request);
@@ -365,17 +414,17 @@ void auth_request_set_credentials(struct auth_request *request,
 				  set_credentials_callback_t *callback);
 void auth_request_userdb_callback(enum userdb_result result,
 				  struct auth_request *request);
-void auth_request_default_verify_plain_continue(struct auth_request *request,
-						verify_plain_callback_t *callback);
+void auth_request_default_verify_plain_continue(
+	struct auth_request *request, verify_plain_callback_t *callback);
 
 void auth_request_refresh_last_access(struct auth_request *request);
 void auth_str_append(string_t *dest, const char *key, const char *value);
-bool auth_request_username_accepted(const char *const *filter, const char *username);
+bool auth_request_username_accepted(const char *const *filter,
+				    const char *username);
 struct event_passthrough *
 auth_request_finished_event(struct auth_request *request, struct event *event);
 void auth_request_log_finished(struct auth_request *request);
 void auth_request_master_user_login_finish(struct auth_request *request);
-const char *auth_request_get_log_prefix_db(struct auth_request *auth_request);
 void auth_request_fields_init(struct auth_request *request);
 
 void auth_request_passdb_lookup_begin(struct auth_request *request);

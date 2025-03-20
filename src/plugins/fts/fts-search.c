@@ -113,11 +113,7 @@ multi_add_lookup_result(struct fts_search_context *fctx,
 			struct mail_search_arg *args,
 			struct fts_multi_result *result)
 {
-	ARRAY_TYPE(seq_range) vuids;
-	size_t orig_size;
-	unsigned int i;
-
-	orig_size = level->args_matches->used;
+	size_t orig_size = level->args_matches->used;
 	fts_search_serialize(level->args_matches, args);
 	if (orig_size > 0) {
 		if (level->args_matches->used != orig_size * 2 ||
@@ -128,11 +124,11 @@ multi_add_lookup_result(struct fts_search_context *fctx,
 		buffer_set_used_size(level->args_matches, orig_size);
 	}
 
-	t_array_init(&vuids, 64);
-	for (i = 0; result->box_results[i].box != NULL; i++) {
+	for (unsigned int i = 0; result->box_results[i].box != NULL; i++) T_BEGIN {
 		struct fts_result *br = &result->box_results[i];
+		ARRAY_TYPE(seq_range) vuids;
 
-		array_clear(&vuids);
+		t_array_init(&vuids, 64);
 		if (array_is_created(&br->definite_uids)) {
 			fctx->box->virtual_vfuncs->get_virtual_uids(fctx->box,
 				br->box, &br->definite_uids, &vuids);
@@ -148,7 +144,7 @@ multi_add_lookup_result(struct fts_search_context *fctx,
 
 		if (array_is_created(&br->scores))
 			level_scores_add_vuids(fctx->box, level, br);
-	}
+	} T_END;
 	return 0;
 }
 
@@ -346,27 +342,25 @@ int fts_search_get_first_missing_uid(struct fts_backend *backend,
 				     struct mailbox *box,
 				     uint32_t *last_indexed_uid_r)
 {
-	uint32_t messages_count = mail_index_view_get_messages_count(box->view);
-	uint32_t uid, last_indexed_uid;
-	int ret;
+	struct mailbox_status status;
+	if (fts_mailbox_get_status(box, STATUS_UIDNEXT, &status) < 0)
+		return -1;
 
-	if (messages_count == 0)
-		return 1;
-
-	mail_index_lookup_uid(box->view, messages_count, &uid);
+	uint32_t uid = status.uidnext > 1 ? status.uidnext - 1 : 1;
+	uint32_t last_indexed_uid;
 	for (bool refreshed = FALSE;; refreshed = TRUE) {
-		ret = fts_backend_is_uid_indexed(backend, box, uid,
-						 &last_indexed_uid);
-		if (ret != 0)
+		int ret = fts_backend_is_uid_indexed(backend, box, uid,
+						     &last_indexed_uid);
+		if (ret < 0)
 			return ret;
-		if (refreshed || backend->updating) {
-			*last_indexed_uid_r = last_indexed_uid;
-			return 0;
-		}
+
+		*last_indexed_uid_r = last_indexed_uid;
+		if (ret > 0 || refreshed || backend->updating)
+			return ret;
 
 		/* UID doesn't seem to be indexed yet.
 		   Refresh FTS and check again. */
-		if (fts_backend_refresh(backend) < 0)
+		if (fts_backend_refresh(backend, box) < 0)
 			return -1;
 	}
 	i_unreached();

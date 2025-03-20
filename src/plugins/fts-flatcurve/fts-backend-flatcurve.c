@@ -13,6 +13,8 @@
 #include "fts-backend-flatcurve.h"
 #include "fts-backend-flatcurve-xapian.h"
 
+#define FTS_FLATCURVE_MAX_TERM_SIZE_MAX 200
+
 enum fts_backend_flatcurve_action {
 	FTS_BACKEND_FLATCURVE_ACTION_OPTIMIZE,
 	FTS_BACKEND_FLATCURVE_ACTION_RESCAN
@@ -42,24 +44,25 @@ fts_backend_flatcurve_init(struct fts_backend *_backend, const char **error_r)
 {
 	struct flatcurve_fts_backend *backend =
 		container_of(_backend, struct flatcurve_fts_backend, backend);
-	struct fts_flatcurve_user *fuser =
-		FTS_FLATCURVE_USER_CONTEXT(_backend->ns->user);
+	struct fts_flatcurve_user *fuser;
 
-	if (fuser == NULL) {
-		*error_r = "Invalid fts-flatcurve settings";
+	backend->event = event_create(_backend->event);
+	event_add_category(backend->event, &event_category_fts_flatcurve);
+
+	if (fts_flatcurve_mail_user_get(_backend->ns->user, backend->event,
+					&fuser, error_r) < 0) {
+		event_unref(&backend->event);
 		return -1;
 	}
 
 	backend->boxname = str_new(backend->pool, 128);
 	backend->db_path = str_new(backend->pool, 256);
 	backend->fuser = fuser;
+	backend->volatile_dir = str_new(backend->pool, 128);
 
 	fuser->backend = backend;
 
 	fts_flatcurve_xapian_init(backend);
-
-	backend->event = event_create(_backend->event);
-	event_add_category(backend->event, &event_category_fts_flatcurve);
 
 	return fts_backend_flatcurve_close_mailbox(backend, error_r);
 }
@@ -68,12 +71,14 @@ int
 fts_backend_flatcurve_close_mailbox(struct flatcurve_fts_backend *backend,
 				    const char **error_r)
 {
+	i_assert(backend->boxname != NULL);
 	int ret = 0;
 	if (str_len(backend->boxname) > 0) {
 		ret = fts_flatcurve_xapian_close(backend, error_r);
 
 		str_truncate(backend->boxname, 0);
 		str_truncate(backend->db_path, 0);
+		str_truncate(backend->volatile_dir, 0);
 	}
 
 	event_set_append_log_prefix(backend->event, FTS_FLATCURVE_DEBUG_PREFIX);
@@ -98,10 +103,12 @@ static void fts_backend_flatcurve_deinit(struct fts_backend *_backend)
 	struct flatcurve_fts_backend *backend =
 		(struct flatcurve_fts_backend *)_backend;
 
-	int ret = fts_backend_flatcurve_close_mailbox(backend, &error);
-	fts_flatcurve_xapian_deinit(backend);
-	if (ret < 0)
-		e_error(backend->event, "%s", error);
+	if (backend->xapian != NULL) {
+		int ret = fts_backend_flatcurve_close_mailbox(backend, &error);
+		fts_flatcurve_xapian_deinit(backend);
+		if (ret < 0)
+			e_error(backend->event, "%s", error);
+	}
 
 	event_unref(&backend->event);
 	pool_unref(&backend->pool);
@@ -112,8 +119,9 @@ int
 fts_backend_flatcurve_set_mailbox(struct flatcurve_fts_backend *backend,
                                   struct mailbox *box, const char **error_r)
 {
-	const char *path;
+	const char *path, *volatile_dir;
 	struct mail_storage *storage;
+	struct mail_user *user;
 
 	if (str_len(backend->boxname) > 0 &&
 	    strcasecmp(box->vname, str_c(backend->boxname)) == 0)
@@ -138,6 +146,11 @@ fts_backend_flatcurve_set_mailbox(struct flatcurve_fts_backend *backend,
 
 	storage = mailbox_get_storage(box);
 	backend->parsed_lock_method = storage->set->parsed_lock_method;
+
+	user = mail_storage_get_user(storage);
+	volatile_dir = mail_user_get_volatile_dir(user);
+	if (volatile_dir != NULL)
+		str_append(backend->volatile_dir, volatile_dir);
 
 	fts_flatcurve_xapian_set_mailbox(backend);
 	return 0;
@@ -181,7 +194,8 @@ fts_backend_flatcurve_update_deinit(struct fts_backend_update_context *_ctx)
 {
 	struct flatcurve_fts_backend_update_context *ctx =
 		(struct flatcurve_fts_backend_update_context *)_ctx;
-	int diff, ret = _ctx->failed ? -1 : 0;
+	int ret = _ctx->failed ? -1 : 0;
+	long long diff;
 	struct timeval now;
 
 	if (ret == 0) {
@@ -189,7 +203,7 @@ fts_backend_flatcurve_update_deinit(struct fts_backend_update_context *_ctx)
 		diff = timeval_diff_msecs(&now, &ctx->start);
 
 		e_debug(ctx->backend->event, "Update transaction completed in "
-			"%u.%03u secs", diff/1000, diff%1000);
+			"%lld.%03lld secs", diff/1000, diff%1000);
 	}
 
 	str_free(&ctx->hdr_name);
@@ -312,15 +326,14 @@ fts_backend_flatcurve_update_build_more(struct fts_backend_update_context *_ctx,
 	if (_ctx->failed || ctx->skip_uid)
 		return -1;
 
-	if (size < ctx->backend->fuser->set.min_term_size)
+	if (size < ctx->backend->fuser->set->min_term_size)
 		return 0;
 
 	/* Xapian has a hard limit of "245 bytes", at least with the glass
-	 * and chert backends.  However, it is highly doubtful that people
-	 * are realistically going to search with more than 10s of
-	 * characters. Therefore, limit term size (via a configurable
-	 * value). */
-	size = I_MIN(size, ctx->backend->fuser->set.max_term_size);
+	 * and chert backends. */
+	size_t orig_size = size;
+	size = I_MIN(size, FTS_FLATCURVE_MAX_TERM_SIZE_MAX);
+	size = uni_utf8_data_truncate(data, orig_size, size);
 
 	const char *error;
 	int ret;
@@ -488,13 +501,18 @@ fts_backend_flatcurve_iterate_ns(struct fts_backend *_backend,
 	struct mailbox_list_iterate_context *iter;
 	const enum mailbox_list_iter_flags iter_flags =
 		MAILBOX_LIST_ITER_NO_AUTO_BOXES |
-		MAILBOX_LIST_ITER_RETURN_NO_FLAGS;
+		MAILBOX_LIST_ITER_RETURN_NO_FLAGS |
+		MAILBOX_LIST_ITER_SKIP_ALIASES;
+
 	enum mailbox_flags mbox_flags = 0;
 	pool_t pool = NULL;
 
 	bool failed = FALSE;
 	iter = mailbox_list_iter_init(_backend->ns->list, "*", iter_flags);
 	while ((info = mailbox_list_iter_next(iter)) != NULL) {
+		if ((info->flags & (MAILBOX_NOSELECT | MAILBOX_NONEXISTENT)) != 0)
+			continue;
+
 		box = mailbox_alloc(backend->backend.ns->list, info->vname,
 				    mbox_flags);
 
@@ -580,6 +598,7 @@ fts_backend_flatcurve_lookup_multi(struct fts_backend *_backend,
 		r->box = boxes[i];
 
 		fresult = p_new(result->pool, struct flatcurve_fts_result, 1);
+		p_array_init(&fresult->maybe_uids, result->pool, 32);
 		p_array_init(&fresult->scores, result->pool, 32);
 		p_array_init(&fresult->uids, result->pool, 32);
 
@@ -593,11 +612,8 @@ fts_backend_flatcurve_lookup_multi(struct fts_backend *_backend,
 			break;
 		}
 
-		if ((query->maybe) ||
-		    ((flags & FTS_LOOKUP_FLAG_NO_AUTO_FUZZY) != 0))
-			r->maybe_uids = fresult->uids;
-		else
-			r->definite_uids = fresult->uids;
+		r->definite_uids = fresult->uids;
+		r->maybe_uids = fresult->maybe_uids;
 		r->scores = fresult->scores;
 
 		if (str_len(query->qtext) == 0) {
@@ -606,17 +622,25 @@ fts_backend_flatcurve_lookup_multi(struct fts_backend *_backend,
 		}
 
 		T_BEGIN {
-			const char *u = fts_backend_flatcurve_seq_range_string(&fresult->uids);
+			const char *m_debug = "", *u_debug = "";
+
+			if (array_not_empty(&fresult->maybe_uids))
+				m_debug = fts_backend_flatcurve_seq_range_string(
+								&fresult->maybe_uids);
+			if (array_not_empty(&fresult->uids))
+				u_debug = fts_backend_flatcurve_seq_range_string(
+								&fresult->uids);
+
 			e_debug(event_create_passthrough(backend->event)->
 				set_name("fts_flatcurve_query")->
-				add_int("count", array_count(&fresult->uids))->
+				add_int("count", seq_range_count(&fresult->uids))->
 				add_str("mailbox", r->box->vname)->
-				add_str("maybe", query->maybe ? "yes" : "no")->
+				add_str("maybe_uids", m_debug)->
 				add_str("query", str_c(query->qtext))->
-				add_str("uids", u)->event(), "Query (%s) "
-				"%smatches=%d uids=%s", str_c(query->qtext),
-				query->maybe ? "maybe_" : "",
-				array_count(&fresult->uids), u);
+				add_str("uids", u_debug)->event(), "Query (%s) "
+				"matches=%d uids=%s maybe_matches=%d maybe_uids=%s",
+				str_c(query->qtext), seq_range_count(&fresult->uids),
+				u_debug, seq_range_count(&fresult->maybe_uids), m_debug);
 		} T_END;
 	}
 

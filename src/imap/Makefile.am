@@ -17,6 +17,7 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-index \
 	-I$(top_srcdir)/src/lib-storage \
 	-I$(top_srcdir)/src/lib-compression \
+	-I$(top_srcdir)/src/lib-var-expand \
 	$(BINARY_CFLAGS)
 
 imap_LDFLAGS = -export-dynamic \
@@ -118,9 +119,13 @@ headers = \
 pkginc_libdir=$(pkgincludedir)
 pkginc_lib_HEADERS = $(headers)
 
+if BUILD_IMAP_HIBERNATE
+TEST_IMAP_CLIENT_HIBERNATE=test-imap-client-hibernate
+endif
+
 test_programs = \
 	test-imap-storage-callbacks \
-	test-imap-client-hibernate
+	$(TEST_IMAP_CLIENT_HIBERNATE)
 noinst_PROGRAMS = $(test_programs)
 
 test_imap_storage_callbacks_SOURCES = \

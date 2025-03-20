@@ -7,6 +7,7 @@
 #include "fs-api.h"
 #include "mkdir-parents.h"
 #include "unlink-old-files.h"
+#include "settings.h"
 #include "mailbox-uidvalidity.h"
 #include "mailbox-list-private.h"
 #include "index-storage.h"
@@ -16,19 +17,6 @@
 #include <dirent.h>
 #include <unistd.h>
 #include <utime.h>
-
-void dbox_storage_get_list_settings(const struct mail_namespace *ns ATTR_UNUSED,
-				    struct mailbox_list_settings *set)
-{
-	if (set->layout == NULL)
-		set->layout = MAILBOX_LIST_NAME_FS;
-	if (set->subscription_fname == NULL)
-		set->subscription_fname = DBOX_SUBSCRIPTION_FILE_NAME;
-	if (*set->maildir_name == '\0')
-		set->maildir_name = DBOX_MAILDIR_NAME;
-	if (*set->mailbox_dir_name == '\0')
-		set->mailbox_dir_name = DBOX_MAILBOX_DIR_NAME;
-}
 
 static bool
 dbox_alt_path_has_changed(const char *root_dir, const char *alt_path,
@@ -45,8 +33,8 @@ dbox_alt_path_has_changed(const char *root_dir, const char *alt_path,
 	}
 
 	if (alt_path == NULL) {
-		e_warning(event,
-			  "%s: Original ALT=%s, but currently no ALT path set",
+		e_warning(event, "%s: Original mail_alt_path=%s, "
+			  "but currently mail_alt_path is empty",
 			  root_dir, linkpath);
 		return TRUE;
 	} else if (strcmp(linkpath, alt_path) != 0) {
@@ -57,7 +45,8 @@ dbox_alt_path_has_changed(const char *root_dir, const char *alt_path,
 			   mdbox. we'll silently replace the symlink. */
 			return TRUE;
 		}
-		e_warning(event, "%s: Original ALT=%s, but currently ALT=%s",
+		e_warning(event, "%s: Original mail_alt_path=%s, "
+			  "but currently mail_alt_path=%s",
 			  root_dir, linkpath, alt_path);
 		return TRUE;
 	}
@@ -105,39 +94,33 @@ int dbox_storage_create(struct mail_storage *_storage,
 	const struct mail_storage_settings *set = _storage->set;
 	const char *error;
 
-	if (*set->mail_attachment_fs != '\0' &&
-	    *set->mail_attachment_dir != '\0') {
-		const char *name, *args, *dir;
+	if (*set->mail_ext_attachment_path != '\0') {
+		const char *dir;
+		int ret;
 
-		args = strpbrk(set->mail_attachment_fs, ": ");
-		if (args == NULL) {
-			name = set->mail_attachment_fs;
-			args = "";
-		} else {
-			name = t_strdup_until(set->mail_attachment_fs, args++);
-		}
-		if (strcmp(name, "sis-queue") == 0 &&
-		    (_storage->class_flags & MAIL_STORAGE_CLASS_FLAG_FILE_PER_MSG) != 0) {
-			/* FIXME: the deduplication part doesn't work, because
-			   sdbox renames the files.. */
-			*error_r = "mail_attachment_fs: "
-				"sis-queue not currently supported by sdbox";
-			return -1;
-		}
 		dir = mail_user_home_expand(_storage->user,
-					    set->mail_attachment_dir);
+					    set->mail_ext_attachment_path);
 		storage->attachment_dir = p_strdup(_storage->pool, dir);
 
-		if (mailbox_list_init_fs(ns->list, _storage->event, name, args,
-					 storage->attachment_dir,
-					 &storage->attachment_fs, &error) < 0) {
-			*error_r = t_strdup_printf("mail_attachment_fs: %s",
+		struct event *event = event_create(_storage->event);
+		settings_event_add_filter_name(event, "mail_ext_attachment");
+		ret = mailbox_list_init_fs(ns->list, event,
+					   storage->attachment_dir,
+					   &storage->attachment_fs, &error);
+		event_unref(&event);
+		if (ret == 0) {
+			*error_r = "mail_ext_attachment_path is set, "
+				"but mail_ext_attachment { fs_driver } is missing";
+			return -1;
+		}
+		if (ret < 0) {
+			*error_r = t_strdup_printf("mail_ext_attachment: %s",
 						   error);
 			return -1;
 		}
 	}
 
-	if (!ns->list->set.alt_dir_nocheck)
+	if (ns->list->mail_set->mail_alt_check)
 		dbox_verify_alt_path(ns->list, _storage->event);
 	return 0;
 }
@@ -174,14 +157,12 @@ void dbox_notify_changes(struct mailbox *box)
 	}
 }
 
-static time_t cleanup_interval(struct mail_user *user)
+static time_t cleanup_interval(struct mail_storage *storage)
 {
-	const struct mail_storage_settings *set =
-		mail_user_set_get_storage_set(user);
-	time_t interval = set->mail_temp_scan_interval;
+	time_t interval = storage->set->mail_temp_scan_interval;
 
 	/* No need for a cryptographic-quality hash here. */
-	unsigned int hash = crc32_str(user->username);
+	unsigned int hash = crc32_str(storage->user->username);
 
 	/* spread from 0.00 to to 30.00% more than the base interval */
 	unsigned int spread_factor = 100000 + hash % 30001;
@@ -189,11 +170,11 @@ static time_t cleanup_interval(struct mail_user *user)
 }
 
 static bool
-dbox_cleanup_temp_files(struct mail_user *user, const char *path,
+dbox_cleanup_temp_files(struct mail_storage *storage, const char *path,
 			time_t last_scan_time, time_t last_change_time)
 {
 	/* check once in a while if there are temp files to clean up */
-	time_t interval = cleanup_interval(user);
+	time_t interval = cleanup_interval(storage);
 	if (interval == 0) {
 		/* disabled */
 		return FALSE;
@@ -211,7 +192,7 @@ dbox_cleanup_temp_files(struct mail_user *user, const char *path,
 		struct stat st;
 		if (stat(path, &st) < 0) {
 			if (errno != ENOENT)
-				e_error(user->event, "stat(%s) failed: %m", path);
+				e_error(storage->event, "stat(%s) failed: %m", path);
 			return FALSE;
 		}
 		last_change_time = st.st_ctime;
@@ -238,7 +219,7 @@ int dbox_mailbox_check_existence(struct mailbox *box)
 	int ret = -1;
 	bool has_log_in_index_dir = FALSE;
 
-	if (box->list->set.index_dir != NULL) {
+	if (box->list->mail_set->mail_index_path[0] != '\0') {
 		/* Just because the index directory exists, it doesn't mean
 		   that the mailbox is selectable. Check that by seeing if
 		   dovecot.index.log exists. If it doesn't, fallback to
@@ -259,8 +240,9 @@ int dbox_mailbox_check_existence(struct mailbox *box)
 	}
 	if (ret < 0) {
 		ret = stat(box_path, &st);
-	} else if (ret == 0 && !box->list->set.iter_from_index_dir &&
-		   *box->list->set.mailbox_dir_name == '\0') {
+	} else if (ret == 0 &&
+		   !box->list->mail_set->mailbox_list_iter_from_index_dir &&
+		   *box->list->mail_set->parsed_mailbox_root_directory_prefix == '\0') {
 		/* There are index files for this mailbox and no separate
 		mailboxes directory is configured. */
 		return 0;
@@ -274,7 +256,7 @@ int dbox_mailbox_check_existence(struct mailbox *box)
 		mail_storage_set_error(box->storage, MAIL_ERROR_NOTFOUND,
 			T_MAIL_ERR_MAILBOX_NOT_FOUND(box->vname));
 		return -1;
-	} else if (errno == EACCES) {
+	} else if (ENOACCESS(errno)) {
 		mailbox_set_critical(box, "%s",
 			mail_error_eacces_msg("stat", box_path));
 		return -1;
@@ -295,7 +277,7 @@ int dbox_mailbox_open(struct mailbox *box)
 	return 0;
 }
 
-int dbox_mailbox_list_cleanup(struct mail_user *user, const char *path,
+int dbox_mailbox_list_cleanup(struct mail_storage *storage, const char *path,
 			      time_t last_temp_file_scan)
 {
 	time_t change_time = -1;
@@ -309,12 +291,13 @@ int dbox_mailbox_list_cleanup(struct mail_user *user, const char *path,
 			change_time = ST_CTIME_SEC(stats);
 		} else {
 			if (errno != ENOENT)
-				e_error(user->event, "stat(%s) failed: %m", path);
+				e_error(storage->event, "stat(%s) failed: %m", path);
 			return -1;
 		}
 	}
 
-	if (dbox_cleanup_temp_files(user, path, last_temp_file_scan, change_time) ||
+	if (dbox_cleanup_temp_files(storage, path, last_temp_file_scan,
+				    change_time) ||
 	    last_temp_file_scan == 0) {
 		/* temp files were scanned. update the last scan timestamp. */
 		return 1;
@@ -329,8 +312,7 @@ void dbox_mailbox_close_cleanup(struct mailbox *box)
 
 	const struct mail_index_header *hdr =
 		mail_index_get_header(box->view);
-	if (dbox_mailbox_list_cleanup(box->storage->user,
-				      mailbox_get_path(box),
+	if (dbox_mailbox_list_cleanup(box->storage, mailbox_get_path(box),
 				      hdr->last_temp_file_scan) > 0)
 		index_mailbox_update_last_temp_file_scan(box);
 }
@@ -398,10 +380,9 @@ int dbox_mailbox_create(struct mailbox *box,
 		if (ret < 0)
 			return -1;
 		if (ret == 0) {
-			mailbox_set_critical(box,
+			storage->v.set_mailbox_corrupted(box,
 				"Existing files in alt path, "
 				"rebuilding storage to avoid losing messages");
-			storage->v.set_mailbox_corrupted(box);
 			return -1;
 		}
 		/* dir is empty, ignore it */
@@ -440,7 +421,6 @@ int dbox_mailbox_create_indexes(struct mailbox *box,
 
 int dbox_verify_alt_storage(struct mailbox_list *list)
 {
-	struct event *event = list->ns->user->event;
 	const char *alt_path;
 	struct stat st;
 
@@ -452,7 +432,7 @@ int dbox_verify_alt_storage(struct mailbox_list *list)
 	if (stat(alt_path, &st) == 0)
 		return 0;
 	if (errno != ENOENT) {
-		e_error(event, "stat(%s) failed: %m", alt_path);
+		e_error(list->event, "stat(%s) failed: %m", alt_path);
 		return -1;
 	}
 

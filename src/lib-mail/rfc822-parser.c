@@ -2,29 +2,30 @@
 
 #include "lib.h"
 #include "str.h"
+#include "punycode.h"
 #include "strescape.h"
 #include "rfc822-parser.h"
 
 /*
    atext        =       ALPHA / DIGIT / ; Any character except controls,
-                        "!" / "#" /     ;  SP, and specials.
-                        "$" / "%" /     ;  Used for atoms
-                        "&" / "'" /
-                        "*" / "+" /
-                        "-" / "/" /
-                        "=" / "?" /
-                        "^" / "_" /
-                        "`" / "{" /
-                        "|" / "}" /
-                        "~"
+			"!" / "#" /     ;  SP, and specials.
+			"$" / "%" /     ;  Used for atoms
+			"&" / "'" /
+			"*" / "+" /
+			"-" / "/" /
+			"=" / "?" /
+			"^" / "_" /
+			"`" / "{" /
+			"|" / "}" /
+			"~"
 
   MIME:
 
   token := 1*<any (US-ASCII) CHAR except SPACE, CTLs,
-              or tspecials>
+	      or tspecials>
   tspecials :=  "(" / ")" / "<" / ">" / "@" /
-                "," / ";" / ":" / "\" / <">
-                "/" / "[" / "]" / "?" / "="
+		"," / ";" / ":" / "\" / <">
+		"/" / "[" / "]" / "?" / "="
 
   So token is same as dot-atom, except stops also at '/', '?' and '='.
 */
@@ -139,7 +140,7 @@ int rfc822_skip_lwsp(struct rfc822_parser_context *ctx)
 	for (; ctx->data < ctx->end;) {
 		if (*ctx->data == ' ' || *ctx->data == '\t' ||
 		    *ctx->data == '\r' || *ctx->data == '\n') {
-                        ctx->data++;
+			ctx->data++;
 			continue;
 		}
 
@@ -412,6 +413,34 @@ rfc822_parse_domain_literal(struct rfc822_parser_context *ctx, string_t *str)
 	return -1;
 }
 
+void rfc822_decode_punycode(const char *input, size_t len, string_t *result)
+{
+	string_t *decoded = t_str_new(64);
+	const char *pos = input;
+	const char *end = CONST_PTR_OFFSET(input, len);
+
+	while (pos < end) {
+		const char *value;
+		const char *delim = strchr(pos, '.');
+		if (delim == NULL)
+			delim = end;
+		if (str_begins(pos, "xn--", &value)) {
+			str_truncate(decoded, 0);
+			if (punycode_decode(value, delim - value, result) < 0)
+				/* Consider it as data */
+				str_append_data(result, pos, delim - pos + 1);
+			else if (*delim == '.')
+				str_append_c(result, *delim);
+		} else {
+			/* No punycode prefix */
+			str_append_data(result, pos, delim - pos + 1);
+		}
+		pos = delim + 1;
+	}
+	if (pos < end)
+		str_append_data(result, pos, end - pos);
+}
+
 int rfc822_parse_domain(struct rfc822_parser_context *ctx, string_t *str)
 {
 	/*
@@ -428,8 +457,21 @@ int rfc822_parse_domain(struct rfc822_parser_context *ctx, string_t *str)
 
 	if (*ctx->data == '[')
 		return rfc822_parse_domain_literal(ctx, str);
-	else
-		return rfc822_parse_dot_atom(ctx, str);
+	else {
+		int ret = rfc822_parse_dot_atom(ctx, str);
+#ifdef EXPERIMENTAL_MAIL_UTF8
+		if (ret == 0) {
+			size_t start_pos = str_len(str);
+			string_t *u = t_str_new(64);
+			const char *data = t_strndup(str_data(str) + start_pos,
+						     str_len(str) - start_pos);
+			rfc822_decode_punycode(data, strlen(data), u);
+			str_truncate(str, start_pos);
+			str_append_str(str, u);
+		}
+#endif
+		return ret;
+	}
 }
 
 int rfc822_parse_content_type(struct rfc822_parser_context *ctx, string_t *str)

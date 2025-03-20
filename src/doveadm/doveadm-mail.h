@@ -130,6 +130,13 @@ void doveadm_mail_server_handle(struct doveadm_server *server,
 				struct doveadm_client *conn,
 				struct doveadm_mail_cmd_context *cmd_ctx,
 				const char *username, bool print_username);
+void doveadm_mail_server_handle_full(struct doveadm_server *server,
+				     struct doveadm_client *conn,
+				     struct doveadm_mail_cmd_context *cmd_ctx,
+				     const char *username,
+				     const char *cmd_name,
+				     const char *const *cmd_args,
+				     bool print_username);
 void doveadm_mail_server_flush(struct doveadm_mail_cmd_context *ctx);
 
 int doveadm_cmd_pass_lookup(struct doveadm_mail_cmd_context *ctx,
@@ -203,12 +210,26 @@ extern struct doveadm_cmd_ver2 doveadm_cmd_mailbox_cache_decision;
 extern struct doveadm_cmd_ver2 doveadm_cmd_mailbox_cache_remove;
 extern struct doveadm_cmd_ver2 doveadm_cmd_mailbox_cache_purge;
 extern struct doveadm_cmd_ver2 doveadm_cmd_rebuild_attachments;
+extern struct doveadm_cmd_ver2 doveadm_cmd_mail_fs_get;
+extern struct doveadm_cmd_ver2 doveadm_cmd_mail_fs_put;
+extern struct doveadm_cmd_ver2 doveadm_cmd_mail_fs_copy;
+extern struct doveadm_cmd_ver2 doveadm_cmd_mail_fs_stat;
+extern struct doveadm_cmd_ver2 doveadm_cmd_mail_fs_metadata;
+extern struct doveadm_cmd_ver2 doveadm_cmd_mail_fs_delete;
+extern struct doveadm_cmd_ver2 doveadm_cmd_mail_fs_iter;
+extern struct doveadm_cmd_ver2 doveadm_cmd_mail_fs_iter_dirs;
+extern struct doveadm_cmd_ver2 doveadm_cmd_mail_dict_get;
+extern struct doveadm_cmd_ver2 doveadm_cmd_mail_dict_set;
+extern struct doveadm_cmd_ver2 doveadm_cmd_mail_dict_unset;
+extern struct doveadm_cmd_ver2 doveadm_cmd_mail_dict_inc;
+extern struct doveadm_cmd_ver2 doveadm_cmd_mail_dict_iter;
 
 #define DOVEADM_CMD_MAIL_COMMON \
 DOVEADM_CMD_PARAM('A', "all-users", CMD_PARAM_BOOL, 0) \
 DOVEADM_CMD_PARAM('S', "socket-path", CMD_PARAM_STR, 0) \
 DOVEADM_CMD_PARAM('u', "user", CMD_PARAM_STR, 0) \
 DOVEADM_CMD_PARAM('\0', "trans-flags", CMD_PARAM_INT64, 0) \
+DOVEADM_CMD_PARAM('\0', "no-userdb-lookup", CMD_PARAM_BOOL, 0) \
 DOVEADM_CMD_PARAM('F', "user-file", CMD_PARAM_ISTREAM, 0)
 
 #define DOVEADM_CMD_MAIL_USAGE_PREFIX \

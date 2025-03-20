@@ -6,14 +6,18 @@
 #include "http-url.h"
 #include "ioloop.h"
 #include "istream.h"
-#include "json-parser.h"
+#include "settings-parser.h"
+#include "json-ostream.h"
 #include "mailbox-attribute.h"
 #include "mail-storage-private.h"
+#include "settings.h"
 #include "str.h"
 #include "strescape.h"
+#include "strnum.h"
 #include "str-parse.h"
 #include "iostream-ssl.h"
 
+#include "push-notification-settings.h"
 #include "push-notification-plugin.h"
 #include "push-notification-drivers.h"
 #include "push-notification-event-messagenew.h"
@@ -27,9 +31,6 @@
 /* Default values. */
 static const char *const default_events[] = { "MessageNew", NULL };
 static const char *const default_mboxes[] = { "INBOX", NULL };
-#define DEFAULT_CACHE_LIFETIME_SECS 60
-#define DEFAULT_TIMEOUT_MSECS 2000
-#define DEFAULT_RETRY_COUNT 1
 
 /* This is data that is shared by all plugin users. */
 struct push_notification_driver_ox_global {
@@ -44,8 +45,6 @@ struct push_notification_driver_ox_config {
 	struct event *event;
 	unsigned int cached_ox_metadata_lifetime_secs;
 	bool use_unsafe_username;
-	unsigned int http_max_retries;
-	unsigned int http_timeout_msecs;
 
 	char *cached_ox_metadata;
 	time_t cached_ox_metadata_timestamp;
@@ -56,88 +55,73 @@ struct push_notification_driver_ox_txn {
 	const char *unsafe_user;
 };
 
-static void
-push_notification_driver_ox_init_global(
-	struct mail_user *user,
-	struct push_notification_driver_ox_config *config)
+static bool
+push_notification_driver_ox_init_global(struct mail_user *user, const char *name)
 {
-	struct http_client_settings http_set;
-	struct ssl_iostream_settings ssl_set;
-
 	if (ox_global->http_client == NULL) {
-		/* This is going to use the first user's settings, but these are
-		   unlikely to change between users so it shouldn't matter much.
-		 */
-		i_zero(&http_set);
-		http_set.debug = user->mail_debug;
-		http_set.max_attempts = config->http_max_retries+1;
-		http_set.request_timeout_msecs = config->http_timeout_msecs;
-		http_set.event_parent = user->event;
-		mail_user_init_ssl_client_settings(user, &ssl_set);
-		http_set.ssl = &ssl_set;
+		const char *error;
 
-		ox_global->http_client = http_client_init(&http_set);
+		struct event *event = event_create(user->event);
+		char *filter_name = p_strdup_printf(
+				event_get_pool(event), "%s/%s",
+				PUSH_NOTIFICATION_SETTINGS_FILTER_NAME,
+				settings_section_escape(name));
+		event_set_ptr(event, SETTINGS_EVENT_FILTER_NAME, filter_name);
+
+		if (http_client_init_auto(event, &ox_global->http_client,
+					  &error) < 0) {
+			e_error(user->event,
+				"Unable to initialize the HTTP client: %s",
+				error);
+			event_unref(&event);
+			return FALSE;
+		}
+		event_unref(&event);
 	}
+
+	return TRUE;
 }
 
 static int
-push_notification_driver_ox_init(struct push_notification_driver_config *config,
-				 struct mail_user *user, pool_t pool,
-				 void **context, const char **error_r)
+push_notification_driver_ox_init(struct mail_user *user, pool_t pool,
+				 const char *name, void **context,
+				 const char **error_r)
 {
 	struct push_notification_driver_ox_config *dconfig;
-	const char *error, *tmp;
 
-	/* Valid config keys: cache_lifetime, url */
-	tmp = hash_table_lookup(config->config, (const char *)"url");
-	if (tmp == NULL) {
-		*error_r = "Driver requires the url parameter";
+	struct push_notification_ox_settings *ox_settings;
+	if (settings_get_filter(user->event, PUSH_NOTIFICATION_SETTINGS_FILTER_NAME,
+				name, &push_notification_ox_setting_parser_info,
+				0, &ox_settings, error_r) < 0)
 		return -1;
-	}
 
 	dconfig = p_new(pool, struct push_notification_driver_ox_config, 1);
 	dconfig->event = event_create(user->event);
 	event_add_category(dconfig->event, &event_category_push_notification);
 	event_set_append_log_prefix(dconfig->event, "push-notification-ox: ");
 
-	if (http_url_parse(tmp, NULL, HTTP_URL_ALLOW_USERINFO_PART, pool,
-			   &dconfig->http_url, &error) < 0) {
-		event_unref(&dconfig->event);
-		*error_r = t_strdup_printf("Failed to parse OX REST URL %s: %s",
-					   tmp, error);
-		return -1;
+	/* The settings check is deliberately only validating a url if it is   
+	   given in the settings. Otherwise any file that does not contain     
+	   push-notification specific settings would fail the validation.      
+	   Thus we need to check here, whether the parsed url exists. */       
+	if (ox_settings->parsed_url == NULL) {                            
+		*error_r = "push_notification_ox_url is missing or empty";
+		event_unref(&dconfig->event);                                  
+		settings_free(ox_settings);                               
+		return -1;                                                     
 	}
-	dconfig->use_unsafe_username =
-		hash_table_lookup(config->config,
-				  (const char *)"user_from_metadata") != NULL;
+	
+	dconfig->http_url = http_url_clone_with_userinfo(pool, ox_settings->parsed_url);
+	e_debug(dconfig->event, "Using URL %s",
+		http_url_create(dconfig->http_url));
 
-	e_debug(dconfig->event, "Using URL %s", tmp);
-
-	tmp = hash_table_lookup(config->config, (const char *)"cache_lifetime");
-	if (tmp == NULL) {
-		dconfig->cached_ox_metadata_lifetime_secs =
-			DEFAULT_CACHE_LIFETIME_SECS;
-	} else if (str_parse_get_interval(
-		tmp, &dconfig->cached_ox_metadata_lifetime_secs, &error) < 0) {
-		event_unref(&dconfig->event);
-		*error_r = t_strdup_printf(
-			"Failed to parse OX cache_lifetime %s: %s", tmp, error);
-		return -1;
-	}
-
-	tmp = hash_table_lookup(config->config, (const char *)"max_retries");
-	if ((tmp == NULL) ||
-	    (str_to_uint(tmp, &dconfig->http_max_retries) < 0)) {
-		dconfig->http_max_retries = DEFAULT_RETRY_COUNT;
-	}
-	tmp = hash_table_lookup(config->config, (const char *)"timeout_msecs");
-	if ((tmp == NULL) ||
-	    (str_to_uint(tmp, &dconfig->http_timeout_msecs) < 0)) {
-		dconfig->http_timeout_msecs = DEFAULT_TIMEOUT_MSECS;
-	}
-
+	dconfig->cached_ox_metadata_lifetime_secs = ox_settings->cache_ttl;
 	e_debug(dconfig->event, "Using cache lifetime: %u",
 		dconfig->cached_ox_metadata_lifetime_secs);
+
+	dconfig->use_unsafe_username = ox_settings->user_from_metadata;
+	e_debug(dconfig->event, "Using user %s",
+		dconfig->use_unsafe_username ? "stored in METADATA" : "sent by OX endpoint");
 
 	if (ox_global == NULL) {
 		ox_global = i_new(struct push_notification_driver_ox_global, 1);
@@ -146,6 +130,11 @@ push_notification_driver_ox_init(struct push_notification_driver_config *config,
 
 	++ox_global->refcount;
 	*context = dconfig;
+
+	settings_free(ox_settings);
+
+	if (!push_notification_driver_ox_init_global(user, name))
+		return -1;
 
 	return 0;
 }
@@ -366,6 +355,7 @@ push_notification_driver_ox_process_msg(
 	struct push_notification_event_messagenew_data *messagenew;
 	struct istream *payload;
 	string_t *str;
+	struct json_ostream *json_output;
 	struct push_notification_driver_ox_txn *txn =
 		(struct push_notification_driver_ox_txn *)dtxn->context;
 	struct mail_user *user = dtxn->ptxn->muser;
@@ -381,8 +371,6 @@ push_notification_driver_ox_process_msg(
 	if (messagenew == NULL)
 		return;
 
-	push_notification_driver_ox_init_global(user, dconfig);
-
 	http_req = http_client_request_url(
 		ox_global->http_client, "PUT", dconfig->http_url,
 		push_notification_driver_ox_http_callback, dconfig);
@@ -391,32 +379,34 @@ push_notification_driver_ox_process_msg(
 				       "application/json; charset=utf-8");
 
 	str = str_new(default_pool, 256);
-	str_append(str, "{\"user\":\"");
-	json_append_escaped(str, dconfig->use_unsafe_username ?
-			    txn->unsafe_user : user->username);
-	str_append(str, "\",\"event\":\"messageNew\",\"folder\":\"");
-	json_append_escaped(str, msg->mailbox);
-	str_printfa(str, "\",\"imap-uidvalidity\":%u,\"imap-uid\":%u",
-		    msg->uid_validity, msg->uid);
+	json_output = json_ostream_create_str(str, 0);
+	json_ostream_ndescend_object(json_output, NULL);
+	json_ostream_nwrite_string(
+		json_output, "user", (dconfig->use_unsafe_username ?
+				      txn->unsafe_user : user->username));
+	json_ostream_nwrite_string(json_output, "event", "messageNew");
+	json_ostream_nwrite_string(json_output, "folder", msg->mailbox);
+	json_ostream_nwrite_number(json_output, "imap-uidvalidity",
+				   msg->uid_validity);
+	json_ostream_nwrite_number(json_output, "imap-uid", msg->uid);
 	if (messagenew->from != NULL) {
-		str_append(str, ",\"from\":\"");
-		json_append_escaped(str, messagenew->from);
-		str_append(str, "\"");
+		json_ostream_nwrite_string(json_output, "from",
+					   messagenew->from);
 	}
 	if (messagenew->subject != NULL) {
-		str_append(str, ",\"subject\":\"");
-		json_append_escaped(str, messagenew->subject);
-		str_append(str, "\"");
+		json_ostream_nwrite_string(json_output, "subject",
+					   messagenew->subject);
 	}
 	if (messagenew->snippet != NULL) {
-		str_append(str, ",\"snippet\":\"");
-		json_append_escaped(str, messagenew->snippet);
-		str_append(str, "\"");
+		json_ostream_nwrite_string(json_output, "snippet",
+					   messagenew->snippet);
 	}
 	if (status_success) {
-		str_printfa(str, ",\"unseen\":%u", box_status.unseen);
+		json_ostream_nwrite_number(json_output, "unseen",
+					   box_status.unseen);
 	}
-	str_append(str, "}");
+	json_ostream_nascend_object(json_output);
+	json_ostream_nfinish_destroy(&json_output);
 
 	e_debug(dconfig->event, "Sending notification: %s", str_c(str));
 
@@ -430,7 +420,7 @@ push_notification_driver_ox_process_msg(
 
 static void
 push_notification_driver_ox_deinit(
-	struct push_notification_driver_user *duser ATTR_UNUSED)
+	struct push_notification_driver_user *duser)
 {
 	struct push_notification_driver_ox_config *dconfig = duser->context;
 

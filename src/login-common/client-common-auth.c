@@ -14,7 +14,7 @@
 #include "login-proxy.h"
 #include "auth-client.h"
 #include "dsasl-client.h"
-#include "master-service-ssl-settings.h"
+#include "ssl-settings.h"
 #include "client-common.h"
 
 /* If we've been waiting auth server to respond for over this many milliseconds,
@@ -180,6 +180,8 @@ static bool client_auth_parse_args(const struct client *client, bool success,
 					value, error);
 				return FALSE;
 			}
+		} else if (strcmp(key, "proxy_no_multiplex") == 0) {
+			reply_r->proxy_no_multiplex = TRUE;
 		} else if (strcmp(key, "proxy_refresh") == 0) {
 			if (str_to_uint(value, &reply_r->proxy_refresh_secs) < 0) {
 				e_error(client->event,
@@ -287,14 +289,7 @@ void client_proxy_finish_destroy_client(struct client *client)
 		return;
 	}
 
-	/* Include hostname in the log message in case it's different from the
-	   IP address in the prefix. */
-	const char *ip_str = login_proxy_get_ip_str(client->login_proxy);
-	const char *host = login_proxy_get_host(client->login_proxy);
-	str_printfa(str, "Started proxying to <%s>",
-		    login_proxy_get_ip_str(client->login_proxy));
-	if (strcmp(ip_str, host) != 0)
-		str_printfa(str, " (<%s>)", host);
+	str_printfa(str, "Started proxying to remote host");
 
 	client_proxy_append_conn_info(str, client);
 
@@ -340,7 +335,7 @@ static void proxy_input(struct client *client)
 	const char *line;
 	unsigned int duration;
 
-	input = login_proxy_get_istream(client->login_proxy);
+	input = login_proxy_get_server_istream(client->login_proxy);
 	switch (i_stream_read(input)) {
 	case -2:
 		login_proxy_failed(client->login_proxy,
@@ -564,21 +559,42 @@ void client_common_proxy_failed(struct client *client,
 	if (reconnecting)
 		return;
 
-	switch (type) {
-	case LOGIN_PROXY_FAILURE_TYPE_CONNECT:
-	case LOGIN_PROXY_FAILURE_TYPE_INTERNAL:
-	case LOGIN_PROXY_FAILURE_TYPE_INTERNAL_CONFIG:
-	case LOGIN_PROXY_FAILURE_TYPE_REMOTE:
-	case LOGIN_PROXY_FAILURE_TYPE_REMOTE_CONFIG:
-	case LOGIN_PROXY_FAILURE_TYPE_PROTOCOL:
-		break;
-	case LOGIN_PROXY_FAILURE_TYPE_AUTH:
-	case LOGIN_PROXY_FAILURE_TYPE_AUTH_TEMPFAIL:
-	case LOGIN_PROXY_FAILURE_TYPE_AUTH_REDIRECT:
-		client->proxy_auth_failed = TRUE;
-		break;
-	}
+	client->proxy_last_failure = type;
+	client->proxy_failed = TRUE;
 	client_proxy_failed(client);
+}
+
+static bool proxy_check_ip_family(const struct client_auth_reply *reply,
+				  const char **error_r)
+{
+	 if (reply->proxy.host_ip.family != 0 &&
+	     reply->proxy.host_ip.family != AF_INET &&
+	     reply->proxy.host_ip.family != AF_INET6) {
+		 *error_r = t_strdup_printf(
+				 "Destination IP address family %u is unsupported",
+				 reply->proxy.host_ip.family);
+		 return FALSE;
+	 }
+
+	 if (reply->proxy.source_ip.family != 0 &&
+	     reply->proxy.source_ip.family != AF_INET &&
+	     reply->proxy.source_ip.family != AF_INET6) {
+		 *error_r = t_strdup_printf(
+				 "Source IP address family %u is unsupported",
+				 reply->proxy.source_ip.family);
+		 return FALSE;
+	}
+
+	 if (reply->proxy.source_ip.family != 0 &&
+	     reply->proxy.host_ip.family != 0 &&
+	     reply->proxy.source_ip.family != reply->proxy.host_ip.family) {
+		 *error_r = t_strdup_printf(
+				 "Source IP (%s) address family does not match destination",
+				 net_ip2addr(&reply->proxy.source_ip));
+		 return FALSE;
+	 }
+
+	return TRUE;
 }
 
 static bool
@@ -589,6 +605,8 @@ proxy_check_start(struct client *client, struct event *event,
 	i_assert(reply->proxy.password != NULL);
 	i_assert(reply->proxy.host != NULL && reply->proxy.host[0] != '\0');
 	i_assert(reply->proxy.host_ip.family != 0);
+	const char *error;
+	struct ip_addr ip;
 
 	if (reply->proxy.sasl_mechanism != NULL) {
 		*sasl_mech_r = dsasl_client_mech_find(reply->proxy.sasl_mechanism);
@@ -600,14 +618,51 @@ proxy_check_start(struct client *client, struct event *event,
 	} else if (reply->proxy.master_user != NULL) {
 		/* have to use PLAIN authentication with master user logins */
 		*sasl_mech_r = &dsasl_client_mech_plain;
+	} else if (!proxy_check_ip_family(reply, &error)) {
+		e_error(event, "%s", error);
+		return FALSE;
+	} else if (reply->proxy.host_ip.family != 0 &&
+		   net_addr2ip(reply->proxy.host, &ip) == 0 &&
+		   !net_ip_compare(&reply->proxy.host_ip, &ip)) {
+		e_error(event, "host and hostip are both IPs, but they don't match");
+		return FALSE;
 	}
 
-	if (login_proxy_is_ourself(client, reply->proxy.host, reply->proxy.port,
-				   reply->proxy.username)) {
+	if (login_proxy_is_ourself(client, reply->proxy.host, &reply->proxy.host_ip,
+				   reply->proxy.port, reply->proxy.username)) {
 		e_error(event, "Proxying loops to itself");
 		return FALSE;
 	}
 	return TRUE;
+}
+
+/* Sets ip_r to source address if one is found for given family,
+   and advances the index pointer to next potential address. */
+static void login_source_ip_get(sa_family_t family, struct ip_addr *ip_r)
+{
+	unsigned int *login_source_ips_idx;
+	unsigned int login_source_ips_count;
+	const struct ip_addr *login_source_ips;
+
+	if (family == AF_INET) {
+		login_source_ips_idx = &login_source_v4_ips_idx;
+		login_source_ips_count = login_source_v4_ips_count;
+		login_source_ips = login_source_v4_ips;
+	} else if (family == AF_INET6) {
+		login_source_ips_idx = &login_source_v6_ips_idx;
+		login_source_ips_count = login_source_v6_ips_count;
+		login_source_ips = login_source_v6_ips;
+	} else
+		i_unreached();
+
+	/* No source IP for this AF */
+	if (login_source_ips_count == 0)
+		return;
+
+	/* select the next source IP with round robin. */
+	*ip_r = login_source_ips[*login_source_ips_idx];
+	*login_source_ips_idx =
+		(*login_source_ips_idx + 1) % login_source_ips_count;
 }
 
 static int proxy_start(struct client *client,
@@ -639,14 +694,11 @@ static int proxy_start(struct client *client,
 	i_zero(&proxy_set);
 	proxy_set.host = reply->proxy.host;
 	proxy_set.ip = reply->proxy.host_ip;
-	if (reply->proxy.source_ip.family != 0) {
+	if (reply->proxy.source_ip.family != 0)
 		proxy_set.source_ip = reply->proxy.source_ip;
-	} else if (login_source_ips_count > 0) {
-		/* select the next source IP with round robin. */
-		proxy_set.source_ip = login_source_ips[login_source_ips_idx];
-		login_source_ips_idx =
-			(login_source_ips_idx + 1) % login_source_ips_count;
-	}
+	else
+		login_source_ip_get(proxy_set.ip.family, &proxy_set.source_ip);
+
 	proxy_set.port = reply->proxy.port;
 	proxy_set.connect_timeout_msecs = reply->proxy.timeout_msecs;
 	if (proxy_set.connect_timeout_msecs == 0)
@@ -665,8 +717,10 @@ static int proxy_start(struct client *client,
 	client->proxy_noauth = reply->proxy.noauth;
 	client->proxy_not_trusted = reply->proxy.remote_not_trusted;
 	client->proxy_redirect_reauth = reply->proxy.redirect_reauth;
+	client->proxy_no_multiplex = reply->proxy_no_multiplex;
 
 	if (login_proxy_new(client, event, &proxy_set, proxy_input,
+			    client->v.proxy_side_channel_input,
 			    client->v.proxy_failed, proxy_redirect) < 0) {
 		event_unref(&event);
 		return -1;
@@ -803,11 +857,17 @@ client_auth_handle_reply(struct client *client,
 
 void client_auth_respond(struct client *client, const char *response)
 {
-	client->auth_client_continue_pending = FALSE;
-	client_set_auth_waiting(client);
-	auth_client_request_continue(client->auth_request, response);
 	if (!client_does_custom_io(client))
 		io_remove(&client->io);
+
+	if (strcmp(response, "*") == 0) {
+		sasl_server_auth_abort(client);
+		return;
+	}
+
+	client->auth_client_continue_pending = FALSE;
+	client_set_auth_waiting(client);
+	sasl_server_auth_continue(client, response);
 }
 
 void client_auth_abort(struct client *client)
@@ -852,32 +912,22 @@ int client_auth_read_line(struct client *client)
 	return i < size ? 1 : 0;
 }
 
-void client_auth_parse_response(struct client *client)
+bool client_auth_parse_response(struct client *client)
 {
 	if (client_auth_read_line(client) <= 0)
-		return;
-
-	/* This has to happen before * handling, otherwise
-	   client can abort failed request. */
-	if (client->final_response) {
-		sasl_server_auth_delayed_final(client);
-		return;
-	}
-
-	if (strcmp(str_c(client->auth_response), "*") == 0) {
-		sasl_server_auth_abort(client);
-		return;
-	}
-
-	client_auth_respond(client, str_c(client->auth_response));
-	memset(str_c_modifiable(client->auth_response), 0,
-	       str_len(client->auth_response));
+		return FALSE;
+	return TRUE;
 }
 
 static void client_auth_input(struct client *client)
 {
 	i_assert(client->v.auth_parse_response != NULL);
-	client->v.auth_parse_response(client);
+	if (!client->v.auth_parse_response(client))
+		return;
+
+	client_auth_respond(client, str_c(client->auth_response));
+	safe_memset(str_c_modifiable(client->auth_response), 0,
+		    str_len(client->auth_response));
 }
 
 void client_auth_send_challenge(struct client *client, const char *data)
@@ -907,8 +957,9 @@ client_auth_reply_args(struct client *client, enum sasl_server_reply sasl_reply,
 		if (!client_auth_parse_args(client, success, FALSE, args,
 					    reply_r, &username)) {
 			client_auth_result(client,
-				CLIENT_AUTH_RESULT_AUTHFAILED, reply_r,
-				AUTH_FAILED_MSG);
+				CLIENT_AUTH_RESULT_TEMPFAIL, reply_r,
+				AUTH_TEMP_FAILED_MSG);
+			client_auth_failed(client);
 			return FALSE;
 		}
 		if (!success) {
@@ -932,7 +983,8 @@ sasl_callback(struct client *client, enum sasl_server_reply sasl_reply,
 
 	i_assert(!client->destroyed ||
 		 sasl_reply == SASL_SERVER_REPLY_AUTH_ABORTED ||
-		 sasl_reply == SASL_SERVER_REPLY_MASTER_FAILED);
+		 sasl_reply == SASL_SERVER_REPLY_MASTER_FAILED ||
+		 sasl_reply == SASL_SERVER_REPLY_MASTER_FAILED_LIMIT);
 
 	client->last_auth_fail = CLIENT_AUTH_FAIL_CODE_NONE;
 	i_zero(&reply);
@@ -941,10 +993,11 @@ sasl_callback(struct client *client, enum sasl_server_reply sasl_reply,
 		if (!client_auth_reply_args(client, sasl_reply,
 					    data, args, &reply))
 			break;
+		reply.final_reply = data;
 
 		client_auth_result(client, CLIENT_AUTH_RESULT_SUCCESS,
 				   &reply, NULL);
-		client_destroy_success(client, "Login");
+		client_destroy_success(client, "Logged in");
 		break;
 	case SASL_SERVER_REPLY_AUTH_FAILED:
 	case SASL_SERVER_REPLY_AUTH_ABORTED:
@@ -969,11 +1022,18 @@ sasl_callback(struct client *client, enum sasl_server_reply sasl_reply,
 			client_auth_failed(client);
 		break;
 	case SASL_SERVER_REPLY_MASTER_FAILED:
-		if (data != NULL) {
+	case SASL_SERVER_REPLY_MASTER_FAILED_LIMIT:
+		if (data == NULL)
+			;
+		else if (sasl_reply == SASL_SERVER_REPLY_MASTER_FAILED) {
 			/* authentication itself succeeded, we just hit some
 			   internal failure. */
 			client_auth_result(client, CLIENT_AUTH_RESULT_TEMPFAIL,
 					   &reply, data);
+		} else {
+			client_auth_result(client,
+				CLIENT_AUTH_RESULT_LIMIT_REACHED, &reply, data);
+			client->auth_login_limit_reached = TRUE;
 		}
 
 		/* the fd may still be hanging somewhere in kernel or another
@@ -1022,7 +1082,7 @@ client_auth_begin_common(struct client *client, const char *mech_name,
 			 const char *init_resp)
 {
 	if (!client->connection_secured &&
-	    strcmp(client->ssl_set->ssl, "required") == 0) {
+	    strcmp(client->ssl_server_set->ssl, "required") == 0) {
 		e_info(client->event_auth, "Login failed: "
 			"SSL required for authentication");
 		client->auth_attempts++;
@@ -1070,7 +1130,7 @@ int client_auth_begin_implicit(struct client *client, const char *mech_name,
 
 bool client_check_plaintext_auth(struct client *client, bool pass_sent)
 {
-	bool ssl_required = (strcmp(client->ssl_set->ssl, "required") == 0);
+	bool ssl_required = (strcmp(client->ssl_server_set->ssl, "required") == 0);
 
 	i_assert(!ssl_required || !client->set->auth_allow_cleartext);
 
@@ -1108,7 +1168,8 @@ void clients_notify_auth_connected(void)
 		timeout_remove(&client->to_auth_waiting);
 
 		T_BEGIN {
-			client_notify_auth_ready(client);
+			if (!client->defer_auth_ready)
+				client_notify_auth_ready(client);
 		} T_END;
 
 		if (!client_does_custom_io(client) && client->input_blocked) {

@@ -7,6 +7,7 @@
 #include "hash.h"
 #include "dlua-script.h"
 #include "dlua-script-private.h"
+#include "settings.h"
 
 #include "mail-storage.h"
 #include "mail-user.h"
@@ -17,6 +18,7 @@
 #include "push-notification-drivers.h"
 #include "push-notification-events.h"
 #include "push-notification-event-message-common.h"
+#include "push-notification-settings.h"
 #include "push-notification-txn-mbox.h"
 #include "push-notification-txn-msg.h"
 
@@ -33,8 +35,6 @@
 #include "push-notification-event-messagenew.h"
 #include "push-notification-event-messageread.h"
 #include "push-notification-event-messagetrash.h"
-
-#define DLUA_LOG_USERENV_KEY "push_notification_lua_script_file"
 
 #define DLUA_FN_BEGIN_TXN "dovecot_lua_notify_begin_txn"
 #define DLUA_FN_EVENT_PREFIX "dovecot_lua_notify_event"
@@ -71,44 +71,24 @@ static const char *push_notification_driver_lua_to_fn(const char *evname);
 
 static int
 push_notification_driver_lua_init(
-	struct push_notification_driver_config *config, struct mail_user *user,
-	pool_t pool, void **context, const char **error_r)
+		struct mail_user *user, pool_t pool, const char *name,
+		void **context, const char **error_r)
 {
 	struct dlua_push_notification_context *ctx;
-	const char *tmp, *file;
+
 	struct event *event = event_create(user->event);
+	char *filter_name = p_strdup_printf(
+			event_get_pool(event), "%s/%s",
+			PUSH_NOTIFICATION_SETTINGS_FILTER_NAME,
+			settings_section_escape(name));
+	event_set_ptr(event, SETTINGS_EVENT_FILTER_NAME, filter_name);
 	event_add_category(event, push_notification_get_event_category());
 	event_set_append_log_prefix(event, "lua: ");
-
-	if ((tmp = mail_user_plugin_getenv(user, DLUA_LOG_USERENV_KEY)) == NULL)
-		tmp = hash_table_lookup(config->config, (const char *)"file");
-
-	if (tmp == NULL) {
-		struct dlua_script *script;
-		/* If there is a script loaded, use the same context */
-		if (mail_lua_plugin_get_script(user, &script)) {
-			dlua_script_ref(script);
-			ctx = p_new(
-				pool, struct dlua_push_notification_context, 1);
-			ctx->script = script;
-			ctx->event = event;
-			*context = ctx;
-			return 0;
-		}
-
-		event_unref(&event);
-		*error_r = "No file in config and no "
-			   DLUA_LOG_USERENV_KEY " set";
-		return -1;
-	}
-	file = tmp;
 
 	ctx = p_new(pool, struct dlua_push_notification_context, 1);
 	ctx->event = event;
 
-	e_debug(ctx->event, "Loading %s", file);
-
-	if (dlua_script_create_file(file, &ctx->script, event, error_r) < 0) {
+	if (dlua_script_create_auto(event, &ctx->script, error_r) <= 0) {
 		/* There is a T_POP after this, which will break errors */
 		event_unref(&event);
 		*error_r = p_strdup(pool, *error_r);

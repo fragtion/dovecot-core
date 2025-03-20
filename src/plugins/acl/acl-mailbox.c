@@ -8,6 +8,7 @@
 #include "array.h"
 #include "ioloop.h"
 #include "istream.h"
+#include "settings.h"
 #include "mailbox-list-private.h"
 #include "acl-api-private.h"
 #include "acl-plugin.h"
@@ -43,7 +44,7 @@ int acl_mailbox_right_lookup(struct mailbox *box, unsigned int right_idx)
 
 	/* If acls are ignored for this namespace do not check if
 	   there are rights. */
-	if (alist->ignore_acls)
+	if (alist->rights.backend->set->acl_ignore)
 		return 1;
 
 	ret = acl_object_have_right(abox->aclobj,
@@ -89,8 +90,7 @@ static void acl_mailbox_free(struct mailbox *box)
 {
 	struct acl_mailbox *abox = ACL_CONTEXT_REQUIRE(box);
 
-	if (abox->aclobj != NULL)
-		acl_object_deinit(&abox->aclobj);
+	acl_object_deinit(&abox->aclobj);
 	abox->module_ctx.super.free(box);
 }
 
@@ -129,7 +129,7 @@ acl_mailbox_create(struct mailbox *box, const struct mailbox_update *update,
 	if (!mailbox_is_autocreated(box)) {
 		/* we're looking up CREATE permission from our parent's rights */
 		ret = acl_mailbox_list_have_right(box->list, box->name, TRUE,
-						  ACL_STORAGE_RIGHT_CREATE, NULL);
+						  ACL_STORAGE_RIGHT_CREATE);
 	} else {
 		/* mailbox is autocreated, so we need to treat it as if it
 		   already exists. ignore the "create" ACL here. */
@@ -154,8 +154,8 @@ acl_mailbox_create(struct mailbox *box, const struct mailbox_update *update,
 	abox->skip_acl_checks = TRUE;
 	ret = abox->module_ctx.super.create_box(box, update, directory);
 	abox->skip_acl_checks = FALSE;
-	/* update local acl object, otherwise with LAYOUT=INDEX, we end up
-	   without local path to acl file, and copying fails. */
+	/* update local acl object, otherwise with mailbox_list_layout=index,
+	   we end up without local path to acl file, and copying fails. */
 	struct acl_backend *acl_be = abox->aclobj->backend;
 	acl_object_deinit(&abox->aclobj);
 	abox->aclobj = acl_object_init_from_name(acl_be, box->name);
@@ -225,7 +225,7 @@ acl_mailbox_rename(struct mailbox *src, struct mailbox *dest)
 	/* and create the new one under the parent mailbox */
 	T_BEGIN {
 		ret = acl_mailbox_list_have_right(dest->list, dest->name, TRUE,
-						ACL_STORAGE_RIGHT_CREATE, NULL);
+						ACL_STORAGE_RIGHT_CREATE);
 	} T_END;
 
 	if (ret <= 0) {
@@ -277,7 +277,8 @@ static void
 acl_mail_update_flags(struct mail *_mail, enum modify_type modify_type,
 		      enum mail_flags flags)
 {
-	struct mail_private *mail = (struct mail_private *)_mail;
+	struct mail_private *mail =
+		container_of(_mail, struct mail_private, mail);
 	union mail_module_context *amail = ACL_MAIL_CONTEXT(mail);
 	bool acl_flags, acl_flag_seen, acl_flag_del;
 
@@ -336,7 +337,8 @@ acl_mail_update_keywords(struct mail *_mail, enum modify_type modify_type,
 
 static void acl_mail_expunge(struct mail *_mail)
 {
-	struct mail_private *mail = (struct mail_private *)_mail;
+	struct mail_private *mail =
+		container_of(_mail, struct mail_private, mail);
 	union mail_module_context *amail = ACL_MAIL_CONTEXT(mail);
 	int ret;
 
@@ -355,7 +357,8 @@ static void acl_mail_expunge(struct mail *_mail)
 void acl_mail_allocated(struct mail *_mail)
 {
 	struct acl_mailbox *abox = ACL_CONTEXT(_mail->box);
-	struct mail_private *mail = (struct mail_private *)_mail;
+	struct mail_private *mail =
+		container_of(_mail, struct mail_private, mail);
 	struct mail_vfuncs *v = mail->vlast;
 	union mail_module_context *amail;
 
@@ -615,20 +618,35 @@ static int acl_mailbox_get_status(struct mailbox *box,
 void acl_mailbox_allocated(struct mailbox *box)
 {
 	struct acl_mailbox_list *alist = ACL_LIST_CONTEXT(box->list);
+	struct acl_settings *set;
 	struct mailbox_vfuncs *v = box->vlast;
 	struct acl_mailbox *abox;
-	bool ignore_acls = (box->flags & MAILBOX_FLAG_IGNORE_ACLS) != 0;
+	const char *error;
+	bool ignore_acls = FALSE;
 
 	if (alist == NULL) {
 		/* ACLs disabled */
 		return;
 	}
 
-	if (mail_namespace_is_shared_user_root(box->list->ns) || alist->ignore_acls) {
+	/* get settings for mailbox */
+	if (settings_get(box->event, &acl_setting_parser_info, 0, &set,
+			 &error) < 0) {
+		mailbox_set_critical(box, "%s", error);
+		box->open_error = box->storage->error;
+		return;
+	}
+
+	if ((box->flags & MAILBOX_FLAG_IGNORE_ACLS) != 0 ||
+	    set->acl_ignore)
+		ignore_acls = TRUE;
+
+	if (mail_namespace_is_shared_user_root(box->list->ns)) {
 		/* this is the root shared namespace, which itself doesn't
 		   have any existing mailboxes. */
 		ignore_acls = TRUE;
 	}
+	settings_free(set);
 
 	abox = p_new(box->pool, struct acl_mailbox, 1);
 	abox->module_ctx.super = *v;

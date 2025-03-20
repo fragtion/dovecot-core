@@ -1,58 +1,25 @@
-/* Copyright (c) 2008-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2024 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
 #include "str.h"
-#include "hash.h"
 #include "settings.h"
+#include "settings-parser.h"
 #include "dict-sql-settings.h"
 
 #include <ctype.h>
 
-enum section_type {
-	SECTION_ROOT = 0,
-	SECTION_MAP,
-	SECTION_FIELDS
-};
+/* <settings checks> */
+#define DICT_MAP_FIELD_TYPES_ENUM \
+	"string:int:uint:double:hexblob:uuid"
+/* </settings checks> */
 
-struct dict_sql_map_field {
+struct dict_sql_map_key_field {
 	struct dict_sql_field sql_field;
 	const char *variable;
 };
 
-struct setting_parser_ctx {
-	pool_t pool;
-	struct dict_sql_settings *set;
-	enum section_type type;
-
-	struct dict_sql_map cur_map;
-	ARRAY(struct dict_sql_map_field) cur_fields;
-};
-
-#define DEF_STR(name) DEF_STRUCT_STR(name, dict_sql_map)
-#define DEF_BOOL(name) DEF_STRUCT_BOOL(name, dict_sql_map)
-
-static const struct setting_def dict_sql_map_setting_defs[] = {
-	DEF_STR(pattern),
-	DEF_STR(table),
-	DEF_STR(username_field),
-	DEF_STR(value_field),
-	DEF_STR(value_type),
-	DEF_STR(expire_field),
-	DEF_BOOL(value_hexblob),
-
-	{ 0, NULL, 0 }
-};
-
-struct dict_sql_settings_cache {
-	pool_t pool;
-	const char *path;
-	struct dict_sql_settings *set;
-};
-
-static HASH_TABLE(const char *, struct dict_sql_settings_cache *) dict_sql_settings_cache;
-
-static const char *dict_sql_type_names[] = {
+const char *dict_sql_type_names[] = {
 	"string",
 	"int",
 	"uint",
@@ -61,6 +28,102 @@ static const char *dict_sql_type_names[] = {
 	"uuid",
 };
 static_assert_array_size(dict_sql_type_names, DICT_SQL_TYPE_COUNT);
+
+#undef DEF
+#define DEF(type, name) \
+	SETTING_DEFINE_STRUCT_##type("dict_map_key_field_"#name, name, struct dict_map_key_field_settings)
+static const struct setting_define dict_map_key_field_setting_defines[] = {
+	DEF(STR, name),
+	DEF(STR, value),
+	DEF(ENUM, type),
+
+	SETTING_DEFINE_LIST_END
+};
+static const struct dict_map_key_field_settings dict_map_key_field_default_settings = {
+	.name = "",
+	.type = DICT_MAP_FIELD_TYPES_ENUM,
+	.value = "",
+};
+const struct setting_parser_info dict_map_key_field_setting_parser_info = {
+	.name = "dict_map_key_field",
+
+	.defines = dict_map_key_field_setting_defines,
+	.defaults = &dict_map_key_field_default_settings,
+
+	.struct_size = sizeof(struct dict_map_key_field_settings),
+	.pool_offset1 = 1 + offsetof(struct dict_map_key_field_settings, pool),
+};
+
+#undef DEF
+#define DEF(type, name) \
+	SETTING_DEFINE_STRUCT_##type("dict_map_value_field_"#name, name, struct dict_map_value_field_settings)
+static const struct setting_define dict_map_value_field_setting_defines[] = {
+	DEF(STR, name),
+	DEF(ENUM, type),
+
+	SETTING_DEFINE_LIST_END
+};
+static const struct dict_map_value_field_settings dict_map_value_field_default_settings = {
+	.name = "",
+	.type = DICT_MAP_FIELD_TYPES_ENUM,
+};
+const struct setting_parser_info dict_map_value_field_setting_parser_info = {
+	.name = "dict_map_value_field",
+
+	.defines = dict_map_value_field_setting_defines,
+	.defaults = &dict_map_value_field_default_settings,
+
+	.struct_size = sizeof(struct dict_map_value_field_settings),
+	.pool_offset1 = 1 + offsetof(struct dict_map_value_field_settings, pool),
+};
+
+#undef DEF
+#define DEF(type, name) \
+	SETTING_DEFINE_STRUCT_##type("dict_map_"#name, name, struct dict_map_settings)
+static const struct setting_define dict_map_setting_defines[] = {
+	DEF(STR, pattern),
+	DEF(STR, sql_table),
+	DEF(STR, username_field),
+	DEF(STR, expire_field),
+	{ .type = SET_FILTER_ARRAY, .key = "dict_map_key_field",
+	  .offset = offsetof(struct dict_map_settings, fields),
+	  .filter_array_field_name = "dict_map_key_field_name", },
+	{ .type = SET_FILTER_ARRAY, .key = "dict_map_value_field",
+	  .offset = offsetof(struct dict_map_settings, values),
+	  .filter_array_field_name = "dict_map_value_field_name", },
+
+	{ .type = SET_FILTER_ARRAY, .key = "dict_map",
+	  .offset = offsetof(struct dict_map_settings, maps),
+	  .filter_array_field_name = "dict_map_pattern", },
+
+	SETTING_DEFINE_LIST_END
+};
+static const struct dict_map_settings dict_map_default_settings = {
+	.pattern = "",
+	.sql_table = "",
+	.username_field = "",
+	.expire_field = "",
+};
+const struct setting_parser_info dict_map_setting_parser_info = {
+	.name = "dict_map",
+
+	.defines = dict_map_setting_defines,
+	.defaults = &dict_map_default_settings,
+
+	.struct_size = sizeof(struct dict_map_settings),
+	.pool_offset1 = 1 + offsetof(struct dict_map_settings, pool),
+};
+
+static enum dict_sql_type dict_sql_type_parse(const char *value_type)
+{
+	for (enum dict_sql_type type = DICT_SQL_TYPE_STRING;
+	    type < DICT_SQL_TYPE_COUNT; type++) {
+		if (strcmp(value_type, dict_sql_type_names[type]) == 0)
+			return type;
+	}
+	/* settings parsing should have failed before getting here */
+	i_panic("BUG: Unknown dict_sql_type '%s'", value_type);
+}
 
 static const char *pattern_read_name(const char **pattern)
 {
@@ -85,24 +148,49 @@ static const char *pattern_read_name(const char **pattern)
 		}
 		*pattern = p;
 	}
-	name = t_strdup_until(name, p);
+	name = t_strconcat("$", t_strdup_until(name, p), NULL);
 	return name;
 }
 
-static const char *dict_sql_fields_map(struct setting_parser_ctx *ctx)
+static int dict_sql_fields_map(struct event *event, pool_t pool,
+			       const struct dict_map_settings *map_set,
+			       struct dict_sql_map *map,
+			       const char **error_r)
 {
-	struct dict_sql_map_field *fields;
+	struct dict_sql_map_key_field *fields;
 	string_t *pattern;
-	const char *p, *name;
+	const char *p, *name, *const *field_names;
 	unsigned int i, count;
 
 	/* go through the variables in the pattern, replace them with plain
 	   '$' character and add its sql field */
-	pattern = t_str_new(strlen(ctx->cur_map.pattern) + 1);
-	fields = array_get_modifiable(&ctx->cur_fields, &count);
+	pattern = t_str_new(strlen(map->pattern) + 1);
 
-	p_array_init(&ctx->cur_map.pattern_fields, ctx->pool, count);
-	for (p = ctx->cur_map.pattern; *p != '\0';) {
+	if (!array_is_empty(&map_set->fields))
+		field_names = array_get(&map_set->fields, &count);
+	else {
+		field_names = NULL;
+		count = 0;
+	}
+	fields = count == 0 ? NULL :
+		t_new(struct dict_sql_map_key_field, count);
+	for (i = 0; i < count; i++) {
+		const struct dict_map_key_field_settings *field_set;
+		if (settings_get_filter(event, "dict_map_key_field",
+					field_names[i],
+					&dict_map_key_field_setting_parser_info,
+					0, &field_set, error_r) < 0)
+			return -1;
+		pool_add_external_ref(pool, field_set->pool);
+		fields[i].sql_field.name = field_set->name;
+		fields[i].sql_field.value_type =
+			dict_sql_type_parse(field_set->type);
+		fields[i].variable = field_set->value;
+		settings_free(field_set);
+	}
+
+	p_array_init(&map->pattern_fields, pool, count);
+	for (p = map->pattern; *p != '\0';) {
 		if (*p != '$') {
 			str_append_c(pattern, *p);
 			p++;
@@ -118,239 +206,123 @@ static const char *dict_sql_fields_map(struct setting_parser_ctx *ctx)
 				break;
 		}
 		if (i == count) {
-			return t_strconcat("Missing SQL field for variable: ",
-					   name, NULL);
+			*error_r = t_strconcat("Missing SQL field for variable: ",
+					       name, NULL);
+			return -1;
 		}
 
 		/* mark this field as used */
 		fields[i].variable = NULL;
-		array_push_back(&ctx->cur_map.pattern_fields,
+		array_push_back(&map->pattern_fields,
 				&fields[i].sql_field);
 	}
 
 	/* make sure there aren't any unused fields */
 	for (i = 0; i < count; i++) {
 		if (fields[i].variable != NULL) {
-			return t_strconcat("Unused variable: ",
-					   fields[i].variable, NULL);
+			*error_r = t_strconcat("Unused variable: ",
+					       fields[i].variable, NULL);
+			return -1;
 		}
 	}
 
-	if (ctx->set->max_pattern_fields_count < count)
-		ctx->set->max_pattern_fields_count = count;
-	ctx->cur_map.pattern = p_strdup(ctx->pool, str_c(pattern));
-	return NULL;
+	map->pattern = p_strdup(pool, str_c(pattern));
+	return 0;
 }
 
-static bool
-dict_sql_value_type_parse(const char *value_type, enum dict_sql_type *type_r)
+static int
+dict_sql_map_settings_get(struct event *event,
+			  struct dict_sql_map_settings *set,
+			  const char **error_r)
 {
-	for (enum dict_sql_type type = DICT_SQL_TYPE_STRING;
-	    type < DICT_SQL_TYPE_COUNT; type++) {
-		if (strcmp(value_type, dict_sql_type_names[type]) == 0) {
-			*type_r = type;
-			return TRUE;
-		}
+	const struct dict_map_settings *map_set;
+	const struct dict_map_value_field_settings *value_set;
+	const char *name;
+
+	if (settings_get(event, &dict_map_setting_parser_info, 0,
+			 &map_set, error_r) < 0)
+		return -1;
+	pool_add_external_ref(set->pool, map_set->pool);
+	pool_t pool_copy = map_set->pool;
+	pool_unref(&pool_copy);
+
+	if (array_is_empty(&map_set->values)) {
+		*error_r = "dict_map_value_field { .. } named list filter is missing";
+		return -1;
 	}
-	return FALSE;
+
+	struct dict_sql_map *map = array_append_space(&set->maps);
+	map->pattern = map_set->pattern;
+	map->table = map_set->sql_table;
+	map->username_field = map_set->username_field;
+	map->expire_field = map_set->expire_field[0] != '\0' ?
+		map_set->expire_field : NULL;
+	map->values_count = array_count(&map_set->values);
+	if (dict_sql_fields_map(event, set->pool, map_set, map, error_r) < 0)
+		return -1;
+
+	string_t *value_field = t_str_new(32);
+	ARRAY(enum dict_sql_type) value_types;
+	p_array_init(&value_types, map_set->pool, map->values_count);
+
+	array_foreach_elem(&map_set->values, name) {
+		if (settings_get_filter(event, "dict_map_value_field", name,
+					&dict_map_value_field_setting_parser_info,
+					0, &value_set, error_r) < 0)
+			return -1;
+
+		if (str_len(value_field) > 0)
+			str_append_c(value_field, ',');
+		str_append(value_field, value_set->name);
+		enum dict_sql_type field_type =
+			dict_sql_type_parse(value_set->type);
+		array_push_back(&value_types, &field_type);
+		settings_free(value_set);
+	}
+	map->value_field = p_strdup(set->pool, str_c(value_field));
+	map->value_types = array_front(&value_types);
+	return 0;
 }
 
-static const char *dict_sql_map_finish(struct setting_parser_ctx *ctx)
+int dict_sql_settings_get(struct event *event,
+			  struct dict_sql_map_settings **set_r,
+			  const char **error_r)
 {
-	unsigned int i;
+	const struct dict_map_settings *maps_set;
+	struct dict_sql_map_settings *set;
+	const char *name, *error;
+	int ret = 0;
 
-	if (ctx->cur_map.pattern == NULL)
-		return "Missing setting: pattern";
-	if (ctx->cur_map.table == NULL)
-		return "Missing setting: table";
-	if (ctx->cur_map.value_field == NULL)
-		return "Missing setting: value_field";
+	pool_t pool = pool_alloconly_create("dict sql map settings", 128);
+	set = p_new(pool, struct dict_sql_map_settings, 1);
+	set->pool = pool;
+	p_array_init(&set->maps, pool, 8);
 
-	if (ctx->cur_map.expire_field != NULL &&
-	    ctx->cur_map.expire_field[0] == '\0')
-		ctx->cur_map.expire_field = NULL;
-	ctx->cur_map.value_fields = (const char *const *)
-		p_strsplit_spaces(ctx->pool, ctx->cur_map.value_field, ",");
-	ctx->cur_map.values_count = str_array_length(ctx->cur_map.value_fields);
-
-	enum dict_sql_type *value_types =
-		p_new(ctx->pool, enum dict_sql_type, ctx->cur_map.values_count);
-	if (ctx->cur_map.value_type != NULL) {
-		const char *const *types =
-			t_strsplit_spaces(ctx->cur_map.value_type, ",");
-		if (str_array_length(types) != ctx->cur_map.values_count)
-			return "Number of fields in value_fields doesn't match value_type";
-		for (i = 0; i < ctx->cur_map.values_count; i++) {
-			if (!dict_sql_value_type_parse(types[i], &value_types[i]))
-				return t_strdup_printf("Invalid value %s in value_type", types[i]);
-		}
-	} else {
-		for (i = 0; i < ctx->cur_map.values_count; i++) {
-			value_types[i] = ctx->cur_map.value_hexblob ?
-				DICT_SQL_TYPE_HEXBLOB : DICT_SQL_TYPE_STRING;
-		}
-	}
-	ctx->cur_map.value_types = value_types;
-
-	if (ctx->cur_map.username_field == NULL) {
-		/* not all queries require this */
-		ctx->cur_map.username_field = "'username_field not set'";
-	}
-
-	if (!array_is_created(&ctx->cur_map.pattern_fields)) {
-		/* no fields besides value. allocate the array anyway. */
-		p_array_init(&ctx->cur_map.pattern_fields, ctx->pool, 1);
-		if (strchr(ctx->cur_map.pattern, '$') != NULL)
-			return "Missing fields for pattern variables";
-	}
-	array_push_back(&ctx->set->maps, &ctx->cur_map);
-	i_zero(&ctx->cur_map);
-	return NULL;
-}
-
-static const char *
-parse_setting(const char *key, const char *value,
-	      struct setting_parser_ctx *ctx)
-{
-	struct dict_sql_map_field *field;
-
-	switch (ctx->type) {
-	case SECTION_ROOT:
-		if (strcmp(key, "connect") == 0) {
-			ctx->set->connect = p_strdup(ctx->pool, value);
-			return NULL;
-		}
-		break;
-	case SECTION_MAP:
-		return parse_setting_from_defs(ctx->pool,
-					       dict_sql_map_setting_defs,
-					       &ctx->cur_map, key, value);
-	case SECTION_FIELDS:
-		if (*value != '$') {
-			return t_strconcat("Value is missing '$' for field: ",
-					   key, NULL);
-		}
-		field = array_append_space(&ctx->cur_fields);
-		field->sql_field.name = p_strdup(ctx->pool, key);
-
-		const char *arg, *last = value + strlen(value) - 1;
-		if (str_begins(value, "${hexblob:", &arg) && *last == '}') {
-			field->variable = p_strdup_until(ctx->pool, arg, last);
-			field->sql_field.value_type = DICT_SQL_TYPE_HEXBLOB;
-		} else if (str_begins(value, "${int:", &arg) && *last == '}') {
-			field->variable = p_strdup_until(ctx->pool, arg, last);
-			field->sql_field.value_type = DICT_SQL_TYPE_INT;
-		} else if (str_begins(value, "${uint:", &arg) && *last == '}') {
-			field->variable = p_strdup_until(ctx->pool, arg, last);
-			field->sql_field.value_type = DICT_SQL_TYPE_UINT;
-		} else if (str_begins(value, "${double:", &arg) && *last == '}') {
-			field->variable = p_strdup_until(ctx->pool, arg, last);
-			field->sql_field.value_type = DICT_SQL_TYPE_DOUBLE;
-		} else if (str_begins(value, "${uuid:", &arg) && *last == '}') {
-			field->variable = p_strdup_until(ctx->pool, arg, last);
-			field->sql_field.value_type = DICT_SQL_TYPE_UUID;
-		} else {
-			field->variable = p_strdup(ctx->pool, value + 1);
-		}
-		return NULL;
-	}
-	return t_strconcat("Unknown setting: ", key, NULL);
-}
-
-static bool
-parse_section(const char *type, const char *name ATTR_UNUSED,
-	      struct setting_parser_ctx *ctx, const char **error_r)
-{
-	switch (ctx->type) {
-	case SECTION_ROOT:
-		if (type == NULL)
-			return FALSE;
-		if (strcmp(type, "map") == 0) {
-			array_clear(&ctx->cur_fields);
-			ctx->type = SECTION_MAP;
-			return TRUE;
-		}
-		break;
-	case SECTION_MAP:
-		if (type == NULL) {
-			ctx->type = SECTION_ROOT;
-			*error_r = dict_sql_map_finish(ctx);
-			return FALSE;
-		}
-		if (strcmp(type, "fields") == 0) {
-			ctx->type = SECTION_FIELDS;
-			return TRUE;
-		}
-		break;
-	case SECTION_FIELDS:
-		if (type == NULL) {
-			ctx->type = SECTION_MAP;
-			*error_r = dict_sql_fields_map(ctx);
-			return FALSE;
-		}
-		break;
-	}
-	*error_r = t_strconcat("Unknown section: ", type, NULL);
-	return FALSE;
-}
-
-struct dict_sql_settings *
-dict_sql_settings_read(const char *path, const char **error_r)
-{
-	struct setting_parser_ctx ctx;
-	struct dict_sql_settings_cache *cache;
-	pool_t pool;
-
-	if (!hash_table_is_created(dict_sql_settings_cache)) {
-		hash_table_create(&dict_sql_settings_cache, default_pool, 0,
-				  str_hash, strcmp);
-	}
-
-	cache = hash_table_lookup(dict_sql_settings_cache, path);
-	if (cache != NULL)
-		return cache->set;
-
-	i_zero(&ctx);
-	pool = pool_alloconly_create("dict sql settings", 1024);
-	ctx.pool = pool;
-	ctx.set = p_new(pool, struct dict_sql_settings, 1);
-	t_array_init(&ctx.cur_fields, 16);
-	p_array_init(&ctx.set->maps, pool, 8);
-
-	if (!settings_read(path, NULL, parse_setting, parse_section,
-			   &ctx, error_r)) {
+	if (settings_get(event, &dict_map_setting_parser_info, 0,
+			 &maps_set, error_r) < 0) {
 		pool_unref(&pool);
-		return NULL;
+		return -1;
 	}
+	if (array_is_created(&maps_set->maps)) {
+		array_foreach_elem(&maps_set->maps, name) {
+			struct event *map_event = event_create(event);
+			settings_event_add_list_filter_name(map_event,
+							    "dict_map", name);
+			if (dict_sql_map_settings_get(map_event, set, &error) < 0) {
+				*error_r = t_strdup_printf(
+					"Failed to get dict_map %s: %s", name, error);
+				ret = -1;
+			}
+			event_unref(&map_event);
+			if (ret < 0)
+				break;
 
-	if (ctx.set->connect == NULL) {
-		*error_r = t_strdup_printf("Error in configuration file %s: "
-					   "Missing connect setting", path);
+		}
+	}
+	settings_free(maps_set);
+	if (ret < 0)
 		pool_unref(&pool);
-		return NULL;
-	}
-
-	cache = p_new(pool, struct dict_sql_settings_cache, 1);
-	cache->pool = pool;
-	cache->path = p_strdup(pool, path);
-	cache->set = ctx.set;
-
-	hash_table_insert(dict_sql_settings_cache, cache->path, cache);
-	return ctx.set;
-}
-
-void dict_sql_settings_deinit(void)
-{
-	struct hash_iterate_context *iter;
-	struct dict_sql_settings_cache *cache;
-	const char *key;
-
-	if (!hash_table_is_created(dict_sql_settings_cache))
-		return;
-
-	iter = hash_table_iterate_init(dict_sql_settings_cache);
-	while (hash_table_iterate(iter, dict_sql_settings_cache, &key, &cache))
-		pool_unref(&cache->pool);
-	hash_table_iterate_deinit(&iter);
-	hash_table_destroy(&dict_sql_settings_cache);
+	else
+		*set_r = set;
+	return ret;
 }

@@ -6,97 +6,63 @@
 #include "service-settings.h"
 #include "login-settings.h"
 #include "pop3-protocol.h"
-#include "pop3-login-settings.h"
 
-#include <stddef.h>
-
-/* <settings checks> */
-static struct file_listener_settings pop3_login_unix_listeners_array[] = {
-	{
-		.path = "srv.pop3-login/%{pid}",
-		.type = "admin",
-		.mode = 0600,
-		.user = "",
-		.group = "",
-	},
-};
-static struct file_listener_settings *pop3_login_unix_listeners[] = {
-	&pop3_login_unix_listeners_array[0],
-};
-static buffer_t pop3_login_unix_listeners_buf = {
-	{ { pop3_login_unix_listeners, sizeof(pop3_login_unix_listeners) } }
-};
-
-static struct inet_listener_settings pop3_login_inet_listeners_array[] = {
-	{
-		.name = "pop3",
-		.address = "",
-		.port = POP3_DEFAULT_PORT,
-	},
-	{
-		.name = "pop3s",
-		.address = "",
-		.port = POP3S_DEFAULT_PORT,
-		.ssl = TRUE,
-	},
-};
-static struct inet_listener_settings *pop3_login_inet_listeners[] = {
-	&pop3_login_inet_listeners_array[0],
-	&pop3_login_inet_listeners_array[1]
-};
-static buffer_t pop3_login_inet_listeners_buf = {
-	{ { pop3_login_inet_listeners, sizeof(pop3_login_inet_listeners) } }
-};
-
-/* </settings checks> */
 struct service_settings pop3_login_service_settings = {
 	.name = "pop3-login",
 	.protocol = "pop3",
 	.type = "login",
 	.executable = "pop3-login",
-	.user = "$default_login_user",
+	.user = "$SET:default_login_user",
 	.group = "",
 	.privileged_group = "",
-	.extra_groups = "",
+	.extra_groups = ARRAY_INIT,
 	.chroot = "login",
 
 	.drop_priv_before_exec = FALSE,
 
-	.process_min_avail = 0,
-	.process_limit = 0,
-	.client_limit = 0,
-	.service_count = 1,
-	.idle_kill = 0,
-	.vsz_limit = UOFF_T_MAX,
+#ifndef DOVECOT_PRO_EDITION
+	.restart_request_count = 1,
+#endif
 
-	.unix_listeners = { { &pop3_login_unix_listeners_buf,
-			      sizeof(pop3_login_unix_listeners[0]) } },
+	.unix_listeners = ARRAY_INIT,
 	.fifo_listeners = ARRAY_INIT,
-	.inet_listeners = { { &pop3_login_inet_listeners_buf,
-			      sizeof(pop3_login_inet_listeners[0]) } }
+	.inet_listeners = ARRAY_INIT,
+};
+
+const struct setting_keyvalue pop3_login_service_settings_defaults[] = {
+	{ "unix_listener", "srv.pop3-login\\s%{pid}" },
+
+	{ "unix_listener/srv.pop3-login\\s%{pid}/path", "srv.pop3-login/%{pid}" },
+	{ "unix_listener/srv.pop3-login\\s%{pid}/type", "admin" },
+	{ "unix_listener/srv.pop3-login\\s%{pid}/mode", "0600" },
+
+	{ "inet_listener", "pop3 pop3s" },
+
+	{ "inet_listener/pop3/name", "pop3" },
+	{ "inet_listener/pop3/port", "110" },
+
+	{ "inet_listener/pop3s/name", "pop3s" },
+	{ "inet_listener/pop3s/port", "995" },
+	{ "inet_listener/pop3s/ssl", "yes" },
+
+	{ NULL, NULL }
+};
+
+static const struct setting_keyvalue pop3_login_default_settings_keyvalue[] = {
+#ifdef DOVECOT_PRO_EDITION
+	{ "service/pop3-login/service_process_limit", "%{system:cpu_count}" },
+	{ "service/pop3-login/service_process_min_avail", "%{system:cpu_count}" },
+#endif
+	{ NULL, NULL },
 };
 
 static const struct setting_define pop3_login_setting_defines[] = {
 	SETTING_DEFINE_LIST_END
 };
 
-static const struct setting_parser_info *pop3_login_setting_dependencies[] = {
-	&login_setting_parser_info,
-	NULL
-};
-
 const struct setting_parser_info pop3_login_setting_parser_info = {
-	.module_name = "pop3-login",
+	.name = "pop3_login",
+
 	.defines = pop3_login_setting_defines,
-
-	.type_offset = SIZE_MAX,
-	.parent_offset = SIZE_MAX,
-
-	.dependencies = pop3_login_setting_dependencies
-};
-
-const struct setting_parser_info *pop3_login_setting_roots[] = {
-	&login_setting_parser_info,
-	&pop3_login_setting_parser_info,
-	NULL
+	.default_settings = pop3_login_default_settings_keyvalue,
 };

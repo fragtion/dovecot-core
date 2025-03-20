@@ -13,6 +13,7 @@
 #include "dns-lookup.h"
 #include "iostream-rawlog.h"
 #include "iostream-ssl.h"
+#include "settings.h"
 #include "http-url.h"
 
 #include "http-client-private.h"
@@ -85,7 +86,7 @@
 
  */
 
-static struct event_category event_category_http_client = {
+struct event_category event_category_http_client = {
 	.name = "http-client"
 };
 
@@ -102,20 +103,42 @@ http_client_context_remove_client(struct http_client_context *cctx,
  * Client
  */
 
+void http_client_settings_init(pool_t pool, struct http_client_settings *set_r)
+{
+	i_zero(set_r);
+	set_r->pool = pool;
+	pool_ref(pool);
+	set_r->max_pipelined_requests = 1;
+	set_r->max_parallel_connections = 1;
+	set_r->connect_backoff_time_msecs =
+		HTTP_CLIENT_DEFAULT_BACKOFF_TIME_MSECS;
+	set_r->connect_backoff_max_time_msecs =
+		HTTP_CLIENT_DEFAULT_BACKOFF_MAX_TIME_MSECS;
+	set_r->request_timeout_msecs =
+		HTTP_CLIENT_DEFAULT_REQUEST_TIMEOUT_MSECS;
+	set_r->auto_redirect = TRUE;
+	set_r->auto_retry = TRUE;
+	set_r->proxy_ssl_tunnel = TRUE;
+}
+
 struct http_client *
 http_client_init_shared(struct http_client_context *cctx,
-			const struct http_client_settings *set)
+			const struct http_client_settings *set,
+			struct event *event_parent)
 {
 	static unsigned int id = 0;
 	struct http_client *client;
 	const char *log_prefix;
 	pool_t pool;
-	size_t pool_size;
 
-	/* certs will be >4K */
-	pool_size = ((set != NULL && set->ssl != NULL) ? 8192 : 1024);
+	i_assert(set != NULL);
+	i_assert(set->max_pipelined_requests > 0);
+	i_assert(set->max_parallel_connections > 0);
+	i_assert(set->connect_backoff_time_msecs > 0);
+	i_assert(set->connect_backoff_max_time_msecs > 0);
+	i_assert(set->request_timeout_msecs > 0);
 
-	pool = pool_alloconly_create("http client", pool_size);
+	pool = pool_alloconly_create("http client", 1024);
 	client = p_new(pool, struct http_client, 1);
 	client->pool = pool;
 	client->ioloop = current_ioloop;
@@ -127,107 +150,22 @@ http_client_init_shared(struct http_client_context *cctx,
 		http_client_context_ref(cctx);
 		log_prefix = t_strdup_printf("http-client[%u]: ", id);
 	} else {
-		i_assert(set != NULL);
-		client->cctx = cctx = http_client_context_create(set);
+		client->cctx = cctx = http_client_context_create();
 		log_prefix = "http-client: ";
 	}
 
-	struct event *parent_event;
-	if (set != NULL && set->event_parent != NULL)
-		parent_event = set->event_parent;
-	else if (cctx->event == NULL)
-		parent_event = NULL;
+	if (event_parent != NULL)
+		client->event = event_create(event_parent);
 	else {
-		/* FIXME: we could use cctx->event, but it already has a log
-		   prefix that we don't want.. should we update event API to
-		   support replacing parent's log prefix? */
-		parent_event = event_get_parent(cctx->event);
+		i_assert(cctx->event != NULL);
+		client->event = event_create(cctx->event);
+		event_drop_parent_log_prefixes(client->event, 1);
 	}
-	client->event = event_create(parent_event);
 	event_add_category(client->event, &event_category_http_client);
-	event_set_forced_debug(client->event,
-			       ((set != NULL && set->debug) ||
-			        (cctx != NULL && cctx->set.debug)));
 	event_set_append_log_prefix(client->event, log_prefix);
 
-	/* Merge provided settings with context defaults */
-	client->set = cctx->set;
-	if (set != NULL) {
-		client->set.dns_client = set->dns_client;
-		client->set.dns_client_socket_path =
-			p_strdup_empty(pool, set->dns_client_socket_path);
-		client->set.dns_ttl_msecs = set->dns_ttl_msecs;
-
-		if (set->user_agent != NULL && *set->user_agent != '\0')
-			client->set.user_agent = p_strdup_empty(pool, set->user_agent);
-		if (set->rawlog_dir != NULL && *set->rawlog_dir != '\0')
-			client->set.rawlog_dir = p_strdup_empty(pool, set->rawlog_dir);
-
-		if (set->ssl != NULL)
-			client->set.ssl = ssl_iostream_settings_dup(pool, set->ssl);
-
-		if (set->proxy_socket_path != NULL && *set->proxy_socket_path != '\0') {
-			client->set.proxy_socket_path = p_strdup(pool, set->proxy_socket_path);
-			client->set.proxy_url = NULL;
-		} else if (set->proxy_url != NULL) {
-			client->set.proxy_url = http_url_clone(pool, set->proxy_url);
-			client->set.proxy_socket_path = NULL;
-		}
-		if (set->proxy_username != NULL && *set->proxy_username != '\0') {
-			client->set.proxy_username = p_strdup_empty(pool, set->proxy_username);
-			client->set.proxy_password = p_strdup(pool, set->proxy_password);
-		} else if (set->proxy_url != NULL && set->proxy_url->user != NULL &&
-			*set->proxy_url->user != '\0') {
-			client->set.proxy_username =
-				p_strdup_empty(pool, set->proxy_url->user);
-			client->set.proxy_password =
-				p_strdup(pool, set->proxy_url->password);
-		}
-
-		if (set->max_idle_time_msecs > 0)
-			client->set.max_idle_time_msecs = set->max_idle_time_msecs;
-		if (set->max_parallel_connections > 0)
-			client->set.max_parallel_connections = set->max_parallel_connections;
-		if (set->max_pipelined_requests > 0)
-			client->set.max_pipelined_requests = set->max_pipelined_requests;
-		if (set->max_attempts > 0)
-			client->set.max_attempts = set->max_attempts;
-		if (set->max_connect_attempts > 0)
-			client->set.max_connect_attempts = set->max_connect_attempts;
-		if (set->connect_backoff_time_msecs > 0) {
-			client->set.connect_backoff_time_msecs =
-				set->connect_backoff_time_msecs;
-		}
-		if (set->connect_backoff_max_time_msecs > 0) {
-			client->set.connect_backoff_max_time_msecs =
-				set->connect_backoff_max_time_msecs;
-		}
-		client->set.no_auto_redirect =
-			client->set.no_auto_redirect || set->no_auto_redirect;
-		client->set.no_auto_retry =
-			client->set.no_auto_retry || set->no_auto_retry;
-		client->set.no_ssl_tunnel =
-			client->set.no_ssl_tunnel || set->no_ssl_tunnel;
-		if (set->max_redirects > 0)
-			client->set.max_redirects = set->max_redirects;
-		if (set->request_absolute_timeout_msecs > 0) {
-			client->set.request_absolute_timeout_msecs =
-				set->request_absolute_timeout_msecs;
-		}
-		if (set->request_timeout_msecs > 0)
-			client->set.request_timeout_msecs = set->request_timeout_msecs;
-		if (set->connect_timeout_msecs > 0)
-			client->set.connect_timeout_msecs = set->connect_timeout_msecs;
-		if (set->soft_connect_timeout_msecs > 0)
-			client->set.soft_connect_timeout_msecs = set->soft_connect_timeout_msecs;
-		if (set->socket_send_buffer_size > 0)
-			client->set.socket_send_buffer_size = set->socket_send_buffer_size;
-		if (set->socket_recv_buffer_size > 0)
-			client->set.socket_recv_buffer_size = set->socket_recv_buffer_size;
-		if (set->max_auto_retry_delay_secs > 0)
-			client->set.max_auto_retry_delay_secs = set->max_auto_retry_delay_secs;
-		client->set.debug = client->set.debug || set->debug;
-	}
+	pool_add_external_ref(client->pool, set->pool);
+	client->set = set;
 
 	i_array_init(&client->delayed_failing_requests, 1);
 
@@ -236,15 +174,43 @@ http_client_init_shared(struct http_client_context *cctx,
 	return client;
 }
 
-struct http_client *http_client_init(const struct http_client_settings *set)
+struct http_client *http_client_init(const struct http_client_settings *set,
+				     struct event *event_parent)
 {
-	return http_client_init_shared(http_client_get_global_context(), set);
+	return http_client_init_shared(http_client_get_global_context(), set,
+				       event_parent);
+}
+
+int http_client_init_auto(struct event *event_parent,
+			  struct http_client **client_r, const char **error_r)
+{
+	const struct http_client_settings *set;
+
+	if (settings_get(event_parent, &http_client_setting_parser_info,
+			 0, &set, error_r) < 0)
+		return -1;
+	*client_r = http_client_init(set, event_parent);
+	return 0;
 }
 
 struct http_client *
-http_client_init_private(const struct http_client_settings *set)
+http_client_init_private(const struct http_client_settings *set,
+			 struct event *event_parent)
 {
-	return http_client_init_shared(NULL, set);
+	return http_client_init_shared(NULL, set, event_parent);
+}
+
+int http_client_init_private_auto(struct event *event_parent,
+				  struct http_client **client_r,
+				  const char **error_r)
+{
+	const struct http_client_settings *set;
+
+	if (settings_get(event_parent, &http_client_setting_parser_info,
+			 0, &set, error_r) < 0)
+		return -1;
+	*client_r = http_client_init_private(set, event_parent);
+	return 0;
 }
 
 void http_client_deinit(struct http_client **_client)
@@ -280,6 +246,8 @@ void http_client_deinit(struct http_client **_client)
 	array_free(&client->delayed_failing_requests);
 	timeout_remove(&client->to_failing_requests);
 
+	settings_free(client->set);
+	settings_free(client->ssl_set);
 	if (client->ssl_ctx != NULL)
 		ssl_iostream_context_unref(&client->ssl_ctx);
 	http_client_context_remove_client(client->cctx, client);
@@ -332,8 +300,8 @@ void http_client_wait(struct http_client *client)
 	prev_ioloop = current_ioloop;
 	client_ioloop = io_loop_create();
 	prev_client_ioloop = http_client_switch_ioloop(client);
-	if (client->set.dns_client != NULL)
-		dns_client_switch_ioloop(client->set.dns_client);
+	if (client->dns_client != NULL)
+		dns_client_switch_ioloop(client->dns_client);
 	/* Either we're waiting for network I/O or we're getting out of a
 	   callback using timeout_add_short(0) */
 	i_assert(io_loop_have_ios(client_ioloop) ||
@@ -355,10 +323,24 @@ void http_client_wait(struct http_client *client)
 	else
 		io_loop_set_current(prev_ioloop);
 	(void)http_client_switch_ioloop(client);
-	if (client->set.dns_client != NULL)
-		dns_client_switch_ioloop(client->set.dns_client);
+	if (client->dns_client != NULL)
+		dns_client_switch_ioloop(client->dns_client);
 	io_loop_set_current(client_ioloop);
 	io_loop_destroy(&client_ioloop);
+}
+
+void http_client_set_ssl_settings(struct http_client *client,
+				  const struct ssl_iostream_settings *ssl)
+{
+	settings_free(client->ssl_set);
+	client->ssl_set = ssl;
+	pool_ref(client->ssl_set->pool);
+}
+
+void http_client_set_dns_client(struct http_client *client,
+				struct dns_client *dns_client)
+{
+	client->dns_client = dns_client;
 }
 
 unsigned int http_client_get_pending_request_count(struct http_client *client)
@@ -368,23 +350,42 @@ unsigned int http_client_get_pending_request_count(struct http_client *client)
 
 int http_client_init_ssl_ctx(struct http_client *client, const char **error_r)
 {
-	const char *error;
+	const struct ssl_settings *ssl_set;
+	const struct ssl_iostream_settings *set = NULL;
+	const char *const names[] = {
+		"http/1.1",
+		NULL
+	};
 
 	if (client->ssl_ctx != NULL)
 		return 0;
 
-	if (client->set.ssl == NULL) {
-		*error_r = "Requested https connection, "
-			   "but no SSL settings given";
-		return -1;
+	if (client->ssl_set != NULL) {
+		int ret;
+		if ((ret = ssl_iostream_client_context_cache_get(client->ssl_set,
+								 &client->ssl_ctx,
+								 error_r)) < 0)
+			return -1;
+		else if (ret > 0)
+			ssl_iostream_context_set_application_protocols(client->ssl_ctx, names);
+		return 0;
 	}
-	if (ssl_iostream_client_context_cache_get(client->set.ssl,
-		&client->ssl_ctx, &error) < 0) {
-		*error_r = t_strdup_printf(
-			"Couldn't initialize SSL context: %s", error);
+	/* no ssl settings given via http_client_settings -
+	   look them up automatically */
+	if (ssl_client_settings_get(client->event, &ssl_set, error_r) < 0)
 		return -1;
+	ssl_client_settings_to_iostream_set(ssl_set, &set);
+
+	int ret = ssl_iostream_client_context_cache_get(set, &client->ssl_ctx,
+							error_r);
+	if (ret > 0) {
+		ssl_iostream_context_set_application_protocols(client->ssl_ctx,
+							       names);
 	}
-	return 0;
+
+	settings_free(set);
+	settings_free(ssl_set);
+	return ret < 0 ? -1 : 0;
 }
 
 /*
@@ -419,105 +420,32 @@ void http_client_delay_request_error(struct http_client *client,
 void http_client_remove_request_error(struct http_client *client,
 				      struct http_client_request *req)
 {
-	struct http_client_request *const *reqs;
-	unsigned int i, count;
+	unsigned int i;
 
-	reqs = array_get(&client->delayed_failing_requests, &count);
-	for (i = 0; i < count; i++) {
-		if (reqs[i] == req) {
-			array_delete(&client->delayed_failing_requests, i, 1);
-			return;
-		}
-	}
+	if (!array_lsearch_ptr_idx(&client->delayed_failing_requests,
+				   req, &i))
+		i_unreached();
+	array_delete(&client->delayed_failing_requests, i, 1);
 }
 
 /*
  * Client shared context
  */
 
-struct http_client_context *
-http_client_context_create(const struct http_client_settings *set)
+struct http_client_context *http_client_context_create(void)
 {
 	struct http_client_context *cctx;
 	pool_t pool;
-	size_t pool_size;
 
-	pool_size = (set->ssl != NULL) ? 8192 : 1024; /* certs will be >4K */
-	pool = pool_alloconly_create("http client context", pool_size);
+	pool = pool_alloconly_create("http client context", 1024);
 	cctx = p_new(pool, struct http_client_context, 1);
 	cctx->pool = pool;
 	cctx->refcount = 1;
 	cctx->ioloop = current_ioloop;
 
-	cctx->event = event_create(set->event_parent);
+	cctx->event = event_create(NULL);
 	event_add_category(cctx->event, &event_category_http_client);
-	event_set_forced_debug(cctx->event, set->debug);
 	event_set_append_log_prefix(cctx->event, "http-client: ");
-
-	cctx->set.dns_client = set->dns_client;
-	cctx->set.dns_client_socket_path =
-		p_strdup_empty(pool, set->dns_client_socket_path);
-	cctx->set.dns_ttl_msecs = (set->dns_ttl_msecs == 0 ?
-			HTTP_CLIENT_DEFAULT_DNS_TTL_MSECS : set->dns_ttl_msecs);
-	cctx->set.user_agent = p_strdup_empty(pool, set->user_agent);
-	cctx->set.rawlog_dir = p_strdup_empty(pool, set->rawlog_dir);
-
-	if (set->ssl != NULL)
-		cctx->set.ssl = ssl_iostream_settings_dup(pool, set->ssl);
-
-	if (set->proxy_socket_path != NULL &&
-	    *set->proxy_socket_path != '\0') {
-		cctx->set.proxy_socket_path =
-			p_strdup(pool, set->proxy_socket_path);
-	} else if (set->proxy_url != NULL) {
-		cctx->set.proxy_url = http_url_clone(pool, set->proxy_url);
-	}
-	if (set->proxy_username != NULL && *set->proxy_username != '\0') {
-		cctx->set.proxy_username =
-			p_strdup_empty(pool, set->proxy_username);
-		cctx->set.proxy_password =
-			p_strdup(pool, set->proxy_password);
-	} else if (set->proxy_url != NULL) {
-		cctx->set.proxy_username =
-			p_strdup_empty(pool, set->proxy_url->user);
-		cctx->set.proxy_password =
-			p_strdup(pool, set->proxy_url->password);
-	}
-
-	cctx->set.max_idle_time_msecs = set->max_idle_time_msecs;
-	cctx->set.max_pipelined_requests =
-		(set->max_pipelined_requests > 0 ?
-		 set->max_pipelined_requests : 1);
-	cctx->set.max_parallel_connections =
-		(set->max_parallel_connections > 0 ?
-		 set->max_parallel_connections : 1);
-	cctx->set.max_attempts = set->max_attempts;
-	cctx->set.max_connect_attempts = set->max_connect_attempts;
-	cctx->set.connect_backoff_time_msecs =
-		(set->connect_backoff_time_msecs == 0 ?
-		 HTTP_CLIENT_DEFAULT_BACKOFF_TIME_MSECS :
-		 set->connect_backoff_time_msecs);
-	cctx->set.connect_backoff_max_time_msecs =
-		(set->connect_backoff_max_time_msecs == 0 ?
-		 HTTP_CLIENT_DEFAULT_BACKOFF_MAX_TIME_MSECS :
-		 set->connect_backoff_max_time_msecs);
-	cctx->set.no_auto_redirect = set->no_auto_redirect;
-	cctx->set.no_auto_retry = set->no_auto_retry;
-	cctx->set.no_ssl_tunnel = set->no_ssl_tunnel;
-	cctx->set.max_redirects = set->max_redirects;
-	cctx->set.response_hdr_limits = set->response_hdr_limits;
-	cctx->set.request_absolute_timeout_msecs =
-		set->request_absolute_timeout_msecs;
-	cctx->set.request_timeout_msecs =
-		(set->request_timeout_msecs == 0 ?
-		 HTTP_CLIENT_DEFAULT_REQUEST_TIMEOUT_MSECS :
-		 set->request_timeout_msecs);
-	cctx->set.connect_timeout_msecs = set->connect_timeout_msecs;
-	cctx->set.soft_connect_timeout_msecs = set->soft_connect_timeout_msecs;
-	cctx->set.max_auto_retry_delay_secs = set->max_auto_retry_delay_secs;
-	cctx->set.socket_send_buffer_size = set->socket_send_buffer_size;
-	cctx->set.socket_recv_buffer_size = set->socket_recv_buffer_size;
-	cctx->set.debug = set->debug;
 
 	cctx->conn_list = http_client_connection_list_init();
 
@@ -564,6 +492,7 @@ void http_client_context_unref(struct http_client_context **_cctx)
 	connection_list_deinit(&cctx->conn_list);
 
 	event_unref(&cctx->event);
+	i_free(cctx->dns_client_socket_path);
 	pool_unref(&cctx->pool);
 }
 
@@ -581,40 +510,55 @@ static void
 http_client_context_update_settings(struct http_client_context *cctx)
 {
 	struct http_client *client;
-	bool debug;
+	bool debug = FALSE;
 
-	/* Revert back to context settings */
-	cctx->dns_client = cctx->set.dns_client;
-	cctx->dns_client_socket_path = cctx->set.dns_client_socket_path;
-	cctx->dns_ttl_msecs = cctx->set.dns_ttl_msecs;
-	cctx->dns_lookup_timeout_msecs =
-		http_client_get_dns_lookup_timeout_msecs(&cctx->set);
-	debug = cctx->set.debug;
-
-	i_assert(cctx->dns_ttl_msecs > 0);
-	i_assert(cctx->dns_lookup_timeout_msecs > 0);
+	/* Revert back to default settings */
+	cctx->dns_client = NULL;
+	i_free(cctx->dns_client_socket_path);
+	cctx->dns_ttl_msecs = UINT_MAX;
+	cctx->dns_lookup_timeout_msecs = UINT_MAX;
 
 	/* Override with available client settings */
 	for (client = cctx->clients_list; client != NULL;
 	     client = client->next) {
 		unsigned int dns_lookup_timeout_msecs =
-			http_client_get_dns_lookup_timeout_msecs(&client->set);
+			http_client_get_dns_lookup_timeout_msecs(client->set);
 
 		if (cctx->dns_client == NULL)
-			cctx->dns_client = client->set.dns_client;
-		if (cctx->dns_client_socket_path == NULL) {
-			cctx->dns_client_socket_path =
-				client->set.dns_client_socket_path;
+			cctx->dns_client = client->dns_client;
+		if (cctx->dns_client_socket_path == NULL &&
+		    client->set->dns_client_socket_path != NULL &&
+		    client->set->dns_client_socket_path[0] != '\0') {
+			/* FIXME: This base_dir expansion shouldn't be here.
+			   Maybe support %{set:base_dir}/dns-client?
+			   The "./" check is to avoid breaking unit tests. */
+			if (client->set->dns_client_socket_path[0] == '/' ||
+			    str_begins_with(client->set->dns_client_socket_path, "./")) {
+				cctx->dns_client_socket_path =
+					i_strdup(client->set->dns_client_socket_path);
+			} else {
+				cctx->dns_client_socket_path =
+					i_strdup_printf("%s/%s",
+							client->set->base_dir,
+							client->set->dns_client_socket_path);
+			}
 		}
-		if (client->set.dns_ttl_msecs != 0 &&
-		    cctx->dns_ttl_msecs > client->set.dns_ttl_msecs)
-			cctx->dns_ttl_msecs = client->set.dns_ttl_msecs;
+		if (client->set->dns_ttl_msecs != 0 &&
+		    cctx->dns_ttl_msecs > client->set->dns_ttl_msecs)
+			cctx->dns_ttl_msecs = client->set->dns_ttl_msecs;
 		if (dns_lookup_timeout_msecs != 0 &&
 		    cctx->dns_lookup_timeout_msecs > dns_lookup_timeout_msecs) {
 			cctx->dns_lookup_timeout_msecs =
 				dns_lookup_timeout_msecs;
 		}
-		debug = debug || client->set.debug;
+		debug = debug || event_want_debug(client->event);
+	}
+
+	if (cctx->dns_ttl_msecs == UINT_MAX)
+		cctx->dns_ttl_msecs = HTTP_CLIENT_DEFAULT_DNS_TTL_MSECS;
+	if (cctx->dns_lookup_timeout_msecs == UINT_MAX) {
+		cctx->dns_lookup_timeout_msecs =
+			HTTP_CLIENT_DEFAULT_DNS_LOOKUP_TIMEOUT_MSECS;
 	}
 
 	event_set_forced_debug(cctx->event, debug);
@@ -744,9 +688,7 @@ struct http_client_context *http_client_get_global_context(void)
 	if (http_client_global_context != NULL)
 		return http_client_global_context;
 
-	struct http_client_settings set;
-	i_zero(&set);
-	http_client_global_context = http_client_context_create(&set);
+	http_client_global_context = http_client_context_create();
 	/* Keep this a bit higher than lib-ssl-iostream */
 	lib_atexit_priority(http_client_global_context_free,
 			    LIB_ATEXIT_PRIORITY_LOW-1);

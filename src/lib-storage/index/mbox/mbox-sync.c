@@ -53,7 +53,6 @@
 #include "mbox-lock.h"
 #include "mbox-sync-private.h"
 
-#include <stddef.h>
 #include <utime.h>
 #include <sys/stat.h>
 
@@ -1989,7 +1988,7 @@ again:
 			buf.modtime = st.st_mtime;
 			buf.actime = sync_ctx.orig_atime;
 			if (utime(mailbox_get_path(&mbox->box), &buf) < 0 &&
-			    errno != EPERM)
+			    !ENOACCESS(errno))
 				mbox_set_syscall_error(mbox, "utime()");
 		}
 	}
@@ -2053,8 +2052,6 @@ mbox_storage_sync_init(struct mailbox *box, enum mailbox_sync_flags flags)
 		if ((flags & MAILBOX_SYNC_FLAG_FULL_READ) != 0 &&
 		    !mbox->storage->set->mbox_very_dirty_syncs)
 			mbox_sync_flags |= MBOX_SYNC_UNDIRTY;
-		if ((flags & MAILBOX_SYNC_FLAG_FULL_WRITE) != 0)
-			mbox_sync_flags |= MBOX_SYNC_REWRITE;
 		if ((flags & MAILBOX_SYNC_FLAG_FORCE_RESYNC) != 0) {
 			mbox_sync_flags |= MBOX_SYNC_UNDIRTY |
 				MBOX_SYNC_REWRITE | MBOX_SYNC_FORCE_SYNC;

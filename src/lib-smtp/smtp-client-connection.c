@@ -13,6 +13,7 @@
 #include "iostream-rawlog.h"
 #include "iostream-ssl.h"
 #include "str.h"
+#include "settings.h"
 #include "dsasl-client.h"
 #include "dns-lookup.h"
 #include "smtp-syntax.h"
@@ -662,6 +663,15 @@ void smtp_client_connection_send_xclient(struct smtp_client_connection *conn)
 	    str_array_icase_find(xclient_args, "CLIENT-TRANSPORT")) {
 		smtp_client_connection_xclient_add(conn, str, offset,
 			"CLIENT-TRANSPORT", xclient->client_transport);
+	}
+
+	/* DESTNAME */
+	if (xclient->local_name != NULL &&
+	    str_array_icase_find(xclient_args, "DESTNAME")) {
+		/* This should already be checked elsewhere */
+		i_assert(connection_is_valid_dns_name(xclient->local_name));
+		smtp_client_connection_xclient_add(conn, str, offset,
+				"DESTNAME", xclient->local_name);
 	}
 
 	/* TTL */
@@ -1526,7 +1536,7 @@ smtp_client_connection_ssl_handshaked(const char **error_r, void *context)
 	if (ssl_iostream_check_cert_validity(conn->ssl_iostream,
 					     host, &error) == 0) {
 		e_debug(conn->event, "SSL handshake successful");
-	} else if (conn->set.ssl->allow_invalid_cert) {
+	} else if (ssl_iostream_get_allow_invalid_cert(conn->ssl_iostream)) {
 		e_debug(conn->event, "SSL handshake successful, "
 			"ignoring invalid certificate: %s", error);
 	} else {
@@ -1563,7 +1573,7 @@ smtp_client_connection_init_ssl_ctx(struct smtp_client_connection *conn,
 				    const char **error_r)
 {
 	struct smtp_client *client = conn->client;
-	const char *error;
+	int ret;
 
 	if (conn->ssl_ctx != NULL)
 		return 0;
@@ -1581,12 +1591,15 @@ smtp_client_connection_init_ssl_ctx(struct smtp_client_connection *conn,
 			"Requested SSL connection, but no SSL settings given";
 		return -1;
 	}
-	if (ssl_iostream_client_context_cache_get(conn->set.ssl, &conn->ssl_ctx,
-						  &error) < 0) {
-		*error_r = t_strdup_printf(
-			"Couldn't initialize SSL context: %s", error);
-		return -1;
-	}
+	if ((ret = ssl_iostream_client_context_cache_get(conn->set.ssl, &conn->ssl_ctx,
+							 error_r)) <= 0)
+		return ret;
+	const char *application_protocol = smtp_protocol_name(conn->protocol);
+	const char *const names[] = {
+		application_protocol,
+		NULL
+	};
+	ssl_iostream_context_set_application_protocols(conn->ssl_ctx, names);
 	return 0;
 }
 
@@ -1614,10 +1627,12 @@ smtp_client_connection_ssl_init(struct smtp_client_connection *conn,
 		conn->conn.output = conn->raw_output;
 	}
 
+	enum ssl_iostream_flags ssl_flags = 0;
+	if (conn->set.ssl_allow_invalid_cert)
+		ssl_flags |= SSL_IOSTREAM_FLAG_ALLOW_INVALID_CERT;
 	connection_input_halt(&conn->conn);
 	if (io_stream_create_ssl_client(
-		conn->ssl_ctx, conn->host, conn->set.ssl,
-		conn->event,
+		conn->ssl_ctx, conn->host, conn->event, ssl_flags,
 		&conn->conn.input, &conn->conn.output,
 		&conn->ssl_iostream, &error) < 0) {
 		*error_r = t_strdup_printf(
@@ -1830,6 +1845,9 @@ static void
 smtp_client_connection_dns_callback(const struct dns_lookup_result *result,
 				    struct smtp_client_connection *conn)
 {
+	/* We ended up here because dns_lookup_abort() was used */
+	if (result->ret == EAI_CANCELED)
+		return;
 	conn->dns_lookup = NULL;
 
 	if (result->ret != 0) {
@@ -2048,6 +2066,7 @@ void smtp_client_connection_disconnect(struct smtp_client_connection *conn)
 	timeout_remove(&conn->to_cmd_fail);
 
 	ssl_iostream_destroy(&conn->ssl_iostream);
+	settings_free(conn->set.ssl);
 	if (conn->ssl_ctx != NULL)
 		ssl_iostream_context_unref(&conn->ssl_ctx);
 	smtp_client_connection_auth_deinit(conn);
@@ -2111,9 +2130,10 @@ smtp_client_connection_do_create(struct smtp_client *client, const char *name,
 		}
 
 		if (set->ssl != NULL) {
-			conn->set.ssl =
-				ssl_iostream_settings_dup(pool, set->ssl);
+			conn->set.ssl = set->ssl;
+			pool_ref(conn->set.ssl->pool);
 		}
+		conn->set.ssl_allow_invalid_cert = set->ssl_allow_invalid_cert;
 
 		if (set->master_user != NULL && *set->master_user != '\0') {
 			conn->set.master_user =
@@ -2198,7 +2218,7 @@ smtp_client_connection_do_create(struct smtp_client *client, const char *name,
 	conn->cap_pool = pool_alloconly_create(
 		"smtp client connection capabilities", 128);
 	conn->state_pool = pool_alloconly_create(
-		"smtp client connection state", 256);
+		"smtp client connection state", 512);
 
 	if (set != NULL && set->event_parent != NULL)
 		conn_event = event_create(set->event_parent);

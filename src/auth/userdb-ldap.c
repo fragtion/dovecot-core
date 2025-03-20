@@ -3,26 +3,34 @@
 #include "auth-common.h"
 #include "userdb.h"
 
-#if defined(USERDB_LDAP) && (defined(BUILTIN_LDAP) || defined(PLUGIN_BUILD))
+#if defined(HAVE_LDAP) && (defined(BUILTIN_LDAP) || defined(PLUGIN_BUILD))
 
 #include "ioloop.h"
 #include "array.h"
 #include "str.h"
 #include "auth-cache.h"
+#include "settings.h"
+#include "auth-settings.h"
 #include "db-ldap.h"
 
 #include <ldap.h>
+
+#define RAW_SETTINGS (SETTINGS_GET_FLAG_NO_CHECK | SETTINGS_GET_FLAG_NO_EXPAND)
 
 struct ldap_userdb_module {
 	struct userdb_module module;
 
 	struct ldap_connection *conn;
+	const char *const *attributes;
+	const char *const *sensitive_attr_names;
+	const char *const *iterate_attributes;
 };
 
 struct userdb_ldap_request {
 	struct ldap_request_search request;
 	userdb_callback_t *userdb_callback;
 	unsigned int entries;
+	bool failed:1;
 };
 
 struct userdb_iter_ldap_request {
@@ -39,21 +47,20 @@ struct ldap_userdb_iterate_context {
 	bool continued, in_callback, deinitialized;
 };
 
-static void
+static int
 ldap_query_get_result(struct ldap_connection *conn,
 		      struct auth_request *auth_request,
 		      struct ldap_request_search *ldap_request,
 		      LDAPMessage *res)
 {
-	struct db_ldap_result_iterate_context *ldap_iter;
-	const char *name, *const *values;
+	struct db_ldap_field_expand_context ctx = {
+		.event = authdb_event(auth_request),
+		.fields = ldap_query_get_fields(auth_request->pool, conn,
+						ldap_request, res, FALSE)
+	};
 
-	ldap_iter = db_ldap_result_iterate_init(conn, ldap_request, res, TRUE);
-	while (db_ldap_result_iterate_next(ldap_iter, &name, &values)) {
-		auth_request_set_userdb_field_values(auth_request,
-						     name, values);
-	}
-	db_ldap_result_iterate_deinit(&ldap_iter);
+	return auth_request_set_userdb_fields_ex(auth_request, &ctx,
+						 db_ldap_field_expand_fn_table);
 }
 
 static void
@@ -63,14 +70,14 @@ userdb_ldap_lookup_finish(struct auth_request *auth_request,
 {
 	enum userdb_result result = USERDB_RESULT_INTERNAL_FAILURE;
 
-	if (res == NULL) {
+	if (res == NULL || urequest->failed) {
 		result = USERDB_RESULT_INTERNAL_FAILURE;
 	} else if (urequest->entries == 0) {
 		result = USERDB_RESULT_USER_UNKNOWN;
-		auth_request_log_unknown_user(auth_request, AUTH_SUBSYS_DB);
+		auth_request_db_log_unknown_user(auth_request);
 	} else if (urequest->entries > 1) {
 		e_error(authdb_event(auth_request),
-			"user_filter matched multiple objects, aborting");
+			"userdb_ldap_filter matched multiple objects, aborting");
 		result = USERDB_RESULT_INTERNAL_FAILURE;
 	} else {
 		result = USERDB_RESULT_OK;
@@ -84,7 +91,8 @@ static void userdb_ldap_lookup_callback(struct ldap_connection *conn,
 					LDAPMessage *res)
 {
 	struct userdb_ldap_request *urequest =
-		(struct userdb_ldap_request *) request;
+		container_of(request, struct userdb_ldap_request, request.request);
+
 	struct auth_request *auth_request =
 		urequest->request.request.auth_request;
 
@@ -96,8 +104,9 @@ static void userdb_ldap_lookup_callback(struct ldap_connection *conn,
 
 	if (urequest->entries++ == 0) {
 		/* first entry */
-		ldap_query_get_result(conn, auth_request,
-				      &urequest->request, res);
+		if (ldap_query_get_result(conn, auth_request,
+					  &urequest->request, res) < 0)
+			urequest->failed = TRUE;
 	}
 }
 
@@ -106,47 +115,40 @@ static void userdb_ldap_lookup(struct auth_request *auth_request,
 {
 	struct userdb_module *_module = auth_request->userdb->userdb;
 	struct ldap_userdb_module *module =
-		(struct ldap_userdb_module *)_module;
+		container_of(_module, struct ldap_userdb_module, module);
 	struct ldap_connection *conn = module->conn;
-	const char **attr_names = (const char **)conn->user_attr_names;
+	struct event *event = authdb_event(auth_request);
+
 	struct userdb_ldap_request *request;
 	const char *error;
-	string_t *str;
+
+	const struct ldap_pre_settings *ldap_pre = NULL;
+	if (settings_get(event, &ldap_pre_setting_parser_info, 0,
+			 &ldap_pre, &error) < 0 ||
+	    ldap_pre_settings_post_check(ldap_pre, DB_LDAP_LOOKUP_TYPE_USERDB,
+					 &error) < 0) {
+		e_error(event, "%s", error);
+		callback(USERDB_RESULT_INTERNAL_FAILURE, auth_request);
+		settings_free(ldap_pre);
+		return;
+	}
 
 	auth_request_ref(auth_request);
 	request = p_new(auth_request->pool, struct userdb_ldap_request, 1);
 	request->userdb_callback = callback;
+	request->request.base = p_strdup(auth_request->pool,
+					 ldap_pre->ldap_base);
+	request->request.filter = p_strdup(auth_request->pool,
+					   ldap_pre->userdb_ldap_filter);
+	request->request.attributes = module->attributes;
+	request->request.sensitive_attr_names = module->sensitive_attr_names;
 
-	str = t_str_new(512);
-	if (auth_request_var_expand(str, conn->set.base, auth_request,
-				    ldap_escape, &error) <= 0) {
-		e_error(authdb_event(auth_request),
-			"Failed to expand base=%s: %s", conn->set.base, error);
-		callback(USERDB_RESULT_INTERNAL_FAILURE, auth_request);
-		return;
-	}
-	request->request.base = p_strdup(auth_request->pool, str_c(str));
+	settings_free(ldap_pre);
 
-	str_truncate(str, 0);
-	if (auth_request_var_expand(str, conn->set.user_filter, auth_request,
-				    ldap_escape, &error) <= 0) {
-		e_error(authdb_event(auth_request),
-			"Failed to expand user_filter=%s: %s",
-			conn->set.user_filter, error);
-		callback(USERDB_RESULT_INTERNAL_FAILURE, auth_request);
-		return;
-	}
-	request->request.filter = p_strdup(auth_request->pool, str_c(str));
-
-	request->request.attr_map = &conn->user_attr_map;
-	request->request.attributes = conn->user_attr_names;
-
-	e_debug(authdb_event(auth_request), "user search: "
-		"base=%s scope=%s filter=%s fields=%s",
-		request->request.base, conn->set.scope,
+	e_debug(event, "user search: base=%s scope=%s filter=%s fields=%s",
+		request->request.base, conn->set->scope,
 		request->request.filter,
-		attr_names == NULL ? "(all)" :
-		t_strarray_join(attr_names, ","));
+		t_strarray_join(module->attributes, ","));
 
 	request->request.request.auth_request = auth_request;
 	request->request.request.callback = userdb_ldap_lookup_callback;
@@ -158,10 +160,8 @@ static void userdb_ldap_iterate_callback(struct ldap_connection *conn,
 					 LDAPMessage *res)
 {
 	struct userdb_iter_ldap_request *urequest =
-		(struct userdb_iter_ldap_request *)request;
+		container_of(request, struct userdb_iter_ldap_request, request.request);
 	struct ldap_userdb_iterate_context *ctx = urequest->ctx;
-	struct db_ldap_result_iterate_context *ldap_iter;
-	const char *name, *const *values;
 
 	if (res == NULL || ldap_msgtype(res) == LDAP_RES_SEARCH_RESULT) {
 		if (res == NULL)
@@ -180,20 +180,54 @@ static void userdb_ldap_iterate_callback(struct ldap_connection *conn,
 	request->create_time = ioloop_time;
 
 	ctx->in_callback = TRUE;
-	ldap_iter = db_ldap_result_iterate_init(conn, &urequest->request,
-						res, TRUE);
-	while (db_ldap_result_iterate_next(ldap_iter, &name, &values)) {
-		if (strcmp(name, "user") != 0) {
-			e_warning(authdb_event(request->auth_request), "iterate: "
-				  "Ignoring field not named 'user': %s", name);
-			continue;
-		}
-		for (; *values != NULL; values++) {
-			ctx->continued = FALSE;
-			ctx->ctx.callback(*values, ctx->ctx.context);
-		}
+
+	struct db_ldap_field_expand_context fctx = {
+		.event = authdb_event(request->auth_request),
+		.fields = ldap_query_get_fields(pool_datastack_create(), conn,
+						&urequest->request, res, TRUE)
+	};
+
+	struct var_expand_params params = {
+		.providers = db_ldap_field_expand_fn_table,
+		.context = &fctx
+	};
+
+	struct event *event = event_create(authdb_event(urequest->request.request.auth_request));
+	event_set_ptr(event, SETTINGS_EVENT_VAR_EXPAND_PARAMS, &params);
+
+	const struct ldap_post_settings *set;
+	const char *error;
+	if (settings_get(event, &ldap_post_setting_parser_info, 0,
+			 &set, &error) < 0) {
+		e_error(event, "%s", error);
+		ctx->ctx.failed = TRUE;
 	}
-	db_ldap_result_iterate_deinit(&ldap_iter);
+	else {
+		unsigned int count;
+		const char *const *items = array_get(&set->iterate_fields, &count);
+		for (unsigned int ndx = 0; ndx < count - 1;) {
+			const char *name = items[ndx++];
+			const char *value = items[ndx++];
+			if (strcmp(name, DB_LDAP_ATTR_MULTI_PREFIX"user") == 0) {
+				value = t_strsplit(value, DB_LDAP_ATTR_SEPARATOR)[0];
+				e_warning(authdb_event(request->auth_request),
+					  "iterate: Taking only first value of %s: %s",
+					  name + 1, value);
+				continue;
+			}
+			if (strcmp(name, "user") != 0) {
+				e_warning(authdb_event(request->auth_request),
+					  "iterate: Ignoring field not named 'user': %s",
+					  name);
+				continue;
+			}
+			ctx->continued = FALSE;
+			ctx->ctx.callback(value, ctx->ctx.context);
+		}
+		settings_free(set);
+	}
+	event_unref(&event);
+
 	if (!ctx->continued)
 		db_ldap_enable_input(conn, FALSE);
 	ctx->in_callback = FALSE;
@@ -205,13 +239,13 @@ userdb_ldap_iterate_init(struct auth_request *auth_request,
 {
 	struct userdb_module *_module = auth_request->userdb->userdb;
 	struct ldap_userdb_module *module =
-		(struct ldap_userdb_module *)_module;
+		container_of(_module, struct ldap_userdb_module, module);
 	struct ldap_connection *conn = module->conn;
+	struct event *event = authdb_event(auth_request);
+
 	struct ldap_userdb_iterate_context *ctx;
 	struct userdb_iter_ldap_request *request;
-	const char **attr_names = (const char **)conn->iterate_attr_names;
 	const char *error;
-	string_t *str;
 
 	ctx = p_new(auth_request->pool, struct ldap_userdb_iterate_context, 1);
 	ctx->ctx.auth_request = auth_request;
@@ -221,35 +255,33 @@ userdb_ldap_iterate_init(struct auth_request *auth_request,
 	request = &ctx->request;
 	request->ctx = ctx;
 
+	const struct ldap_pre_settings *ldap_pre = NULL;
+	if (settings_get(event, &ldap_pre_setting_parser_info, 0,
+			 &ldap_pre, &error) < 0 ||
+	    ldap_pre_settings_post_check(ldap_pre, DB_LDAP_LOOKUP_TYPE_ITERATE,
+					 &error) < 0) {
+		e_error(event, "%s", error);
+		settings_free(ldap_pre);
+		ctx->ctx.failed = TRUE;
+		return &ctx->ctx;
+	}
+
 	auth_request_ref(auth_request);
 	request->request.request.auth_request = auth_request;
-
-	str = t_str_new(512);
-	if (auth_request_var_expand(str, conn->set.base, auth_request,
-				    ldap_escape, &error) <= 0) {
-		e_error(authdb_event(auth_request),
-			"Failed to expand base=%s: %s", conn->set.base, error);
-		ctx->ctx.failed = TRUE;
-	}
-	request->request.base = p_strdup(auth_request->pool, str_c(str));
-
-	str_truncate(str, 0);
-	if (auth_request_var_expand(str, conn->set.iterate_filter,
-				    auth_request, ldap_escape, &error) <= 0) {
-		e_error(authdb_event(auth_request),
-			"Failed to expand iterate_filter=%s: %s",
-			conn->set.iterate_filter, error);
-		ctx->ctx.failed = TRUE;
-	}
-	request->request.filter = p_strdup(auth_request->pool, str_c(str));
-	request->request.attr_map = &conn->iterate_attr_map;
-	request->request.attributes = conn->iterate_attr_names;
+	request->request.base = p_strdup(auth_request->pool,
+					 ldap_pre->ldap_base);
+	request->request.filter = p_strdup(auth_request->pool,
+					   ldap_pre->userdb_ldap_iterate_filter);
+	request->request.attributes = module->iterate_attributes;
+	request->request.sensitive_attr_names = module->sensitive_attr_names;
 	request->request.multi_entry = TRUE;
+	settings_free(ldap_pre);
 
-	e_debug(auth_request->event, "ldap: iterate: base=%s scope=%s filter=%s fields=%s",
-		request->request.base, conn->set.scope,
-		request->request.filter, attr_names == NULL ? "(all)" :
-		t_strarray_join(attr_names, ","));
+	e_debug(event, "ldap: iterate: base=%s scope=%s filter=%s fields=%s",
+		request->request.base, conn->set->scope,
+		request->request.filter,
+		t_strarray_join(module->iterate_attributes, ","));
+
 	request->request.request.callback = userdb_ldap_iterate_callback;
 	db_ldap_request(conn, &request->request.request);
 	return &ctx->ctx;
@@ -258,8 +290,12 @@ userdb_ldap_iterate_init(struct auth_request *auth_request,
 static void userdb_ldap_iterate_next(struct userdb_iterate_context *_ctx)
 {
 	struct ldap_userdb_iterate_context *ctx =
-		(struct ldap_userdb_iterate_context *)_ctx;
+		container_of(_ctx, struct ldap_userdb_iterate_context, ctx);
 
+	if (_ctx->failed) {
+		_ctx->callback(NULL, _ctx->context);
+		return;
+	}
 	ctx->continued = TRUE;
 	if (!ctx->in_callback)
 		db_ldap_enable_input(ctx->conn, TRUE);
@@ -268,7 +304,7 @@ static void userdb_ldap_iterate_next(struct userdb_iterate_context *_ctx)
 static int userdb_ldap_iterate_deinit(struct userdb_iterate_context *_ctx)
 {
 	struct ldap_userdb_iterate_context *ctx =
-		(struct ldap_userdb_iterate_context *)_ctx;
+		container_of(_ctx, struct ldap_userdb_iterate_context, ctx);
 	int ret = _ctx->failed ? -1 : 0;
 
 	db_ldap_enable_input(ctx->conn, TRUE);
@@ -276,35 +312,54 @@ static int userdb_ldap_iterate_deinit(struct userdb_iterate_context *_ctx)
 	return ret;
 }
 
-static struct userdb_module *
-userdb_ldap_preinit(pool_t pool, const char *args)
+static int userdb_ldap_preinit(pool_t pool, struct event *event,
+			       struct userdb_module **module_r,
+			       const char **error_r ATTR_UNUSED)
 {
+	const struct auth_userdb_post_settings *auth_post = NULL;
+	const struct ldap_post_settings *ldap_post = NULL;
+	const struct ldap_pre_settings *ldap_pre = NULL;
 	struct ldap_userdb_module *module;
-	struct ldap_connection *conn;
+	int ret = -1;
+
+	if (settings_get(event, &auth_userdb_post_setting_parser_info,
+			 RAW_SETTINGS, &auth_post, error_r) < 0)
+		goto failed;
+	if (settings_get(event, &ldap_post_setting_parser_info,
+			 RAW_SETTINGS, &ldap_post, error_r) < 0)
+		goto failed;
+	if (settings_get(event, &ldap_pre_setting_parser_info,
+			 RAW_SETTINGS, &ldap_pre, error_r) < 0)
+		goto failed;
 
 	module = p_new(pool, struct ldap_userdb_module, 1);
-	module->conn = conn = db_ldap_init(args, TRUE);
-	p_array_init(&conn->user_attr_map, pool, 16);
-	p_array_init(&conn->iterate_attr_map, pool, 16);
+	module->conn = db_ldap_init(event);
 
-	db_ldap_set_attrs(conn, conn->set.user_attrs, &conn->user_attr_names,
-			  &conn->user_attr_map, NULL);
-	db_ldap_set_attrs(conn, conn->set.iterate_attrs,
-			  &conn->iterate_attr_names,
-			  &conn->iterate_attr_map, NULL);
-	module->module.blocking = conn->set.blocking;
-	module->module.default_cache_key =
-		auth_cache_parse_key(pool,
-				     t_strconcat(conn->set.base,
-						 conn->set.user_attrs,
-						 conn->set.user_filter, NULL));
-	return &module->module;
+	db_ldap_get_attribute_names(pool, &auth_post->fields,
+				    &module->attributes,
+				    &module->sensitive_attr_names, NULL);
+	db_ldap_get_attribute_names(pool, &ldap_post->iterate_fields,
+				    &module->iterate_attributes, NULL, NULL);
+
+	module->module.default_cache_key = auth_cache_parse_key_and_fields(
+		pool, t_strconcat(ldap_pre->ldap_base,
+				  ldap_pre->userdb_ldap_filter, NULL),
+		&auth_post->fields, NULL);
+
+	*module_r = &module->module;
+	ret = 0;
+
+failed:
+	settings_free(auth_post);
+	settings_free(ldap_pre);
+	settings_free(ldap_post);
+	return ret;
 }
 
 static void userdb_ldap_init(struct userdb_module *_module)
 {
 	struct ldap_userdb_module *module =
-		(struct ldap_userdb_module *)_module;
+		container_of(_module, struct ldap_userdb_module, module);
 
 	if (!module->module.blocking || worker)
 		db_ldap_connect_delayed(module->conn);
@@ -313,7 +368,7 @@ static void userdb_ldap_init(struct userdb_module *_module)
 static void userdb_ldap_deinit(struct userdb_module *_module)
 {
 	struct ldap_userdb_module *module =
-		(struct ldap_userdb_module *)_module;
+		container_of(_module, struct ldap_userdb_module, module);
 
 	db_ldap_unref(&module->conn);
 }
@@ -324,17 +379,17 @@ struct userdb_module_interface userdb_ldap =
 struct userdb_module_interface userdb_ldap_plugin =
 #endif
 {
-	"ldap",
+	.name = "ldap",
 
-	userdb_ldap_preinit,
-	userdb_ldap_init,
-	userdb_ldap_deinit,
+	.preinit = userdb_ldap_preinit,
+	.init = userdb_ldap_init,
+	.deinit = userdb_ldap_deinit,
 
-	userdb_ldap_lookup,
+	.lookup = userdb_ldap_lookup,
 
-	userdb_ldap_iterate_init,
-	userdb_ldap_iterate_next,
-	userdb_ldap_iterate_deinit
+	.iterate_init = userdb_ldap_iterate_init,
+	.iterate_next = userdb_ldap_iterate_next,
+	.iterate_deinit = userdb_ldap_iterate_deinit
 };
 #else
 struct userdb_module_interface userdb_ldap = {

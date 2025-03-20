@@ -9,7 +9,7 @@
     - namespace separator = ':'
     - fs_list separator = '.'
     - mailbox_list storage_name_escape_char = '+'
-    - mailbox_list vname_escape_char = '~'
+    - mailbox_list mailbox_list_visible_escape_char = '~'
     - fs_list storage_name_escape_char = '%'
 
    remote_name = "prefix/~foo/bar^baz+_%_."
@@ -19,7 +19,7 @@
     - storage_name_escape character + is escaped as +2b
    vname = "~7efoo:bar.baz+_%_."
     - imapc_list_prefix is dropped
-    - vname_escape_character ~ is escaped into ~7e
+    - mailbox_list_visible_escape_char ~ is escaped into ~7e
     - separator is changed from ^ to :
     - storage_name_escape_characters are unescaped
    fs_name = "prefix.~foo.bar^baz+_%25_%2e"
@@ -31,10 +31,12 @@
 #include "lib.h"
 #include "ioloop.h"
 #include "str.h"
+#include "settings.h"
 #include "settings-parser.h"
 #include "imap-arg.h"
 #include "imap-match.h"
 #include "imap-utf7.h"
+#include "mail-storage-service.h"
 #include "mailbox-tree.h"
 #include "mailbox-list-subscriptions.h"
 #include "imapc-storage.h"
@@ -95,12 +97,17 @@ static int imapc_list_init(struct mailbox_list *_list, const char **error_r)
 {
 	struct imapc_mailbox_list *list = (struct imapc_mailbox_list *)_list;
 
-	list->set = settings_parser_get_root_set(_list->ns->user->set_parser,
-						 imapc_get_setting_parser_info());
-	if (imapc_storage_client_create(_list->ns, list->set, _list->mail_set,
+	if (imapc_storage_client_create(_list,
 					&list->client, error_r) < 0)
 		return -1;
 	list->client->_list = list;
+	list->set = list->client->set;
+
+	if ((_list->ns->flags & NAMESPACE_FLAG_UNUSABLE) != 0) {
+		/* Avoid connecting to imapc just to access mailbox names.
+		   There are no mailboxes, so the separator doesn't matter. */
+		list->root_sep = '/';
+	}
 
 	imapc_storage_client_register_untagged(list->client, "LIST",
 					       imapc_untagged_list);
@@ -123,6 +130,7 @@ static void imapc_list_deinit(struct mailbox_list *_list)
 	}
 	if (list->index_list != NULL)
 		mailbox_list_destroy(&list->index_list);
+	settings_instance_free(&list->index_list_set_instance);
 	mailbox_tree_deinit(&list->mailboxes);
 	if (list->tmp_subscriptions != NULL)
 		mailbox_tree_deinit(&list->tmp_subscriptions);
@@ -193,7 +201,7 @@ imapc_list_remote_to_storage_name(struct imapc_mailbox_list *list,
 	return mailbox_list_escape_name_params(remote_name, "",
 		list->root_sep,
 		mailbox_list_get_hierarchy_sep(&list->list),
-		list->list.set.storage_name_escape_char, "");
+		list->list.mail_set->mailbox_list_storage_escape_char[0], "");
 }
 
 static const char *
@@ -208,9 +216,9 @@ const char *
 imapc_list_storage_to_remote_name(struct imapc_mailbox_list *list,
 				  const char *storage_name)
 {
-	return mailbox_list_unescape_name_params(storage_name, "", list->root_sep,
-				mailbox_list_get_hierarchy_sep(&list->list),
-				list->list.set.storage_name_escape_char);
+	return mailbox_list_unescape_name_params(storage_name, "",
+		list->root_sep, mailbox_list_get_hierarchy_sep(&list->list),
+		list->list.mail_set->mailbox_list_storage_escape_char[0]);
 }
 
 static struct mailbox_node *
@@ -415,34 +423,64 @@ imapc_list_get_vname(struct mailbox_list *_list, const char *storage_name)
 
 static struct mailbox_list *imapc_list_get_fs(struct imapc_mailbox_list *list)
 {
-	struct event *event = list->list.ns->user->event;
-	struct mailbox_list_settings list_set;
 	const char *error, *dir;
 
-	dir = list->list.set.index_dir;
-	if (dir == NULL)
-		dir = list->list.set.root_dir;
+	if (list->list.mail_set->mail_index_path[0] == '\0')
+		dir = list->list.mail_set->mail_path;
+	else if (strcmp(list->list.mail_set->mail_index_path,
+			MAIL_INDEX_PATH_MEMORY) == 0)
+		dir = "";
+	else
+		dir = list->list.mail_set->mail_index_path;
 
-	if (dir == NULL || dir[0] == '\0') {
+	if (dir[0] == '\0') {
 		/* indexes disabled */
 	} else if (list->index_list == NULL && !list->index_list_failed) {
-		mailbox_list_settings_init_defaults(&list_set);
-		list_set.layout = MAILBOX_LIST_NAME_MAILDIRPLUSPLUS;
-		list_set.root_dir = dir;
-		list_set.index_pvt_dir = p_strdup_empty(list->list.pool, list->list.set.index_pvt_dir);
+		struct settings_instance *set_instance =
+			mail_storage_service_user_get_settings_instance(
+				list->list.ns->user->service_user);
+		list->index_list_set_instance =
+			settings_instance_dup(set_instance);
+		mail_storage_2nd_settings_reset(list->index_list_set_instance, "*/");
 		/* Filesystem needs to be able to store any kind of a mailbox
 		   name. */
-		list_set.storage_name_escape_char =
-			IMAPC_LIST_FS_NAME_ESCAPE_CHAR;
+		settings_override(list->index_list_set_instance,
+				  "*/mailbox_list_storage_escape_char",
+				  IMAPC_LIST_FS_NAME_ESCAPE_CHAR,
+				  SETTINGS_OVERRIDE_TYPE_CODE);
+		settings_override(list->index_list_set_instance,
+				  "*/mailbox_list_layout",
+				  MAILBOX_LIST_NAME_MAILDIRPLUSPLUS,
+				  SETTINGS_OVERRIDE_TYPE_CODE);
+		settings_override(list->index_list_set_instance,
+				  "*/mail_path",
+				  list->list.mail_set->mail_path,
+				  SETTINGS_OVERRIDE_TYPE_CODE);
+		settings_override(list->index_list_set_instance,
+				  "*/mail_index_private_path",
+				  list->list.mail_set->mail_index_private_path,
+				  SETTINGS_OVERRIDE_TYPE_CODE);
 
-		if (mailbox_list_create(list_set.layout, list->list.ns,
-					&list_set, MAILBOX_LIST_FLAG_SECONDARY,
-					&list->index_list, &error) < 0) {
-			e_error(event,
+		const struct mail_storage_settings *mail_set = NULL;
+		struct event *event = event_create(list->list.event);
+		event_set_ptr(event, SETTINGS_EVENT_INSTANCE,
+			      list->index_list_set_instance);
+		settings_event_add_filter_name(event,
+			MAILBOX_LIST_NAME_MAILDIRPLUSPLUS);
+		if (settings_get(event, &mail_storage_setting_parser_info, 0,
+				 &mail_set, &error) < 0) {
+			e_error(list->list.event, "%s", error);
+			list->index_list_failed = TRUE;
+		} else if (mailbox_list_create(event, list->list.ns, mail_set,
+					       MAILBOX_LIST_FLAG_SECONDARY,
+					       &list->index_list, &error) < 0) {
+			e_error(list->list.event,
 				"imapc: Couldn't create %s mailbox list: %s",
-				list_set.layout, error);
+				MAILBOX_LIST_NAME_MAILDIRPLUSPLUS, error);
 			list->index_list_failed = TRUE;
 		}
+		settings_free(mail_set);
+		event_unref(&event);
 	}
 	return list->index_list;
 }
@@ -459,9 +497,8 @@ imapc_list_storage_to_fs_name(struct imapc_mailbox_list *list,
 
 	remote_name = imapc_list_storage_to_remote_name(list, storage_name);
 	return mailbox_list_escape_name_params(remote_name, "",
-			list->root_sep,
-			mailbox_list_get_hierarchy_sep(fs_list),
-			fs_list->set.storage_name_escape_char, "");
+		list->root_sep, mailbox_list_get_hierarchy_sep(fs_list),
+		fs_list->mail_set->mailbox_list_storage_escape_char[0], "");
 }
 
 static const char *
@@ -477,7 +514,7 @@ imapc_list_fs_to_storage_name(struct imapc_mailbox_list *list,
 	remote_name = mailbox_list_unescape_name_params(fs_name, "",
 			list->root_sep,
 			mailbox_list_get_hierarchy_sep(fs_list),
-			fs_list->set.storage_name_escape_char);
+			fs_list->mail_set->mailbox_list_storage_escape_char[0]);
 	return imapc_list_remote_to_storage_name(list, remote_name);
 }
 
@@ -509,8 +546,8 @@ imapc_list_get_temp_prefix(struct mailbox_list *_list, bool global)
 			mailbox_list_get_global_temp_prefix(fs_list) :
 			mailbox_list_get_temp_prefix(fs_list);
 	} else {
-		i_panic("imapc: Can't return a temp prefix for '%s'",
-			_list->ns->prefix);
+		i_panic("imapc: Can't return a temp prefix for namespace %s",
+			_list->ns->set->name);
 	}
 }
 
@@ -568,6 +605,11 @@ static int imapc_list_refresh(struct imapc_mailbox_list *list)
 		return -1;
 	if (list->refreshed_mailboxes)
 		return 0;
+	if ((list->list.ns->flags & NAMESPACE_FLAG_UNUSABLE) != 0) {
+		list->refreshed_mailboxes = TRUE;
+		list->refreshed_mailboxes_recently = TRUE;
+		return 0;
+	}
 
 	if (*list->set->imapc_list_prefix == '\0')
 		pattern = "*";
@@ -819,7 +861,8 @@ imapc_list_subscriptions_refresh(struct mailbox_list *_src_list,
 	if (imapc_list_try_get_root_sep(src_list, &list_sep) < 0)
 		return -1;
 
-	if (src_list->refreshed_subscriptions) {
+	if (src_list->refreshed_subscriptions ||
+	    (src_list->list.ns->flags & NAMESPACE_FLAG_UNUSABLE) != 0) {
 		if (dest_list->subscriptions == NULL)
 			dest_list->subscriptions = mailbox_tree_init(dest_sep);
 		return 0;
@@ -972,7 +1015,7 @@ int imapc_list_get_mailbox_flags(struct mailbox_list *_list, const char *name,
 	}
 
 	if (list->mailboxes == NULL) {
-		/* imapc list isn't used, but e.g. LAYOUT=none */
+		/* imapc list isn't used, but e.g. mailbox_list_layout=none */
 		*flags_r = 0;
 		return 0;
 	}

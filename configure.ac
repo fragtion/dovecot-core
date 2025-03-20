@@ -19,6 +19,9 @@ AM_INIT_AUTOMAKE([foreign tar-ustar])
 AM_SILENT_RULES([yes])
 
 AM_MAINTAINER_MODE
+AC_PROG_GREP
+AC_PROG_SED
+
 PKG_PREREQ([0.28])
 PKG_PROG_PKG_CONFIG
 
@@ -29,7 +32,6 @@ AC_ARG_ENABLE(devel-checks,
 AS_HELP_STRING([--enable-devel-checks], [Enable some extra expensive checks for developers]),
 	if test x$enableval = xyes; then
 		AC_DEFINE(DEBUG,, [Build with extra debugging checks])
-		want_devel_checks=yes
 	fi)
 
 AC_ARG_ENABLE(static-checker,
@@ -43,6 +45,26 @@ AS_HELP_STRING([--enable-asserts], [Enable asserts (default)]),
 	if test x$enableval = xno; then
 		AC_DEFINE(DISABLE_ASSERTS,, [Disable asserts])
 	fi)
+
+AC_ARG_ENABLE([pro-build],
+  [AS_HELP_STRING([--enable-pro-build], [Enable pro build related defines])],
+  [is_pro_build=yes],
+  [is_pro_build=no]
+)
+
+experimental_capabilities=""
+have_mail_utf8=no
+
+AC_ARG_ENABLE(experimental-mail-utf8,
+AS_HELP_STRING([--enable-experimental-mail-utf8], [Enable experimental support for SMTPUTF8 and UTF8=ACCEPT]),
+	AS_IF([test x$enableval = xyes], [
+	       AC_DEFINE([EXPERIMENTAL_MAIL_UTF8],, [Build with SMTPUTF8 and UTF8=ACCEPT support])
+	       experimental_capabilities="${experimental_capabilities} UTF8=ACCEPT"
+	       have_mail_utf8=yes
+	])
+)
+
+AC_SUBST([DOVECOT_HAVE_MAIL_UTF8], $have_mail_utf8)
 
 AC_ARG_WITH(shared-libs,
 AS_HELP_STRING([--with-shared-libs], [Link binaries using shared Dovecot libraries (default)]),
@@ -64,11 +86,6 @@ AC_ARG_WITH(notify,
 AS_HELP_STRING([--with-notify=NOTIFY], [Specify the file system notification method to use (inotify, kqueue, none; default is detected in the above order)]),
 	notify=$withval,
 	notify=)
-
-AC_ARG_WITH(nss,
-AS_HELP_STRING([--with-nss], [Build with NSS module support (auto)]),
-  TEST_WITH(nss, $withval),
-  want_nss=auto)
 
 AC_ARG_WITH(pam,
 AS_HELP_STRING([--with-pam], [Build with PAM support (auto)]),
@@ -128,17 +145,17 @@ AS_HELP_STRING([--with-cassandra], [Build with Cassandra driver support]),
   want_cassandra=no)
 
 AC_ARG_WITH(stemmer,
-AS_HELP_STRING([--with-stemmer], [Build with libstemmer support (for FTS) (auto)]),
+AS_HELP_STRING([--with-stemmer], [Build with libstemmer support (for lib-language) (auto)]),
   TEST_WITH(stemmer, $withval),
   want_stemmer=auto)
 
 AC_ARG_WITH(textcat,
-AS_HELP_STRING([--with-textcat], [Build with libtextcat support (for FTS) (auto)]),
+AS_HELP_STRING([--with-textcat], [Build with libtextcat support (for lib-language) (auto)]),
   TEST_WITH(textcat, $withval),
   want_textcat=auto)
 
 AC_ARG_WITH(icu,
-AS_HELP_STRING([--with-icu], [Build with libicu support (for FTS normalization) (auto)]),
+AS_HELP_STRING([--with-icu], [Build with libicu support (for lib-language normalization) (auto)]),
   want_icu=$withval,
   want_icu=auto)
 
@@ -214,16 +231,6 @@ DOVECOT_WANT_SYSTEMD
 dovecot_moduledir="$libdir/dovecot"
 DC_DOVECOT_MODULEDIR
 
-AC_ARG_WITH(docs,
-AS_HELP_STRING([--with-docs], [Install documentation (default)]),
-	if test x$withval = xno; then
-		want_docs=no
-	else
-		want_docs=yes
-	fi,
-	want_docs=yes)
-AM_CONDITIONAL(INSTALL_DOCS, test "$want_docs" = "yes")
-
 dnl always enable all of the passbs and userdbs that don't require extra libs
 want_passwd=yes
 want_passwd_file=yes
@@ -249,13 +256,40 @@ AM_ICONV
 # SIZE_MAX is missing without this
 CXXFLAGS="$CXXFLAGS -D__STDC_LIMIT_MACROS"
 
-AC_DEFINE_UNQUOTED(DOVECOT_NAME, "$PACKAGE_NAME", [Dovecot name])
+# Use the first x.y.z numbers of the version. Also allow x.y numbering.
+AS_IF([echo "$PACKAGE_VERSION" | grep '^[[0-9]]*\.[[0-9]]*\.[[0-9]]'], [
+  DOVECOT_CONFIG_VERSION=$(echo "$PACKAGE_VERSION" | $SED 's/^\([[0-9]]*\.[[0-9]]*\.[[0-9]]*\).*$/\1/')
+], [
+  DOVECOT_CONFIG_VERSION=$(echo "$PACKAGE_VERSION" | $SED 's/^\([[0-9]]*\.[[0-9]]*\).*$/\1/')
+])
+AS_IF([test "$is_pro_build" = "yes"], [
+  SET_PRO_DEFINES
+  AC_SUBST(DOVECOT_ASSET_URL, "doc.dovecotpro.com")
+  AC_DEFINE(DOVECOT_DOC_URL, "https://doc.dovecotpro.com/", [Documentation URL])
+  AC_SUBST(DOVECOT_PRO_BUILD, 1)
+], [
+  AC_DEFINE_UNQUOTED(DOVECOT_NAME, "$PACKAGE_NAME", [Dovecot name])
+  AC_SUBST(DOVECOT_ASSET_URL, "doc.dovecot.org")
+  AC_DEFINE(DOVECOT_DOC_URL, "https://doc.dovecot.org/", [Documentation URL])
+  AC_SUBST(DOVECOT_PRO_BUILD, 0)
+])
+AC_DEFINE_UNQUOTED(DOVECOT_CONFIG_VERSION, "$DOVECOT_CONFIG_VERSION", [Dovecot configuration version])
+AC_SUBST(DOVECOT_CONFIG_VERSION)
+
 AC_DEFINE_UNQUOTED(DOVECOT_STRING, "$PACKAGE_STRING", [Dovecot string])
 AC_DEFINE_UNQUOTED(DOVECOT_VERSION, "$PACKAGE_VERSION", [Dovecot version])
 
 AC_DEFINE([DOVECOT_VERSION_MAJOR], regexp(AC_PACKAGE_VERSION, [^\([0-9]+\)\.\([0-9]+\)], [\1]), [Dovecot major version])
 AC_DEFINE([DOVECOT_VERSION_MINOR], regexp(AC_PACKAGE_VERSION, [^\([0-9]+\)\.\([0-9]+\)], [\2]), [Dovecot minor version])
 AC_DEFINE([DOVECOT_VERSION_MICRO], regexp(AC_PACKAGE_VERSION, [^\([0-9]+\)\.\([0-9]+\).\([0-9]+\)], [\3]), [Dovecot micro version])
+
+AC_SUBST(DOVECOT_ASSET_VERSION, regexp(AC_PACKAGE_VERSION, [^\([0-9]+\)\.\([0-9]+\).\([0-9]+\)], [\1.\2.\3]))
+AS_IF([test "$DOVECOT_ASSET_VERSION" = "0.0.0"], [
+  AC_SUBST([DOVECOT_ASSET_VERSION], "main")
+])
+AS_IF([test "$DOVECOT_ASSET_VERSION" = ""], [
+  AC_SUBST([DOVECOT_ASSET_VERSION], "main")
+])
 
 AC_COMPILE_IFELSE([AC_LANG_PROGRAM([
 ],[
@@ -290,7 +324,7 @@ DOVECOT_LIBCAP
 DOVECOT_RANDOM
 DOVECOT_ARC4RANDOM
 
-AC_DEFINE(PACKAGE_WEBPAGE, "http://www.dovecot.org/", [Support URL])
+AC_DEFINE(PACKAGE_WEBPAGE, "https://www.dovecot.org/", [Support URL])
 
 AC_CHECK_FUNCS(flock pread setproctitle setresgid \
 	       getmntinfo setpriority quotactl getmntent kqueue kevent \
@@ -305,8 +339,18 @@ DOVECOT_SOCKPEERCRED
 DOVECOT_TYPEOF
 DOVECOT_IOLOOP
 DOVECOT_NOTIFY
+AS_CASE(
+   ["$notify"],
+   [none],   [BUILD_IMAP_HIBERNATE=0],
+   [kqueue], [BUILD_IMAP_HIBERNATE=0],
+   [BUILD_IMAP_HIBERNATE=1])
+AS_IF([test "$BUILD_IMAP_HIBERNATE"=1],
+      AC_DEFINE(BUILD_IMAP_HIBERNATE,, [Build with imap hibernate]))
+AM_CONDITIONAL([BUILD_IMAP_HIBERNATE], [test "$BUILD_IMAP_HIBERNATE" = 1])
 
 DOVECOT_GLIBC
+
+DOVECOT_SCHED
 
 dnl * OS specific options
 DC_PLUGIN_DEPS
@@ -389,8 +433,8 @@ dnl * find random source
 
 AC_ARG_WITH(random-source,
 AS_HELP_STRING([--with-random-source=file], [Device file to use as random source (default=/dev/urandom)]),
-        random_source=$withval,
-        random_source=/dev/urandom)
+	random_source=$withval,
+	random_source=/dev/urandom)
 
 AC_MSG_CHECKING([for $random_source])
 if test -c $random_source || test -s $random_source; then
@@ -427,6 +471,7 @@ DOVECOT_LINUX_MREMAP
 DOVECOT_MMAP_WRITE
 
 DOVECOT_FD_PASSING
+DOVECOT_FACCESSAT2
 
 DOVECOT_SENDFILE
 
@@ -482,20 +527,6 @@ DOVECOT_WANT_CASSANDRA
 
 DOVECOT_SQL
 
-if test $have_modules = yes; then
-  AC_DEFINE(HAVE_MODULES,, [Define if you have dynamic module support])
-  AC_SUBST(MODULE_LIBS)
-
-  # shrext_cmds comes from libtool.m4
-  module=yes eval MODULE_SUFFIX=$shrext_cmds
-  if test "$MODULE_SUFFIX" = ""; then
-    # too old libtool?
-    MODULE_SUFFIX=.so
-  fi
-  AC_DEFINE_UNQUOTED(MODULE_SUFFIX,"$MODULE_SUFFIX", [Dynamic module suffix])
-  AC_SUBST(MODULE_SUFFIX)
-fi
-
 AC_SUBST(AUTH_CFLAGS)
 AC_SUBST(AUTH_LIBS)
 AC_SUBST(SQL_CFLAGS)
@@ -506,8 +537,6 @@ AC_SUBST(CDB_LIBS)
 AC_SUBST(dict_drivers)
 
 AC_C_BIGENDIAN
-
-DOVECOT_IPV6
 
 dnl **
 dnl ** storage classes
@@ -529,6 +558,7 @@ LIBDOVECOT_LA_LIBS='\
 	$(top_builddir)/src/lib-oauth2/liboauth2.la \
 	$(top_builddir)/src/lib-smtp/libsmtp.la \
 	$(top_builddir)/src/lib-program-client/libprogram_client.la \
+	$(top_builddir)/src/lib-var-expand/libvar_expand.la \
 	$(top_builddir)/src/lib-master/libmaster.la \
 	$(top_builddir)/src/lib-login/liblogin.la \
 	$(top_builddir)/src/lib-settings/libsettings.la \
@@ -536,6 +566,7 @@ LIBDOVECOT_LA_LIBS='\
 	$(top_builddir)/src/lib-fs/libfs.la \
 	$(top_builddir)/src/lib-dict/libdict.la \
 	$(top_builddir)/src/lib-dns/libdns.la \
+	$(top_builddir)/src/lib-dns-client/libdns-client.la \
 	$(top_builddir)/src/lib-imap/libimap.la \
 	$(top_builddir)/src/lib-mail/libmail.la \
 	$(top_builddir)/src/lib-sasl/libsasl.la \
@@ -545,11 +576,14 @@ LIBDOVECOT_LA_LIBS='\
 	$(top_builddir)/src/lib-charset/libcharset.la \
 	$(top_builddir)/src/lib-ssl-iostream/libssl_iostream.la \
 	$(top_builddir)/src/lib-dcrypt/libdcrypt.la \
+	$(top_builddir)/src/lib-json/libjson.la \
 	$(top_builddir)/src/lib-test/libtest.la \
 	$(top_builddir)/src/lib/liblib.la'
 # This is used in dovecot-config, which is grepped in dovecot.m4,
 # so it needs to be in a single line.
 LIBDOVECOT_LA_LIBS=`echo "$LIBDOVECOT_LA_LIBS" | tr -d '\t\n\\\\'`
+
+LIBDOVECOT_LUA=''
 
 if test "$want_shared_libs" = "yes"; then
   LIBDOVECOT_DEPS='$(top_builddir)/src/lib-dovecot/libdovecot.la'
@@ -557,15 +591,21 @@ if test "$want_shared_libs" = "yes"; then
   LIBDOVECOT_STORAGE_DEPS='$(top_builddir)/src/lib-storage/libdovecot-storage.la $(top_builddir)/src/lib-imap-storage/libimap-storage.la'
   LIBDOVECOT_LOGIN='$(top_builddir)/src/login-common/libdovecot-login.la'
   LIBDOVECOT_LDA='$(top_builddir)/src/lib-lda/libdovecot-lda.la'
+  if test $want_lua != no; then
+    LIBDOVECOT_LUA='$(top_builddir)/src/lib-lua/libdovecot-lua.la'
+  fi
 else
   LIBDOVECOT_DEPS="$LIBDOVECOT_LA_LIBS"
   LIBDOVECOT="$LIBDOVECOT_DEPS \$(LIBICONV) \$(MODULE_LIBS)"
   LIBDOVECOT_STORAGE_DEPS='$(top_builddir)/src/lib-storage/libstorage.la'
   LIBDOVECOT_LOGIN='$(top_builddir)/src/login-common/liblogin.la'
   LIBDOVECOT_LDA='$(top_builddir)/src/lib-lda/liblda.la'
+  if test $want_lua != no; then
+    LIBDOVECOT_LUA='$(top_builddir)/src/lib-lua/libdlua.la'
+  fi
 fi
 if test $want_ldap != no; then
-  LIBDOVECOT_LDAP='$(top_builddir)/src/lib-ldap/libdovecot-ldap.la'
+  LIBDOVECOT_LDAP='$(top_builddir)/src/lib-ldap/libdldap.la'
 else
   LIBDOVECOT_LDAP=''
 fi
@@ -573,13 +613,10 @@ LIBDOVECOT_STORAGE="$LIBDOVECOT_STORAGE_DEPS"
 LIBDOVECOT_DSYNC='$(top_builddir)/src/doveadm/dsync/libdovecot-dsync.la'
 LIBDOVECOT_SQL='$(top_builddir)/src/lib-sql/libsql.la'
 LIBDOVECOT_COMPRESS='$(top_builddir)/src/lib-compression/libcompression.la'
-LIBDOVECOT_LIBFTS='$(top_builddir)/src/lib-fts/libfts.la'
+LIBDOVECOT_LIBLANG='$(top_builddir)/src/lib-language/libdovecot-language.la'
 
-if test $want_lua != no; then
-  LIBDOVECOT_LUA='$(top_builddir)/src/lib-lua/libdovecot-lua.la'
-else
-  LIBDOVECOT_LUA=''
-fi
+LIBDOVECOT_OPENSSL='$(top_builddir)/src/lib-ssl-iostream/libssl_iostream_openssl.la'
+LIBDOVECOT_OPENSSL_DEPS="$LIBDOVECOT_OPENSSL"
 
 AC_SUBST(LIBDOVECOT)
 AC_SUBST(LIBDOVECOT_LA_LIBS)
@@ -592,10 +629,12 @@ AC_SUBST(LIBDOVECOT_COMPRESS)
 AC_SUBST(LIBDOVECOT_DSYNC)
 AC_SUBST(LIBDOVECOT_LDA)
 AC_SUBST(LIBDOVECOT_LDAP)
-AC_SUBST(LIBDOVECOT_LIBFTS)
-AC_SUBST(LIBDOVECOT_LIBFTS_DEPS)
+AC_SUBST(LIBDOVECOT_LIBLANG)
+AC_SUBST(LIBDOVECOT_LIBLANG_DEPS)
 AC_SUBST(LIBDOVECOT_LUA)
 AC_SUBST(LIBDOVECOT_LUA_DEPS)
+AC_SUBST(LIBDOVECOT_OPENSSL)
+AC_SUBST(LIBDOVECOT_OPENSSL_DEPS)
 
 dnl **
 dnl ** SQL drivers
@@ -680,22 +719,46 @@ dnl **
 dnl ** Settings
 dnl **
 
-dnl get a list of setting .[ch] files, but list .h files first
-FILES1=`find $srcdir/src -name '*settings.[[ch]]'|grep "$srcdir/src/lib-" | sed 's/^\(.*\)\(.\)$/\2 \1\2/' | grep -E -v 'lib-(master|smtp|settings).*c$' | sort -r | sed s/^..//`
-FILES2=`find $srcdir/src -name '*settings.[[ch]]'|grep -v "$srcdir/src/lib-" | sed 's/^\(.*\)\(.\)$/\2 \1\2/' | grep -v all-settings | sort -r | sed s/^..//`
-SETTING_FILES=`echo $FILES1 $FILES2 | sed -e s,$srcdir/src,./src,g -e 's,./src,$(top_srcdir)/src,g'`
+libdovecot_dirs=`echo "$LIBDOVECOT_LA_LIBS" | $SED -e "s:\\$(top_builddir):$srcdir:g" -e 's:/[[^/]]*\\.la::g'`
+
+libdovecot_headers=
+libdovecot_c_files=
+non_libdovecot_headers=
+non_libdovecot_c_files=
+all_files=`find $srcdir/src -name '*.[[ch]]' | $GREP -v '/src/config/all-settings.c' | $GREP -v '/src/lib-settings/' | $GREP -v '/test-' | xargs $GREP -e 'struct setting_parser_info [[a-z]]' -e 'struct service_settings [[a-z]]' -e '<settings checks>' | $SED 's/:.*//' | sort | uniq`
+for file in $all_files; do
+  dir=`echo "$file" | $SED 's:/[[^/]]*$::'`
+  basefile=`basename $file`
+  if echo "$libdovecot_dirs" | $GREP "$dir" >/dev/null; then
+    dnl lib-dovecot
+    if echo "$file" | $GREP '\.h$' >/dev/null; then
+      libdovecot_headers="$libdovecot_headers $file"
+    else
+      libdovecot_c_files="$libdovecot_c_files $file"
+    fi
+  else
+    dnl not lib-dovecot
+    dnl ignore hibernation if not being built
+
+    if test "$BUILD_IMAP_HIBERNATE" = 0 && test "$basefile" = "imap-hibernate-settings.c"; then
+      continue
+    elif echo "$file" | $GREP '\.h$' >/dev/null; then
+      non_libdovecot_headers="$non_libdovecot_headers $file"
+    else
+      non_libdovecot_c_files="$non_libdovecot_c_files $file"
+    fi
+  fi
+done
+
+dnl libdovecot is linked to doveconf/config binaries, so don't duplicate the .c
+dnl file contents. However, we still need to scan the .c files for any
+dnl setting_parser_infos that aren't elsewhere.
+
+# list headers first, C files last
+SETTING_FILES=`echo $libdovecot_headers $non_libdovecot_headers $non_libdovecot_c_files | $SED -e s,$srcdir/src,./src,g -e 's,./src,$(top_srcdir)/src,g'`
+SETTING_LINKED_FILES=`echo $libdovecot_c_files | $SED -e s,$srcdir/src,./src,g -e 's,./src,$(top_srcdir)/src,g'`
 AC_SUBST(SETTING_FILES)
-
-dnl **
-dnl ** capabilities
-dnl **
-
-dnl IDLE doesn't really belong to banner. It's there just to make Blackberries
-dnl happy, because otherwise BIS server disables push email.
-capability_banner="IMAP4rev1 SASL-IR LOGIN-REFERRALS ID ENABLE IDLE"
-capability="$capability_banner SORT SORT=DISPLAY THREAD=REFERENCES THREAD=REFS THREAD=ORDEREDSUBJECT MULTIAPPEND URL-PARTIAL CATENATE UNSELECT CHILDREN NAMESPACE UIDPLUS LIST-EXTENDED I18NLEVEL=1 CONDSTORE QRESYNC ESEARCH ESORT SEARCHRES WITHIN CONTEXT=SEARCH LIST-STATUS BINARY MOVE SNIPPET=FUZZY PREVIEW=FUZZY PREVIEW STATUS=SIZE SAVEDATE COMPRESS=DEFLATE INPROGRESS"
-AC_DEFINE_UNQUOTED(CAPABILITY_STRING, "$capability", [IMAP capabilities])
-AC_DEFINE_UNQUOTED(CAPABILITY_BANNER_STRING, "$capability_banner", [IMAP capabilities advertised in banner])
+AC_SUBST(SETTING_LINKED_FILES)
 
 CFLAGS="$CFLAGS $EXTRA_CFLAGS"
 CXXFLAGS="$CXXFLAGS $EXTRA_CFLAGS"
@@ -731,8 +794,8 @@ AC_CONFIG_FILES([
 Makefile
 doc/Makefile
 doc/man/Makefile
-doc/example-config/Makefile
-doc/example-config/conf.d/Makefile
+doc/index.html
+doc/dovecot.conf
 src/Makefile
 src/lib/Makefile
 src/lib-sql/Makefile
@@ -745,9 +808,10 @@ src/lib-dict/Makefile
 src/lib-dict-backend/Makefile
 src/lib-dict-extra/Makefile
 src/lib-dns/Makefile
+src/lib-dns-client/Makefile
 src/lib-doveadm/Makefile
 src/lib-fs/Makefile
-src/lib-fts/Makefile
+src/lib-language/Makefile
 src/lib-http/Makefile
 src/lib-oauth2/Makefile
 src/lib-pop3/Makefile
@@ -756,6 +820,7 @@ src/lib-imap-storage/Makefile
 src/lib-imap-client/Makefile
 src/lib-imap-urlauth/Makefile
 src/lib-index/Makefile
+src/lib-json/Makefile
 src/lib-lda/Makefile
 src/lib-ldap/Makefile
 src/lib-lua/Makefile
@@ -782,6 +847,8 @@ src/lib-storage/index/dbox-multi/Makefile
 src/lib-storage/index/dbox-single/Makefile
 src/lib-storage/index/raw/Makefile
 src/lib-storage/index/shared/Makefile
+src/lib-var-expand/Makefile
+src/lib-var-expand-crypt/Makefile
 src/anvil/Makefile
 src/auth/Makefile
 src/config/Makefile
@@ -815,7 +882,6 @@ src/plugins/fts-flatcurve/Makefile
 src/plugins/fts-solr/Makefile
 src/plugins/last-login/Makefile
 src/plugins/lazy-expunge/Makefile
-src/plugins/listescape/Makefile
 src/plugins/mail-log/Makefile
 src/plugins/mail-lua/Makefile
 src/plugins/notify/Makefile
@@ -830,7 +896,6 @@ src/plugins/virtual/Makefile
 src/plugins/welcome/Makefile
 src/plugins/mail-compress/Makefile
 src/plugins/mail-crypt/Makefile
-src/plugins/var-expand-crypt/Makefile
 src/plugins/apparmor/Makefile
 src/plugins/charset-alias/Makefile
 stamp.h
@@ -843,10 +908,10 @@ if test "$want_sql" = "plugin"; then
   sql_drivers="$sql_drivers (plugins)"
 fi
 
-not_passdb=`echo "$not_passdb"|sed 's/ / -/g'`
-not_userdb=`echo "$not_userdb"|sed 's/ / -/g'`
-not_sql_drivers=`echo "$not_sql_drivers"|sed 's/ / -/g'`
-not_fts=`echo "$not_fts"|sed 's/ / -/g'`
+not_passdb=`echo "$not_passdb"| $SED 's/ / -/g'`
+not_userdb=`echo "$not_userdb"| $SED 's/ / -/g'`
+not_sql_drivers=`echo "$not_sql_drivers"| $SED 's/ / -/g'`
+not_fts=`echo "$not_fts"| $SED 's/ / -/g'`
 
 echo
 echo "Install prefix . : $prefix"

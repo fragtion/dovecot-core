@@ -4,6 +4,12 @@
 #include "ioloop.h"
 #include "event-filter-private.h"
 
+#ifdef __FreeBSD__
+#  define NET_LOOPBACK "lo0"
+#else
+#  define NET_LOOPBACK "lo"
+#endif
+
 static void test_event_filter_strings(void)
 {
 	struct event_filter *filter;
@@ -19,6 +25,8 @@ static void test_event_filter_strings(void)
 
 	struct event *e2 = event_create(NULL);
 	event_add_str(e2, "str", "hello *world");
+
+	error = NULL;
 
 	/* "quoting" works with \escaping */
 	filter = event_filter_create();
@@ -68,7 +76,7 @@ static void test_event_filter_override_parent_fields(void)
 	event_add_str(child, "child_str", "child_str");
 	event_add_int(child, "int1", 6);
 	event_add_int(child, "int2", 0);
-	event_add_int(child, "child_int", 8);
+	event_add_int(child, "child_int", -8);
 
 	/* parent matches: test a mix of parent/child fields */
 	filter = event_filter_create();
@@ -93,7 +101,7 @@ static void test_event_filter_override_parent_fields(void)
 
 	/* child matches: test fields that exist only in child */
 	filter = event_filter_create();
-	test_assert(event_filter_parse("child_str=child_str AND child_int=8", filter, &error) == 0);
+	test_assert(event_filter_parse("child_str=child_str AND child_int=-8", filter, &error) == 0);
 	test_assert(event_filter_match(filter, child, &failure_ctx));
 	test_assert(!event_filter_match(filter, parent, &failure_ctx));
 	event_filter_unref(&filter);
@@ -345,7 +353,7 @@ static void test_event_filter_strlist(void)
 
 	filter = event_filter_create();
 	/* should match empty list */
-	event_filter_parse("abc=\"\"", filter, NULL);
+	test_assert(event_filter_parse("abc=\"\"", filter, NULL) == 0);
 	test_assert(event_filter_match(filter, e, &failure_ctx));
 	/* should still be empty */
 	event_strlist_append(e, "abc", NULL);
@@ -359,18 +367,18 @@ static void test_event_filter_strlist(void)
 	/* should match non-empty list that has value 'one' */
 	filter = event_filter_create();
 	event_strlist_append(e, "abc", "two");
-	event_filter_parse("abc=one", filter, NULL);
+	test_assert(event_filter_parse("abc=one", filter, NULL) == 0);
 	test_assert(event_filter_match(filter, e, &failure_ctx));
 	event_filter_unref(&filter);
 
 	/* should match non-empty list that has no value 'three' */
 	filter = event_filter_create();
-	event_filter_parse("abc=one AND NOT abc=three", filter, NULL);
+	test_assert(event_filter_parse("abc=one AND NOT abc=three", filter, NULL) == 0);
 	test_assert(event_filter_match(filter, e, &failure_ctx));
 	event_filter_unref(&filter);
 
 	filter = event_filter_create();
-	event_filter_parse("abc>one", filter, NULL);
+	test_assert(event_filter_parse("abc>one", filter, NULL) == 0);
 	test_expect_error_string("Event filter for string list field 'abc' only "
 				 "supports equality operation '=' not '>'.");
 	test_assert(!event_filter_match(filter, e, &failure_ctx));
@@ -395,7 +403,7 @@ static void test_event_filter_strlist_recursive(void)
 
 	/* empty filter: parent is non-empty */
 	filter = event_filter_create();
-	event_filter_parse("list1=\"\"", filter, NULL);
+	test_assert(event_filter_parse("list1=\"\"", filter, NULL) == 0);
 	test_assert(event_filter_match(filter, e, &failure_ctx));
 	event_strlist_append(parent, "list1", "foo");
 	test_assert(!event_filter_match(filter, e, &failure_ctx));
@@ -403,7 +411,7 @@ static void test_event_filter_strlist_recursive(void)
 
 	/* matching filter: matches parent */
 	filter = event_filter_create();
-	event_filter_parse("list2=parent", filter, NULL);
+	test_assert(event_filter_parse("list2=parent", filter, NULL) == 0);
 	/* empty: */
 	test_assert(!event_filter_match(filter, e, &failure_ctx));
 	/* set parent but no child: */
@@ -416,7 +424,7 @@ static void test_event_filter_strlist_recursive(void)
 
 	/* matching filter: matches child */
 	filter = event_filter_create();
-	event_filter_parse("list3=child", filter, NULL);
+	test_assert(event_filter_parse("list3=child", filter, NULL) == 0);
 	/* empty: */
 	test_assert(!event_filter_match(filter, e, &failure_ctx));
 	/* set child but no parent: */
@@ -448,7 +456,7 @@ static void test_event_filter_strlist_global_events(void)
 
 	/* empty filter: global is non-empty */
 	filter = event_filter_create();
-	event_filter_parse("list1=\"\"", filter, NULL);
+	test_assert(event_filter_parse("list1=\"\"", filter, NULL) == 0);
 	test_assert(event_filter_match(filter, e, &failure_ctx));
 	event_strlist_append(global, "list1", "foo");
 	test_assert(!event_filter_match(filter, e, &failure_ctx));
@@ -456,7 +464,7 @@ static void test_event_filter_strlist_global_events(void)
 
 	/* matching filter: matches global */
 	filter = event_filter_create();
-	event_filter_parse("list2=global", filter, NULL);
+	test_assert(event_filter_parse("list2=global", filter, NULL) == 0);
 	/* empty: */
 	test_assert(!event_filter_match(filter, e, &failure_ctx));
 	/* set global but no local: */
@@ -469,7 +477,7 @@ static void test_event_filter_strlist_global_events(void)
 
 	/* matching filter: matches local */
 	filter = event_filter_create();
-	event_filter_parse("list3=local", filter, NULL);
+	test_assert(event_filter_parse("list3=local", filter, NULL) == 0);
 	/* empty: */
 	test_assert(!event_filter_match(filter, e, &failure_ctx));
 	/* set local but no global: */
@@ -846,7 +854,8 @@ static void test_event_filter_ips(void)
 		{ "ip = 2001:1190:c02a:130:a87a:ad7:5b76:3310",
 		  test_addr2ip("2000:1190:c02a:130:a87a:ad7:5b76:3310"), FALSE },
 
-		{ "ip = fe80::1%lo", test_addr2ip("fe80::1%lo"), TRUE },
+		{ t_strdup_printf("ip = %s", "fe80::1%"NET_LOOPBACK),
+		  test_addr2ip("fe80::1%"NET_LOOPBACK), TRUE },
 	};
 	for (unsigned int i = 0; i < N_ELEMENTS(tests); i++) {
 		filter = event_filter_create();

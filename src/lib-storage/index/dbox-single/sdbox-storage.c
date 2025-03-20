@@ -11,6 +11,7 @@
 #include "dbox-save.h"
 #include "sdbox-file.h"
 #include "sdbox-sync.h"
+#include "sdbox-settings.h"
 #include "sdbox-storage.h"
 
 extern struct mail_storage dbox_storage, sdbox_storage;
@@ -48,8 +49,8 @@ static int sdbox_storage_create(struct mail_storage *_storage,
 	if (storage->attachment_fs != NULL) {
 		props = fs_get_properties(storage->attachment_fs);
 		if ((props & FS_PROPERTY_RENAME) == 0) {
-			*error_r = "mail_attachment_fs: "
-				"Backend doesn't support renaming";
+			*error_r = "mail_ext_attachment: "
+				"FS driver doesn't support renaming";
 			return -1;
 		}
 	}
@@ -65,7 +66,7 @@ sdbox_storage_find_root_dir(const struct mail_namespace *ns)
 	if (ns->owner != NULL &&
 	    mail_user_get_home(ns->owner, &home) > 0) {
 		path = t_strconcat(home, "/sdbox", NULL);
-		if (access(path, R_OK|W_OK|X_OK) == 0) {
+		if (i_faccessat2(AT_FDCWD, path, R_OK | W_OK | X_OK, AT_EACCESS) == 0) {
 			e_debug(event,
 				"sdbox autodetect: root exists (%s)", path);
 			return path;
@@ -76,15 +77,18 @@ sdbox_storage_find_root_dir(const struct mail_namespace *ns)
 	return NULL;
 }
 
-static bool sdbox_storage_autodetect(const struct mail_namespace *ns,
-				     struct mailbox_list_settings *set)
+static bool
+sdbox_storage_autodetect(const struct mail_namespace *ns,
+			 const struct mail_storage_settings *mail_set,
+			 const char **root_path_r,
+			 const char **inbox_path_r ATTR_UNUSED)
 {
 	struct event *event = ns->user->event;
 	struct stat st;
 	const char *path, *root_dir;
 
-	if (set->root_dir != NULL)
-		root_dir = set->root_dir;
+	if (mail_set->mail_path[0] != '\0')
+		root_dir = mail_set->mail_path;
 	else {
 		root_dir = sdbox_storage_find_root_dir(ns);
 		if (root_dir == NULL) {
@@ -107,8 +111,7 @@ static bool sdbox_storage_autodetect(const struct mail_namespace *ns,
 		return FALSE;
 	}
 
-	set->root_dir = root_dir;
-	dbox_storage_get_list_settings(ns, set);
+	*root_path_r = root_dir;
 	return TRUE;
 }
 
@@ -291,12 +294,13 @@ sdbox_get_attachment_path_suffix(struct dbox_file *_file)
 			file->uid);
 }
 
-void sdbox_set_mailbox_corrupted(struct mailbox *box)
+void sdbox_set_mailbox_corrupted(struct mailbox *box, const char *reason)
 {
 	struct sdbox_mailbox *mbox = SDBOX_MAILBOX(box);
 	struct sdbox_index_header hdr;
 	bool need_resize;
 
+	mailbox_set_critical(box, "%s", reason);
 	if (sdbox_read_header(mbox, &hdr, TRUE, &need_resize) < 0 ||
 	    hdr.rebuild_count == 0)
 		mbox->corrupted_rebuild_count = 1;
@@ -304,8 +308,10 @@ void sdbox_set_mailbox_corrupted(struct mailbox *box)
 		mbox->corrupted_rebuild_count = hdr.rebuild_count;
 }
 
-static void sdbox_set_file_corrupted(struct dbox_file *_file)
+static void sdbox_set_file_corrupted(struct dbox_file *_file,
+				     const char *reason)
 {
+	mail_storage_set_critical(&_file->storage->storage, "%s", reason);
 	(void)dbox_file_fix(_file, 0);
 }
 
@@ -348,8 +354,9 @@ static int sdbox_mailbox_open(struct mailbox *box)
 		return 0;
 	}
 
-	if (box->list->set.index_dir != NULL && existence_ret == 0) {
-		/* If there is an separate INDEX directory configured but no
+	if (box->list->mail_set->mail_index_path[0] != '\0' &&
+	    existence_ret == 0) {
+		/* If there is an separate mail_index_path configured but no
 		   index files found for this mailbox, do an index rebuild */
 		if (sdbox_sync(mbox, SDBOX_SYNC_FLAG_FORCE_REBUILD) < 0)
 			return -1;
@@ -447,12 +454,10 @@ struct mail_storage sdbox_storage = {
 	.event_category = &event_category_sdbox,
 
 	.v = {
-                NULL,
 		sdbox_storage_alloc,
 		sdbox_storage_create,
 		dbox_storage_destroy,
 		NULL,
-		dbox_storage_get_list_settings,
 		sdbox_storage_autodetect,
 		sdbox_mailbox_alloc,
 		NULL,
@@ -464,14 +469,13 @@ struct mail_storage dbox_storage = {
 	.name = "dbox", /* alias */
 	.class_flags = MAIL_STORAGE_CLASS_FLAG_FILE_PER_MSG,
 	.event_category = &event_category_sdbox,
+	.set_info = &sdbox_setting_parser_info,
 
 	.v = {
-		NULL,
 		sdbox_storage_alloc,
 		sdbox_storage_create,
 		dbox_storage_destroy,
 		NULL,
-		dbox_storage_get_list_settings,
 		sdbox_storage_autodetect,
 		sdbox_mailbox_alloc,
 		NULL,

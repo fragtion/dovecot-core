@@ -9,12 +9,14 @@
 #include "strescape.h"
 #include "time-util.h"
 #include "str-parse.h"
+#include "settings-parser.h"
 #include "mail-user.h"
 #include "mail-storage-private.h"
 #include "fts-api.h"
 #include "fts-storage.h"
 #include "fts-indexer.h"
-#include "fts-indexer-status.h"
+#include "lang-indexer-status.h"
+#include "fts-user.h"
 
 #define INDEXER_SOCKET_NAME "indexer"
 #define INDEXER_WAIT_MSECS 250
@@ -31,6 +33,7 @@ struct fts_indexer_context {
 
 	bool notified:1;
 	bool failed:1;
+	bool started:1;
 	bool completed:1;
 };
 
@@ -95,6 +98,7 @@ int fts_indexer_more(struct fts_indexer_context *ctx)
 {
 	int ret;
 
+	ctx->started = TRUE;
 	if ((ret = fts_indexer_more_int(ctx)) < 0) {
 		/* If failed is already set, the code has had a chance to
 		 * set an internal error already, i.e. MAIL_ERROR_INUSE. */
@@ -115,7 +119,7 @@ static void fts_indexer_destroy(struct connection *conn)
 	struct fts_indexer_context *ctx =
 		container_of(conn, struct fts_indexer_context, conn);
 	connection_deinit(conn);
-	if (!ctx->completed)
+	if (ctx->started && !ctx->completed)
 		ctx->failed = TRUE;
 	ctx->completed = TRUE;
 }
@@ -125,7 +129,7 @@ int fts_indexer_deinit(struct fts_indexer_context **_ctx)
 	struct fts_indexer_context *ctx = *_ctx;
 	i_assert(ctx != NULL);
 	*_ctx = NULL;
-	if (!ctx->completed)
+	if (ctx->started && !ctx->completed)
 		ctx->failed = TRUE;
 	int ret = ctx->failed ? -1 : 0;
 	if (ctx->notified) {
@@ -206,7 +210,7 @@ static void fts_indexer_client_connected(struct connection *conn, bool success)
 		ctx->failed = TRUE;
 		return;
 	}
-	ctx->failed = ctx->completed = FALSE;
+	ctx->failed = ctx->started = ctx->completed = FALSE;
 	const char *cmd = t_strdup_printf("PREPEND\t1\t%s\t%s\t0\t%s\n",
 			      str_tabescape(ctx->box->storage->user->username),
 			      str_tabescape(ctx->box->vname),
@@ -247,23 +251,12 @@ static const struct connection_vfuncs indexer_client_vfuncs =
 int fts_indexer_init(struct fts_backend *backend, struct mailbox *box,
 		     struct fts_indexer_context **ctx_r)
 {
+	const struct fts_settings *fset = fts_mailbox_get_settings(box);
 	struct ioloop *prev_ioloop = current_ioloop;
 	struct fts_indexer_context *ctx;
 	uint32_t last_uid, seq1, seq2;
-	const char *path, *value, *error;
-	unsigned int timeout_secs = 0;
+	const char *path;
 	int ret;
-
-	value = mail_user_plugin_getenv(box->storage->user, "fts_index_timeout");
-	if (value != NULL) {
-		if (str_parse_get_interval(value, &timeout_secs, &error) < 0) {
-			e_error(box->storage->user->event,
-				"Invalid fts_index_timeout setting: %s",
-				error);
-			return -1;
-		}
-	}
-
 	ret = fts_search_get_first_missing_uid(backend, box, &last_uid);
 	if (ret < 0)
 		return -1;
@@ -288,7 +281,9 @@ int fts_indexer_init(struct fts_backend *backend, struct mailbox *box,
 	ctx->ioloop = io_loop_create();
 	ctx->connection_list = connection_list_init(&indexer_client_set,
 						    &indexer_client_vfuncs);
-	ctx->conn.input_idle_timeout_secs = timeout_secs;
+	ctx->conn.input_idle_timeout_secs =
+		fset->search_timeout == SET_TIME_INFINITE ? 0 :
+		fset->search_timeout;
 	connection_init_client_unix(ctx->connection_list, &ctx->conn,
 				    path);
 	ret = connection_client_connect(&ctx->conn);

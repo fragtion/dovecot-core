@@ -12,26 +12,23 @@
 
 static const struct setting_define quota_status_setting_defines[] = {
 	DEF(STR, recipient_delimiter),
+	DEF(STR, quota_status_nouser),
 
 	SETTING_DEFINE_LIST_END
 };
 
 static const struct quota_status_settings quota_status_default_settings = {
 	.recipient_delimiter = "+",
-};
-
-static const struct setting_parser_info *quota_status_setting_dependencies[] = {
-	NULL
+	.quota_status_nouser = "REJECT Unknown user",
 };
 
 const struct setting_parser_info quota_status_setting_parser_info = {
-	.module_name = "mail",
+	.name = "quota_status",
+	.plugin_dependency = "lib10_quota_plugin",
+
 	.defines = quota_status_setting_defines,
 	.defaults = &quota_status_default_settings,
 
-	.type_offset = SIZE_MAX,
 	.struct_size = sizeof(struct quota_status_settings),
-
-	.parent_offset = SIZE_MAX,
-	.dependencies = quota_status_setting_dependencies
+	.pool_offset1 = 1 + offsetof(struct quota_status_settings, pool),
 };

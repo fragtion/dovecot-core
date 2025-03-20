@@ -12,7 +12,7 @@
 
 struct flatcurve_fts_backend {
 	struct fts_backend backend;
-	string_t *boxname, *db_path;
+	string_t *boxname, *db_path, *volatile_dir;
 
 	struct event *event;
 
@@ -46,12 +46,11 @@ struct flatcurve_fts_query {
 	struct flatcurve_fts_query_xapian *xapian;
 
 	pool_t pool;
-
-	bool maybe:1;
 };
 
 struct flatcurve_fts_result {
 	ARRAY_TYPE(fts_score_map) scores;
+	ARRAY_TYPE(seq_range) maybe_uids;
 	ARRAY_TYPE(seq_range) uids;
 };
 

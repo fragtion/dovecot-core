@@ -19,7 +19,7 @@ YACC=/bin/false
 # of lex and yacc (or bison in yacc-compatibility mode).  Both flex and
 # bison can handle properly naming the generated files, and it is simpler
 # and cleaner to make this rule ourselves instead of working around ylwrap
-# and yywrap's antiquated notion of what is hapenning.
+# and yywrap's antiquated notion of what is happening.
 .l.c:
 	$(AM_V_GEN)$(FLEX) -o $@ $<
 
@@ -50,6 +50,7 @@ liblib_la_SOURCES = \
 	buffer-istream.c \
 	child-wait.c \
 	connection.c \
+	cpu-count.c \
 	cpu-limit.c \
 	crc32.c \
 	data-stack.c \
@@ -101,7 +102,6 @@ liblib_la_SOURCES = \
 	istream-failure-at.c \
 	istream-file.c \
 	istream-hash.c \
-	istream-jsonstr.c \
 	istream-limit.c \
 	istream-multiplex.c \
 	istream-nonuls.c \
@@ -123,8 +123,6 @@ liblib_la_SOURCES = \
 	ioloop-select.c \
 	ioloop-epoll.c \
 	ioloop-kqueue.c \
-	json-parser.c \
-	json-tree.c \
 	lib.c \
 	lib-event.c \
 	lib-signals.c \
@@ -136,6 +134,7 @@ liblib_la_SOURCES = \
 	mempool-allocfree.c \
 	mempool-alloconly.c \
 	mempool-datastack.c \
+	mempool-null.c \
 	mempool-system.c \
 	mempool-unsafe-datastack.c \
 	mkdir-parents.c \
@@ -163,6 +162,7 @@ liblib_la_SOURCES = \
 	process-stat.c \
 	process-title.c \
 	priorityq.c \
+	punycode.c \
 	randgen.c \
 	rand.c \
 	read-full.c \
@@ -196,8 +196,6 @@ liblib_la_SOURCES = \
 	uri-util.c \
 	utc-offset.c \
 	utc-mktime.c \
-	var-expand.c \
-	var-expand-if.c \
 	wildcard-match.c \
 	write-full.c
 
@@ -216,9 +214,11 @@ headers = \
 	child-wait.h \
 	compat.h \
 	connection.h \
+	cpu-count.h \
 	cpu-limit.h \
 	crc32.h \
 	data-stack.h \
+	doc.h \
 	eacces-error.h \
 	env-util.h \
 	event-filter.h \
@@ -254,6 +254,7 @@ headers = \
 	imem.h \
 	ipwd.h \
 	iostream.h \
+	iostream-multiplex-private.h \
 	iostream-private.h \
 	iostream-pump.h \
 	iostream-proxy.h \
@@ -270,7 +271,6 @@ headers = \
 	istream-failure-at.h \
 	istream-file-private.h \
 	istream-hash.h \
-	istream-jsonstr.h \
 	istream-multiplex.h \
 	istream-nonuls.h \
 	istream-private.h \
@@ -285,8 +285,6 @@ headers = \
 	ioloop-iolist.h \
 	ioloop-private.h \
 	ioloop-notify-fd.h \
-	json-parser.h \
-	json-tree.h \
 	lib.h \
 	lib-event.h \
 	lib-event-private.h \
@@ -324,6 +322,7 @@ headers = \
 	process-stat.h \
 	process-title.h \
 	priorityq.h \
+	punycode.h \
 	randgen.h \
 	read-full.h \
 	restrict-access.h \
@@ -357,8 +356,6 @@ headers = \
 	uri-util.h \
 	utc-offset.h \
 	utc-mktime.h \
-	var-expand.h \
-	var-expand-private.h \
 	wildcard-match.h \
 	write-full.h
 
@@ -419,7 +416,6 @@ test_lib_SOURCES = \
 	test-istream-concat.c \
 	test-istream-crlf.c \
 	test-istream-failure-at.c \
-	test-istream-jsonstr.c \
 	test-istream-multiplex.c \
 	test-istream-noop.c \
 	test-istream-seekable.c \
@@ -427,8 +423,6 @@ test_lib_SOURCES = \
 	test-istream-tee.c \
 	test-istream-try.c \
 	test-istream-unix.c \
-	test-json-parser.c \
-	test-json-tree.c \
 	test-lib-event.c \
 	test-lib-signals.c \
 	test-llist.c \
@@ -451,6 +445,7 @@ test_lib_SOURCES = \
 	test-primes.c \
 	test-printf-format-fix.c \
 	test-priorityq.c \
+	test-punycode.c \
 	test-random.c \
 	test-seq-range-array.c \
 	test-seq-set-builder.c \
@@ -467,7 +462,6 @@ test_lib_SOURCES = \
 	test-unichar.c \
 	test-utc-mktime.c \
 	test-uri.c \
-	test-var-expand.c \
 	test-wildcard-match.c
 
 test_headers = \

@@ -4,7 +4,7 @@
 /* Major version changes are not backwards compatible,
    minor version numbers can be ignored. */
 #define AUTH_CLIENT_PROTOCOL_MAJOR_VERSION 1
-#define AUTH_CLIENT_PROTOCOL_MINOR_VERSION 2
+#define AUTH_CLIENT_PROTOCOL_MINOR_VERSION 3
 
 /* GSSAPI can use quite large packets */
 #define AUTH_CLIENT_MAX_LINE_LENGTH 16384
@@ -26,6 +26,8 @@ enum mech_security_flags {
 	MECH_SEC_MUTUAL_AUTH		= 0x0040,
 	/* Allow NULs in input data */
 	MECH_SEC_ALLOW_NULS		= 0x0080,
+	/* Requires channel binding */
+	MECH_SEC_CHANNEL_BINDING        = 0x0100,
 };
 
 /* auth failure codes */

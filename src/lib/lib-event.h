@@ -10,6 +10,7 @@
 
 struct event;
 struct event_log_params;
+struct event_category_iterator;
 
 /* Hierarchical category of events. Each event can belong to multiple
    categories. For example [ lib-storage/maildir, syscall/io ]. The categories
@@ -40,12 +41,14 @@ enum event_field_value_type {
 struct event_field {
 	const char *key;
 	enum event_field_value_type value_type;
-	struct {
+	union {
 		const char *str;
 		intmax_t intmax;
 		struct timeval timeval;
-		struct ip_addr ip;
-		unsigned int ip_bits; /* set for event filters */
+		struct {
+			struct ip_addr ip;
+			unsigned int ip_bits; /* set for event filters */
+		};
 		ARRAY_TYPE(const_string) strlist;
 	} value;
 };
@@ -390,6 +393,8 @@ void event_field_clear(struct event *event, const char *key);
 
 /* Returns the parent event, or NULL if it doesn't exist. */
 struct event *event_get_parent(const struct event *event);
+/* Returns the memory pool used by the event. */
+pool_t event_get_pool(const struct event *event);
 /* Get the event's creation time. */
 void event_get_create_time(const struct event *event, struct timeval *tv_r);
 /* Get the time when the event was last sent. Returns TRUE if time was
@@ -420,6 +425,20 @@ event_get_fields(const struct event *event, unsigned int *count_r);
    Parent events' categories aren't returned. */
 struct event_category *const *
 event_get_categories(const struct event *event, unsigned int *count_r);
+
+/* Iterator for scanning through all categories of the event, including the
+   parents and higher ancestry of the categories directly associated with this
+   event. Note that this does not include the categories of any parent event. To
+   avoid useless allocation of an iterator, the event_categories_iterate_init()
+   function returns NULL if no categories are associated with this event. The
+   event_categories_iterate() and event_categories_iterate_deinit() functions
+   safely handle this NULL iterator.
+ */
+struct event_category_iterator *
+event_categories_iterate_init(const struct event *event);
+bool event_categories_iterate(struct event_category_iterator *iter,
+			      const struct event_category **cat_r);
+void event_categories_iterate_deinit(struct event_category_iterator **_iter);
 
 /* Export the event into a tabescaped string, so its fields are separated
    with TABs and there are no NUL, CR or LF characters. */

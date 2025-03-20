@@ -10,25 +10,22 @@
 #include "all-settings.h"
 #include "config-parser.h"
 #include "config-request.h"
+#include "config-filter.h"
 #include "old-set-parser.h"
 
 struct config_export_context {
 	pool_t pool;
 	string_t *value;
-	string_t *prefix;
-	HASH_TABLE(char *, char *) keys;
+	HASH_TABLE(const char *, const char *) keys;
 	enum config_dump_scope scope;
+	const char *dovecot_config_version;
+	const char *path_prefix;
 
 	config_request_callback_t *callback;
 	void *context;
 
 	enum config_dump_flags flags;
-	const struct config_module_parser *parsers;
-	struct config_module_parser *dup_parsers;
-	struct master_service_settings_output output;
-	unsigned int section_idx;
-
-	bool failed;
+	const struct config_module_parser *module_parsers;
 };
 
 static void config_export_size(string_t *str, uoff_t size)
@@ -39,6 +36,10 @@ static void config_export_size(string_t *str, uoff_t size)
 
 	if (size == 0) {
 		str_append_c(str, '0');
+		return;
+	}
+	if (size == SET_SIZE_UNLIMITED) {
+		str_append(str, SET_VALUE_UNLIMITED);
 		return;
 	}
 	for (i = 1; i < N_ELEMENTS(suffixes) && (size % 1024) == 0; i++) {
@@ -54,6 +55,10 @@ static void config_export_time(string_t *str, unsigned int stamp)
 
 	if (stamp == 0) {
 		str_append_c(str, '0');
+		return;
+	}
+	if (stamp == SET_TIME_INFINITE) {
+		str_append(str, SET_VALUE_INFINITE);
 		return;
 	}
 
@@ -79,106 +84,72 @@ static void config_export_time(string_t *str, unsigned int stamp)
 
 static void config_export_time_msecs(string_t *str, unsigned int stamp_msecs)
 {
-	if ((stamp_msecs % 1000) == 0)
+	if (stamp_msecs == SET_TIME_MSECS_INFINITE)
+		str_append(str, SET_VALUE_INFINITE);
+	else if ((stamp_msecs % 1000) == 0)
 		config_export_time(str, stamp_msecs/1000);
 	else
 		str_printfa(str, "%u ms", stamp_msecs);
 }
 
 bool config_export_type(string_t *str, const void *value,
-			const void *default_value,
-			enum setting_type type, bool dump_default,
-			bool *dump_r)
+			enum setting_type type)
 {
 	switch (type) {
 	case SET_BOOL: {
-		const bool *val = value, *dval = default_value;
+		const bool *val = value;
 
-		if (dump_default || dval == NULL || *val != *dval)
-			str_append(str, *val ? "yes" : "no");
+		str_append(str, *val ? "yes" : "no");
 		break;
 	}
 	case SET_SIZE: {
-		const uoff_t *val = value, *dval = default_value;
+		const uoff_t *val = value;
 
-		if (dump_default || dval == NULL || *val != *dval)
-			config_export_size(str, *val);
+		config_export_size(str, *val);
+		break;
+	}
+	case SET_UINTMAX: {
+		const uint64_t *val = value;
+		str_printfa(str, "%ju", *val);
 		break;
 	}
 	case SET_UINT:
-	case SET_UINT_OCT:
-	case SET_TIME:
-	case SET_TIME_MSECS: {
-		const unsigned int *val = value, *dval = default_value;
-
-		if (dump_default || dval == NULL || *val != *dval) {
-			switch (type) {
-			case SET_UINT_OCT:
-				str_printfa(str, "0%o", *val);
-				break;
-			case SET_TIME:
-				config_export_time(str, *val);
-				break;
-			case SET_TIME_MSECS:
-				config_export_time_msecs(str, *val);
-				break;
-			default:
-				str_printfa(str, "%u", *val);
-				break;
-			}
+	case SET_UINT_OCT: {
+		const unsigned int *val = value;
+		if (*val == SET_UINT_UNLIMITED) {
+			str_append(str, SET_VALUE_UNLIMITED);
+			break;
 		}
-		break;
-	}
-	case SET_IN_PORT: {
-		const in_port_t *val = value, *dval = default_value;
-
-		if (dump_default || dval == NULL || *val != *dval)
+		if (type == SET_UINT_OCT)
+			str_printfa(str, "0%o", *val);
+		else
 			str_printfa(str, "%u", *val);
 		break;
 	}
-	case SET_STR_VARS: {
-		const char *const *val = value, *sval;
-		const char *const *_dval = default_value;
-		const char *dval = _dval == NULL ? NULL : *_dval;
+	case SET_TIME:
+	case SET_TIME_MSECS: {
+		const unsigned int *val = value;
 
-		i_assert(*val == NULL ||
-			 **val == SETTING_STRVAR_UNEXPANDED[0]);
-
-		sval = *val == NULL ? NULL : (*val + 1);
-		if ((dump_default || null_strcmp(sval, dval) != 0) &&
-		    sval != NULL) {
-			str_append(str, sval);
-			*dump_r = TRUE;
-		}
+		if (type == SET_TIME)
+			config_export_time(str, *val);
+		else
+			config_export_time_msecs(str, *val);
 		break;
 	}
-	case SET_STR: {
-		const char *const *val = value;
-		const char *const *_dval = default_value;
-		const char *dval = _dval == NULL ? NULL : *_dval;
+	case SET_IN_PORT: {
+		const in_port_t *val = value;
 
-		if ((dump_default || null_strcmp(*val, dval) != 0) &&
-		    *val != NULL) {
-			str_append(str, *val);
-			*dump_r = TRUE;
-		}
+		str_printfa(str, "%u", *val);
 		break;
 	}
+	case SET_STR:
+	case SET_STR_NOVARS:
+	case SET_FILE:
 	case SET_ENUM: {
 		const char *const *val = value;
-		size_t len = strlen(*val);
 
-		if (dump_default)
+		if (*val != NULL)
 			str_append(str, *val);
-		else {
-			const char *const *_dval = default_value;
-			const char *dval = _dval == NULL ? NULL : *_dval;
-
-			i_assert(dval != NULL);
-			if (strncmp(*val, dval, len) != 0 ||
-			    ((*val)[len] != ':' && (*val)[len] != '\0'))
-				str_append(str, *val);
-		}
 		break;
 	}
 	default:
@@ -188,50 +159,21 @@ bool config_export_type(string_t *str, const void *value,
 }
 
 static void
-setting_export_section_name(string_t *str, const struct setting_define *def,
-			    const void *set, unsigned int idx)
-{
-	const char *const *name;
-	size_t name_offset;
-
-	if (def->type != SET_DEFLIST_UNIQUE) {
-		/* not unique, use the index */
-		str_printfa(str, "%u", idx);
-		return;
-	}
-	name_offset = def->list_info->type_offset;
-	i_assert(name_offset != SIZE_MAX);
-
-	name = CONST_PTR_OFFSET(set, name_offset);
-	if (*name == NULL || **name == '\0') {
-		/* no name, this one isn't unique. use the index. */
-		str_printfa(str, "%u", idx);
-	} else T_BEGIN {
-		str_append(str, settings_section_escape(*name));
-	} T_END;
-}
-
-static void
 settings_export(struct config_export_context *ctx,
-		const struct setting_parser_info *info,
-		bool parent_unique_deflist,
-		const void *set, const void *change_set)
+		const struct config_module_parser *module_parser)
 {
-	const struct setting_define *def;
-	const void *value, *default_value, *change_value;
-	void *const *children, *const *change_children = NULL;
-	unsigned int i, count, count2;
-	size_t prefix_len;
-	const char *str;
-	char *key;
+	const struct setting_parser_info *info = module_parser->info;
+	uint8_t change_value;
+	unsigned int i, count, define_idx;
 	bool dump, dump_default = FALSE;
 
-	for (def = info->defines; def->key != NULL; def++) {
-		value = CONST_PTR_OFFSET(set, def->offset);
-		default_value = info->defaults == NULL ? NULL :
-			CONST_PTR_OFFSET(info->defaults, def->offset);
-		change_value = CONST_PTR_OFFSET(change_set, def->offset);
+	for (define_idx = 0; info->defines[define_idx].key != NULL; define_idx++) {
+		const struct setting_define *def = &info->defines[define_idx];
+
+		change_value = module_parser->change_counters[define_idx];
 		switch (ctx->scope) {
+		case CONFIG_DUMP_SCOPE_DEFAULT:
+			i_unreached();
 		case CONFIG_DUMP_SCOPE_ALL_WITH_HIDDEN:
 			dump_default = TRUE;
 			break;
@@ -244,147 +186,218 @@ settings_export(struct config_export_context *ctx,
 			/* hidden - dump default only if it's explicitly set */
 			/* fall through */
 		case CONFIG_DUMP_SCOPE_SET:
-			dump_default = *((const char *)change_value) != 0;
+			if (change_value < CONFIG_PARSER_CHANGE_EXPLICIT) {
+				/* setting is unchanged in config file */
+				continue;
+			}
+			dump_default = TRUE;
+			break;
+		case CONFIG_DUMP_SCOPE_SET_AND_DEFAULT_OVERRIDES:
+			if (change_value == 0) {
+				/* setting is completely unchanged */
+				continue;
+			}
+			dump_default = TRUE;
 			break;
 		case CONFIG_DUMP_SCOPE_CHANGED:
+			if (change_value < CONFIG_PARSER_CHANGE_EXPLICIT) {
+				/* setting is unchanged in config file */
+				continue;
+			}
 			dump_default = FALSE;
 			break;
 		}
-		if (!parent_unique_deflist ||
-		    (ctx->flags & CONFIG_DUMP_FLAG_HIDE_LIST_DEFAULTS) == 0) {
-			/* .. */
-		} else if (*((const char *)change_value) == 0 &&
-			   def->offset != info->type_offset) {
-			/* this is mainly for service {} blocks. if value
-			   hasn't changed, it's the default. even if
-			   info->defaults has a different value. */
-			default_value = value;
-		} else {
-			/* value is set explicitly, but we don't know the
-			   default here. assume it's not the default. */
-			dump_default = TRUE;
-		}
 
+		bool value_stop_list = FALSE;
 		dump = FALSE;
-		count = 0; children = NULL;
 		str_truncate(ctx->value, 0);
 		switch (def->type) {
+		case SET_FILE:
 		case SET_BOOL:
 		case SET_SIZE:
+		case SET_UINTMAX:
 		case SET_UINT:
 		case SET_UINT_OCT:
 		case SET_TIME:
 		case SET_TIME_MSECS:
 		case SET_IN_PORT:
-		case SET_STR_VARS:
 		case SET_STR:
-		case SET_ENUM:
-			if (!config_export_type(ctx->value, value,
-						default_value, def->type,
-						dump_default, &dump))
-				i_unreached();
-			break;
-		case SET_DEFLIST:
-		case SET_DEFLIST_UNIQUE: {
-			const ARRAY_TYPE(void_array) *val = value;
-			const ARRAY_TYPE(void_array) *change_val = change_value;
-
-			if (!array_is_created(val))
-				break;
-
-			children = array_get(val, &count);
-			for (i = 0; i < count; i++) {
-				if (i > 0)
-					str_append_c(ctx->value, ' ');
-				setting_export_section_name(ctx->value, def, children[i],
-							    ctx->section_idx + i);
+		case SET_STR_NOVARS:
+		case SET_ENUM: {
+			string_t *default_str = NULL;
+			bool default_changed = FALSE;
+			const char *old_default;
+			i_assert(info->defaults != NULL);
+			if (module_parser->change_counters[define_idx] <= CONFIG_PARSER_CHANGE_DEFAULTS) {
+				/* Setting isn't explicitly set. We need to see
+				   if its default has changed. */
+				const char *key_with_path = def->key;
+				if (ctx->path_prefix[0] != '\0') {
+					key_with_path = t_strconcat(
+						ctx->path_prefix, def->key, NULL);
+				}
+				if (old_settings_default(ctx->dovecot_config_version,
+							 def->key, key_with_path,
+							 &old_default)) {
+					default_str = t_str_new(strlen(old_default));
+					str_append(default_str, old_default);
+					default_changed = TRUE;
+				}
 			}
-			change_children = array_get(change_val, &count2);
-			i_assert(count == count2);
+
+			if ((!dump_default || module_parser->change_counters[define_idx] == 0) &&
+			    default_str == NULL) {
+				const void *default_value =
+					CONST_PTR_OFFSET(info->defaults,
+							 def->offset);
+				default_str = t_str_new(64);
+				if (!config_export_type(default_str, default_value,
+							def->type))
+					i_unreached();
+				if (def->type == SET_ENUM) {
+					/* enum begins with default: followed
+					   by other valid values */
+					const char *p = strchr(str_c(default_str), ':');
+					if (p != NULL) {
+						str_truncate(default_str,
+							p - str_c(default_str));
+					}
+				}
+			}
+			if (!dump_default &&
+			    strcmp(str_c(default_str),
+				   module_parser->settings[define_idx].str) == 0) {
+				/* Explicitly set setting value wasn't
+				   actually changed from its default. */
+				break;
+			}
+			if (module_parser->change_counters[define_idx] >
+					CONFIG_PARSER_CHANGE_DEFAULTS) {
+				/* explicitly set */
+				str_append(ctx->value,
+					module_parser->settings[define_idx].str);
+			} else if (module_parser->change_counters[define_idx] ==
+				   CONFIG_PARSER_CHANGE_DEFAULTS && !default_changed) {
+				/* default not changed by old version checks */
+				str_append(ctx->value,
+					module_parser->settings[define_idx].str);
+			} else {
+				str_append_str(ctx->value, default_str);
+			}
+			dump = TRUE;
 			break;
 		}
-		case SET_STRLIST: {
-			const ARRAY_TYPE(const_string) *val = value;
+		case SET_STRLIST:
+		case SET_BOOLLIST: {
+			const ARRAY_TYPE(const_string) *val =
+				module_parser->settings[define_idx].array.values;
 			const char *const *strings;
 
-			if (!array_is_created(val))
-				break;
-
-			key = p_strconcat(ctx->pool, str_c(ctx->prefix),
-					  def->key, NULL);
-
-			if (hash_table_lookup(ctx->keys, key) != NULL) {
+			value_stop_list = module_parser->settings[define_idx].array.stop_list;
+			if (hash_table_is_created(ctx->keys) &&
+			    hash_table_lookup(ctx->keys, def->key) != NULL) {
 				/* already added all of these */
 				break;
 			}
-			hash_table_insert(ctx->keys, key, key);
-			/* for doveconf -n to see this KEY_LIST */
-			ctx->callback(key, "", CONFIG_KEY_LIST, ctx->context);
+			if ((ctx->flags & CONFIG_DUMP_FLAG_DEDUPLICATE_KEYS) != 0)
+				hash_table_insert(ctx->keys, def->key, def->key);
 
-			strings = array_get(val, &count);
-			i_assert(count % 2 == 0);
-			for (i = 0; i < count; i += 2) {
-				str = p_strdup_printf(ctx->pool, "%s%s%c%s",
-						      str_c(ctx->prefix),
+			if (val != NULL) {
+				strings = array_get(val, &count);
+				i_assert(count % 2 == 0);
+			} else {
+				strings = NULL;
+				count = 0;
+			}
+
+			/* for doveconf -n to see this KEY_LIST */
+			struct config_export_setting export_set = {
+				.type = CONFIG_KEY_LIST,
+				.def_type = def->type,
+				.key = def->key,
+				.key_define_idx = define_idx,
+				.value = "",
+				.list_count = count / 2,
+				.value_stop_list = value_stop_list,
+			};
+			ctx->callback(&export_set, ctx->context);
+
+			export_set.type = def->type == SET_STRLIST ?
+				CONFIG_KEY_NORMAL : CONFIG_KEY_BOOLLIST_ELEM;
+			for (i = 0; i < count; i += 2) T_BEGIN {
+				export_set.key = t_strdup_printf("%s%c%s",
 						      def->key,
 						      SETTINGS_SEPARATOR,
 						      strings[i]);
-				ctx->callback(str, strings[i+1],
-					      CONFIG_KEY_NORMAL, ctx->context);
-			}
-			count = 0;
+				export_set.list_idx = i / 2;
+				export_set.value = strings[i+1];
+				/* only the last element stops the list */
+				export_set.value_stop_list = value_stop_list &&
+					i + 2 == count;
+				if (def->type == SET_BOOLLIST &&
+				    strcmp(export_set.value, "no") == 0 &&
+				    value_stop_list)
+					; /* ignore */
+				else
+					ctx->callback(&export_set, ctx->context);
+			} T_END;
 			break;
 		}
+		case SET_FILTER_ARRAY: {
+			const ARRAY_TYPE(const_string) *val =
+				module_parser->settings[define_idx].array.values;
+			const char *name;
+
+			if (val == NULL)
+				break;
+
+			array_foreach_elem(val, name) {
+				if (str_len(ctx->value) > 0)
+					str_append_c(ctx->value, ' ');
+				str_append(ctx->value,
+					   settings_section_escape(name));
+			}
+			break;
+		}
+		case SET_FILTER_NAME:
 		case SET_ALIAS:
 			break;
 		}
 		if (str_len(ctx->value) > 0 || dump) {
-			key = p_strconcat(ctx->pool, str_c(ctx->prefix),
-					  def->key, NULL);
-			if (hash_table_lookup(ctx->keys, key) == NULL) {
+			if (!hash_table_is_created(ctx->keys) ||
+			    hash_table_lookup(ctx->keys, def->key) == NULL) {
 				enum config_key_type type;
 
-				if (def->offset == info->type_offset &&
-				    parent_unique_deflist)
-					type = CONFIG_KEY_UNIQUE_KEY;
-				else if (SETTING_TYPE_IS_DEFLIST(def->type))
-					type = CONFIG_KEY_LIST;
+				if (def->type == SET_FILTER_ARRAY)
+					type = CONFIG_KEY_FILTER_ARRAY;
 				else
 					type = CONFIG_KEY_NORMAL;
-				ctx->callback(key, str_c(ctx->value), type,
-					ctx->context);
-				hash_table_insert(ctx->keys, key, key);
+				struct config_export_setting export_set = {
+					.type = type,
+					.def_type = def->type,
+					.key = def->key,
+					.key_define_idx = define_idx,
+					.value = str_c(ctx->value),
+				};
+				ctx->callback(&export_set, ctx->context);
+				if ((ctx->flags & CONFIG_DUMP_FLAG_DEDUPLICATE_KEYS) != 0)
+					hash_table_insert(ctx->keys, def->key, def->key);
 			}
-		}
-
-		i_assert(count == 0 || children != NULL);
-		prefix_len = str_len(ctx->prefix);
-		unsigned int section_start_idx = ctx->section_idx;
-		ctx->section_idx += count;
-		for (i = 0; i < count; i++) {
-			str_append(ctx->prefix, def->key);
-			str_append_c(ctx->prefix, SETTINGS_SEPARATOR);
-			setting_export_section_name(ctx->prefix, def, children[i],
-						    section_start_idx + i);
-			str_append_c(ctx->prefix, SETTINGS_SEPARATOR);
-			settings_export(ctx, def->list_info,
-					def->type == SET_DEFLIST_UNIQUE,
-					children[i], change_children[i]);
-
-			str_truncate(ctx->prefix, prefix_len);
 		}
 	}
 }
 
+#undef config_export_init
 struct config_export_context *
 config_export_init(enum config_dump_scope scope,
 		   enum config_dump_flags flags,
+		   const char *dovecot_config_version, const char *path_prefix,
 		   config_request_callback_t *callback, void *context)
 {
 	struct config_export_context *ctx;
 	pool_t pool;
 
-	pool = pool_alloconly_create(MEMPOOL_GROWING"config export", 1024*64);
+	pool = pool_alloconly_create(MEMPOOL_GROWING"config export", 512);
 	ctx = p_new(pool, struct config_export_context, 1);
 	ctx->pool = pool;
 
@@ -392,123 +405,77 @@ config_export_init(enum config_dump_scope scope,
 	ctx->callback = callback;
 	ctx->context = context;
 	ctx->scope = scope;
+	ctx->dovecot_config_version = p_strdup(pool, dovecot_config_version);
+	ctx->path_prefix = p_strdup(pool, path_prefix);
 	ctx->value = str_new(pool, 256);
-	ctx->prefix = str_new(pool, 64);
-	hash_table_create(&ctx->keys, ctx->pool, 0, str_hash, strcmp);
+	if ((ctx->flags & CONFIG_DUMP_FLAG_DEDUPLICATE_KEYS) != 0)
+		hash_table_create(&ctx->keys, ctx->pool, 0, str_hash, strcmp);
 	return ctx;
 }
 
-void config_export_by_filter(struct config_export_context *ctx,
-			     const struct config_filter *filter)
+void config_export_set_module_parsers(struct config_export_context *ctx,
+				      const struct config_module_parser *module_parsers)
 {
-	const char *error;
-
-	if (config_filter_parsers_get(config_filter, ctx->pool, filter,
-				      &ctx->dup_parsers, &ctx->output,
-				      &error) < 0) {
-		i_error("%s", error);
-		ctx->failed = TRUE;
-	}
-	ctx->parsers = ctx->dup_parsers;
+	ctx->module_parsers = module_parsers;
 }
 
-void config_export_parsers(struct config_export_context *ctx,
-			   const struct config_module_parser *parsers)
+unsigned int config_export_get_parser_count(struct config_export_context *ctx)
 {
-	ctx->parsers = parsers;
+	unsigned int i = 0;
+	for (i = 0; ctx->module_parsers[i].info != NULL; i++) ;
+	return i;
 }
 
-void config_export_get_output(struct config_export_context *ctx,
-			      struct master_service_settings_output *output_r)
+void config_export_free(struct config_export_context **_ctx)
 {
-	*output_r = ctx->output;
-}
+	struct config_export_context *ctx = *_ctx;
 
-const char *
-config_export_get_import_environment(struct config_export_context *ctx)
-{
-	enum setting_type stype;
-	unsigned int i;
+	*_ctx = NULL;
 
-	for (i = 0; ctx->parsers[i].root != NULL; i++) {
-		if (ctx->parsers[i].root == &master_service_setting_parser_info) {
-			const char *const *value =
-				settings_parse_get_value(ctx->parsers[i].parser,
-					"import_environment", &stype);
-			i_assert(value != NULL);
-			return *value;
-		}
-	}
-	i_unreached();
-}
-
-const char *config_export_get_base_dir(struct config_export_context *ctx)
-{
-	enum setting_type stype;
-	unsigned int i;
-
-	for (i = 0; ctx->parsers[i].root != NULL; i++) {
-		if (ctx->parsers[i].root == &master_service_setting_parser_info) {
-			const char *const *value =
-				settings_parse_get_value(ctx->parsers[i].parser,
-					"base_dir", &stype);
-			i_assert(value != NULL);
-			return *value;
-		}
-	}
-	i_unreached();
-}
-
-static void config_export_free(struct config_export_context *ctx)
-{
-	if (ctx->dup_parsers != NULL)
-		config_filter_parsers_free(ctx->dup_parsers);
-	hash_table_destroy(&ctx->keys);
+	if (hash_table_is_created(ctx->keys))
+		hash_table_destroy(&ctx->keys);
 	pool_unref(&ctx->pool);
 }
 
-int config_export_finish(struct config_export_context **_ctx,
-			 unsigned int *section_idx)
+int config_export_all_parsers(struct config_export_context **_ctx)
 {
 	struct config_export_context *ctx = *_ctx;
-	const struct config_module_parser *parser;
 	const char *error;
 	unsigned int i;
 	int ret = 0;
 
 	*_ctx = NULL;
 
-	if (ctx->failed) {
-		config_export_free(ctx);
-		return -1;
-	}
-
-	ctx->section_idx = *section_idx;
-	for (i = 0; ctx->parsers[i].root != NULL; i++) {
-		parser = &ctx->parsers[i];
-
-		T_BEGIN {
-			settings_export(ctx, parser->root, FALSE,
-					settings_parser_get(parser->parser),
-					settings_parser_get_changes(parser->parser));
-		} T_END;
-
-		if ((ctx->flags & CONFIG_DUMP_FLAG_CHECK_SETTINGS) != 0) {
-			settings_parse_var_skip(parser->parser);
-			if (!settings_parser_check(parser->parser, ctx->pool,
-						   &error)) {
-				if ((ctx->flags & CONFIG_DUMP_FLAG_CALLBACK_ERRORS) != 0) {
-					ctx->callback(NULL, error, CONFIG_KEY_ERROR,
-						      ctx->context);
-				} else {
-					i_error("%s", error);
-					ret = -1;
-					break;
-				}
-			}
+	for (i = 0; ctx->module_parsers[i].info != NULL; i++) {
+		if (config_export_parser(ctx, i, &error) < 0) {
+			i_error("%s", error);
+			ret = -1;
+			break;
 		}
 	}
-	*section_idx = ctx->section_idx;
-	config_export_free(ctx);
+	config_export_free(&ctx);
 	return ret;
+}
+
+const struct setting_parser_info *
+config_export_parser_get_info(struct config_export_context *ctx,
+			      unsigned int parser_idx)
+{
+	return ctx->module_parsers[parser_idx].info;
+}
+
+int config_export_parser(struct config_export_context *ctx,
+			 unsigned int parser_idx, const char **error_r)
+{
+	const struct config_module_parser *module_parser =
+		&ctx->module_parsers[parser_idx];
+
+	if (module_parser->delayed_error != NULL) {
+		*error_r = module_parser->delayed_error;
+		return -1;
+	}
+	if (module_parser->settings != NULL) T_BEGIN {
+		settings_export(ctx, module_parser);
+	} T_END;
+	return 0;
 }

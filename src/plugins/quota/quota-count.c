@@ -2,6 +2,7 @@
 
 #include "lib.h"
 #include "ioloop.h"
+#include "settings.h"
 #include "mailbox-list-iter.h"
 #include "quota-private.h"
 
@@ -29,7 +30,7 @@ quota_count_mailbox(struct quota_root *root, struct mail_namespace *ns,
 		    enum quota_get_result *error_result_r,
 		    const char **error_r)
 {
-	struct quota_rule *rule;
+	const struct quota_root_settings *set = NULL;
 	struct mailbox *box;
 	struct mailbox_metadata metadata;
 	struct mailbox_status status;
@@ -37,14 +38,15 @@ quota_count_mailbox(struct quota_root *root, struct mail_namespace *ns,
 	const char *errstr;
 	int ret;
 
-	rule = quota_root_rule_find(root->set, vname);
-	if (rule != NULL && rule->ignore) {
-		/* mailbox not included in quota */
-		return 0;
-	}
-
 	box = mailbox_alloc(ns->list, vname, MAILBOX_FLAG_READONLY);
-	if ((box->storage->class_flags & MAIL_STORAGE_CLASS_FLAG_NOQUOTA) != 0) {
+	if (settings_get_filter(box->event, "quota", root->set_filter_name,
+				&quota_root_setting_parser_info, 0,
+				&set, error_r) < 0) {
+		*error_result_r = QUOTA_GET_RESULT_INTERNAL_ERROR;
+		ret = -1;
+	} else if (set->quota_ignore)
+		ret = 0;
+	else if ((box->storage->class_flags & MAIL_STORAGE_CLASS_FLAG_NOQUOTA) != 0) {
 		/* quota doesn't exist for this mailbox/storage */
 		ret = 0;
 	} else if (mailbox_get_metadata(box, MAILBOX_METADATA_VIRTUAL_SIZE,
@@ -73,6 +75,7 @@ quota_count_mailbox(struct quota_root *root, struct mail_namespace *ns,
 		*bytes += metadata.virtual_size;
 		*count += status.messages;
 	}
+	settings_free(set);
 	mailbox_free(&box);
 	return ret;
 }
@@ -101,8 +104,8 @@ quota_mailbox_iter_deinit(struct quota_mailbox_iter **_iter,
 	if (iter->iter != NULL) {
 		if (mailbox_list_iter_deinit(&iter->iter) < 0) {
 			error2 = t_strdup_printf(
-				"Listing namespace '%s' failed: %s",
-				iter->ns->prefix,
+				"Listing namespace %s failed: %s",
+				iter->ns->set->name,
 				mailbox_list_get_last_internal_error(iter->ns->list, NULL));
 			ret = -1;
 		}
@@ -125,13 +128,11 @@ quota_mailbox_iter_next(struct quota_mailbox_iter *iter)
 	unsigned int count;
 
 	if (iter->iter == NULL) {
-		namespaces = array_get(&iter->root->quota->namespaces, &count);
-		do {
-			if (iter->ns_idx >= count)
-				return NULL;
+		namespaces = array_get(&iter->root->namespaces, &count);
+		if (iter->ns_idx >= count)
+			return NULL;
 
-			iter->ns = namespaces[iter->ns_idx++];
-		} while (!quota_root_is_namespace_visible(iter->root, iter->ns));
+		iter->ns = namespaces[iter->ns_idx++];
 		iter->iter = mailbox_list_iter_init(iter->ns->list, "*",
 			MAILBOX_LIST_ITER_SKIP_ALIASES |
 			MAILBOX_LIST_ITER_RETURN_NO_FLAGS |
@@ -144,8 +145,7 @@ quota_mailbox_iter_next(struct quota_mailbox_iter *iter)
 	}
 	if (mailbox_list_iter_deinit(&iter->iter) < 0) {
 		iter->error = t_strdup_printf(
-			"Listing namespace '%s' failed: %s",
-			iter->ns->prefix,
+			"Listing namespace %s failed: %s", iter->ns->set->name,
 			mailbox_list_get_last_internal_error(iter->ns->list, NULL));
 	}
 	if (iter->ns->prefix_len > 0 &&
@@ -234,13 +234,11 @@ static struct quota_root *count_quota_alloc(void)
 	return &root->root;
 }
 
-static int count_quota_init(struct quota_root *root, const char *args,
-			    const char **error_r)
+static int count_quota_init(struct quota_root *root,
+			    const char **error_r ATTR_UNUSED)
 {
-	event_set_append_log_prefix(root->backend.event, "quota-count: ");
-
 	root->auto_updating = TRUE;
-	return quota_root_default_init(root, args, error_r);
+	return 0;
 }
 
 static void count_quota_deinit(struct quota_root *_root)
@@ -311,7 +309,7 @@ static int quota_count_recalculate_box(struct mailbox *box,
 		*error_r = t_strdup_printf(
 			"Couldn't commit mail index transaction for %s: %s",
 			box->vname,
-			mail_index_get_error_message(box->view->index));
+			mail_index_get_last_error(box->view->index, NULL));
 		return -1;
 	}
 	/* getting the vsize now forces its recalculation */

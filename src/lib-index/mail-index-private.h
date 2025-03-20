@@ -132,7 +132,6 @@ struct mail_index_record_map {
 	void *records; /* struct mail_index_record[] */
 	unsigned int records_count;
 
-	struct mail_index_map_modseq *modseq;
 	uint32_t last_appended_uid;
 };
 
@@ -195,10 +194,7 @@ struct mail_index_settings {
 struct mail_index_error {
 	/* Human-readable error text */
 	char *text;
-
-	/* Error happened because there's no disk space, i.e. syscall failed
-	   with ENOSPC or EDQUOT. */
-	bool nodiskspace:1;
+	enum mail_index_error_code code;
 };
 
 struct mail_index {
@@ -273,12 +269,12 @@ struct mail_index {
 	/* Module-specific contexts. */
 	ARRAY(union mail_index_module_context *) module_contexts;
 
-	/* Last error returned by mail_index_get_error_message().
+	/* Last error returned by mail_index_get_last_error().
 	   Cleared by mail_index_reset_error(). */
 	struct mail_index_error last_error;
 	/* Timestamp when mmap() failure was logged the last time. This is used
 	   to prevent logging the same error too rapidly. This could happen
-	   e.g. if mmap()ing a large cache file that exceeeds process's
+	   e.g. if mmap()ing a large cache file that exceeds process's
 	   VSZ limit. */
 	time_t last_mmap_error_time;
 	/* If non-NULL, dovecot.index should be recreated as soon as possible.
@@ -308,9 +304,6 @@ struct mail_index {
 	   mail_index_base_optimization_settings.rewrite_min_log_bytes the next
 	   time when checking if index needs a rewrite. */
 	bool index_min_write:1;
-	/* mail_index_modseq_enable() has been called. Track per-flag
-	   modseq numbers in memory (global modseqs are tracked anyway). */
-	bool modseqs_enabled:1;
 	/* mail_index_open() is creating new index files */
 	bool initial_create:1;
 	/* TRUE after mail_index_map() has succeeded */
@@ -321,6 +314,9 @@ struct mail_index {
 	/* Index has been fsck'd, but mail_index_reset_fscked() hasn't been
 	   called yet. */
 	bool fscked:1;
+	/* mail_index_open() has created new index files */
+	bool initial_created:1;
+
 };
 
 extern struct mail_index_module_register mail_index_module_register;
@@ -393,6 +389,12 @@ void mail_index_map_lookup_seq_range(struct mail_index_map *map,
 				     uint32_t *first_seq_r,
 				     uint32_t *last_seq_r);
 
+/* Returns TRUE if indexid is ok, FALSE if it has either unexpectedly changed,
+   or it couldn't be determined easily whether it has changed permanently or
+   temporarily. If FALSE is returned, the mailbox should be reopened. */
+bool mail_index_hdr_check_indexid(struct mail_index *index,
+				  const struct mail_index_header *hdr);
+
 /* Returns 1 on success, 0 on non-critical errors we want to silently fix,
    -1 if map isn't usable. The caller is responsible for logging the errors
    if -1 is returned. */
@@ -400,8 +402,7 @@ int mail_index_map_check_header(struct mail_index_map *map,
 				const char **error_r);
 /* Returns 1 if header is usable, 0 or -1 if not. The caller should log an
    error if -1 is returned, but not if 0 is returned. */
-bool mail_index_check_header_compat(struct mail_index *index,
-				    const struct mail_index_header *hdr,
+bool mail_index_check_header_compat(const struct mail_index_header *hdr,
 				    uoff_t file_size, const char **error_r);
 int mail_index_map_parse_extensions(struct mail_index_map *map);
 int mail_index_map_parse_keywords(struct mail_index_map *map);
@@ -420,9 +421,13 @@ unsigned int mail_index_map_ext_hdr_offset(unsigned int name_len);
 void mail_index_fsck_locked(struct mail_index *index);
 
 /* Log an error and set it as the index's current error that is available
-   with mail_index_get_error_message(). */
+   with mail_index_get_last_error(). */
 void mail_index_set_error(struct mail_index *index, const char *fmt, ...)
 	ATTR_FORMAT(2, 3) ATTR_COLD;
+void mail_index_set_error_code(struct mail_index *index,
+			       enum mail_index_error_code code,
+			       const char *fmt, ...)
+	ATTR_FORMAT(3, 4) ATTR_COLD;
 /* Same as mail_index_set_error(), but don't log the error. */
 void mail_index_set_error_nolog(struct mail_index *index, const char *str)
 	ATTR_COLD;

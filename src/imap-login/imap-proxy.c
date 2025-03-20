@@ -9,6 +9,7 @@
 #include "str.h"
 #include "str-sanitize.h"
 #include "safe-memset.h"
+#include "compression.h"
 #include "dsasl-client.h"
 #include "imap-login-client.h"
 #include "client-authenticate.h"
@@ -41,6 +42,8 @@ static void proxy_write_id(struct imap_client *client, string_t *str)
 		str_append_str(str, client->common.client_id);
 		str_append_c(str, ' ');
 	}
+	if (!client->common.proxy_no_multiplex)
+		str_append(str, "\"x-multiplex\" \"0\" ");
 	str_printfa(str, "\"x-session-id\" \"%s\" "
 		    "\"x-originating-ip\" \"%s\" "
 		    "\"x-originating-port\" \"%u\" "
@@ -56,6 +59,11 @@ static void proxy_write_id(struct imap_client *client, string_t *str)
 		    client->common.proxy_ttl - 1,
 		    client->common.end_client_tls_secured ?
 		    CLIENT_TRANSPORT_TLS : CLIENT_TRANSPORT_INSECURE);
+
+	if (client->common.local_name != NULL) {
+		str_append(str, " \"x-connected-name\" ");
+		imap_append_nstring(str, client->common.local_name);
+	}
 
 	/* append any forward_ variables to request */
 	for(const char *const *ptr = client->common.auth_passdb_args; *ptr != NULL; ptr++) {
@@ -268,6 +276,14 @@ static bool auth_resp_code_is_tempfail(const char *resp)
 			   strlen(IMAP_RESP_CODE_UNAVAILABLE"]")) == 0;
 }
 
+static bool auth_resp_code_is_serverbug(const char *resp)
+{
+	/* Dovecot uses [UNAVAILABLE] for failures that can be retried.
+	   Non-retriable failures are [SERVERBUG]. */
+	return strncasecmp(resp, IMAP_RESP_CODE_SERVERBUG"]",
+			   strlen(IMAP_RESP_CODE_SERVERBUG"]")) == 0;
+}
+
 static bool
 auth_resp_code_parse_referral(struct client *client, const char *resp,
 			      const char **userhostport_r)
@@ -320,7 +336,7 @@ int imap_proxy_parse_line(struct client *client, const char *line)
 
 	i_assert(!client->destroyed);
 
-	output = login_proxy_get_ostream(client->login_proxy);
+	output = login_proxy_get_server_ostream(client->login_proxy);
 	if (!imap_client->proxy_seen_banner) {
 		/* this is a banner */
 		imap_client->proxy_rcvd_state = IMAP_PROXY_RCVD_STATE_BANNER;
@@ -388,7 +404,7 @@ int imap_proxy_parse_line(struct client *client, const char *line)
 		if (login_proxy_starttls(client->login_proxy) < 0)
 			return -1;
 		/* i/ostreams changed. */
-		output = login_proxy_get_ostream(client->login_proxy);
+		output = login_proxy_get_server_ostream(client->login_proxy);
 		str = t_str_new(128);
 		if (proxy_write_login(imap_client, str) < 0)
 			return -1;
@@ -429,6 +445,8 @@ int imap_proxy_parse_line(struct client *client, const char *line)
 			else if (auth_resp_code_parse_referral(client, line + 4,
 							       &log_line))
 				failure_type = LOGIN_PROXY_FAILURE_TYPE_AUTH_REDIRECT;
+			else if (auth_resp_code_is_serverbug(line + 4))
+				failure_type = LOGIN_PROXY_FAILURE_TYPE_REMOTE;
 			else {
 				client_send_raw(client, t_strconcat(
 					imap_client->cmd_tag, " ", line, "\r\n", NULL));
@@ -492,6 +510,25 @@ int imap_proxy_parse_line(struct client *client, const char *line)
 	} else if (str_begins_icase_with(line, "* ID ")) {
 		/* Reply to ID command we sent, ignore it */
 		return 0;
+	} else if (str_begins(line, "* MULTIPLEX ", &suffix)) {
+		if (strcmp(suffix, "0") != 0) {
+			const char *reason = t_strdup_printf(
+				"Unsupported MULTIPLEX version: %s", suffix);
+			login_proxy_failed(client->login_proxy,
+				login_proxy_get_event(client->login_proxy),
+				LOGIN_PROXY_FAILURE_TYPE_PROTOCOL, reason);
+			return -1;
+		}
+		if (client->proxy_no_multiplex) {
+			login_proxy_failed(client->login_proxy,
+				login_proxy_get_event(client->login_proxy),
+				LOGIN_PROXY_FAILURE_TYPE_PROTOCOL,
+				"MULTIPLEX started without being requested");
+			return -1;
+		}
+		login_proxy_multiplex_input_start(client->login_proxy);
+		/* force caller to refresh istream */
+		return 1;
 	} else if (str_begins_with(line, "* BYE ")) {
 		/* Login unexpectedly failed (due to some internal error).
 		   Don't forward the BYE to the client, since we're not going
@@ -552,6 +589,55 @@ imap_proxy_send_failure_reply(struct imap_client *imap_client,
 	case LOGIN_PROXY_FAILURE_TYPE_AUTH:
 		/* reply was already sent */
 		break;
+	}
+}
+
+static int
+proxy_side_cmd_compress(struct client *client, const char *const *args,
+			const char **error_r)
+{
+
+	if (str_array_length(args) < 2) {
+		*error_r = "Missing parameters";
+		return -1;
+	}
+
+	struct ostream *client_output =
+		login_proxy_get_client_ostream(client->login_proxy);
+	const struct compression_handler *handler;
+	int ret = compression_lookup_handler(t_str_lcase(args[0]), &handler);
+	if (ret <= 0) {
+		/* IMAP backend normally checks this already. If we get here,
+		   there is a mismatch between what algorithms proxy and
+		   backend supports. */
+		o_stream_nsend_str(client_output, t_strdup_printf(
+			"%s NO %s compression mechanism\r\n", args[1],
+			ret == 0 ? "Unsupported" : "Unknown"));
+		return 0;
+	}
+
+	e_debug(client->event, "Started compression with %s mechanism",
+		handler->name);
+	o_stream_nsend_str(client_output, t_strdup_printf(
+		"%s OK Begin compression.\r\n", args[1]));
+
+	login_proxy_replace_client_iostream_pre(client->login_proxy);
+	/* The _pre() call may have replaced the client iostreams.
+	   Use client->input/output to get the latest ones. */
+	login_proxy_replace_client_iostream_post(client->login_proxy,
+		handler->create_istream(client->input),
+		handler->create_ostream_auto(client->output, client->event));
+	return 0;
+}
+
+int imap_proxy_side_channel_input(struct client *client,
+				  const char *const *args, const char **error_r)
+{
+	if (strcmp(args[0], "compress") == 0)
+		return proxy_side_cmd_compress(client, args + 1, error_r);
+	else {
+		*error_r = "Unsupported command";
+		return -1;
 	}
 }
 

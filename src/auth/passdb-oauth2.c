@@ -43,48 +43,24 @@ oauth2_verify_plain(struct auth_request *request, const char *password,
 	db_oauth2_lookup(module->db, req, password, request, oauth2_verify_plain_continue, request);
 }
 
-static struct passdb_module *
-oauth2_preinit(pool_t pool, const char *args)
+static int
+oauth2_preinit(pool_t pool, struct event *event, struct passdb_module **module_r,
+	       const char **error_r)
 {
 	struct oauth2_passdb_module *module;
 
 	module = p_new(pool, struct oauth2_passdb_module, 1);
-	module->db = db_oauth2_init(args);
+	if (db_oauth2_init(event, TRUE, &module->db, error_r) < 0)
+		return -1;
 	module->module.default_pass_scheme = "PLAIN";
-
-	if (db_oauth2_uses_password_grant(module->db)) {
-		module->module.default_cache_key = "%u";
-	} else {
-		module->module.default_cache_key = "%u%w";
-	}
-
-	return &module->module;
-}
-
-static void oauth2_deinit(struct passdb_module *passdb)
-{
-	struct oauth2_passdb_module *module = (struct oauth2_passdb_module *)passdb;
-	db_oauth2_unref(&module->db);
-}
-
-/* FIXME: Remove when oauth2 mech is fixed */
-const char *passdb_oauth2_get_oidc_url(struct passdb_module *passdb)
-{
-	struct oauth2_passdb_module *module =
-		container_of(passdb, struct oauth2_passdb_module, module);
-	if (module->db != NULL)
-		return db_oauth2_get_openid_configuration_url(module->db);
-	return NULL;
+	module->module.default_cache_key = "%u";
+	*module_r = &module->module;
+	return 0;
 }
 
 struct passdb_module_interface passdb_oauth2 = {
-	"oauth2",
+	.name = "oauth2",
 
-	oauth2_preinit,
-	NULL,
-	oauth2_deinit,
-
-	oauth2_verify_plain,
-	NULL,
-	NULL
+	.preinit = oauth2_preinit,
+	.verify_plain = oauth2_verify_plain,
 };

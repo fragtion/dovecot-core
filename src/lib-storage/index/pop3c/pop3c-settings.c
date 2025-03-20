@@ -5,18 +5,17 @@
 #include "mail-storage-settings.h"
 #include "pop3c-settings.h"
 
-#include <stddef.h>
-
 #undef DEF
 #define DEF(type, name) \
 	SETTING_DEFINE_STRUCT_##type(#name, name, struct pop3c_settings)
 
 static const struct setting_define pop3c_setting_defines[] = {
+	{ .type = SET_FILTER_NAME, .key = "pop3c" },
 	DEF(STR, pop3c_host),
 	DEF(IN_PORT, pop3c_port),
 
-	DEF(STR_VARS, pop3c_user),
-	DEF(STR_VARS, pop3c_master_user),
+	DEF(STR, pop3c_user),
+	DEF(STR, pop3c_master_user),
 	DEF(STR, pop3c_password),
 
 	DEF(ENUM, pop3c_ssl),
@@ -25,7 +24,7 @@ static const struct setting_define pop3c_setting_defines[] = {
 	DEF(STR, pop3c_rawlog_dir),
 	DEF(BOOL, pop3c_quick_received_date),
 
-	DEF(STR, pop3c_features),
+	DEF(BOOLLIST, pop3c_features),
 
 	SETTING_DEFINE_LIST_END
 };
@@ -34,7 +33,7 @@ static const struct pop3c_settings pop3c_default_settings = {
 	.pop3c_host = "",
 	.pop3c_port = 110,
 
-	.pop3c_user = "%u",
+	.pop3c_user = "%{user}",
 	.pop3c_master_user = "",
 	.pop3c_password = "",
 
@@ -44,7 +43,7 @@ static const struct pop3c_settings pop3c_default_settings = {
 	.pop3c_rawlog_dir = "",
 	.pop3c_quick_received_date = FALSE,
 
-	.pop3c_features = ""
+	.pop3c_features = ARRAY_INIT
 };
 
 /* <settings checks> */
@@ -66,7 +65,7 @@ pop3c_settings_parse_features(struct pop3c_settings *set,
 	const struct pop3c_feature_list *list;
 	const char *const *str;
 
-	str = t_strsplit_spaces(set->pop3c_features, " ,");
+	str = settings_boollist_get(&set->pop3c_features);
 	for (; *str != NULL; str++) {
 		list = pop3c_feature_list;
 		for (; list->name != NULL; list++) {
@@ -96,21 +95,14 @@ static bool pop3c_settings_check(void *_set, pool_t pool ATTR_UNUSED,
 }
 /* </settings checks> */
 
-static const struct setting_parser_info pop3c_setting_parser_info = {
-	.module_name = "pop3c",
+const struct setting_parser_info pop3c_setting_parser_info = {
+	.name = "pop3c",
+
 	.defines = pop3c_setting_defines,
 	.defaults = &pop3c_default_settings,
 
-	.type_offset = SIZE_MAX,
 	.struct_size = sizeof(struct pop3c_settings),
+	.pool_offset1 = 1 + offsetof(struct pop3c_settings, pool),
 
-	.parent_offset = SIZE_MAX,
-	.parent = &mail_user_setting_parser_info,
-
-        .check_func = pop3c_settings_check
+	.check_func = pop3c_settings_check
 };
-
-const struct setting_parser_info *pop3c_get_setting_parser_info(void)
-{
-	return &pop3c_setting_parser_info;
-}

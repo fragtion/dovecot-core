@@ -25,8 +25,6 @@ struct fs;
 
 #define MAIL_SHARED_STORAGE_NAME "shared"
 
-#define MAIL_STORAGE_LOST_MAILBOX_PREFIX "recovered-lost-folder-"
-
 enum mail_storage_list_index_rebuild_reason {
 	/* Mailbox list index was found to be corrupted. */
 	MAIL_STORAGE_LIST_INDEX_REBUILD_REASON_CORRUPTED,
@@ -51,8 +49,6 @@ struct mail_module_register {
 };
 
 struct mail_storage_vfuncs {
-	const struct setting_parser_info *(*get_setting_parser_info)(void);
-
 	struct mail_storage *(*alloc)(void);
 	int (*create)(struct mail_storage *storage, struct mail_namespace *ns,
 		      const char **error_r);
@@ -60,10 +56,12 @@ struct mail_storage_vfuncs {
 	void (*add_list)(struct mail_storage *storage,
 			 struct mailbox_list *list);
 
-	void (*get_list_settings)(const struct mail_namespace *ns,
-				  struct mailbox_list_settings *set);
+	/* Returns TRUE if mailbox path could be autodetected. root_path_r
+	   must be returned in that case. inbox_path_r is NULL already when
+	   calling, and means the default INBOX path is used. */
 	bool (*autodetect)(const struct mail_namespace *ns,
-			   struct mailbox_list_settings *set);
+			   const struct mail_storage_settings *mail_set,
+			   const char **root_path_r, const char **inbox_path_r);
 
 	struct mailbox *(*mailbox_alloc)(struct mail_storage *storage,
 					 struct mailbox_list *list,
@@ -146,6 +144,8 @@ struct mail_storage {
 	   here avoids adding them to index_mail_data.access_part. */
 	enum mail_fetch_field nonbody_access_fields;
 	struct event_category *event_category;
+	/* Storage-specific settings */
+	const struct setting_parser_info *set_info;
 
         struct mail_storage_vfuncs v, *vlast;
 
@@ -163,9 +163,6 @@ struct mail_storage {
 	/* A "root dir" to enable storage sharing.  It is only ever used for
 	 * uniqueness checking (via strcmp) and never used as a path. */
 	const char *unique_root_dir;
-
-	/* prefix for lost mailbox */
-	const char *lost_mailbox_prefix;
 
 	/* Last error set in mail_storage_set_critical(). */
 	char *last_internal_error;
@@ -194,6 +191,7 @@ struct mail_storage {
 
 	/* optional fs-api object for accessing mailboxes */
 	struct fs *mailboxes_fs;
+	struct settings_instance *mailboxes_fs_set_instance;
 
 	/* Module-specific contexts. See mail_storage_module_id. */
 	ARRAY(union mail_storage_module_context *) module_contexts;
@@ -226,6 +224,11 @@ struct virtual_mailbox_vfuncs {
 	void (*get_virtual_backend_boxes)(struct mailbox *box,
 					  ARRAY_TYPE(mailboxes) *mailboxes,
 					  bool only_with_msgs);
+	uint32_t (*get_virtual_backend_last_uid)(struct mailbox *box,
+						 struct mailbox *bbox);
+	void (*get_virtual_backend_mail_uid)(struct mailbox *box, uint32_t seq,
+					     struct mailbox **backend_box_r,
+					     uint32_t *backend_uid_r);
 };
 
 struct mailbox_vfuncs {
@@ -502,8 +505,9 @@ struct mailbox {
 	bool update_first_saved:1;
 	/* mailbox_verify_create_name() only checks for mailbox_verify_name() */
 	bool skip_create_name_restrictions:1;
-	/* Using LAYOUT=index and mailbox is being opened with a corrupted
-	   mailbox name. Try to revert to the previously known good name. */
+	/* Using mailbox_list_layout=index and mailbox is being opened with a
+	   corrupted mailbox name. Try to revert to the previously known good
+	   name. */
 	bool corrupted_mailbox_name:1;
 	/* mailbox_open() returned MAIL_ERROR_NOTFOUND because the mailbox
 	   doesn't have the LOOKUP ACL right. */
@@ -551,10 +555,10 @@ struct mail_vfuncs {
 			  struct message_size *hdr_size,
 			  struct message_size *body_size,
 			  struct istream **stream_r);
-	int (*get_binary_stream)(struct mail *mail,
+	int (*get_binary_stream)(struct mail *_mail,
 				 const struct message_part *part,
-				 bool include_hdr, uoff_t *size_r,
-				 unsigned int *lines_r, bool *binary_r,
+				 bool include_hdr,
+				 struct mail_binary_properties *bprops_r,
 				 struct istream **stream_r);
 
 	int (*get_special)(struct mail *mail, enum mail_fetch_field field,
@@ -738,6 +742,11 @@ struct mail_save_context {
 	   implemented via save, and the save_*() methods want to access the
 	   source mail. */
 	struct mail *copy_src_mail;
+	/* Set during mailbox_move() and mailbox_save_begin_replace(). This
+	   is made available for the quota plugin to allow accounting for the
+	   size of the mail that is being expunged as part of the MOVE and
+	   REPLACE commands, respectively. */
+	struct mail *expunged_mail;
 
 	/* data that changes for each saved mail */
 	struct mail_save_data data;
@@ -877,11 +886,6 @@ void mailbox_refresh_permissions(struct mailbox *box);
 /* Open private index files for mailbox. Returns 1 if opened, 0 if there
    are no private indexes (or flags) in this mailbox, -1 if error. */
 int mailbox_open_index_pvt(struct mailbox *box);
-/* Create path's directory with proper permissions. The root directory is also
-   created if necessary. Returns 1 if created, 0 if it already existed,
-   -1 if error. */
-int mailbox_mkdir(struct mailbox *box, const char *path,
-		  enum mailbox_list_path_type type);
 /* Create a non-mailbox type directory for mailbox if it's missing (e.g. index).
    Optimized for case where the directory usually exists. */
 int mailbox_create_missing_dir(struct mailbox *box,
@@ -925,7 +929,14 @@ static inline const char *mailbox_name_sanitize(const char *name)
 }
 
 struct event *
-mail_storage_mailbox_create_event(struct event *parent, const char *vname);
+mail_storage_mailbox_create_event(struct event *parent,
+				  struct mailbox_list *list, const char *vname);
+/* Try to get mailbox_settings for a mailbox. Returns 1 on success, -1 on
+   error, 0 if settings need to be merged and caller should be calling
+   settings_get() instead with the mailbox event. */
+int mailbox_name_try_get_settings(struct mailbox_list *list, const char *vname,
+				  const struct mailbox_settings **set_r,
+				  const char **error_r);
 
 /* for unit testing */
 int mailbox_verify_name(struct mailbox *box);

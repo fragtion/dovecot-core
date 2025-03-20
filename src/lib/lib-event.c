@@ -4,6 +4,7 @@
 #include "lib-event-private.h"
 #include "event-filter.h"
 #include "array.h"
+#include "hash.h"
 #include "llist.h"
 #include "time-util.h"
 #include "str.h"
@@ -11,6 +12,8 @@
 #include "ioloop-private.h"
 
 #include <ctype.h>
+
+HASH_TABLE_DEFINE_TYPE(category_set, void *, const struct event_category *);
 
 enum event_code {
 	EVENT_CODE_ALWAYS_LOG_SOURCE	= 'a',
@@ -48,7 +51,7 @@ enum event_code {
 struct event_internal_category {
 	/* More than one category can be represented by the internal state.
 	   To give consumers a unique but consistent category pointer, we
-	   return a pointer to this 'represetative' category structure.
+	   return a pointer to this 'representative' category structure.
 	   Because we allocated it, we know that it will live exactly as
 	   long as we need it to. */
 	struct event_category representative;
@@ -60,6 +63,11 @@ struct event_internal_category {
 
 struct event_reason {
 	struct event *event;
+};
+
+struct event_category_iterator {
+	HASH_TABLE_TYPE(category_set) hash;
+	struct hash_iterate_context *iter;
 };
 
 extern struct event_passthrough event_passthrough_vfuncs;
@@ -99,6 +107,7 @@ static void event_copy_parent_defaults(struct event *event,
 	event->passthrough = parent->passthrough;
 	event->min_log_level = parent->min_log_level;
 	event->forced_debug = parent->forced_debug;
+	event->forced_never_debug = parent->forced_never_debug;
 	event->disable_callbacks = parent->disable_callbacks;
 }
 
@@ -331,7 +340,7 @@ static inline void replace_parent_ref(struct event *event, struct event *new)
  *	G -> E -> F
  *
  * where G contains the fields and categories of A, B, and C (and trivially
- * D beacuse D was empty).
+ * D because D was empty).
  *
  * Note that even though F has not yet been sent out, we send it now because
  * it is part of the "rest" range.
@@ -899,16 +908,11 @@ event_find_category(const struct event *event,
 		    const struct event_category *category)
 {
 	struct event_internal_category *internal = category->internal;
-	struct event_category *cat;
 
 	/* make sure we're always looking for a representative */
 	i_assert(category == &internal->representative);
 
-	array_foreach_elem(&event->categories, cat) {
-		if (cat == category)
-			return TRUE;
-	}
-	return FALSE;
+	return array_lsearch_ptr(&event->categories, category) != NULL;
 }
 
 struct event *
@@ -1013,7 +1017,7 @@ event_find_field_recursive_str(const struct event *event, const char *key)
 	case EVENT_FIELD_VALUE_TYPE_STR:
 		return field->value.str;
 	case EVENT_FIELD_VALUE_TYPE_INTMAX:
-		return dec2str(field->value.intmax);
+		return t_strdup_printf("%jd", field->value.intmax);
 	case EVENT_FIELD_VALUE_TYPE_TIMEVAL:
 		return t_strdup_printf("%"PRIdTIME_T".%u",
 			field->value.timeval.tv_sec,
@@ -1078,12 +1082,11 @@ event_strlist_append(struct event *event, const char *key, const char *value)
 {
 	struct event_field *field = event_get_field(event, key, FALSE);
 
-	if (field->value_type != EVENT_FIELD_VALUE_TYPE_STRLIST)
-		i_zero(&field->value);
-	field->value_type = EVENT_FIELD_VALUE_TYPE_STRLIST;
-
-	if (!array_is_created(&field->value.strlist))
+	if (field->value_type != EVENT_FIELD_VALUE_TYPE_STRLIST ||
+	    !array_is_created(&field->value.strlist)) {
+		field->value_type = EVENT_FIELD_VALUE_TYPE_STRLIST;
 		p_array_init(&field->value.strlist, event->pool, 1);
+	}
 
 	/* lets not add empty values there though */
 	if (value == NULL)
@@ -1213,6 +1216,11 @@ struct event *event_get_parent(const struct event *event)
 	return event->parent;
 }
 
+pool_t event_get_pool(const struct event *event)
+{
+	return event->pool;
+}
+
 void event_get_create_time(const struct event *event, struct timeval *tv_r)
 {
 	*tv_r = event->tv_created;
@@ -1255,6 +1263,68 @@ event_get_categories(const struct event *event, unsigned int *count_r)
 		return NULL;
 	}
 	return array_get(&event->categories, count_r);
+}
+
+static void
+insert_category(HASH_TABLE_TYPE(category_set) hash,
+		const struct event_category *const cat)
+{
+	/* insert this category (key == the unique internal pointer) */
+	hash_table_update(hash, cat->internal, cat);
+
+	/* insert parent's categories */
+	if (cat->parent != NULL)
+		insert_category(hash, cat->parent);
+}
+
+struct event_category_iterator *
+event_categories_iterate_init(const struct event *event)
+{
+	struct event_category_iterator *iter;
+	struct event_category *const *cats;
+	unsigned int count, i;
+
+	cats = event_get_categories(event, &count);
+	if (count == 0)
+		return NULL;
+
+	iter = i_new(struct event_category_iterator, 1);
+
+	hash_table_create_direct(&iter->hash, default_pool,
+				 3 * count /* estimate */);
+
+	/* Insert all the categories into the hash table */
+	for (i = 0; i < count; i++)
+		insert_category(iter->hash, cats[i]);
+
+	iter->iter = hash_table_iterate_init(iter->hash);
+
+	return iter;
+}
+
+bool event_categories_iterate(struct event_category_iterator *iter,
+			      const struct event_category **cat_r)
+{
+	void *key ATTR_UNUSED;
+
+	if (iter == NULL) {
+		*cat_r = NULL;
+		return FALSE;
+	}
+	return hash_table_iterate(iter->iter, iter->hash, &key, cat_r);
+}
+
+void event_categories_iterate_deinit(struct event_category_iterator **_iter)
+{
+	struct event_category_iterator *iter = *_iter;
+
+	if (iter == NULL)
+		return;
+	*_iter = NULL;
+
+	hash_table_iterate_deinit(&iter->iter);
+	hash_table_destroy(&iter->hash);
+	i_free(iter);
 }
 
 void event_send(struct event *event, struct failure_context *ctx,
@@ -1617,17 +1687,11 @@ void event_register_callback(event_callback_t *callback)
 
 void event_unregister_callback(event_callback_t *callback)
 {
-	event_callback_t *const *callbackp;
+	unsigned int idx;
 
-	array_foreach(&event_handlers, callbackp) {
-		if (*callbackp == callback) {
-			unsigned int idx =
-				array_foreach_idx(&event_handlers, callbackp);
-			array_delete(&event_handlers, idx, 1);
-			return;
-		}
-	}
-	i_unreached();
+	if (!array_lsearch_ptr_idx(&event_handlers, callback, &idx))
+		i_unreached();
+	array_delete(&event_handlers, idx, 1);
 }
 
 void event_category_register_callback(event_category_callback_t *callback)
@@ -1637,18 +1701,11 @@ void event_category_register_callback(event_category_callback_t *callback)
 
 void event_category_unregister_callback(event_category_callback_t *callback)
 {
-	event_category_callback_t *const *callbackp;
+	unsigned int idx;
 
-	array_foreach(&event_category_callbacks, callbackp) {
-		if (*callbackp == callback) {
-			unsigned int idx =
-				array_foreach_idx(&event_category_callbacks,
-						  callbackp);
-			array_delete(&event_category_callbacks, idx, 1);
-			return;
-		}
-	}
-	i_unreached();
+	if (!array_lsearch_ptr_idx(&event_category_callbacks, callback, &idx))
+		i_unreached();
+	array_delete(&event_category_callbacks, idx, 1);
 }
 
 static struct event_passthrough *

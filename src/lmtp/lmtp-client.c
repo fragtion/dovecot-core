@@ -9,8 +9,8 @@
 #include "ostream.h"
 #include "hostpid.h"
 #include "process-title.h"
-#include "var-expand.h"
 #include "module-dir.h"
+#include "settings.h"
 #include "master-service-ssl.h"
 #include "master-service-settings.h"
 #include "iostream-ssl.h"
@@ -83,6 +83,9 @@ static void client_load_modules(struct client *client)
 {
         struct module_dir_load_settings mod_set;
 
+	if (!array_is_created(&client->lmtp_set->mail_plugins) ||
+	    array_is_empty(&client->lmtp_set->mail_plugins))
+		return;
         i_zero(&mod_set);
         mod_set.abi_version = DOVECOT_ABI_VERSION;
         mod_set.require_init_funcs = TRUE;
@@ -92,7 +95,7 @@ static void client_load_modules(struct client *client)
         mail_storage_service_modules =
                 module_dir_load_missing(mail_storage_service_modules,
                                         client->lmtp_set->mail_plugin_dir,
-                                        client->lmtp_set->mail_plugins,
+                                        settings_boollist_get(&client->lmtp_set->mail_plugins),
                                         &mod_set);
 	module_dir_init(mail_storage_service_modules);
 }
@@ -100,9 +103,6 @@ static void client_load_modules(struct client *client)
 static void client_read_settings(struct client *client, bool ssl)
 {
 	struct mail_storage_service_input input;
-	struct setting_parser_context *set_parser;
-	struct lmtp_settings *lmtp_set;
-	struct lda_settings *lda_set;
 	const char *error;
 
 	i_zero(&input);
@@ -114,25 +114,24 @@ static void client_read_settings(struct client *client, bool ssl)
 	input.end_client_tls_secured = ssl;
 	input.username = "";
 
-	if (mail_storage_service_read_settings(storage_service, &input,
-					       &set_parser, &error) < 0)
-		i_fatal("%s", error);
-
-	/* create raw user before duplicating the settings parser */
+	client->set_instance = settings_instance_new(
+		master_service_get_settings_root(master_service));
+	event_set_ptr(client->event, SETTINGS_EVENT_INSTANCE,
+		      client->set_instance);
 	client->raw_mail_user =
-		raw_storage_create_from_set(storage_service, set_parser);
+		raw_storage_create_from_set(storage_service, client->set_instance);
 
-	set_parser = settings_parser_dup(set_parser, client->pool);
-	lmtp_settings_get(set_parser, client->pool, &lmtp_set, &lda_set);
-	settings_parser_unref(&set_parser);
-	const struct var_expand_table *tab =
-		mail_storage_service_get_var_expand_table(storage_service, &input);
-	if (settings_var_expand(&lmtp_setting_parser_info, lmtp_set,
-				client->pool, tab, &error) <= 0)
-		i_fatal("Failed to expand settings: %s", error);
-	client->service_set = master_service_settings_get(master_service);
-	client->lmtp_set = lmtp_set;
-	client->unexpanded_lda_set = lda_set;
+	const struct var_expand_params *params =
+		mail_storage_service_get_var_expand_params(storage_service, &input);
+
+	struct event *event = event_create(client->event);
+	event_set_ptr(event, SETTINGS_EVENT_VAR_EXPAND_PARAMS, (void *)params);
+	if (settings_get(event, &lda_setting_parser_info, 0,
+			 &client->lda_set, &error) < 0 ||
+	    settings_get(event, &lmtp_setting_parser_info, 0,
+			 &client->lmtp_set, &error) < 0)
+		i_fatal("%s", error);
+	event_unref(&event);
 }
 
 struct client *client_create(int fd_in, int fd_out,
@@ -150,6 +149,7 @@ struct client *client_create(int fd_in, int fd_out,
 
 	pool = pool_alloconly_create("lmtp client", 2048);
 	client = p_new(pool, struct client, 1);
+	client->refcount = 1;
 	client->pool = pool;
 	client->v = lmtp_client_vfuncs;
 	client->remote_ip = conn->remote_ip;
@@ -161,15 +161,17 @@ struct client *client_create(int fd_in, int fd_out,
 	client->real_remote_ip = conn->real_remote_ip;
 	client->real_remote_port = conn->real_remote_port;
 	client->state_pool = pool_alloconly_create("client state", 4096);
+	if (conn->haproxy.ssl)
+		client->local_name = conn->haproxy.hostname;
 
 	client->event = event_create(NULL);
 	event_add_category(client->event, &event_category_lmtp);
 
 	client_read_settings(client, conn_tls);
 	client_load_modules(client);
-	client->my_domain = client->unexpanded_lda_set->hostname;
+	client->my_domain = p_strdup(client->pool, client->lda_set->hostname);
 
-	if (client->service_set->verbose_proctitle)
+	if (master_service_get_service_settings(master_service)->verbose_proctitle)
 		verbose_proctitle = TRUE;
 
 	p_array_init(&client->module_contexts, client->pool, 5);
@@ -182,9 +184,14 @@ struct client *client_create(int fd_in, int fd_out,
 		SMTP_CAPABILITY_CHUNKING |
 		SMTP_CAPABILITY_XCLIENT |
 		SMTP_CAPABILITY__ORCPT;
+
+#ifdef EXPERIMENTAL_MAIL_UTF8
+	if (client->lmtp_set->mail_utf8_extensions)
+		lmtp_set.capabilities |= SMTP_CAPABILITY_SMTPUTF8;
+#endif
 	if (!conn_tls && master_service_ssl_is_enabled(master_service))
 		lmtp_set.capabilities |= SMTP_CAPABILITY_STARTTLS;
-	lmtp_set.hostname = client->unexpanded_lda_set->hostname;
+	lmtp_set.hostname = client->lda_set->hostname;
 	lmtp_set.login_greeting = client->lmtp_set->login_greeting;
 	lmtp_set.max_message_size = UOFF_T_MAX;
 	lmtp_set.rcpt_param_extensions = rcpt_param_extensions;
@@ -241,15 +248,43 @@ void client_state_reset(struct client *client)
 	p_clear(client->state_pool);
 }
 
+void client_ref(struct client *client)
+{
+	i_assert(client->refcount > 0);
+	client->refcount++;
+}
+
+void client_unref(struct client **_client)
+{
+	struct client *client = *_client;
+
+	if (client == NULL)
+		return;
+	*_client = NULL;
+
+	i_assert(client->refcount > 0);
+	if (--client->refcount > 0)
+		return;
+
+	client->v.destroy(client);
+}
+
 void client_destroy(struct client **_client, const char *enh_code,
 		    const char *reason)
 {
 	struct client *client = *_client;
+	struct smtp_server_connection *conn = client->conn;
 
 	*_client = NULL;
 
-	smtp_server_connection_terminate(&client->conn,
+	client_ref(client);
+	smtp_server_connection_terminate(&conn,
 		(enh_code == NULL ? "4.0.0" : enh_code), reason);
+	/* smtp_server_connection_terminate() calls
+	   client_connection_state_changed(), which may still access
+	   client->conn. Don't clear it before that. */
+	client->conn = NULL;
+	client_unref(&client);
 }
 
 static void
@@ -266,6 +301,10 @@ client_default_destroy(struct client *client)
 		mail_user_deinit(&client->raw_mail_user);
 
 	client_state_reset(client);
+
+	settings_instance_free(&client->set_instance);
+	settings_free(client->lda_set);
+	settings_free(client->lmtp_set);
 	event_unref(&client->event);
 	pool_unref(&client->state_pool);
 	pool_unref(&client->pool);
@@ -317,6 +356,11 @@ client_connection_state_changed(void *context,
 	client->state.state = new_state;
 	client->state.args = i_strdup(new_args);
 
+	if (client->local_name == NULL) {
+		const char *local_name =
+			smtp_server_connection_get_server_name(client->conn);
+		client->local_name = p_strdup(client->pool, local_name);
+	}
 	if (clients_count == 1)
 		refresh_proctitle();
 }
@@ -339,6 +383,8 @@ client_connection_proxy_data_updated(void *context,
 
 	client->remote_ip = data->source_ip;
 	client->remote_port = data->source_port;
+	client->local_name = data->local_name;
+
 	if (data->client_transport != NULL) {
 		client->end_client_tls_secured = TRUE;
 		client->end_client_tls_secured =
@@ -348,6 +394,35 @@ client_connection_proxy_data_updated(void *context,
 
 	if (clients_count == 1)
 		refresh_proctitle();
+}
+
+static int
+client_connection_tls_sni_callback(void *context, const char *name,
+				   const char **error_r)
+{
+	struct client *client = context;
+
+	const struct lda_settings *old_lda_set = client->lda_set;
+	const struct lmtp_settings *old_lmtp_set = client->lmtp_set;
+	client->lda_set = NULL;
+	client->lmtp_set = NULL;
+	event_add_str(client->event, "local_name", name);
+	if (settings_get(client->event, &lda_setting_parser_info, 0,
+			 &client->lda_set, error_r) < 0 ||
+	    settings_get(client->event, &lmtp_setting_parser_info, 0,
+			 &client->lmtp_set, error_r) < 0) {
+		settings_free(client->lda_set);
+		settings_free(client->lmtp_set);
+		client->lda_set = old_lda_set;
+		client->lmtp_set = old_lmtp_set;
+		return -1;
+	}
+	settings_free(old_lda_set);
+	settings_free(old_lmtp_set);
+	smtp_server_connection_set_greeting(client->conn,
+					    client->lmtp_set->login_greeting);
+
+	return 0;
 }
 
 static void client_connection_disconnect(void *context, const char *reason)
@@ -368,7 +443,7 @@ static void client_connection_free(void *context)
 {
 	struct client *client = context;
 
-	client->v.destroy(client);
+	client_unref(&client);
 }
 
 static bool client_connection_is_trusted(void *context)
@@ -378,10 +453,7 @@ static bool client_connection_is_trusted(void *context)
 	struct ip_addr net_ip;
 	unsigned int bits;
 
-	if (client->lmtp_set->login_trusted_networks == NULL)
-		return FALSE;
-
-	net = t_strsplit_spaces(client->lmtp_set->login_trusted_networks, ", ");
+	net = settings_boollist_get(&client->lmtp_set->login_trusted_networks);
 	for (; *net != NULL; net++) {
 		if (net_parse_range(*net, &net_ip, &bits) < 0) {
 			e_error(client->event, "login_trusted_networks: "
@@ -399,7 +471,7 @@ void clients_destroy(void)
 {
 	while (clients != NULL) {
 		struct client *client = clients;
-		client_destroy(&client, "4.3.2", "Shutting down");
+		client_destroy(&client, "4.3.2", MASTER_SERVICE_SHUTTING_DOWN_MSG);
 	}
 }
 
@@ -415,6 +487,8 @@ static const struct smtp_server_callbacks lmtp_callbacks = {
 	.conn_state_changed = client_connection_state_changed,
 
 	.conn_proxy_data_updated = client_connection_proxy_data_updated,
+
+	.conn_tls_sni_callback = client_connection_tls_sni_callback,
 
 	.conn_disconnect = client_connection_disconnect,
 	.conn_free = client_connection_free,

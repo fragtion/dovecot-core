@@ -193,6 +193,11 @@ proxy_send_xclient(struct submission_client *client, struct ostream *output)
 			client->common.end_client_tls_secured ?
 			CLIENT_TRANSPORT_TLS : CLIENT_TRANSPORT_INSECURE);
 	}
+	if (client->common.local_name != NULL &&
+	    str_array_icase_find(client->proxy_xclient, "DESTNAME")) {
+		proxy_send_xclient_more(client, output, str, "DESTNAME",
+					client->common.local_name);
+	}
 	if (str_array_icase_find(client->proxy_xclient, "FORWARD")) {
 		buffer_t *fwd = proxy_compose_xclient_forward(client);
 
@@ -543,7 +548,7 @@ int submission_proxy_parse_line(struct client *client, const char *line)
 		subm_client->proxy_reply_status = status;
 	}
 
-	output = login_proxy_get_ostream(client->login_proxy);
+	output = login_proxy_get_server_ostream(client->login_proxy);
 	switch (subm_client->proxy_state) {
 	case SUBMISSION_PROXY_BANNER:
 		/* this is a banner */
@@ -611,7 +616,7 @@ int submission_proxy_parse_line(struct client *client, const char *line)
 		if (login_proxy_starttls(client->login_proxy) < 0)
 			return -1;
 		/* i/ostreams changed. */
-		output = login_proxy_get_ostream(client->login_proxy);
+		output = login_proxy_get_server_ostream(client->login_proxy);
 
 		subm_client->proxy_capability = 0;
 		i_free_and_null(subm_client->proxy_xclient);

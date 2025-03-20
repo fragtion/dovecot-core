@@ -108,8 +108,8 @@ maildir_list_get_path(struct mailbox_list *_list, const char *name,
 
 	if (name == NULL) {
 		/* return root directories */
-		return mailbox_list_set_get_root_path(&_list->set, type,
-						      path_r) ? 1 : 0;
+		return mailbox_list_default_get_root_path(_list, type,
+							  path_r) ? 1 : 0;
 	}
 
 	if (_list->mail_set->mail_full_filesystem_access &&
@@ -118,45 +118,46 @@ maildir_list_get_path(struct mailbox_list *_list, const char *name,
 		return 1;
 	}
 
-	root_dir = _list->set.root_dir;
+	root_dir = _list->mail_set->mail_path;
 	switch (type) {
 	case MAILBOX_LIST_PATH_TYPE_DIR:
 	case MAILBOX_LIST_PATH_TYPE_MAILBOX:
 		break;
 	case MAILBOX_LIST_PATH_TYPE_ALT_DIR:
 	case MAILBOX_LIST_PATH_TYPE_ALT_MAILBOX:
-		if (_list->set.alt_dir == NULL)
+		if (_list->mail_set->mail_alt_path[0] == '\0')
 			return 0;
-		root_dir = _list->set.alt_dir;
+		root_dir = _list->mail_set->mail_alt_path;
 		break;
 	case MAILBOX_LIST_PATH_TYPE_CONTROL:
-		if (_list->set.control_dir != NULL) {
+		if (_list->mail_set->mail_control_path[0] != '\0') {
 			*path_r = maildir_list_get_dirname_path(_list,
-					       _list->set.control_dir, name);
+				_list->mail_set->mail_control_path, name);
 			return 1;
 		}
 		break;
 	case MAILBOX_LIST_PATH_TYPE_INDEX_CACHE:
-		if (_list->set.index_cache_dir != NULL) {
+		if (_list->mail_set->mail_cache_path[0] != '\0') {
 			*path_r = maildir_list_get_dirname_path(_list,
-						_list->set.index_cache_dir, name);
+				_list->mail_set->mail_cache_path, name);
 			return 1;
 		}
 		/* fall through */
 	case MAILBOX_LIST_PATH_TYPE_INDEX:
-		if (_list->set.index_dir != NULL) {
-			if (*_list->set.index_dir == '\0')
+		if (_list->mail_set->mail_index_path[0] != '\0') {
+			if (strcmp(_list->mail_set->mail_index_path,
+				   MAIL_INDEX_PATH_MEMORY) == 0)
 				return 0;
 			*path_r = maildir_list_get_dirname_path(_list,
-						_list->set.index_dir, name);
+				_list->mail_set->mail_index_path, name);
 			return 1;
 		}
 		break;
 	case MAILBOX_LIST_PATH_TYPE_INDEX_PRIVATE:
-		if (_list->set.index_pvt_dir == NULL)
+		if (_list->mail_set->mail_index_private_path[0] == '\0')
 			return 0;
 		*path_r = maildir_list_get_dirname_path(_list,
-					_list->set.index_pvt_dir, name);
+			_list->mail_set->mail_index_private_path, name);
 		return 1;
 	case MAILBOX_LIST_PATH_TYPE_LIST_INDEX:
 	case MAILBOX_LIST_PATH_TYPE_COUNT:
@@ -166,8 +167,9 @@ maildir_list_get_path(struct mailbox_list *_list, const char *name,
 	if (type == MAILBOX_LIST_PATH_TYPE_ALT_DIR ||
 	    type == MAILBOX_LIST_PATH_TYPE_ALT_MAILBOX) {
 		/* don't use inbox_path */
-	} else if (strcmp(name, "INBOX") == 0 && _list->set.inbox_path != NULL) {
-		*path_r = _list->set.inbox_path;
+	} else if (strcmp(name, "INBOX") == 0 &&
+		   _list->mail_set->mail_inbox_path[0] != '\0') {
+		*path_r = _list->mail_set->mail_inbox_path;
 		return 1;
 	}
 
@@ -191,15 +193,17 @@ static int maildir_list_set_subscribed(struct mailbox_list *_list,
 		(struct maildir_mailbox_list *)_list;
 	const char *path;
 
-	if (_list->set.subscription_fname == NULL) {
+	if (_list->mail_set->mailbox_subscriptions_filename[0] == '\0') {
 		mailbox_list_set_error(_list, MAIL_ERROR_NOTPOSSIBLE,
 				       "Subscriptions not supported");
 		return -1;
 	}
 
-	path = t_strconcat(_list->set.control_dir != NULL ?
-			   _list->set.control_dir : _list->set.root_dir,
-			   "/", _list->set.subscription_fname, NULL);
+	path = t_strconcat(_list->mail_set->mail_control_path[0] != '\0' ?
+			   _list->mail_set->mail_control_path :
+			   _list->mail_set->mail_path,
+			   "/", _list->mail_set->mailbox_subscriptions_filename,
+			   NULL);
 
 	return subsfile_set_subscribed(_list, path, list->temp_prefix,
 				       name, set);

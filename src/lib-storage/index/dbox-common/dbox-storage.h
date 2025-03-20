@@ -8,13 +8,14 @@ struct dbox_mail;
 struct dbox_storage;
 struct dbox_save_context;
 
-#define DBOX_SUBSCRIPTION_FILE_NAME "subscriptions"
 #define DBOX_UIDVALIDITY_FILE_NAME "dovecot-uidvalidity"
 #define DBOX_TEMP_FILE_PREFIX ".temp."
 #define DBOX_ALT_SYMLINK_NAME "dbox-alt-root"
 
+/* <settings checks> */
 #define DBOX_MAILBOX_DIR_NAME "mailboxes"
 #define DBOX_MAILDIR_NAME "dbox-Mails"
+/* </settings checks> */
 
 /* Delete temp files having ctime older than this. */
 #define DBOX_TMP_DELETE_SECS (36*60*60)
@@ -50,9 +51,9 @@ struct dbox_storage_vfuncs {
 	   "-<mailbox_guid>-<uid>" */
 	const char *(*get_attachment_path_suffix)(struct dbox_file *file);
 	/* mark the mailbox corrupted */
-	void (*set_mailbox_corrupted)(struct mailbox *box);
+	void (*set_mailbox_corrupted)(struct mailbox *box, const char *reason);
 	/* mark the file corrupted */
-	void (*set_file_corrupted)(struct dbox_file *file);
+	void (*set_file_corrupted)(struct dbox_file *file, const char *reason);
 };
 
 struct dbox_storage {
@@ -65,8 +66,6 @@ struct dbox_storage {
 
 #define DBOX_STORAGE(s)		container_of(s, struct dbox_storage, storage)
 
-void dbox_storage_get_list_settings(const struct mail_namespace *ns,
-				    struct mailbox_list_settings *set);
 int dbox_storage_create(struct mail_storage *storage,
 			struct mail_namespace *ns,
 			const char **error_r);
@@ -77,7 +76,7 @@ int dbox_mailbox_check_existence(struct mailbox *box);
 int dbox_mailbox_open(struct mailbox *box);
 void dbox_mailbox_close(struct mailbox *box);
 void dbox_mailbox_close_cleanup(struct mailbox *box);
-int dbox_mailbox_list_cleanup(struct mail_user *user, const char *path,
+int dbox_mailbox_list_cleanup(struct mail_storage *storage, const char *path,
 			      time_t last_temp_file_scan);
 int dbox_mailbox_create(struct mailbox *box,
 			const struct mailbox_update *update, bool directory);

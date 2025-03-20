@@ -10,6 +10,7 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib \
 	-I$(top_srcdir)/src/lib-test \
 	-I$(top_srcdir)/src/lib-settings \
+	-I$(top_srcdir)/src/lib-json \
 	-I$(top_srcdir)/src/lib-auth \
 	-I$(top_srcdir)/src/lib-auth-client \
 	-I$(top_srcdir)/src/lib-compression \
@@ -28,6 +29,7 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-dcrypt \
 	-I$(top_srcdir)/src/lib-sasl \
 	-I$(top_srcdir)/src/stats \
+	-I$(top_srcdir)/src/lib-var-expand \
 	-DMODULEDIR=\""$(moduledir)"\" \
 	-DAUTH_MODULE_DIR=\""$(moduledir)/auth"\" \
 	-DDOVEADM_MODULEDIR=\""$(doveadm_moduledir)"\" \
@@ -40,6 +42,7 @@ AM_CPPFLAGS = \
 
 
 libs = \
+       ../lib-auth/libauth-crypt.la \
 	dsync/libdsync.la \
 	../lib-compression/libcompression.la
 
@@ -89,9 +92,11 @@ doveadm_common_mail_cmds = \
 	doveadm-mail.c \
 	doveadm-mail-altmove.c \
 	doveadm-mail-deduplicate.c \
+	doveadm-mail-dict.c \
 	doveadm-mail-expunge.c \
 	doveadm-mail-fetch.c \
 	doveadm-mail-flags.c \
+	doveadm-mail-fs.c \
 	doveadm-mail-import.c \
 	doveadm-mail-index.c \
 	doveadm-mail-iter.c \
@@ -169,6 +174,8 @@ pkginc_lib_HEADERS = \
 noinst_HEADERS = \
 	client-connection.h \
 	client-connection-private.h \
+	doveadm-dict.h \
+	doveadm-fs.h \
 	doveadm-who.h
 
 test_programs = \

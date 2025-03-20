@@ -11,12 +11,12 @@
 #include "str.h"
 #include "process-title.h"
 #include "restrict-access.h"
-#include "settings-parser.h"
+#include "settings.h"
 #include "master-service.h"
+#include "master-service-settings.h"
 #include "login-server.h"
 #include "master-interface.h"
 #include "master-admin-client.h"
-#include "var-expand.h"
 #include "mail-error.h"
 #include "mail-user.h"
 #include "mail-namespace.h"
@@ -142,12 +142,20 @@ client_create_from_input(const struct mail_storage_service_input *input,
 		if (write(fd_out, lookup_error_str, strlen(lookup_error_str)) < 0) {
 			/* ignored */
 		}
+		event_unref(&event);
 		return -1;
 	}
 	restrict_access_allow_coredumps(TRUE);
 
-	set = settings_parser_get_root_set(mail_user->set_parser,
-			&pop3_setting_parser_info);
+	if (settings_get(mail_user->event, &pop3_setting_parser_info, 0,
+			 &set, error_r) < 0) {
+		if (write(fd_out, lookup_error_str, strlen(lookup_error_str)) < 0) {
+			/* ignored */
+		}
+		mail_user_deinit(&mail_user);
+		event_unref(&event);
+		return -1;
+	}
 	if (set->verbose_proctitle)
 		verbose_proctitle = TRUE;
 
@@ -178,9 +186,20 @@ static int lock_session(struct client *client)
 static int init_namespaces(struct client *client, bool already_logged_in)
 {
 	const char *error;
+	int ret;
 
 	/* finish initializing the user (see comment in main()) */
-	if (mail_namespaces_init(client->user, &error) < 0) {
+	ret = mail_namespaces_init(client->user, &error);
+	if (ret == 0) {
+		i_assert(client->inbox_ns == NULL);
+		client->inbox_ns = mail_namespace_find_inbox(client->user->namespaces);
+		i_assert(client->inbox_ns != NULL);
+
+		client->mail_set = mailbox_list_get_mail_set(client->inbox_ns->list);
+		pool_ref(client->mail_set->pool);
+	}
+
+	if (ret < 0) {
 		if (!already_logged_in)
 			client_send_line(client, MSG_BYE_INTERNAL_ERROR);
 
@@ -188,11 +207,6 @@ static int init_namespaces(struct client *client, bool already_logged_in)
 		client_destroy(client, error);
 		return -1;
 	}
-
-	i_assert(client->inbox_ns == NULL);
-	client->inbox_ns = mail_namespace_find_inbox(client->user->namespaces);
-	i_assert(client->inbox_ns != NULL);
-
 	return 0;
 }
 
@@ -337,7 +351,7 @@ master_admin_cmd_kick_user(const char *user, const guid_128_t conn_guid)
 		if (strcmp(client->user->username, user) == 0 &&
 		    (guid_128_is_empty(conn_guid) ||
 		     guid_128_cmp(client->anvil_conn_guid, conn_guid) == 0))
-			client_kick(client);
+			client_kick(client, FALSE);
 	}
 	return count;
 }
@@ -357,14 +371,11 @@ static void client_connected(struct master_service_connection *conn)
 
 int main(int argc, char *argv[])
 {
-	static const struct setting_parser_info *set_roots[] = {
-		&pop3_setting_parser_info,
-		NULL
-	};
 	struct login_server_settings login_set;
 	enum master_service_flags service_flags = 0;
 	enum mail_storage_service_flags storage_service_flags = 0;
 	const char *username = NULL, *auth_socket_path = "auth-master";
+	const char *error;
 	int c;
 
 	i_zero(&login_set);
@@ -413,7 +424,9 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	const char *error;
+	if (master_service_settings_read_simple(master_service, &error) < 0)
+		i_fatal("%s", error);
+
 	if (t_abspath(auth_socket_path, &login_set.auth_socket_path, &error) < 0) {
 		i_fatal("t_abspath(%s) failed: %s", auth_socket_path, error);
 	}
@@ -435,7 +448,7 @@ int main(int argc, char *argv[])
 
 	storage_service =
 		mail_storage_service_init(master_service,
-					  set_roots, storage_service_flags);
+					  storage_service_flags);
 	master_service_init_finish(master_service);
 	/* NOTE: login_set.*_socket_path are now invalid due to data stack
 	   having been freed */

@@ -139,8 +139,8 @@ void array_sort_i(struct array *array, int (*cmp)(const void *, const void *))
 	      count, array->element_size, cmp);
 }
 
-void *array_bsearch_i(struct array *array, const void *key,
-		     int (*cmp)(const void *, const void *))
+const void *array_bsearch_i(const struct array *array, const void *key,
+		            int (*cmp)(const void *, const void *))
 {
 	unsigned int count;
 
@@ -163,4 +163,33 @@ const void *array_lsearch_i(const struct array *array, const void *key,
 	}
 
 	return NULL;
+}
+
+const void *array_lsearch_ptr_i(const struct array *array, const void *key)
+{
+	i_assert(array->element_size == sizeof(key));
+	const void *const *data = array->buffer->data;
+	unsigned int i, count = array_count_i(array);
+
+	for (i = 0; i < count; i++) {
+		if (data[i] == key)
+			return data[i];
+	}
+	return NULL;
+}
+
+bool array_lsearch_ptr_idx_i(const struct array *array, const void *key,
+			     unsigned int *idx_r)
+{
+	i_assert(array->element_size == sizeof(key));
+	const void *const *data = array->buffer->data;
+	unsigned int i, count = array_count_i(array);
+
+	for (i = 0; i < count; i++) {
+		if (data[i] == key) {
+			*idx_r = i;
+			return TRUE;
+		}
+	}
+	return FALSE;
 }

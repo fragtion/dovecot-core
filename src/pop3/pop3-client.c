@@ -14,7 +14,7 @@
 #include "llist.h"
 #include "hostpid.h"
 #include "file-dotlock.h"
-#include "var-expand.h"
+#include "settings.h"
 #include "master-service.h"
 #include "mail-storage.h"
 #include "mail-storage-service.h"
@@ -300,32 +300,36 @@ static int init_mailbox(struct client *client, const char **error_r)
 	return -1;
 }
 
-static enum uidl_keys parse_uidl_keymask(const char *format)
+static int parse_uidl_keymask(const char *format, enum uidl_keys *keys,
+			      const char **error_r)
 {
 	enum uidl_keys mask = 0;
+	struct var_expand_program *prog;
+	if (var_expand_program_create(format, &prog, error_r) < 0)
+		return -1;
+	const char *const *vars = var_expand_program_variables(prog);
+	int ret = 0;
 
-	for (; *format != '\0'; format++) {
-		if (format[0] == '%' && format[1] != '\0') {
-			switch (var_get_key(++format)) {
-			case 'v':
-				mask |= UIDL_UIDVALIDITY;
-				break;
-			case 'u':
-				mask |= UIDL_UID;
-				break;
-			case 'm':
-				mask |= UIDL_MD5;
-				break;
-			case 'f':
-				mask |= UIDL_FILE_NAME;
-				break;
-			case 'g':
-				mask |= UIDL_GUID;
-				break;
-			}
+	for (; *vars != NULL; vars++) {
+		if (strcmp(*vars, "uidvalidity") == 0)
+			mask |= UIDL_UIDVALIDITY;
+		else if (strcmp(*vars, "uid") == 0)
+			mask |= UIDL_UID;
+		else if (strcmp(*vars, "md5") == 0)
+			mask |= UIDL_MD5;
+		else if (strcmp(*vars, "filename") == 0)
+			mask |= UIDL_FILE_NAME;
+		else if (strcmp(*vars, "guid") == 0)
+			mask |= UIDL_GUID;
+		else {
+			*error_r = t_strdup_printf("Invalid key %%{%s}", *vars);
+			ret = -1;
+			break;
 		}
 	}
-	return mask;
+	if (ret == 0)
+		*keys = mask;
+	return ret;
 }
 
 static void pop3_lock_session_refresh(struct client *client)
@@ -339,8 +343,6 @@ static void pop3_lock_session_refresh(struct client *client)
 
 int pop3_lock_session(struct client *client)
 {
-	const struct mail_storage_settings *mail_set =
-		mail_storage_service_user_get_mail_set(client->user->service_user);
 	struct dotlock_settings dotlock_set;
 	enum mailbox_list_path_type type;
 	const char *dir, *path;
@@ -367,8 +369,8 @@ int pop3_lock_session(struct client *client)
 	path = t_strdup_printf("%s/"POP3_LOCK_FNAME, dir);
 
 	dotlock_set = session_dotlock_set;
-	dotlock_set.use_excl_lock = mail_set->dotlock_use_excl;
-	dotlock_set.nfs_flush = mail_set->mail_nfs_storage;
+	dotlock_set.use_excl_lock = client->mail_set->dotlock_use_excl;
+	dotlock_set.nfs_flush = client->mail_set->mail_nfs_storage;
 
 	ret = file_dotlock_create(&dotlock_set, path, 0,
 				  &client->session_dotlock);
@@ -417,13 +419,7 @@ struct client *client_create(int fd_in, int fd_out,
 
 	client->user = user;
 
-	client->mail_set = mail_user_set_get_storage_set(user);
-	client->uidl_keymask =
-		parse_uidl_keymask(client->mail_set->pop3_uidl_format);
-	if (client->uidl_keymask == 0)
-		i_fatal("Invalid pop3_uidl_format");
-
-	if (var_has_key(set->pop3_logout_format, 'u', "uidl_change")) {
+	if (set->parsed_want_uidl_change) {
 		/* logging uidl_change. we need hashes of the UIDLs */
 		client->message_uidls_save = TRUE;
 	} else if (strcmp(set->pop3_uidl_duplicates, "allow") != 0) {
@@ -457,6 +453,12 @@ int client_init_mailbox(struct client *client, const char **error_r)
 
 	/* refresh proctitle before a potentially long-running init_mailbox() */
 	pop3_refresh_proctitle();
+
+	if (parse_uidl_keymask(client->mail_set->pop3_uidl_format,
+			       &client->uidl_keymask, &errmsg) < 0)
+		i_fatal("Invalid pop3_uidl_format: %s", errmsg);
+	if (client->uidl_keymask == 0)
+		i_fatal("Invalid pop3_uidl_format: Empty format");
 
 	flags = MAILBOX_FLAG_POP3_SESSION;
 	if (!client->set->pop3_no_flag_updates)
@@ -527,46 +529,54 @@ static const char *client_build_uidl_change_string(struct client *client)
 
 static const char *client_stats(struct client *client)
 {
-	const char *uidl_change = "";
-	if (var_has_key(client->set->pop3_logout_format,
-			'o', "uidl_change"))
+	const char *error, *uidl_change = "";
+
+	if (client->set->parsed_want_uidl_change)
 		uidl_change = client_build_uidl_change_string(client);
 
 	const struct var_expand_table logout_tab[] = {
-		{ 'p', dec2str(client->top_bytes), "top_bytes" },
-		{ 't', dec2str(client->top_count), "top_count" },
-		{ 'b', dec2str(client->retr_bytes), "retr_bytes" },
-		{ 'r', dec2str(client->retr_count), "retr_count" },
-		{ 'd', !client->delete_success ? "0" :
-		       dec2str(client->deleted_count), "deleted_count" },
-		{ 'm', dec2str(client->messages_count), "message_count" },
-		{ 's', dec2str(client->total_size), "message_bytes" },
-		{ 'i', dec2str(i_stream_get_absolute_offset(client->input)),
-		  "input" },
-		{ 'o', dec2str(client->output->offset), "output" },
-		{ 'u', uidl_change, "uidl_change" },
-		{ '\0', !client->delete_success ? "0" :
-		        dec2str(client->deleted_size), "deleted_bytes" },
-		{ '\0', NULL, NULL }
+		{ .key = "top_bytes", .value = dec2str(client->top_bytes) },
+		{ .key = "top_count", .value = dec2str(client->top_count) },
+		{ .key = "retr_bytes", .value = dec2str(client->retr_bytes) },
+		{ .key = "retr_count", .value = dec2str(client->retr_count) },
+		{ .key = "deleted_count",
+		  .value = !client->delete_success ? "0" :
+			   dec2str(client->deleted_count) },
+		{ .key = "message_count", .value = dec2str(client->messages_count) },
+		{ .key = "message_bytes", .value = dec2str(client->total_size) },
+		{ .key = "input",
+		  .value = dec2str(i_stream_get_absolute_offset(client->input)), },
+		{ .key = "output", .value = dec2str(client->output->offset) },
+		{ .key = "uidl_change", .value = uidl_change },
+		{ .key = "deleted_bytes", .value = !client->delete_success ? "0" :
+		        dec2str(client->deleted_size) },
+		VAR_EXPAND_TABLE_END
 	};
-	const struct var_expand_table *user_tab =
-		mail_user_var_expand_table(client->user);
-	const struct var_expand_table *tab =
-		t_var_expand_merge_tables(logout_tab, user_tab);
+
+	const struct var_expand_params *user_params =
+		mail_user_var_expand_params(client->user);
+	const struct var_expand_params params = {
+		.tables_arr = (const struct var_expand_table*[]) {
+			user_params->table,
+			logout_tab,
+			NULL
+		},
+		.providers = user_params->providers,
+		.context =  user_params->context,
+		.event = client->event,
+	};
 	string_t *str;
-	const char *error;
+
+	event_add_int(client->event, "net_in_bytes", i_stream_get_absolute_offset(client->input));
+	event_add_int(client->event, "net_out_bytes", client->output->offset);
 
 	str = t_str_new(128);
-	if (var_expand_with_funcs(str, client->set->pop3_logout_format,
-				  tab, mail_user_var_expand_func_table,
-				  client->user, &error) <= 0) {
+	if (var_expand(str, client->set->pop3_logout_format,
+			   &params, &error) < 0) {
 		e_error(client->event,
 			"Failed to expand pop3_logout_format=%s: %s",
 			client->set->pop3_logout_format, error);
 	}
-
-	event_add_int(client->event, "net_in_bytes", i_stream_get_absolute_offset(client->input));
-	event_add_int(client->event, "net_out_bytes", client->output->offset);
 
 	return str_c(str);
 }
@@ -640,6 +650,8 @@ static void client_default_destroy(struct client *client, const char *reason)
 	i_stream_destroy(&client->input);
 	o_stream_destroy(&client->output);
 
+	if (client->fd_in == client->fd_out)
+		(void)shutdown(client->fd_out, SHUT_RDWR);
 	fd_close_maybe_stdio(&client->fd_in, &client->fd_out);
 
 	/* Autoexpunging might run for a long time. Disconnect the client
@@ -650,6 +662,8 @@ static void client_default_destroy(struct client *client, const char *reason)
 	pop3_refresh_proctitle();
 	mail_user_autoexpunge(client->user);
 	mail_user_deinit(&client->user);
+	settings_free(client->set);
+	settings_free(client->mail_set);
 
 	pop3_client_count--;
 	DLLIST_REMOVE(&pop3_clients, client);
@@ -909,20 +923,22 @@ static int client_output(struct client *client)
 	}
 }
 
-void client_kick(struct client *client)
+void client_kick(struct client *client, bool shutdown)
 {
 	mail_storage_service_io_activate_user(client->user->service_user);
 	if (client->cmd == NULL) {
 		client_send_line(client,
 			"-ERR [SYS/TEMP] "MASTER_SERVICE_SHUTTING_DOWN_MSG".");
 	}
-	client_destroy(client, MASTER_SERVICE_SHUTTING_DOWN_MSG);
+	client_destroy(client, shutdown ? MASTER_SERVICE_SHUTTING_DOWN_MSG :
+		       MASTER_SERVICE_USER_KICKED_MSG);
 }
 
 void clients_destroy_all(void)
 {
+	bool shutdown = !master_service_is_user_kicked(master_service);
 	while (pop3_clients != NULL)
-		client_kick(pop3_clients);
+		client_kick(pop3_clients, shutdown);
 }
 
 struct pop3_client_vfuncs pop3_client_vfuncs = {

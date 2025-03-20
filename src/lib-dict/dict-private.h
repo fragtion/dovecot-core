@@ -12,8 +12,7 @@ enum dict_driver_flags {
 };
 
 struct dict_vfuncs {
-	int (*init)(struct dict *dict_driver, const char *uri,
-		    const struct dict_settings *set,
+	int (*init)(const struct dict *dict_driver, struct event *event,
 		    struct dict **dict_r, const char **error_r);
 	void (*deinit)(struct dict *dict);
 	void (*wait)(struct dict *dict);
@@ -109,6 +108,7 @@ struct dict_transaction_context {
 	const char *error;
 
 	bool changed:1;
+	bool non_atomic:1;
 };
 
 void dict_transaction_commit_async_noop_callback(

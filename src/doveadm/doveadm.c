@@ -15,7 +15,6 @@
 #include "doveadm-dump.h"
 #include "doveadm-mail.h"
 #include "doveadm-settings.h"
-#include "doveadm-dsync.h"
 #include "doveadm.h"
 
 #include <getopt.h>
@@ -223,8 +222,10 @@ static void cmd_exec(struct doveadm_cmd_context *cctx)
 
 	/* Avoid re-executing doveconf after the binary is executed */
 	int config_fd = doveadm_settings_get_config_fd();
-	fd_close_on_exec(config_fd, FALSE);
-	env_put(DOVECOT_CONFIG_FD_ENV, dec2str(config_fd));
+	if (config_fd != -1) {
+		fd_close_on_exec(config_fd, FALSE);
+		env_put(DOVECOT_CONFIG_FD_ENV, dec2str(config_fd));
+	}
 
 	path = t_strdup_printf("%s/%s", doveadm_settings->libexec_dir, binary);
 
@@ -320,7 +321,6 @@ int main(int argc, char *argv[])
 	}
 	master_service_init_log(master_service);
 
-	doveadm_settings_init();
 	doveadm_cmds_init();
 	for (i = 0; i < N_ELEMENTS(doveadm_cmdline_commands_ver2); i++)
 		doveadm_cmd_register_ver2(doveadm_cmdline_commands_ver2[i]);

@@ -7,13 +7,15 @@
 #include "istream-try.h"
 #include "ostream.h"
 #include "iostream-temp.h"
+#include "settings.h"
 #include "compression.h"
 #include "fs-api-private.h"
+
+#define FS_COMPRESS_ISTREAM_MIN_BUFFER_SIZE 1024
 
 struct compress_fs {
 	struct fs fs;
 	const struct compression_handler *compress_handler;
-	int compress_level;
 	bool try_plain;
 };
 
@@ -28,8 +30,39 @@ struct compress_fs_file {
 	struct ostream *temp_output;
 };
 
+struct fs_compress_settings {
+	pool_t pool;
+	const char *fs_compress_write_method;
+	bool fs_compress_read_plain_fallback;
+};
+
 #define COMPRESS_FS(ptr)	container_of((ptr), struct compress_fs, fs)
 #define COMPRESS_FILE(ptr)	container_of((ptr), struct compress_fs_file, file)
+
+#undef DEF
+#define DEF(type, name) \
+	SETTING_DEFINE_STRUCT_##type(#name, name, struct fs_compress_settings)
+static const struct setting_define fs_compress_setting_defines[] = {
+	DEF(STR, fs_compress_write_method),
+	DEF(BOOL, fs_compress_read_plain_fallback),
+
+	SETTING_DEFINE_LIST_END
+};
+static const struct fs_compress_settings fs_compress_default_settings = {
+	.fs_compress_write_method = "",
+	.fs_compress_read_plain_fallback = FALSE,
+};
+
+const struct setting_parser_info fs_compress_setting_parser_info = {
+	.name = "fs_compress",
+	.plugin_dependency = "libfs_compress",
+
+	.defines = fs_compress_setting_defines,
+	.defaults = &fs_compress_default_settings,
+
+	.struct_size = sizeof(struct fs_compress_settings),
+	.pool_offset1 = 1 + offsetof(struct fs_compress_settings, pool),
+};
 
 extern const struct fs fs_class_compress;
 
@@ -43,61 +76,31 @@ static struct fs *fs_compress_alloc(void)
 }
 
 static int
-fs_compress_init(struct fs *_fs, const char *args,
-		 const struct fs_settings *set, const char **error_r)
+fs_compress_init(struct fs *_fs, const struct fs_parameters *params,
+		 const char **error_r)
 {
 	struct compress_fs *fs = COMPRESS_FS(_fs);
-	const char *p, *compression_name, *level_str;
-	const char *parent_name, *parent_args;
+	const struct fs_compress_settings *set;
 	int ret;
 
-	/* get compression handler name */
-	if (str_begins(args, "maybe-", &args))
-		fs->try_plain = TRUE;
-
-	p = strchr(args, ':');
-	if (p == NULL) {
-		*error_r = "Compression method not given as parameter";
+	if (settings_get(_fs->event, &fs_compress_setting_parser_info, 0,
+			 &set, error_r) < 0)
 		return -1;
-	}
-	compression_name = t_strdup_until(args, p++);
-	args = p;
+	fs->try_plain = set->fs_compress_read_plain_fallback;
 
-	/* get compression level */
-	p = strchr(args, ':');
-	if (p == NULL || p[1] == '\0') {
-		*error_r = "Parent filesystem not given as parameter";
-		return -1;
-	}
-
-	level_str = t_strdup_until(args, p++);
-	args = p;
-	ret = compression_lookup_handler(compression_name, &fs->compress_handler);
+	ret = set->fs_compress_write_method[0] == '\0' ? 1 :
+		compression_lookup_handler(set->fs_compress_write_method,
+					   &fs->compress_handler);
 	if (ret <= 0) {
 		*error_r = t_strdup_printf("Compression method '%s' %s.",
-					   compression_name, ret == 0 ?
-					   "not supported" : "unknown");
+			set->fs_compress_write_method,
+			ret == 0 ? "not supported" : "unknown");
+		settings_free(set);
 		return -1;
 	}
-	if (str_to_int(level_str, &fs->compress_level) < 0 ||
-	    fs->compress_level < fs->compress_handler->get_min_level() ||
-	    fs->compress_level > fs->compress_handler->get_max_level()) {
-		 *error_r = t_strdup_printf(
-			"Invalid compression level parameter '%s': "
-			"Level must be between %d..%d", level_str,
-			fs->compress_handler->get_min_level(),
-			fs->compress_handler->get_max_level());
-		return -1;
-	}
-	parent_args = strchr(args, ':');
-	if (parent_args == NULL) {
-		parent_name = args;
-		parent_args = "";
-	} else {
-		parent_name = t_strdup_until(args, parent_args);
-		parent_args++;
-	}
-	return fs_init(parent_name, parent_args, set, &_fs->parent, error_r);
+	settings_free(set);
+
+	return fs_init_parent(_fs, params, error_r);
 }
 
 static void fs_compress_free(struct fs *_fs)
@@ -160,6 +163,16 @@ static void fs_compress_file_close(struct fs_file *_file)
 	fs_file_close(_file->parent);
 }
 
+static void fs_compress_set_metadata(struct fs_file *_file,
+				     const char *key, const char *value)
+{
+	struct compress_fs_file *file = COMPRESS_FILE(_file);
+
+	fs_set_metadata(_file->parent, key, value);
+	if (file->super_read != NULL)
+		fs_set_metadata(file->super_read, key, value);
+}
+
 static struct istream *
 fs_compress_read_stream(struct fs_file *_file, size_t max_buffer_size)
 {
@@ -173,7 +186,13 @@ fs_compress_read_stream(struct fs_file *_file, size_t max_buffer_size)
 		return file->input;
 	}
 
-	input = fs_read_stream(file->super_read, max_buffer_size);
+	input = fs_read_stream(file->super_read,
+		I_MAX(FS_COMPRESS_ISTREAM_MIN_BUFFER_SIZE, max_buffer_size));
+	if (input->stream_errno != 0) {
+		file->input = input;
+		i_stream_ref(file->input);
+		return file->input;
+	}
 	if (file->fs->try_plain)
 		flags |= ISTREAM_DECOMPRESS_FLAG_TRY;
 	file->input = i_stream_create_decompress(input, flags);
@@ -186,7 +205,7 @@ static void fs_compress_write_stream(struct fs_file *_file)
 {
 	struct compress_fs_file *file = COMPRESS_FILE(_file);
 
-	if (file->fs->compress_level == 0) {
+	if (file->fs->compress_handler == NULL) {
 		fs_wrapper_write_stream(_file);
 		return;
 	}
@@ -198,7 +217,7 @@ static void fs_compress_write_stream(struct fs_file *_file)
 					   IOSTREAM_TEMP_FLAG_TRY_FD_DUP,
 					   fs_file_path(_file));
 	_file->output = file->fs->compress_handler->
-		create_ostream(file->temp_output, file->fs->compress_level);
+		create_ostream_auto(file->temp_output, _file->event);
 }
 
 static int fs_compress_write_stream_finish(struct fs_file *_file, bool success)
@@ -207,7 +226,7 @@ static int fs_compress_write_stream_finish(struct fs_file *_file, bool success)
 	struct istream *input;
 	int ret;
 
-	if (file->fs->compress_level == 0)
+	if (file->fs->compress_handler == NULL)
 		return fs_wrapper_write_stream_finish(_file, success);
 
 	if (_file->output != NULL) {
@@ -258,7 +277,7 @@ const struct fs fs_class_compress = {
 		.get_path = fs_wrapper_file_get_path,
 		.set_async_callback = fs_wrapper_set_async_callback,
 		.wait_async = fs_wrapper_wait_async,
-		.set_metadata = fs_wrapper_set_metadata,
+		.set_metadata = fs_compress_set_metadata,
 		.get_metadata = fs_wrapper_get_metadata,
 		.prefetch = fs_wrapper_prefetch,
 		.read = fs_read_via_stream,

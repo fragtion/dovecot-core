@@ -17,7 +17,7 @@ enum auth_request_flags {
 	AUTH_REQUEST_FLAG_VALID_CLIENT_CERT	= 0x02,
 	/* Skip penalty checks for this request */
 	AUTH_REQUEST_FLAG_NO_PENALTY		= 0x04,
-	/* Support final SASL response */
+	/* Support final SASL response (handled locally) */
 	AUTH_REQUEST_FLAG_SUPPORT_FINAL_RESP	= 0x08,
 	/* Enable auth_debug=yes logging for this request */
 	AUTH_REQUEST_FLAG_DEBUG			= 0x10,
@@ -45,7 +45,7 @@ struct auth_connect_id {
 
 struct auth_request_info {
 	const char *mech;
-	const char *service;
+	const char *protocol;
 	const char *session_id;
 	const char *cert_username;
 	const char *local_name;
@@ -72,6 +72,10 @@ typedef void auth_request_callback_t(struct auth_client_request *request,
 				     const char *data_base64,
 				     const char *const *args, void *context);
 
+typedef int auth_channel_binding_callback_t(const char *type, void *context,
+					    const buffer_t **data_r,
+					    const char **error_r);
+
 typedef void auth_connect_notify_callback_t(struct auth_client *client,
 					    bool connected, void *context);
 
@@ -90,7 +94,7 @@ void auth_client_set_connect_timeout(struct auth_client *client,
 				     unsigned int msecs);
 void auth_client_set_connect_notify(struct auth_client *client,
 				    auth_connect_notify_callback_t *callback,
-				    void *context) ATTR_NULL(2, 3);
+				    void *context);
 const struct auth_mech_desc *
 auth_client_get_available_mechs(struct auth_client *client,
 				unsigned int *mech_count);
@@ -107,15 +111,18 @@ void auth_client_get_connect_id(struct auth_client *client,
 struct auth_client_request *
 auth_client_request_new(struct auth_client *client,
 			const struct auth_request_info *request_info,
-			auth_request_callback_t *callback, void *context)
-	ATTR_NULL(4);
+			auth_request_callback_t *callback, void *context);
+/* Enable channel binding support for this request. */
+void auth_client_request_enable_channel_binding(
+	struct auth_client_request *request,
+	auth_channel_binding_callback_t *callback, void *context);
 /* Continue authentication. Call when
    reply->result == AUTH_CLIENT_REQUEST_CONTINUE */
 void auth_client_request_continue(struct auth_client_request *request,
 				  const char *data_base64);
 /* Abort ongoing authentication request. */
 void auth_client_request_abort(struct auth_client_request **request,
-			       const char *reason) ATTR_NULL(2);
+			       const char *reason);
 /* Return ID of this request. */
 unsigned int auth_client_request_get_id(struct auth_client_request *request);
 /* Return the PID of the server that handled this request. */

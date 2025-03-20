@@ -41,17 +41,11 @@ void passdb_register_module(struct passdb_module_interface *iface)
 
 void passdb_unregister_module(struct passdb_module_interface *iface)
 {
-	struct passdb_module_interface *const *ifaces;
 	unsigned int idx;
 
-	array_foreach(&passdb_interfaces, ifaces) {
-		if (*ifaces == iface) {
-			idx = array_foreach_idx(&passdb_interfaces, ifaces);
-			array_delete(&passdb_interfaces, idx, 1);
-			return;
-		}
-	}
-	i_panic("passdb_unregister_module(%s): Not registered", iface->name);
+	if (!array_lsearch_ptr_idx(&passdb_interfaces, iface, &idx))
+		i_panic("passdb_unregister_module(%s): Not registered", iface->name);
+	array_delete(&passdb_interfaces, idx, 1);
 }
 
 bool passdb_get_credentials(struct auth_request *auth_request,
@@ -170,30 +164,14 @@ void passdb_handle_credentials(enum passdb_result result,
 	callback(result, credentials, size, auth_request);
 }
 
-static struct passdb_module *
-passdb_find(const char *driver, const char *args, unsigned int *idx_r)
-{
-	struct passdb_module *const *passdbs;
-	unsigned int i, count;
-
-	passdbs = array_get(&passdb_modules, &count);
-	for (i = 0; i < count; i++) {
-		if (strcmp(passdbs[i]->iface.name, driver) == 0 &&
-		    strcmp(passdbs[i]->args, args) == 0) {
-			*idx_r = i;
-			return passdbs[i];
-		}
-	}
-	return NULL;
-}
-
 struct passdb_module *
-passdb_preinit(pool_t pool, const struct auth_passdb_settings *set)
+passdb_preinit(pool_t pool, struct event *event,
+	       const struct auth_passdb_settings *set)
 {
 	static unsigned int auth_passdb_id = 0;
 	struct passdb_module_interface *iface;
 	struct passdb_module *passdb;
-	unsigned int idx;
+	const char *error;
 
 	iface = passdb_interface_find(set->driver);
 	if (iface == NULL || iface->verify_plain == NULL) {
@@ -207,25 +185,18 @@ passdb_preinit(pool_t pool, const struct auth_passdb_settings *set)
 		i_fatal("Support not compiled in for passdb driver '%s'",
 			set->driver);
 	}
-	if (iface->preinit == NULL && iface->init == NULL &&
-	    *set->args != '\0') {
-		i_fatal("passdb %s: No args are supported: %s",
-			set->driver, set->args);
-	}
 
-	passdb = passdb_find(set->driver, set->args, &idx);
-	if (passdb != NULL)
-		return passdb;
-
-	if (iface->preinit == NULL)
+	if (iface->preinit != NULL) {
+		if (iface->preinit(pool, event, &passdb, &error) < 0)
+			i_fatal("passdb %s: %s", set->name, error);
+		passdb->default_pass_scheme =
+			set->default_password_scheme;
+		passdb->blocking = set->use_worker;
+	} else {
 		passdb = p_new(pool, struct passdb_module, 1);
-	else
-		passdb = iface->preinit(pool, set->args);
+	}
 	passdb->id = ++auth_passdb_id;
 	passdb->iface = *iface;
-	passdb->args = p_strdup(pool, set->args);
-	/* NOTE: if anything else than driver & args are added here,
-	   passdb_find() also needs to be updated. */
 	array_push_back(&passdb_modules, &passdb);
 	return passdb;
 }
@@ -239,39 +210,21 @@ void passdb_init(struct passdb_module *passdb)
 
 void passdb_deinit(struct passdb_module *passdb)
 {
-	unsigned int idx;
-
 	i_assert(passdb->init_refcount > 0);
 
 	if (--passdb->init_refcount > 0)
 		return;
 
-	if (passdb_find(passdb->iface.name, passdb->args, &idx) == NULL)
+	unsigned int i;
+	if (!array_lsearch_ptr_idx(&passdb_modules, passdb, &i))
 		i_unreached();
-	array_delete(&passdb_modules, idx, 1);
+	array_delete(&passdb_modules, i, 1);
 
 	if (passdb->iface.deinit != NULL)
 		passdb->iface.deinit(passdb);
 
 	/* make sure passdb isn't accessed again */
 	passdb->iface = passdb_iface_deinit;
-}
-
-void passdbs_generate_md5(unsigned char md5[STATIC_ARRAY MD5_RESULTLEN])
-{
-	struct md5_context ctx;
-	struct passdb_module *const *passdbs;
-	unsigned int i, count;
-
-	md5_init(&ctx);
-	passdbs = array_get(&passdb_modules, &count);
-	for (i = 0; i < count; i++) {
-		md5_update(&ctx, &passdbs[i]->id, sizeof(passdbs[i]->id));
-		md5_update(&ctx, passdbs[i]->iface.name,
-			   strlen(passdbs[i]->iface.name));
-		md5_update(&ctx, passdbs[i]->args, strlen(passdbs[i]->args));
-	}
-	md5_final(&ctx, md5);
 }
 
 const char *
@@ -300,7 +253,6 @@ passdb_result_to_string(enum passdb_result result)
 
 extern struct passdb_module_interface passdb_passwd;
 extern struct passdb_module_interface passdb_bsdauth;
-extern struct passdb_module_interface passdb_dict;
 #ifdef HAVE_LUA
 extern struct passdb_module_interface passdb_lua;
 #endif
@@ -317,7 +269,6 @@ void passdbs_init(void)
 	i_array_init(&passdb_modules, 16);
 	passdb_register_module(&passdb_passwd);
 	passdb_register_module(&passdb_bsdauth);
-	passdb_register_module(&passdb_dict);
 #ifdef HAVE_LUA
 	passdb_register_module(&passdb_lua);
 #endif

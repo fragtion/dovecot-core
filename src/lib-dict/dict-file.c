@@ -13,6 +13,7 @@
 #include "nfs-workarounds.h"
 #include "istream.h"
 #include "ostream.h"
+#include "settings.h"
 #include "dict-transaction-memory.h"
 #include "dict-private.h"
 
@@ -48,6 +49,35 @@ struct file_dict_iterate_context {
 	const char *error;
 };
 
+struct dict_file_settings {
+	pool_t pool;
+
+	const char *dict_file_lock_method;
+	const char *dict_file_path;
+};
+#undef DEF
+#define DEF(type, name) \
+	SETTING_DEFINE_STRUCT_##type(#name, name, struct dict_file_settings)
+static const struct setting_define dict_file_setting_defines[] = {
+	DEF(ENUM, dict_file_lock_method),
+	DEF(STR, dict_file_path),
+
+	SETTING_DEFINE_LIST_END
+};
+static const struct dict_file_settings dict_file_default_settings = {
+	.dict_file_lock_method = "dotlock:fcntl:flock",
+	.dict_file_path = "",
+};
+const struct setting_parser_info dict_file_setting_parser_info = {
+	.name = "dict_file",
+
+	.defines = dict_file_setting_defines,
+	.defaults = &dict_file_default_settings,
+
+	.struct_size = sizeof(struct dict_file_settings),
+	.pool_offset1 = 1 + offsetof(struct dict_file_settings, pool),
+};
+
 static struct dotlock_settings file_dict_dotlock_settings = {
 	.timeout = 60*2,
 	.stale_timeout = 60,
@@ -77,41 +107,28 @@ file_dict_ensure_path_home_dir(struct file_dict *dict, const char *home_dir,
 }
 
 static int
-file_dict_init(struct dict *driver, const char *uri,
-	       const struct dict_settings *set ATTR_UNUSED,
+file_dict_init(const struct dict *dict_driver, struct event *event,
 	       struct dict **dict_r, const char **error_r)
 {
+	struct dict_file_settings *set;
 	struct file_dict *dict;
-	const char *p, *path;
+
+	if (settings_get(event, &dict_file_setting_parser_info, 0,
+			 &set, error_r) < 0)
+		return -1;
 
 	dict = i_new(struct file_dict, 1);
-	dict->lock_method = FILE_LOCK_METHOD_DOTLOCK;
+	dict->path = i_strdup(set->dict_file_path);
+	if (!file_lock_method_parse(set->dict_file_lock_method,
+				    &dict->lock_method))
+		i_unreached(); /* enum should have been checked already */
+	settings_free(set);
 
-	p = strchr(uri, ':');
-	if (p == NULL) {
-		/* no parameters */
-		path = uri;
-	} else {
-		path = t_strdup_until(uri, p++);
-		if (strcmp(p, "lock=fcntl") == 0)
-			dict->lock_method = FILE_LOCK_METHOD_FCNTL;
-		else if (strcmp(p, "lock=flock") == 0)
-			dict->lock_method = FILE_LOCK_METHOD_FLOCK;
-		else {
-			*error_r = t_strdup_printf("Invalid parameter: %s", p+1);
-			i_free(dict);
-			return -1;
-		}
-	}
-
-	/* keep the path for now, later in dict operations check if home_dir
-	   should be prepended. */
-	dict->path = i_strdup(path);
-
-	dict->dict = *driver;
+	dict->dict = *dict_driver;
 	dict->hash_pool = pool_alloconly_create("file dict", 1024);
 	hash_table_create(&dict->hash, dict->hash_pool, 0, str_hash, strcmp);
 	dict->fd = -1;
+
 	*dict_r = &dict->dict;
 	return 0;
 }

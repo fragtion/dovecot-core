@@ -1,10 +1,10 @@
 /* Copyright (c) 2010-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
+#include "array.h"
 #include "process-title.h"
-#include "settings-parser.h"
+#include "settings.h"
 #include "master-service.h"
-#include "master-service-settings.h"
 #include "doveadm.h"
 #include "doveadm-settings.h"
 #include "client-connection-private.h"
@@ -14,12 +14,12 @@ bool doveadm_client_is_allowed_command(const struct doveadm_settings *set,
 {
 	bool ret = FALSE;
 
-	if (*set->doveadm_allowed_commands == '\0')
+	if (array_is_empty(&set->doveadm_allowed_commands))
 		return TRUE;
 
 	T_BEGIN {
 		const char *const *cmds =
-			t_strsplit(set->doveadm_allowed_commands, ",");
+			settings_boollist_get(&set->doveadm_allowed_commands);
 		for (; *cmds != NULL; cmds++) {
 			if (strcmp(*cmds, cmd_name) == 0) {
 				ret = TRUE;
@@ -32,27 +32,13 @@ bool doveadm_client_is_allowed_command(const struct doveadm_settings *set,
 
 static int client_connection_read_settings(struct client_connection *conn)
 {
-	const struct setting_parser_info *set_roots[] = {
-		&doveadm_setting_parser_info,
-		NULL
-	};
-	struct master_service_settings_input input;
-	struct master_service_settings_output output;
 	const char *error;
 
-	i_zero(&input);
-	input.roots = set_roots;
-	input.service = "doveadm";
-	input.local_ip = conn->local_ip;
-	input.remote_ip = conn->remote_ip;
-
-	if (master_service_settings_read(master_service, &input,
-					 &output, &error) < 0) {
-		e_error(conn->event, "Error reading configuration: %s", error);
+	if (settings_get(conn->event, &doveadm_setting_parser_info, 0,
+			 &conn->set, &error) < 0) {
+		e_error(conn->event, "%s", error);
 		return -1;
 	}
-	conn->set = master_service_settings_get_root_set_dup(master_service,
-				&doveadm_setting_parser_info, conn->pool);
 	return 0;
 }
 
@@ -66,8 +52,10 @@ int client_connection_init(struct client_connection *conn,
 	conn->type = type;
 	conn->pool = pool;
 
-	(void)net_getsockname(fd, &conn->local_ip, &conn->local_port);
-	(void)net_getpeername(fd, &conn->remote_ip, &conn->remote_port);
+	if (net_getsockname(fd, &conn->local_ip, &conn->local_port) == 0)
+		event_add_ip(conn->event, "local_ip", &conn->local_ip);
+	if (net_getpeername(fd, &conn->remote_ip, &conn->remote_port) == 0)
+		event_add_ip(conn->event, "remote_ip", &conn->local_ip);
 
 	ip = net_ip2addr(&conn->remote_ip);
 	if (ip[0] != '\0')
@@ -94,6 +82,7 @@ void client_connection_destroy(struct client_connection **_conn)
 	if (doveadm_verbose_proctitle)
 		process_title_set("[idling]");
 
+	settings_free(conn->set);
 	event_unref(&conn->event);
 	pool_unref(&conn->pool);
 }
@@ -113,14 +102,8 @@ void client_connection_set_proctitle(struct client_connection *conn,
 	process_title_set(str);
 }
 
-void doveadm_server_init(void)
-{
-	doveadm_http_server_init();
-}
-
 void doveadm_server_deinit(void)
 {
 	if (doveadm_client != NULL)
 		client_connection_destroy(&doveadm_client);
-	doveadm_http_server_deinit();
 }

@@ -3,7 +3,6 @@
 #include "test-lib.h"
 #include "net.h"
 #include "str.h"
-#include "safe-mkstemp.h"
 #include "randgen.h"
 #include "istream.h"
 #include "ostream.h"
@@ -16,17 +15,13 @@
 static void test_ostream_file_random_once(void)
 {
 	struct ostream *output;
-	string_t *path = t_str_new(128);
 	char buf[MAX_BUFSIZE*4], buf2[MAX_BUFSIZE*4], randbuf[MAX_BUFSIZE];
 	unsigned int i, offset, size;
 	ssize_t ret;
 	int fd;
 
 	memset(buf, 0, sizeof(buf));
-	fd = safe_mkstemp(path, 0600, (uid_t)-1, (gid_t)-1);
-	if (fd == -1)
-		i_fatal("safe_mkstemp(%s) failed: %m", str_c(path));
-	i_unlink(str_c(path));
+	fd = test_create_temp_fd();
 	output = o_stream_create_fd(fd, MAX_BUFSIZE);
 	o_stream_cork(output);
 
@@ -181,9 +176,60 @@ static void test_ostream_file_send_istream_sendfile(void)
 	test_end();
 }
 
+static void test_ostream_file_send_over_iov_max(void)
+{
+	test_begin("ostream file send over IOV_MAX");
+
+	int fd = open(".temp.istream", O_RDWR | O_CREAT | O_TRUNC, 0600);
+	if (fd == -1)
+		i_fatal("creat(.temp.istream) failed: %m");
+	struct ostream *output = o_stream_create_fd(fd, 0);
+
+	struct const_iovec iov[IOV_MAX*3];
+	unsigned int input[N_ELEMENTS(iov)];
+	for (unsigned int i = 0; i < N_ELEMENTS(iov); i++) {
+		input[i] = i;
+		iov[i].iov_base = &input[i];
+		iov[i].iov_len = sizeof(input[i]);
+	}
+	ssize_t ret = o_stream_sendv(output, iov, IOV_MAX * 2);
+	test_assert(ret == sizeof(input[0]) * IOV_MAX * 2);
+	ret = o_stream_sendv(output, iov + IOV_MAX * 2, IOV_MAX);
+	test_assert(ret == sizeof(input[0]) * IOV_MAX);
+	o_stream_destroy(&output);
+
+	unsigned int readbuf[N_ELEMENTS(iov) + 1];
+	ret = pread(fd, readbuf, sizeof(readbuf), 0);
+	test_assert(ret == sizeof(input));
+	test_assert(memcmp(input, readbuf, sizeof(input)) == 0);
+	i_close_fd(&fd);
+
+	i_unlink(".temp.istream");
+	test_end();
+}
+
 void test_ostream_file(void)
 {
 	test_ostream_file_random();
 	test_ostream_file_send_istream_file();
 	test_ostream_file_send_istream_sendfile();
+	test_ostream_file_send_over_iov_max();
+}
+
+enum fatal_test_state fatal_ostream_file(unsigned int stage)
+{
+	struct ostream *output;
+
+	switch (stage) {
+	case 0:
+		test_begin("ostream file missing error handling");
+		output = o_stream_create_fd(dev_null_fd, 0);
+		o_stream_set_name(output, "stdout");
+		o_stream_nsend_str(output, "test\n");
+		test_expect_fatal_string("output stream stdout is missing error handling");
+		o_stream_destroy(&output);
+		return FATAL_TEST_FAILURE;
+	}
+	test_end();
+	return FATAL_TEST_FINISHED;
 }

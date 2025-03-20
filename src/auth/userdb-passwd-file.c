@@ -7,6 +7,7 @@
 
 #include "istream.h"
 #include "str.h"
+#include "settings.h"
 #include "auth-cache.h"
 #include "db-passwd-file.h"
 
@@ -24,41 +25,48 @@ struct passwd_file_userdb_module {
         struct userdb_module module;
 
 	struct db_passwd_file *pwf;
-	const char *username_format;
 };
 
 static int
-passwd_file_add_extra_fields(struct auth_request *request, char *const *fields)
+passwd_file_add_extra_fields(struct auth_request *request,
+			     const char *const *fields,
+			     struct auth_fields *pwd_fields)
 {
 	string_t *str = t_str_new(512);
         const struct var_expand_table *table;
 	const char *key, *value, *error;
 	unsigned int i;
+	int ret = 0;
 
-	table = auth_request_get_var_expand_table(request, NULL);
+	table = auth_request_get_var_expand_table(request);
 
 	for (i = 0; fields[i] != NULL; i++) {
-		if (!str_begins(fields[i], "userdb_", &key))
-			continue;
-
+		key = fields[i];
 		value = strchr(key, '=');
 		if (value != NULL) {
 			key = t_strdup_until(key, value);
 			str_truncate(str, 0);
 			if (auth_request_var_expand_with_table(str, value + 1,
-					request, table, NULL, &error) <= 0) {
+					request, table, NULL, &error) < 0) {
 				e_error(authdb_event(request),
 					"Failed to expand extra field %s: %s",
 					fields[i], error);
-				return -1;
+				ret = -1;
+				break;
 			}
 			value = str_c(str);
 		} else {
 			value = "";
 		}
-		auth_request_set_userdb_field(request, key, value);
+		if (request->userdb->set->fields_import_all &&
+		    str_begins(key, "userdb_", &key))
+			auth_request_set_userdb_field(request, key, value);
+		auth_fields_add(pwd_fields, key, value, 0);
 	}
-	return 0;
+	if (ret == 0 && auth_request_set_userdb_fields_ex(request, pwd_fields,
+							  db_passwd_file_var_expand_fn) < 0)
+		ret = -1;
+	return ret;
 }
 
 static void passwd_file_lookup(struct auth_request *auth_request,
@@ -66,37 +74,57 @@ static void passwd_file_lookup(struct auth_request *auth_request,
 {
 	struct userdb_module *_module = auth_request->userdb->userdb;
 	struct passwd_file_userdb_module *module =
-		(struct passwd_file_userdb_module *)_module;
+		container_of(_module, struct passwd_file_userdb_module, module);
 	struct passwd_user *pu;
 	int ret;
 
 	ret = db_passwd_file_lookup(module->pwf, auth_request,
-				    module->username_format, &pu);
+				    auth_request->set->username_format, &pu);
 	if (ret <= 0 || pu->uid == 0) {
 		callback(ret < 0 ? USERDB_RESULT_INTERNAL_FAILURE :
 			 USERDB_RESULT_USER_UNKNOWN, auth_request);
 		return;
 	}
 
+	pool_t pool = pool_alloconly_create("passwd-file fields", 256);
+	struct auth_fields *pwd_fields = auth_fields_init(pool);
+
 	if (pu->uid != (uid_t)-1) {
-		auth_request_set_userdb_field(auth_request, "uid",
-					      dec2str(pu->uid));
+		const char *value = dec2str(pu->uid);
+		if (auth_request->userdb->set->fields_import_all) {
+			auth_request_set_userdb_field(auth_request, "uid",
+						      value);
+		}
+		auth_fields_add(pwd_fields, "uid", value, 0);
 	}
 	if (pu->gid != (gid_t)-1) {
-		auth_request_set_userdb_field(auth_request, "gid",
-					      dec2str(pu->gid));
+		const char *value = dec2str(pu->gid);
+		if (auth_request->userdb->set->fields_import_all) {
+			auth_request_set_userdb_field(auth_request, "gid",
+						      value);
+		}
+		auth_fields_add(pwd_fields, "gid", value, 0);
 	}
 
-	if (pu->home != NULL)
-		auth_request_set_userdb_field(auth_request, "home", pu->home);
+	if (pu->home != NULL) {
+		if (auth_request->userdb->set->fields_import_all) {
+			auth_request_set_userdb_field(auth_request,
+						      "home", pu->home);
+		}
+		auth_fields_add(pwd_fields, "home", pu->home, 0);
+	}
 
-	if (pu->extra_fields != NULL &&
-	    passwd_file_add_extra_fields(auth_request, pu->extra_fields) < 0) {
+	const char *const *extra_fields = pu->extra_fields != NULL ?
+		pu->extra_fields : empty_str_array;
+	if (passwd_file_add_extra_fields(auth_request, extra_fields,
+					 pwd_fields) < 0) {
 		callback(USERDB_RESULT_INTERNAL_FAILURE, auth_request);
+		pool_unref(&pool);
 		return;
 	}
 
 	callback(USERDB_RESULT_OK, auth_request);
+	pool_unref(&pool);
 }
 
 static struct userdb_iterate_context *
@@ -105,7 +133,7 @@ passwd_file_iterate_init(struct auth_request *auth_request,
 {
 	struct userdb_module *_module = auth_request->userdb->userdb;
 	struct passwd_file_userdb_module *module =
-		(struct passwd_file_userdb_module *)_module;
+		container_of(_module, struct passwd_file_userdb_module, module);
 	struct passwd_file_userdb_iterate_context *ctx;
 	int fd;
 
@@ -115,13 +143,34 @@ passwd_file_iterate_init(struct auth_request *auth_request,
 	ctx->ctx.context = context;
 	ctx->skip_passdb_entries = !module->pwf->userdb_warn_missing;
 	if (module->pwf->default_file == NULL) {
-		e_error(authdb_event(auth_request),
-			"passwd-file: User iteration isn't currently supported "
-			"with %%variable paths");
-		ctx->ctx.failed = TRUE;
-		return &ctx->ctx;
+		const struct var_expand_params params = {
+			.table = auth_request_get_var_expand_table(auth_request),
+			.providers = auth_request_var_expand_providers,
+			.context = auth_request,
+			.event = authdb_event(auth_request),
+		};
+		const char *error;
+		string_t *dest = t_str_new(32);
+		if (var_expand_program_execute(dest, module->pwf->prog, &params,
+					       &error) < 0) {
+			e_error(authdb_event(auth_request),
+				"passwd-file: User iteration failed: "
+				"Cannot expand '%s': %s", module->pwf->path, error);
+			ctx->ctx.failed = TRUE;
+			return &ctx->ctx;
+		}
+		const char *path;
+		if (db_passwd_fix_path(str_c(dest), &path, module->pwf->path, &error) < 0) {
+			e_error(authdb_event(auth_request),
+				"passwd-file: User iteration failed: "
+				"Cannot normalize '%s': %s", str_c(dest), error);
+			ctx->ctx.failed = TRUE;
+			return &ctx->ctx;
+		}
+		ctx->path = i_strdup(path);
+	} else {
+		ctx->path = i_strdup(module->pwf->default_file->path);
 	}
-	ctx->path = i_strdup(module->pwf->default_file->path);
 
 	/* for now we support only a single passwd-file */
 	fd = open(ctx->path, O_RDONLY);
@@ -138,7 +187,7 @@ passwd_file_iterate_init(struct auth_request *auth_request,
 static void passwd_file_iterate_next(struct userdb_iterate_context *_ctx)
 {
 	struct passwd_file_userdb_iterate_context *ctx =
-		(struct passwd_file_userdb_iterate_context *)_ctx;
+		container_of(_ctx, struct passwd_file_userdb_iterate_context, ctx);
 	const char *line, *p;
 
 	if (ctx->input == NULL)
@@ -172,7 +221,7 @@ static void passwd_file_iterate_next(struct userdb_iterate_context *_ctx)
 static int passwd_file_iterate_deinit(struct userdb_iterate_context *_ctx)
 {
 	struct passwd_file_userdb_iterate_context *ctx =
-		(struct passwd_file_userdb_iterate_context *)_ctx;
+		container_of(_ctx, struct passwd_file_userdb_iterate_context, ctx);
 	int ret = _ctx->failed ? -1 : 0;
 
 	i_stream_destroy(&ctx->input);
@@ -181,38 +230,30 @@ static int passwd_file_iterate_deinit(struct userdb_iterate_context *_ctx)
 	return ret;
 }
 
-static struct userdb_module *
-passwd_file_preinit(pool_t pool, const char *args)
+static int
+passwd_file_preinit(pool_t pool, struct event *event,
+		    struct userdb_module **module_r, const char **error_r)
 {
 	struct passwd_file_userdb_module *module;
-	const char *format = PASSWD_FILE_DEFAULT_USERNAME_FORMAT;
-	const char *p;
+	const struct passwd_file_settings *set;
 
-	if (str_begins(args, "username_format=", &args)) {
-		p = strchr(args, ' ');
-		if (p == NULL) {
-			format = p_strdup(pool, args);
-			args = "";
-		} else {
-			format = p_strdup_until(pool, args, p);
-			args = p + 1;
-		}
-	}
-
-	if (*args == '\0')
-		i_fatal("userdb passwd-file: Missing args");
+	if (settings_get(event, &passwd_file_setting_parser_info, 0,
+			 &set, error_r) < 0)
+		return -1;
 
 	module = p_new(pool, struct passwd_file_userdb_module, 1);
-	module->pwf = db_passwd_file_init(args, TRUE,
+	module->pwf = db_passwd_file_init(set->passwd_file_path, TRUE,
 					  global_auth_settings->debug);
-	module->username_format = format;
-	return &module->module;
+	settings_free(set);
+
+	*module_r = &module->module;
+	return 0;
 }
 
 static void passwd_file_init(struct userdb_module *_module)
 {
 	struct passwd_file_userdb_module *module =
-		(struct passwd_file_userdb_module *)_module;
+		container_of(_module, struct passwd_file_userdb_module, module);
 
 	db_passwd_file_parse(module->pwf);
 }
@@ -220,23 +261,23 @@ static void passwd_file_init(struct userdb_module *_module)
 static void passwd_file_deinit(struct userdb_module *_module)
 {
 	struct passwd_file_userdb_module *module =
-		(struct passwd_file_userdb_module *)_module;
+		container_of(_module, struct passwd_file_userdb_module, module);
 
 	db_passwd_file_unref(&module->pwf);
 }
 
 struct userdb_module_interface userdb_passwd_file = {
-	"passwd-file",
+	.name = "passwd-file",
 
-	passwd_file_preinit,
-	passwd_file_init,
-	passwd_file_deinit,
+	.preinit = passwd_file_preinit,
+	.init = passwd_file_init,
+	.deinit = passwd_file_deinit,
 
-	passwd_file_lookup,
+	.lookup = passwd_file_lookup,
 
-	passwd_file_iterate_init,
-	passwd_file_iterate_next,
-	passwd_file_iterate_deinit
+	.iterate_init = passwd_file_iterate_init,
+	.iterate_next = passwd_file_iterate_next,
+	.iterate_deinit = passwd_file_iterate_deinit
 };
 #else
 struct userdb_module_interface userdb_passwd_file = {

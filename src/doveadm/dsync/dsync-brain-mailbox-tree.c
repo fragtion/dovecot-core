@@ -23,29 +23,29 @@ static void dsync_brain_check_namespaces(struct dsync_brain *brain)
 			continue;
 
 		sep = mail_namespace_get_sep(ns);
-		escape_char = mailbox_list_get_settings(ns->list)->vname_escape_char;
+		escape_char = ns->list->mail_set->mailbox_list_visible_escape_char[0];
 		if (first_ns == NULL) {
 			brain->hierarchy_sep = sep;
 			brain->escape_char = escape_char;
 			first_ns = ns;
 		} else if (brain->hierarchy_sep != sep) {
 			i_fatal("Synced namespaces have conflicting separators "
-				"('%c' for prefix=\"%s\", '%c' for prefix=\"%s\")",
-				brain->hierarchy_sep, first_ns->prefix,
-				sep, ns->prefix);
+				"('%c' for %s, '%c' for %s)",
+				brain->hierarchy_sep, first_ns->set->name,
+				sep, ns->set->name);
 		} else if (brain->escape_char != escape_char) {
 			i_fatal("Synced namespaces have conflicting escape chars "
-				"('%c' for prefix=\"%s\", '%c' for prefix=\"%s\")",
-				brain->escape_char, first_ns->prefix,
-				escape_char, ns->prefix);
+				"('%c' for %s, '%c' for %s)",
+				brain->escape_char, first_ns->set->name,
+				escape_char, ns->set->name);
 		}
 	}
 	if (brain->hierarchy_sep != '\0')
 		return;
 
-	i_fatal("All your namespaces have a location setting. "
-		"Only namespaces with empty location settings are converted. "
-		"(One namespace should default to mail_location setting)");
+	/* We get here only in some rare situations, since namespaces'
+	   existence is normally checked before already. */
+	i_fatal("No namespaces found for syncing");
 }
 
 void dsync_brain_mailbox_trees_init(struct dsync_brain *brain)
@@ -66,8 +66,8 @@ void dsync_brain_mailbox_trees_init(struct dsync_brain *brain)
 	for (ns = brain->user->namespaces; ns != NULL; ns = ns->next) {
 		if (!dsync_brain_want_namespace(brain, ns))
 			continue;
-		e_debug(brain->event, "Namespace %s has location %s",
-			ns->prefix, ns->set->location);
+		e_debug(brain->event, "Namespace %s has path %s",
+			ns->set->name, ns->list->mail_set->mail_path);
 		if (dsync_mailbox_tree_fill(brain->local_mailbox_tree, ns,
 					    brain->sync_box,
 					    brain->sync_box_guid,
@@ -577,7 +577,7 @@ bool dsync_brain_recv_mailbox_tree_deletes(struct dsync_brain *brain)
 				dsync_mailbox_node_get_full_name(brain->local_mailbox_tree, node);
 			e_debug(brain->event,
 				"Remote mailbox tree deletion: guid=%s type=%s "
-				"timestamp=%ld name=%s local update=%s",
+				"timestamp=%"PRIdTIME_T" name=%s local update=%s",
 				guid_128_to_string(deletes[i].guid),
 				dsync_mailbox_delete_type_to_string(deletes[i].type),
 				deletes[i].timestamp, node_name, status);

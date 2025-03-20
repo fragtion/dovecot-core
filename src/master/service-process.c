@@ -56,13 +56,16 @@ static int
 service_unix_pid_listener_get_path(struct service_listener *l, pid_t pid,
 				   string_t *path, const char **error_r)
 {
-	struct var_expand_table var_table[] = {
-		{ '\0', dec2str(pid), "pid" },
-		{ '\0', NULL, NULL },
+	const struct var_expand_params params = {
+		.table = (const struct var_expand_table[]) {
+			{ .key = "pid", .value = dec2str(pid) },
+			VAR_EXPAND_TABLE_END
+		},
+		.event = l->service->event,
 	};
 
 	str_truncate(path, 0);
-	return var_expand(path, l->set.fileset.set->path, var_table, error_r);
+	return var_expand(path, l->set.fileset.set->path, &params, error_r);
 }
 
 static void
@@ -117,8 +120,7 @@ service_dup_fds(struct service *service)
 					str_append(listener_settings, "\tssl");
 				if (listeners[i]->set.inetset.set->haproxy)
 					str_append(listener_settings, "\thaproxy");
-				if (listeners[i]->set.inetset.set->type != NULL &&
-				    *listeners[i]->set.inetset.set->type != '\0') {
+				if (*listeners[i]->set.inetset.set->type != '\0') {
 					str_append(listener_settings, "\ttype=");
 					str_append_tabescaped(
 						listener_settings,
@@ -127,8 +129,7 @@ service_dup_fds(struct service *service)
 			}
 			if (listeners[i]->type == SERVICE_LISTENER_FIFO ||
 			    listeners[i]->type == SERVICE_LISTENER_UNIX) {
-				if (listeners[i]->set.fileset.set->type != NULL &&
-				    *listeners[i]->set.fileset.set->type != '\0') {
+				if (*listeners[i]->set.fileset.set->type != '\0') {
 					str_append(listener_settings, "\ttype=");
 					str_append_tabescaped(
 						listener_settings,
@@ -154,7 +155,7 @@ service_dup_fds(struct service *service)
 		array_foreach(&service->unix_pid_listeners, listenerp) {
 			l = *listenerp;
 			ret = service_unix_pid_listener_get_path(l, pid, path, &error);
-			if (ret > 0) {
+			if (ret == 0) {
 				ret = service_unix_listener_listen(l,
 					str_c(path), FALSE, &error);
 			}
@@ -298,7 +299,7 @@ service_process_setup_environment(struct service *service, unsigned int uid,
 				  const char *hostdomain)
 {
 	const struct master_service_settings *service_set =
-		service->list->service_set;
+		master_service_get_service_settings(master_service);
 	master_service_env_clean();
 
 	env_put(MASTER_IS_PARENT_ENV, "1");
@@ -308,10 +309,11 @@ service_process_setup_environment(struct service *service, unsigned int uid,
 	env_put(MASTER_PROCESS_LIMIT_ENV, dec2str(service->process_limit));
 	env_put(MASTER_PROCESS_MIN_AVAIL_ENV,
 		dec2str(service->set->process_min_avail));
-	env_put(MASTER_SERVICE_IDLE_KILL_ENV, dec2str(service->idle_kill));
-	if (service->set->service_count != 0) {
+	env_put(MASTER_SERVICE_IDLE_KILL_INTERVAL_ENV,
+		dec2str(service->idle_kill_interval));
+	if (service->set->restart_request_count != 0) {
 		env_put(MASTER_SERVICE_COUNT_ENV,
-			dec2str(service->set->service_count));
+			dec2str(service->set->restart_request_count));
 	}
 	env_put(MASTER_UID_ENV, dec2str(uid));
 	env_put(MY_HOSTNAME_ENV, my_hostname);
@@ -319,7 +321,7 @@ service_process_setup_environment(struct service *service, unsigned int uid,
 
 	if (service_set->verbose_proctitle)
 		env_put(MASTER_VERBOSE_PROCTITLE_ENV, "1");
-	if (!service->set->master_set->version_ignore)
+	if (!service->list->set->version_ignore)
 		env_put(MASTER_DOVECOT_VERSION_ENV, PACKAGE_VERSION);
 
 	if (service_set->stats_writer_socket_path[0] == '\0')
@@ -451,6 +453,8 @@ void service_process_destroy(struct service_process *process)
 	struct service *service = process->service;
 	struct service_list *service_list = service->list;
 
+	i_assert(!process->destroyed);
+
 	if (array_is_created(&service->unix_pid_listeners)) {
 		struct service_listener *const *listenerp;
 		string_t *path = t_str_new(128);
@@ -459,7 +463,7 @@ void service_process_destroy(struct service_process *process)
 		array_foreach(&service->unix_pid_listeners, listenerp) {
 			str_truncate(path, 0);
 			if (service_unix_pid_listener_get_path(*listenerp,
-					process->pid, path, &error) > 0)
+					process->pid, path, &error) == 0)
 				i_unlink_if_exists(str_c(path));
 		}
 	}
@@ -470,6 +474,7 @@ void service_process_destroy(struct service_process *process)
 		DLLIST2_REMOVE(&service->idle_processes_head,
 			       &service->idle_processes_tail, process);
 		i_assert(service->process_idling > 0);
+		i_assert(service->process_idling <= service->process_avail);
 		service->process_idling--;
 		service->process_idling_lowwater_since_kills =
 			I_MIN(service->process_idling_lowwater_since_kills,
@@ -480,6 +485,7 @@ void service_process_destroy(struct service_process *process)
 	if (process->available_count > 0) {
 		i_assert(service->process_avail > 0);
 		service->process_avail--;
+		i_assert(service->process_idling <= service->process_avail);
 	}
 	i_assert(service->process_count > 0);
 	service->process_count--;

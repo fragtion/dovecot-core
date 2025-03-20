@@ -19,7 +19,6 @@ int main(int argc, char *argv[])
 {
 	const enum master_service_flags service_flags =
 		MASTER_SERVICE_FLAG_DONT_SEND_STATS;
-	const char *path, *error;
 
 	master_service = master_service_init("config", service_flags,
 					     &argc, &argv, "");
@@ -30,12 +29,10 @@ int main(int argc, char *argv[])
 	restrict_access_by_env(RESTRICT_ACCESS_FLAG_ALLOW_ROOT, NULL);
 	restrict_access_allow_coredumps(TRUE);
 
-	set_config_binary(TRUE);
-	config_parse_load_modules();
+	settings_set_config_binary(SETTINGS_BINARY_CONFIG);
+	config_parse_load_modules(FALSE);
 
-	path = master_service_get_config_path(master_service);
-	if (config_parse_file(path, CONFIG_PARSE_FLAG_EXPAND_VALUES, &error) <= 0)
-		i_fatal("%s", error);
+	config_connections_init();
 
 	/* notify about our success only after successfully parsing the
 	   config file, so if the parsing fails, master won't immediately
@@ -45,8 +42,6 @@ int main(int argc, char *argv[])
 	master_service_run(master_service, client_connected);
 	config_connections_destroy_all();
 
-	config_filter_deinit(&config_filter);
-	old_settings_deinit_global();
 	module_dir_unload(&modules);
 	config_parser_deinit();
 	master_service_deinit(&master_service);

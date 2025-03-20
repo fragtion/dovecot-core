@@ -39,8 +39,8 @@ struct mdbox_storage {
 	/* if non-zero, storage should be rebuilt (except if rebuild_count
 	   has changed from this value) */
 	uint32_t corrupted_rebuild_count;
+	char *corrupted_reason;
 
-	bool corrupted:1;
 	bool rebuilding_storage:1;
 	bool preallocate_space:1;
 };
@@ -112,8 +112,9 @@ int mdbox_storage_create(struct mail_storage *_storage,
 void mdbox_storage_destroy(struct mail_storage *_storage);
 int mdbox_mailbox_open(struct mailbox *box);
 
-void mdbox_storage_set_corrupted(struct mdbox_storage *storage);
-void mdbox_set_mailbox_corrupted(struct mailbox *box);
-void mdbox_set_file_corrupted(struct dbox_file *file);
+void mdbox_storage_set_corrupted(struct mdbox_storage *storage,
+				 const char *reason, ...) ATTR_FORMAT(2, 3);
+void mdbox_set_mailbox_corrupted(struct mailbox *box, const char *reason);
+void mdbox_set_file_corrupted(struct dbox_file *file, const char *reason);
 
 #endif

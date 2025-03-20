@@ -85,6 +85,9 @@ void password_scheme_register(const struct password_scheme *scheme);
 void password_scheme_unregister(const struct password_scheme *scheme);
 
 void password_schemes_init(void);
+/* Calls password_schemes_init, the difference is that this
+   will attempt to register also crypt and sodium schemes. */
+void password_schemes_register_all(void);
 void password_schemes_allow_weak(bool allow);
 void password_schemes_deinit(void);
 
@@ -98,11 +101,6 @@ const char *password_generate_md5_crypt(const char *pw, const char *salt);
 int password_generate_otp(const char *pw, const char *state_data,
 			  unsigned int algo, const char **result_r)
 	ATTR_NULL(2);
-
-int crypt_verify(const char *plaintext,
-		 const struct password_generate_params *params,
-		 const unsigned char *raw_password, size_t size,
-		 const char **error_r);
 
 int scram_scheme_parse(const struct hash_method *hmethod, const char *name,
 		       const unsigned char *credentials, size_t size,

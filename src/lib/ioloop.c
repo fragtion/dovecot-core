@@ -18,6 +18,11 @@
    Dovecot generally doesn't have very important short timeouts, so to avoid
    logging many warnings about this, use a rather high value. */
 #define IOLOOP_TIME_MOVED_FORWARDS_MIN_USECS (100000)
+/* When the ioloop wait time is large, the "time moved forwards" detection
+   can't be done as reliably. Apparently if we ask the kernel to wait for
+   10000ms, it might think it's okay to stop after 10100ms or more. So use
+   a larger value for larger timeouts. */
+#define IOLOOP_TIME_MOVED_FORWARDS_MIN_USECS_LARGE (1000000)
 
 time_t ioloop_time = 0;
 struct timeval ioloop_timeval;
@@ -408,14 +413,11 @@ void timeout_remove(struct timeout **_timeout)
 	if (timeout->item.idx != UINT_MAX)
 		priorityq_remove(timeout->ioloop->timeouts, &timeout->item);
 	else if (!timeout->one_shot && timeout->msecs > 0) {
-		struct timeout *const *to_idx;
-		array_foreach(&ioloop->timeouts_new, to_idx) {
-			if (*to_idx == timeout) {
-				array_delete(&ioloop->timeouts_new,
-					array_foreach_idx(&ioloop->timeouts_new, to_idx), 1);
-				break;
-			}
-		}
+		unsigned int idx;
+
+		if (!array_lsearch_ptr_idx(&ioloop->timeouts_new, timeout, &idx))
+			i_unreached();
+		array_delete(&ioloop->timeouts_new, idx, 1);
 	}
 	timeout_free(timeout);
 }
@@ -654,9 +656,13 @@ static void io_loop_handle_timeouts_real(struct ioloop *ioloop)
 		/* the callback may have slept, so check the time again. */
 		i_gettimeofday(&ioloop_timeval);
 	} else {
+		int max_diff = diff_usecs < IOLOOP_TIME_MOVED_FORWARDS_MIN_USECS_LARGE ?
+			IOLOOP_TIME_MOVED_FORWARDS_MIN_USECS :
+			IOLOOP_TIME_MOVED_FORWARDS_MIN_USECS_LARGE;
+
 		diff_usecs = timeval_diff_usecs(&ioloop->next_max_time,
 						&ioloop_timeval);
-		if (unlikely(-diff_usecs >= IOLOOP_TIME_MOVED_FORWARDS_MIN_USECS)) {
+		if (unlikely(-diff_usecs >= max_diff)) {
 			io_loops_timeouts_update(-diff_usecs);
 			/* time moved forward */
 			ioloop->time_moved_callback(&ioloop->next_max_time,
@@ -1004,17 +1010,11 @@ void io_loop_add_switch_callback(io_switch_callback_t *callback)
 
 void io_loop_remove_switch_callback(io_switch_callback_t *callback)
 {
-	io_switch_callback_t *const *callbackp;
 	unsigned int idx;
 
-	array_foreach(&io_switch_callbacks, callbackp) {
-		if (*callbackp == callback) {
-			idx = array_foreach_idx(&io_switch_callbacks, callbackp);
-			array_delete(&io_switch_callbacks, idx, 1);
-			return;
-		}
-	}
-	i_unreached();
+	if (!array_lsearch_ptr_idx(&io_switch_callbacks, callback, &idx))
+		i_unreached();
+	array_delete(&io_switch_callbacks, idx, 1);
 }
 
 void io_loop_add_destroy_callback(io_destroy_callback_t *callback)
@@ -1028,17 +1028,11 @@ void io_loop_add_destroy_callback(io_destroy_callback_t *callback)
 
 void io_loop_remove_destroy_callback(io_destroy_callback_t *callback)
 {
-	io_destroy_callback_t *const *callbackp;
 	unsigned int idx;
 
-	array_foreach(&io_destroy_callbacks, callbackp) {
-		if (*callbackp == callback) {
-			idx = array_foreach_idx(&io_destroy_callbacks, callbackp);
-			array_delete(&io_destroy_callbacks, idx, 1);
-			return;
-		}
-	}
-	i_unreached();
+	if (!array_lsearch_ptr_idx(&io_destroy_callbacks, callback, &idx))
+		i_unreached();
+	array_delete(&io_destroy_callbacks, idx, 1);
 }
 
 struct ioloop_context *io_loop_context_new(struct ioloop *ioloop)

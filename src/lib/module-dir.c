@@ -6,8 +6,6 @@
 #include "sort.h"
 #include "module-dir.h"
 
-#ifdef HAVE_MODULES
-
 #include <unistd.h>
 #include <fcntl.h>
 #include <dirent.h>
@@ -340,25 +338,27 @@ static bool module_is_loaded(struct module *modules, const char *name)
 	return module_dir_find(modules, name) != NULL;
 }
 
-static void module_names_fix(const char **module_names)
+static const char **module_names_fix(const char *const *module_names)
 {
+	const char **fixed_names;
 	unsigned int i, j;
 
-	if (module_names[0] == NULL)
-		return;
+	if (module_names == NULL)
+		return NULL;
 
 	/* allow giving the module names also in non-base form.
 	   convert them in here. */
+	fixed_names = t_new(const char *, str_array_length(module_names) + 1);
 	for (i = 0; module_names[i] != NULL; i++)
-		module_names[i] = module_file_get_name(module_names[i]);
+		fixed_names[i] = module_file_get_name(module_names[i]);
 
 	/* @UNSAFE: drop duplicates */
-	i_qsort(module_names, i, sizeof(*module_names), i_strcmp_p);
-	for (i = j = 1; module_names[i] != NULL; i++) {
-		if (strcmp(module_names[i-1], module_names[i]) != 0)
-			module_names[j++] = module_names[i];
+	i_qsort(fixed_names, i, sizeof(*fixed_names), i_strcmp_p);
+	for (i = j = 1; fixed_names[i] != NULL; i++) {
+		if (strcmp(fixed_names[i-1], fixed_names[i]) != 0)
+			fixed_names[j++] = fixed_names[i];
 	}
-	module_names[j] = NULL;
+	return fixed_names;
 }
 
 static bool
@@ -491,7 +491,7 @@ module_dir_load_real(struct module **_modules,
 }
 
 int module_dir_try_load_missing(struct module **modules,
-				const char *dir, const char *module_names,
+				const char *dir, const char *const *module_names,
 				const struct module_dir_load_settings *set,
 				const char **error_r)
 {
@@ -499,14 +499,9 @@ int module_dir_try_load_missing(struct module **modules,
 	int ret;
 
 	T_BEGIN {
-		const char **arr = NULL;
-
-		if (module_names != NULL) {
-			arr = t_strsplit_spaces(module_names, ", ");
-			module_names_fix(arr);
-		}
-
-		ret = module_dir_load_real(modules, dir, arr, set, &error);
+		ret = module_dir_load_real(modules, dir,
+					   module_names_fix(module_names),
+					   set, &error);
 	} T_END;
 	*error_r = t_strdup(error);
 	i_free(error);
@@ -515,7 +510,7 @@ int module_dir_try_load_missing(struct module **modules,
 
 struct module *
 module_dir_load_missing(struct module *old_modules,
-			const char *dir, const char *module_names,
+			const char *dir, const char *const *module_names,
 			const struct module_dir_load_settings *set)
 {
 	struct module *new_modules = old_modules;
@@ -596,61 +591,7 @@ void module_dir_unload(struct module **modules)
 	*modules = NULL;
 }
 
-#else
-
-#ifndef MODULE_SUFFIX
-#  define MODULE_SUFFIX ".so" /* just to avoid build failure */
-#endif
-
-struct module *
-module_dir_load_missing(struct module *old_modules ATTR_UNUSED,
-			const char *dir ATTR_UNUSED,
-			const char *module_names,
-			const struct module_dir_load_settings *set ATTR_UNUSED)
-{
-#define NO_SUPPORT_ERRSTR "Dynamically loadable module support not built in"
-	if (module_names == NULL)
-		i_error(NO_SUPPORT_ERRSTR);
-	else {
-		i_fatal(NO_SUPPORT_ERRSTR", can't load plugins: %s",
-			module_names);
-	}
-	return NULL;
-}
-
-void module_dir_init(struct module *modules ATTR_UNUSED)
-{
-}
-
-void module_dir_deinit(struct module *modules ATTR_UNUSED)
-{
-}
-
-void module_dir_unload(struct module **modules ATTR_UNUSED)
-{
-}
-
-struct module *module_dir_find(struct module *modules ATTR_UNUSED,
-			       const char *name ATTR_UNUSED)
-{
-	return NULL;
-}
-
-void *module_get_symbol(struct module *module ATTR_UNUSED,
-			const char *symbol ATTR_UNUSED)
-{
-	return NULL;
-}
-
-void *module_get_symbol_quiet(struct module *module ATTR_UNUSED,
-			      const char *symbol ATTR_UNUSED)
-{
-	return NULL;
-}
-
-#endif
-
-struct module *module_dir_load(const char *dir, const char *module_names,
+struct module *module_dir_load(const char *dir, const char *const *module_names,
 			       const struct module_dir_load_settings *set)
 {
 	return module_dir_load_missing(NULL, dir, module_names, set);

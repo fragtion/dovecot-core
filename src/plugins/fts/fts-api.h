@@ -13,9 +13,6 @@ struct fts_backend;
 enum fts_lookup_flags {
 	/* Specifies if the args should be ANDed or ORed together. */
 	FTS_LOOKUP_FLAG_AND_ARGS	= 0x01,
-	/* Require exact matching for non-fuzzy search args by returning all
-	   such matches as maybe_uids instead of definite_uids */
-	FTS_LOOKUP_FLAG_NO_AUTO_FUZZY	= 0x02
 };
 
 enum fts_backend_build_key_type {
@@ -94,7 +91,8 @@ struct fts_multi_result {
 extern struct event_category event_category_fts;
 
 int fts_backend_init(const char *backend_name, struct mail_namespace *ns,
-		     const char **error_r, struct fts_backend **backend_r);
+		     struct event *event, const char **error_r,
+		     struct fts_backend **backend_r);
 void fts_backend_deinit(struct fts_backend **backend);
 
 /* Get the last_uid for the mailbox. */
@@ -140,7 +138,7 @@ int fts_backend_update_build_more(struct fts_backend_update_context *ctx,
 
 /* Refresh index to make sure we see latest changes from lookups.
    Returns 0 if ok, -1 if error. */
-int fts_backend_refresh(struct fts_backend *backend);
+int fts_backend_refresh(struct fts_backend *backend, struct mailbox *box);
 /* Go through the entire index and make sure all mails are indexed,
    and delete any extra mails in the index. */
 int fts_backend_rescan(struct fts_backend *backend);

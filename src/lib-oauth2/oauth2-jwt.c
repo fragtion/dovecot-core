@@ -14,42 +14,65 @@
 #include "base64.h"
 #include "str-sanitize.h"
 #include "dcrypt.h"
-#include "var-expand.h"
 #include "oauth2.h"
 #include "oauth2-private.h"
 #include "dict.h"
 
 #include <time.h>
 
-static const char *get_field(const struct json_tree *tree, const char *key,
-			     enum json_type *type_r)
+static const struct json_tree_node *
+get_field_node(const struct json_tree *tree, const char *key)
 {
-	const struct json_tree_node *root = json_tree_root(tree);
-	const struct json_tree_node *value_node = json_tree_find_key(root, key);
-	if (value_node == NULL || value_node->value_type == JSON_TYPE_OBJECT ||
-	    value_node->value_type == JSON_TYPE_ARRAY)
+	const struct json_tree_node *root = json_tree_get_root_const(tree);
+	const struct json_tree_node *value_node;
+
+	value_node = json_tree_node_get_member(root, key);
+	if (value_node == NULL ||
+	    json_tree_node_is_object(value_node) ||
+	    json_tree_node_is_array(value_node))
 		return NULL;
-	if (type_r != NULL)
-		*type_r = value_node->value_type;
-	return json_tree_get_value_str(value_node);
+
+	return value_node;
 }
 
-static const char *get_field_multiple(const struct json_tree *tree, const char *key)
+static const char *
+get_field(const struct json_tree *tree, const char *key,
+	  enum json_type *type_r)
 {
-	const struct json_tree_node *root = json_tree_root(tree);
-	const struct json_tree_node *value_node = json_tree_find_key(root, key);
-	if (value_node == NULL || value_node->value_type == JSON_TYPE_OBJECT)
-		return NULL;
-	if (value_node->value_type != JSON_TYPE_ARRAY)
-		return json_tree_get_value_str(value_node);
+	const struct json_tree_node *value_node = get_field_node(tree, key);
 
-	const struct json_tree_node *entry_node = json_tree_get_child(value_node);
+	if (value_node == NULL)
+		return NULL;
+	if (type_r != NULL)
+		*type_r = json_tree_node_get_type(value_node);
+	return json_tree_node_as_str(value_node);
+}
+
+static const char *
+get_field_multiple(const struct json_tree *tree, const char *key)
+{
+	const struct json_tree_node *root = json_tree_get_root_const(tree);
+	const struct json_tree_node *value_node;
+
+	value_node = json_tree_node_get_member(root, key);
+	if (value_node == NULL || json_tree_node_is_object(value_node))
+		return NULL;
+	if (!json_tree_node_is_array(value_node))
+		return json_tree_node_as_str(value_node);
+
+	const struct json_tree_node *entry_node;
+
+	entry_node = json_tree_node_get_child(value_node);
 	string_t *values = t_str_new(64);
-	for (; entry_node != NULL; entry_node = entry_node->next) {
-		if (entry_node->value_type == JSON_TYPE_OBJECT ||
-		    entry_node->value_type == JSON_TYPE_ARRAY)
+
+	for (; entry_node != NULL;
+	     entry_node = json_tree_node_get_next(entry_node)) {
+		if (json_tree_node_is_object(entry_node) ||
+		    json_tree_node_is_array(entry_node))
 		    	continue;
-		const char *value_str = json_tree_get_value_str(entry_node);
+
+		const char *value_str =	json_tree_node_as_str(entry_node);
+
 		if (str_len(values) > 0)
 			str_append_c(values, '\t');
 		str_append_tabescaped(values, value_str);
@@ -57,31 +80,33 @@ static const char *get_field_multiple(const struct json_tree *tree, const char *
 	return str_c(values);
 }
 
-static int get_time_field(const struct json_tree *tree, const char *key,
-			  int64_t *value_r)
+static int
+get_time_field(const struct json_tree *tree, const char *key,
+	       int64_t *value_r)
 {
-	time_t tvalue;
-	enum json_type value_type;
-	const char *value = get_field(tree, key, &value_type);
+	const struct json_tree_node *value_node = get_field_node(tree, key);
 
-	int tz_offset ATTR_UNUSED;
-	if (value == NULL)
+	if (value_node == NULL)
 		return 0;
-	if (value_type == JSON_TYPE_NUMBER) {
-		/* Parse with atof() to handle the json valid exponential formats,
-		   but discard the decimal part of the fields as we are not
-		   interested in them.
 
-		   The worst case of x.99999 would appear as almost a second older
-		   than the actual x which is same as saying we processed it a
-		   second later for the purpose of JWT tokens */
-		double v = atof(value);
-		*value_r = (int64_t) v;
-		if (*value_r < 0)
+	enum json_type value_type = json_tree_node_get_type(value_node);
+
+	if (value_type == JSON_TYPE_NUMBER) {
+		int64_t tstamp;
+
+		if (json_tree_node_get_int64(value_node, &tstamp) < 0 ||
+		    tstamp < 0)
 			return -1;
+		*value_r = tstamp;
 		return 1;
-	} else if (iso8601_date_parse((const unsigned char*)value, strlen(value),
-				      &tvalue, &tz_offset)) {
+	}
+
+	const char *value = json_tree_node_as_str(value_node);
+	time_t tvalue;
+	int tz_offset ATTR_UNUSED;
+
+	if (iso8601_date_parse((const unsigned char*)value, strlen(value),
+			       &tvalue, &tz_offset)) {
 		if (tvalue < 0)
 			return -1;
 		*value_r = tvalue;
@@ -94,12 +119,14 @@ static int get_time_field(const struct json_tree *tree, const char *key,
 static const char *escape_identifier(const char *identifier)
 {
 	size_t pos = strcspn(identifier, "/%");
+
 	/* nothing to escape */
 	if (identifier[pos] == '\0')
 		return identifier;
 
 	size_t len = strlen(identifier);
 	string_t *new_id = t_str_new(len);
+
 	str_append_data(new_id, identifier, pos);
 
 	for (size_t i = pos; i < len; i++) {
@@ -179,16 +206,17 @@ oauth2_validate_hmac(const struct oauth2_settings *set, const char *azp,
 	}
 
 	const buffer_t *key;
+
 	if (oauth2_lookup_hmac_key(set, azp, alg, key_id, &key, error_r) < 0)
 		return -1;
 
 	struct hmac_context ctx;
+	unsigned char digest[method->digest_size];
+
 	hmac_init(&ctx, key->data, key->used, method);
 	hmac_update(&ctx, blobs[0], strlen(blobs[0]));
 	hmac_update(&ctx, ".", 1);
 	hmac_update(&ctx, blobs[1], strlen(blobs[1]));
-	unsigned char digest[method->digest_size];
-
 	hmac_final(&ctx, digest);
 
 	buffer_t *their_digest =
@@ -234,6 +262,7 @@ oauth2_lookup_pubkey(const struct oauth2_settings *set, const char *azp,
 	/* try to load key */
 	struct dcrypt_public_key *pubkey;
 	const char *error;
+
 	if (!dcrypt_key_load_public(&pubkey, key_str, &error)) {
 		*error_r = t_strdup_printf("Cannot load key: %s", error);
 		return -1;
@@ -274,7 +303,8 @@ oauth2_validate_rsa_ecdsa(const struct oauth2_settings *set,
 		i_unreached();
 	}
 
-	if (strcmp(alg+2, "256") == 0) {
+	if (strcmp(alg+2, "256") == 0 ||
+	    strcmp(alg+2, "256K") == 0) {
 		method = "sha256";
 	} else if (strcmp(alg+2, "384") == 0) {
 		method = "sha384";
@@ -327,33 +357,78 @@ oauth2_validate_signature(const struct oauth2_settings *set, const char *azp,
 	return -1;
 }
 
+struct jwt_node {
+	const char *prefix;
+	const struct json_tree_node *root;
+	bool array:1;
+};
+
 static void
-oauth2_jwt_copy_fields(ARRAY_TYPE(oauth2_field) *fields, struct json_tree *tree)
+oauth2_jwt_copy_fields(ARRAY_TYPE(oauth2_field) *fields,
+		       struct json_tree *tree)
 {
 	pool_t pool = array_get_pool(fields);
-	ARRAY(const struct json_tree_node*) nodes;
-	const struct json_tree_node *root = json_tree_root(tree);
+	ARRAY(struct jwt_node) nodes;
 
 	t_array_init(&nodes, 1);
-	array_push_back(&nodes, &root);
+
+	struct jwt_node *root = array_append_space(&nodes);
+
+	root->prefix = "";
+	root->root = json_tree_get_root_const(tree);
 
 	while (array_count(&nodes) > 0) {
-		const struct json_tree_node *const *pnode = array_front(&nodes);
-		const struct json_tree_node *node = *pnode;
-		array_pop_front(&nodes);
-		while (node != NULL) {
-			if (node->value_type == JSON_TYPE_OBJECT) {
-				root = node->value.child;
-				array_push_back(&nodes, &root);
-			} else if (node->key != NULL) {
-				struct oauth2_field *field =
-					array_append_space(fields);
-				field->name = p_strdup(pool, node->key);
-				field->value = p_strdup(
-					pool, json_tree_get_value_str(node));
+		const struct jwt_node *subroot = array_front(&nodes);
+		const struct json_tree_node *tnode = subroot->root;
+
+		while (tnode != NULL) {
+			const struct json_node *jnode =
+				json_tree_node_get(tnode);
+
+			if (!json_node_is_singular(jnode)) {
+				root = array_append_space(&nodes);
+				root->root = json_tree_node_get_child(tnode);
+				root->array = json_node_is_array(jnode);
+				if (jnode->name == NULL)
+					root->prefix = subroot->prefix;
+				else if (*subroot->prefix != '\0')
+					root->prefix = t_strconcat(subroot->prefix, jnode->name, "_", NULL);
+				else
+					root->prefix = t_strconcat(jnode->name, "_", NULL);
+			} else {
+				struct oauth2_field *field;
+				const char *name;
+
+				if (subroot->array) {
+					name = strrchr(subroot->prefix, '_');
+					if (name != NULL)
+						name = t_strdup_until(subroot->prefix, name);
+					else
+						name = subroot->prefix;
+					array_foreach_modifiable(fields, field) {
+						if (strcmp(field->name, name) == 0)
+							break;
+					}
+					if (field == NULL || field->name == NULL) {
+						field = array_append_space(fields);
+						field->name = p_strdup(pool, name);
+					}
+				} else {
+					field = array_append_space(fields);
+					field->name = p_strconcat(pool, subroot->prefix, jnode->name, NULL);
+				}
+
+				const char *value = str_tabescape(json_node_as_str(jnode));
+
+				if (field->value != NULL) {
+					field->value = p_strconcat(pool, field->value, "\t", value, NULL);
+				} else {
+					field->value = p_strdup(pool, value);
+				}
 			}
-			node = node->next;
+			tnode = json_tree_node_get_next(tnode);
 		}
+		array_pop_front(&nodes);
 	}
 }
 
@@ -388,18 +463,18 @@ static bool check_scope(const char *req, const char *got)
 }
 
 static int
-oauth2_jwt_body_process(const struct oauth2_settings *set, const char *alg,
-			const char *kid, ARRAY_TYPE(oauth2_field) *fields,
-			struct json_tree *tree, const char *const *blobs,
-			const char **error_r)
+oauth2_jwt_body_process(const struct oauth2_settings *set,
+			const char *alg, const char *kid,
+			ARRAY_TYPE(oauth2_field) *fields,
+			struct json_tree *tree,
+			const char *const *blobs, const char **error_r)
 {
 	const char *sub = get_field(tree, "sub", NULL);
-
-	int ret;
 	int64_t t0 = time(NULL);
 	/* default IAT and NBF to now */
 	int64_t iat, nbf, exp;
 	int tz_offset ATTR_UNUSED;
+	int ret;
 
 	if (sub == NULL) {
 		*error_r = "Missing 'sub' field";
@@ -445,6 +520,7 @@ oauth2_jwt_body_process(const struct oauth2_settings *set, const char *alg,
 	}
 
 	const char *iss = get_field(tree, "iss", NULL);
+
 	if (set->issuers != NULL && *set->issuers != NULL) {
 		if (iss == NULL) {
 			*error_r = "Token is missing 'iss' field";
@@ -458,6 +534,7 @@ oauth2_jwt_body_process(const struct oauth2_settings *set, const char *alg,
 	}
 
 	const char *aud = get_field_multiple(tree, "aud");
+
 	/* if there is client_id configured, then aud should be present */
 	if (set->client_id != NULL && *set->client_id != '\0') {
 		if (aud == NULL) {
@@ -482,8 +559,9 @@ oauth2_jwt_body_process(const struct oauth2_settings *set, const char *alg,
 		}
 
 		if (!check_scope(req_scope, got_scope)) {
-			*error_r = t_strdup_printf("configured scope '%s' missing from token scope '%s'",
-						   req_scope, got_scope);
+			*error_r = t_strdup_printf(
+				"configured scope '%s' missing from token scope '%s'",
+				req_scope, got_scope);
 			return -1;
 		}
 	}
@@ -534,7 +612,7 @@ int oauth2_try_parse_jwt(const struct oauth2_settings *set,
 
 	const char *alg, *kid;
 	ret = oauth2_jwt_header_process(header_tree, &alg, &kid, error_r);
-	json_tree_deinit(&header_tree);
+	json_tree_unref(&header_tree);
 	if (ret < 0)
 		return -1;
 
@@ -558,7 +636,7 @@ int oauth2_try_parse_jwt(const struct oauth2_settings *set,
 		return -1;
 	ret = oauth2_jwt_body_process(set, alg, kid, fields, body_tree, blobs,
 				      error_r);
-	json_tree_deinit(&body_tree);
+	json_tree_unref(&body_tree);
 
 	return ret;
 }

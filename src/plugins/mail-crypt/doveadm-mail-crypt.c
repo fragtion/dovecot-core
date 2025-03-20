@@ -9,6 +9,7 @@
 #include "buffer.h"
 #include "ioloop.h"
 #include "ioloop-private.h"
+#include "settings.h"
 #include "mail-namespace.h"
 #include "mail-storage.h"
 #include "mail-storage-private.h"
@@ -89,6 +90,7 @@ mcp_user_create(struct mail_user *user, const char *dest_username,
 
 	i_zero(&input);
 	input.service = old_input->service;
+	input.protocol = old_input->protocol;
 	input.username = dest_username;
 	input.session_id_prefix = user->session_id;
 	input.flags_override_add = MAIL_STORAGE_SERVICE_FLAG_NO_PLUGINS |
@@ -110,13 +112,19 @@ mcp_update_shared_key(struct mailbox_transaction_context *t,
 {
 	const char *error;
 	struct mail_user *dest_user;
+	const struct crypt_acl_settings *set;
 	struct ioloop_context *cur_ioloop_ctx;
 	struct dcrypt_public_key *pkey;
 	const char *dest_username;
 	int ret = 0;
 
-	bool disallow_insecure =
-		mail_user_plugin_getenv_bool(user, MAIL_CRYPT_ACL_SECURE_SHARE_SETTING);
+	if (settings_get(user->event, &crypt_acl_setting_parser_info, 0,
+			 &set, &error) < 0) {
+		e_error(user->event, "%s", error);
+		return -1;
+	}
+	bool disallow_insecure = set->crypt_acl_require_secure_key_sharing;
+	settings_free(set);
 
 	ret = mcp_user_create(user, target_uid, &dest_user, &error);
 
@@ -691,7 +699,7 @@ static void cmd_mcp_key_export_cb(const struct generated_key *key,
 			doveadm_print("");
 		} else {
 			/* this is to make it more compatible with openssl cli
-			   as it expects BEGIN on it's own line */
+			   as it expects BEGIN on its own line */
 			doveadm_print(t_strdup_printf("\n%s", str_c(out)));
 		}
 		dcrypt_key_unref_private(&pkey);
@@ -786,13 +794,23 @@ static int cmd_mcp_key_password_run(struct doveadm_mail_cmd_context *_ctx,
 		ctx->new_password = p_strdup(_ctx->pool, passw);
 	}
 
-	if (ctx->clear_password &&
-	    (ctx->new_password != NULL ||
-	     mail_user_plugin_getenv(user, MAIL_CRYPT_USERENV_PASSWORD) != NULL)) {
-		doveadm_print("clear password and new password specified");
-		_ctx->exit_code = EX_USAGE;
+	const struct crypt_settings *set;
+	const char *error;
+	if (settings_get(user->event, &crypt_setting_parser_info, 0,
+			 &set, &error) < 0) {
+		e_error(cctx->event, "%s", error);
 		return -1;
 	}
+
+	if (ctx->clear_password &&
+	    (ctx->new_password != NULL ||
+	     set->crypt_user_key_password[0] != '\0')) {
+		doveadm_print("clear password and new password specified");
+		_ctx->exit_code = EX_USAGE;
+		settings_free(set);
+		return -1;
+	}
+	settings_free(set);
 
 	struct mail_namespace *ns = mail_namespace_find_inbox(user->namespaces);
 	struct mailbox *box = mailbox_alloc(ns->list, "INBOX", 0);
@@ -812,7 +830,6 @@ static int cmd_mcp_key_password_run(struct doveadm_mail_cmd_context *_ctx,
 					    MAIL_ATTRIBUTE_TYPE_PRIVATE,
 					    USER_CRYPT_PREFIX
 					    PRIVKEYS_PREFIX);
-	const char *error;
 	const char *key_id;
 	int ret = 1;
 	unsigned int count = 0;

@@ -593,7 +593,8 @@ anvil_connection_handshake(struct anvil_connection *conn,
 	i_stream_unref(&orig_input);
 
 	struct ostream *orig_output = conn->conn.output;
-	conn->conn.output = o_stream_create_multiplex(orig_output, SIZE_MAX);
+	conn->conn.output = o_stream_create_multiplex(orig_output, SIZE_MAX,
+		OSTREAM_MULTIPLEX_FORMAT_PACKET);
 	o_stream_set_no_error_handling(conn->conn.output, TRUE);
 	o_stream_unref(&orig_output);
 
@@ -654,10 +655,10 @@ anvil_connection_input_line(struct connection *_conn, const char *line)
 	}
 
 	args = t_strsplit_tabescaped(line);
-	if (!conn->conn.handshake_received && !conn->fifo) {
+	if (!connection_handshake_received(&conn->conn) && !conn->fifo) {
 		if (anvil_connection_handshake(conn, args) < 0)
 			return -1;
-		conn->conn.handshake_received = TRUE;
+		connection_set_handshake_ready(&conn->conn);
 		return 1;
 	}
 

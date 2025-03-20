@@ -279,25 +279,17 @@ static void mail_index_record_map_free(struct mail_index_map *map,
 		rec_map->mmap_base = NULL;
 	}
 	array_free(&rec_map->maps);
-	if (rec_map->modseq != NULL)
-		mail_index_map_modseq_free(&rec_map->modseq);
 	i_free(rec_map);
 }
 
 static void mail_index_record_map_unlink(struct mail_index_map *map)
 {
-	struct mail_index_map *const *maps;
-	unsigned int idx = UINT_MAX;
+	unsigned int idx;
 
-	array_foreach(&map->rec_map->maps, maps) {
-		if (*maps == map) {
-			idx = array_foreach_idx(&map->rec_map->maps, maps);
-			break;
-		}
-	}
-	i_assert(idx != UINT_MAX);
-
+	if (!array_lsearch_ptr_idx(&map->rec_map->maps, map, &idx))
+		i_unreached();
 	array_delete(&map->rec_map->maps, idx, 1);
+
 	if (array_count(&map->rec_map->maps) == 0) {
 		mail_index_record_map_free(map, map->rec_map);
 		map->rec_map = NULL;
@@ -437,8 +429,6 @@ void mail_index_record_map_move_to_private(struct mail_index_map *map)
 					    map->hdr.record_size);
 		mail_index_record_map_unlink(map);
 		map->rec_map = new_map;
-		if (map->rec_map->modseq != NULL)
-			new_map->modseq = mail_index_map_modseq_clone(map->rec_map->modseq);
 	} else {
 		new_map = map->rec_map;
 	}
@@ -476,8 +466,6 @@ void mail_index_map_move_to_memory(struct mail_index_map *map)
 		new_map = map->rec_map;
 	else {
 		new_map = mail_index_record_map_alloc(map);
-		new_map->modseq = map->rec_map->modseq == NULL ? NULL :
-			mail_index_map_modseq_clone(map->rec_map->modseq);
 	}
 
 	mail_index_map_copy_records(new_map, map->rec_map,

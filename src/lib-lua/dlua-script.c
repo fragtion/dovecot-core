@@ -2,13 +2,16 @@
 
 #include "lib.h"
 #include "llist.h"
+#include "array.h"
 #include "istream.h"
 #include "sha1.h"
 #include "str.h"
 #include "hex-binary.h"
 #include "eacces-error.h"
 #include "ioloop.h"
+#include "settings.h"
 #include "dlua-script-private.h"
+#include "settings.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -24,6 +27,32 @@ struct event_category event_category_lua = {
 };
 
 static struct dlua_script *dlua_scripts = NULL;
+
+#undef DEF
+#define DEF(type, name) \
+	SETTING_DEFINE_STRUCT_##type("lua_"#name, name, struct dlua_settings)
+
+static const struct setting_define dlua_setting_defines[] = {
+	DEF(FILE, file),
+	DEF(STRLIST, settings),
+
+	SETTING_DEFINE_LIST_END
+};
+
+static const struct dlua_settings dlua_default_settings = {
+	.file = "",
+	.settings = ARRAY_INIT,
+};
+
+const struct setting_parser_info dlua_setting_parser_info = {
+	.name = "dlua",
+
+	.defines = dlua_setting_defines,
+	.defaults = &dlua_default_settings,
+
+	.struct_size = sizeof(struct dlua_settings),
+	.pool_offset1 = 1 + offsetof(struct dlua_settings, pool),
+};
 
 static int
 dlua_script_create_finish(struct dlua_script *script, const char **error_r);
@@ -161,6 +190,8 @@ static void dlua_call_deinit_function(struct dlua_script *script)
 
 int dlua_script_init(struct dlua_script *script, const char **error_r)
 {
+	const struct dlua_settings *set;
+
 	if (script->init)
 		return 0;
 	script->init = TRUE;
@@ -174,9 +205,33 @@ int dlua_script_init(struct dlua_script *script, const char **error_r)
 
 	int ret = 0;
 
-	if (dlua_pcall(script->L, LUA_SCRIPT_INIT_FN, 0, 0, error_r) < 0)
+	if (settings_get(script->event, &dlua_setting_parser_info, 0, &set,
+			 error_r) < 0)
 		return -1;
 
+	if (!array_is_empty(&set->settings)) {
+		i_assert((array_count(&set->settings) % 2 == 0));
+
+		/* prepare a table for arguments */
+		lua_createtable(script->L, 0,
+				array_count(&set->settings) / 2);
+		unsigned int count;
+		const char *const *str_array = array_get(&set->settings,
+							 &count);
+		for (unsigned int i = 0; i < count; i += 2) {
+			lua_pushstring(script->L, str_array[i + 1]);
+			lua_setfield(script->L, -2, str_array[i]);
+		}
+	} else {
+		lua_newtable(script->L);
+	}
+
+	if (dlua_pcall(script->L, LUA_SCRIPT_INIT_FN, 1, 0, error_r) < 0) {
+		settings_free(set);
+		return -1;
+	}
+
+	settings_free(set);
 	i_assert(lua_gettop(script->L) == 0);
 	return ret;
 }
@@ -325,6 +380,43 @@ int dlua_script_create_stream(struct istream *is, struct dlua_script **script_r,
 
 	*script_r = script;
 	return 0;
+}
+
+int dlua_script_create_auto(struct event *event_parent,
+			    struct dlua_script **script_r,
+			    const char **error_r)
+{
+	const struct dlua_settings *set;
+	struct settings_file file;
+	int ret = 1;
+
+	if (settings_get(event_parent, &dlua_setting_parser_info, 0, &set,
+			 error_r) < 0)
+		return -1;
+
+	settings_file_get(set->file, set->pool, &file);
+	if (set->file[0] == '\0') {
+		*error_r = "lua_file setting is empty";
+		ret = 0;
+	} else if (file.path[0] == '\0') {
+		*error_r = "Lua doesn't support inline content for lua_file";
+		ret = -1;
+	}
+	if (ret < 1)  {
+		settings_free(set);
+		return ret;
+	}
+
+	ret = dlua_script_create_file(file.path, script_r, event_parent,
+				      error_r);
+	if (ret < 0) {
+		i_assert(*error_r != NULL);
+		*error_r = t_strdup_printf("Lua script '%s': %s", file.path,
+					   *error_r);
+	} else
+		ret = 1;
+	settings_free(set);
+	return ret;
 }
 
 static void dlua_script_destroy(struct dlua_script *script)

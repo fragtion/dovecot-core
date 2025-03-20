@@ -5,11 +5,12 @@
 
 struct config_parser_context;
 
-bool old_settings_handle(struct config_parser_context *ctx,
-			 enum config_line_type type,
-			 const char *key, const char *value);
-void old_settings_handle_post(struct config_parser_context *ctx);
-void old_settings_init(struct config_parser_context *ctx);
-void old_settings_deinit_global(void);
+void old_settings_handle(struct config_parser_context *ctx,
+			 struct config_line *line);
+bool old_settings_default(const char *dovecot_config_version,
+			  const char *key, const char *key_with_path,
+			  const char **old_default_r);
+unsigned int
+old_settings_default_changes_count(const char *dovecot_config_version);
 
 #endif

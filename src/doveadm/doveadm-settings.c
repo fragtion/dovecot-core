@@ -2,41 +2,19 @@
 
 #include "lib.h"
 #include "array.h"
-#include "var-expand.h"
-#include "settings-parser.h"
+#include "settings.h"
 #include "service-settings.h"
 #include "mail-storage-settings.h"
 #include "master-service.h"
 #include "master-service-settings.h"
-#include "master-service-ssl-settings.h"
 #include "iostream-ssl.h"
 #include "doveadm-settings.h"
 
-ARRAY_TYPE(doveadm_setting_root) doveadm_setting_roots;
 bool doveadm_verbose_proctitle;
 
-static pool_t doveadm_settings_pool = NULL;
 static int global_config_fd = -1;
 
 static bool doveadm_settings_check(void *_set, pool_t pool, const char **error_r);
-
-/* <settings checks> */
-static struct file_listener_settings doveadm_unix_listeners_array[] = {
-	{
-		.path = "doveadm-server",
-		.type = "tcp",
-		.mode = 0600,
-		.user = "",
-		.group = "",
-	},
-};
-static struct file_listener_settings *doveadm_unix_listeners[] = {
-	&doveadm_unix_listeners_array[0]
-};
-static buffer_t doveadm_unix_listeners_buf = {
-	{ { doveadm_unix_listeners, sizeof(doveadm_unix_listeners) } }
-};
-/* </settings checks> */
 
 struct service_settings doveadm_service_settings = {
 	.name = "doveadm",
@@ -46,22 +24,28 @@ struct service_settings doveadm_service_settings = {
 	.user = "",
 	.group = "",
 	.privileged_group = "",
-	.extra_groups = "$default_internal_group",
 	.chroot = "",
 
 	.drop_priv_before_exec = FALSE,
 
-	.process_min_avail = 0,
-	.process_limit = 0,
 	.client_limit = 1,
-	.service_count = 1,
-	.idle_kill = 0,
-	.vsz_limit = UOFF_T_MAX,
+	.restart_request_count = 1,
 
-	.unix_listeners = { { &doveadm_unix_listeners_buf,
-			      sizeof(doveadm_unix_listeners[0]) } },
+	.unix_listeners = ARRAY_INIT,
 	.fifo_listeners = ARRAY_INIT,
 	.inet_listeners = ARRAY_INIT
+};
+
+const struct setting_keyvalue doveadm_service_settings_defaults[] = {
+	{ "unix_listener", "doveadm-server" },
+
+	{ "unix_listener/doveadm-server/path", "doveadm-server" },
+	{ "unix_listener/doveadm-server/type", "tcp" },
+	{ "unix_listener/doveadm-server/mode", "0600" },
+
+	{ "service_extra_groups", "$SET:default_internal_group" },
+
+	{ NULL, NULL }
 };
 
 #undef DEF
@@ -69,11 +53,11 @@ struct service_settings doveadm_service_settings = {
 	SETTING_DEFINE_STRUCT_##type(#name, name, struct doveadm_settings)
 
 static const struct setting_define doveadm_setting_defines[] = {
-	DEF(STR, base_dir),
-	DEF(STR, libexec_dir),
-	DEF(STR, mail_plugins),
+	DEF(STR_HIDDEN, base_dir),
+	DEF(STR_HIDDEN, libexec_dir),
+	DEF(BOOLLIST, mail_plugins),
 	DEF(STR, mail_plugin_dir),
-	DEF(STR_VARS, mail_temp_dir),
+	DEF(STR, mail_temp_dir),
 	DEF(BOOL, auth_debug),
 	DEF(STR, auth_socket_path),
 	DEF(STR, doveadm_socket_path),
@@ -83,17 +67,15 @@ static const struct setting_define doveadm_setting_defines[] = {
 	DEF(ENUM, doveadm_ssl),
 	DEF(STR, doveadm_username),
 	DEF(STR, doveadm_password),
-	DEF(STR, doveadm_allowed_commands),
+	DEF(BOOLLIST, doveadm_allowed_commands),
 	DEF(STR, dsync_alt_char),
-	DEF(STR, dsync_remote_cmd),
+	DEF(STR_NOVARS, dsync_remote_cmd),
 	DEF(STR, doveadm_api_key),
 	DEF(STR, dsync_features),
 	DEF(UINT, dsync_commit_msgs_interval),
-	DEF(STR, doveadm_http_rawlog_dir),
-	DEF(STR, dsync_hashed_headers),
+	DEF(STR_HIDDEN, dsync_hashed_headers),
 
-	{ .type = SET_STRLIST, .key = "plugin",
-	  .offset = offsetof(struct doveadm_settings, plugin_envs) },
+	{ .type = SET_FILTER_NAME, .key = DOVEADM_SERVER_FILTER },
 
 	SETTING_DEFINE_LIST_END
 };
@@ -101,9 +83,13 @@ static const struct setting_define doveadm_setting_defines[] = {
 const struct doveadm_settings doveadm_default_settings = {
 	.base_dir = PKG_RUNDIR,
 	.libexec_dir = PKG_LIBEXECDIR,
-	.mail_plugins = "",
+	.mail_plugins = ARRAY_INIT,
 	.mail_plugin_dir = MODULEDIR,
+#ifdef DOVECOT_PRO_EDITION
+	.mail_temp_dir = "/dev/shm/dovecot",
+#else
 	.mail_temp_dir = "/tmp",
+#endif
 	.auth_debug = FALSE,
 	.auth_socket_path = "auth-userdb",
 	.doveadm_socket_path = "doveadm-server",
@@ -112,38 +98,27 @@ const struct doveadm_settings doveadm_default_settings = {
 	.doveadm_ssl = "no:ssl:starttls",
 	.doveadm_username = "doveadm",
 	.doveadm_password = "",
-	.doveadm_allowed_commands = "",
+	.doveadm_allowed_commands = ARRAY_INIT,
 	.dsync_alt_char = "_",
-	.dsync_remote_cmd = "ssh -l%{login} %{host} doveadm dsync-server -u%u -U",
+	.dsync_remote_cmd = "ssh -l%{login} %{host} doveadm dsync-server -u%{user} -U",
 	.dsync_features = "",
 	.dsync_hashed_headers = "Date Message-ID",
 	.dsync_commit_msgs_interval = 100,
 	.doveadm_api_key = "",
-	.doveadm_http_rawlog_dir = "",
-
-	.plugin_envs = ARRAY_INIT
-};
-
-static const struct setting_parser_info *doveadm_setting_dependencies[] = {
-	&mail_user_setting_parser_info,
-	NULL
 };
 
 const struct setting_parser_info doveadm_setting_parser_info = {
-	.module_name = "doveadm",
+	.name = "doveadm",
+
 	.defines = doveadm_setting_defines,
 	.defaults = &doveadm_default_settings,
 
-	.type_offset = SIZE_MAX,
 	.struct_size = sizeof(struct doveadm_settings),
-
-	.parent_offset = SIZE_MAX,
+	.pool_offset1 = 1 + offsetof(struct doveadm_settings, pool),
 	.check_func = doveadm_settings_check,
-	.dependencies = doveadm_setting_dependencies
 };
 
-struct doveadm_settings *doveadm_settings;
-const struct master_service_settings *service_set;
+const struct doveadm_settings *doveadm_settings;
 
 static void
 fix_base_path(struct doveadm_settings *set, pool_t pool, const char **str)
@@ -214,111 +189,37 @@ static bool doveadm_settings_check(void *_set, pool_t pool ATTR_UNUSED,
 }
 /* </settings checks> */
 
-const struct master_service_ssl_settings *doveadm_ssl_set = NULL;
-
-void doveadm_get_ssl_settings(struct ssl_iostream_settings *set_r, pool_t pool)
-{
-	master_service_ssl_client_settings_to_iostream_set(doveadm_ssl_set,
-							   pool, set_r);
-}
-
-void doveadm_settings_expand(struct doveadm_settings *set, pool_t pool)
-{
-	struct var_expand_table tab[] = { { '\0', NULL, NULL } };
-	const char *error;
-
-	if (settings_var_expand(&doveadm_setting_parser_info, set,
-				pool, tab, &error) <= 0)
-		i_fatal("Failed to expand settings: %s", error);
-}
-
 void doveadm_read_settings(void)
 {
-	static const struct setting_parser_info *default_set_roots[] = {
-		&master_service_ssl_setting_parser_info,
-		&doveadm_setting_parser_info,
-	};
 	struct master_service_settings_input input;
 	struct master_service_settings_output output;
-	const struct doveadm_settings *set;
-	struct doveadm_setting_root *root;
-	ARRAY(const struct setting_parser_info *) set_roots;
 	const char *error;
 
-	t_array_init(&set_roots, N_ELEMENTS(default_set_roots) +
-		     array_count(&doveadm_setting_roots) + 1);
-	array_append(&set_roots, default_set_roots,
-		     N_ELEMENTS(default_set_roots));
-	array_foreach_modifiable(&doveadm_setting_roots, root)
-		array_push_back(&set_roots, &root->info);
-	array_append_zero(&set_roots);
-
 	i_zero(&input);
-	input.roots = array_front(&set_roots);
-	input.service = "doveadm";
 	input.preserve_user = TRUE;
 	input.preserve_home = TRUE;
 	input.return_config_fd = TRUE; /* for doveadm exec */
 	if (master_service_settings_read(master_service, &input,
 					 &output, &error) < 0)
-		i_fatal("Error reading configuration: %s", error);
+		i_fatal("%s", error);
 	i_assert(global_config_fd == -1);
 	global_config_fd = output.config_fd;
-	fd_close_on_exec(output.config_fd, TRUE);
+	if (output.config_fd != -1)
+		fd_close_on_exec(output.config_fd, TRUE);
 
-	doveadm_settings_pool = pool_alloconly_create("doveadm settings", 1024);
-	service_set = master_service_settings_get_root_set_dup(master_service,
-		&master_service_setting_parser_info, doveadm_settings_pool);
-	doveadm_verbose_proctitle = service_set->verbose_proctitle;
+	doveadm_verbose_proctitle = master_service_get_service_settings(master_service)->verbose_proctitle;
 
-	set = master_service_settings_get_root_set(
-		master_service, &doveadm_setting_parser_info);
-	doveadm_settings = settings_dup(&doveadm_setting_parser_info, set,
-					doveadm_settings_pool);
-	doveadm_ssl_set = master_service_settings_get_root_set_dup(
-		master_service, &master_service_ssl_setting_parser_info,
-		doveadm_settings_pool);
-	doveadm_settings_expand(doveadm_settings, doveadm_settings_pool);
-	doveadm_settings->parsed_features = set->parsed_features; /* copy this value by hand */
-
-	array_foreach_modifiable(&doveadm_setting_roots, root) {
-		root->settings = master_service_settings_get_root_set_dup(
-			master_service, root->info, doveadm_settings_pool);
-	}
+	doveadm_settings =
+		settings_get_or_fatal(master_service_get_event(master_service),
+				      &doveadm_setting_parser_info);
 }
 
 int doveadm_settings_get_config_fd(void)
 {
-	i_assert(global_config_fd != -1);
 	return global_config_fd;
-}
-
-void doveadm_setting_roots_add(const struct setting_parser_info *info)
-{
-	struct doveadm_setting_root *root;
-
-	root = array_append_space(&doveadm_setting_roots);
-	root->info = info;
-}
-
-void *doveadm_setting_roots_get_settings(const struct setting_parser_info *info)
-{
-	const struct doveadm_setting_root *root;
-
-	array_foreach(&doveadm_setting_roots, root) {
-		if (root->info == info)
-			return root->settings;
-	}
-	i_panic("Failed to find settings for module %s", info->module_name);
-}
-
-void doveadm_settings_init(void)
-{
-	i_array_init(&doveadm_setting_roots, 8);
 }
 
 void doveadm_settings_deinit(void)
 {
-	array_free(&doveadm_setting_roots);
-	pool_unref(&doveadm_settings_pool);
+	settings_free(doveadm_settings);
 }

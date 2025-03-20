@@ -2,8 +2,10 @@
 #define MAIL_STORAGE_SERVICE_H
 
 #include "net.h"
+#include "module-context.h"
 
 struct master_service;
+struct ssl_iostream_settings;
 struct mail_user;
 struct setting_parser_context;
 struct setting_parser_info;
@@ -30,16 +32,20 @@ enum mail_storage_service_flags {
 	MAIL_STORAGE_SERVICE_FLAG_NO_PLUGINS		= 0x100,
 	/* Don't close auth connections because of idling. */
 	MAIL_STORAGE_SERVICE_FLAG_NO_IDLE_TIMEOUT	= 0x200,
-	/* When executing doveconf, tell it to use sysexits codes */
-	MAIL_STORAGE_SERVICE_FLAG_USE_SYSEXITS		= 0x400,
 	/* Don't create namespaces, only the user. */
 	MAIL_STORAGE_SERVICE_FLAG_NO_NAMESPACES		= 0x800,
+	/* Initialize the user only minimally. Used by "doveadm mail fs"
+	   commands. */
+	MAIL_STORAGE_SERVICE_FLAG_MINIMAL_USER_INIT	= 0x1000,
 };
 
 struct mail_storage_service_input {
 	struct event *event_parent;
 
+	/* service name - NULL defaults to master_service_get_name() */
 	const char *service;
+	/* protocol name - defaults to service name */
+	const char *protocol;
 	const char *username;
 	/* If set, use this string as the session ID */
 	const char *session_id;
@@ -52,13 +58,17 @@ struct mail_storage_service_input {
 
 	struct ip_addr local_ip, remote_ip;
 	in_port_t local_port, remote_port;
+	const char *local_name;
 
+	/* SETTINGS_OVERRIDE_TYPE_USERDB fields */
 	const char *const *userdb_fields;
+	/* SETTINGS_OVERRIDE_TYPE_CODE fields */
+	const char *const *code_override_fields;
 
 	const char *const *forward_fields;
 
-	/* Use this settings parser instead of looking it up. */
-	struct setting_parser_context *unexpanded_set_parser;
+	/* Use this settings instance instead of looking it up. */
+	struct settings_instance *set_instance;
 
 	/* Override specified global flags */
 	enum mail_storage_service_flags flags_override_add;
@@ -78,21 +88,60 @@ struct mail_storage_service_input {
 	bool no_free_init_failure:1;
 };
 
+struct mail_storage_service_user {
+	pool_t pool;
+	int refcount;
+
+	struct mail_storage_service_ctx *service_ctx;
+	struct mail_storage_service_input input;
+	enum mail_storage_service_flags flags;
+
+	struct event *event;
+	struct ioloop_context *ioloop_ctx;
+	const char *log_prefix, *auth_mech, *auth_token, *auth_user;
+	const char *master_user;
+	const char *local_name;
+
+	const char *system_groups_user, *uid_source, *gid_source;
+	const char *chdir_path;
+	const struct mail_user_settings *user_set;
+	struct settings_instance *set_instance;
+
+	unsigned int session_id_counter;
+
+	/* Module-specific contexts. See mail_storage_module_id. */
+	ARRAY(union mail_storage_service_user_module_context *) module_contexts;
+
+	bool anonymous:1;
+	bool admin:1;
+	bool master_service_user_set:1;
+	bool home_from_userdb:1;
+};
+
+struct mail_storage_service_user_module_register {
+	unsigned int id;
+};
+
+union mail_storage_service_user_module_context {
+	struct mail_storage_service_user_module_register *reg;
+};
+extern struct mail_storage_service_user_module_register
+	mail_storage_service_user_module_register;
 extern struct module *mail_storage_service_modules;
+
+/* Stored here, since it's used by both obox and fts_dovecot plugins.
+   It's better not to have to link fts_dovecot with obox plugin. */
+extern MODULE_CONTEXT_DEFINE(metacache_service_user_module,
+			     &mail_storage_service_user_module_register);
 
 struct mail_storage_service_ctx *
 mail_storage_service_init(struct master_service *service,
-			  const struct setting_parser_info *set_roots[],
-			  enum mail_storage_service_flags flags) ATTR_NULL(2);
+			  enum mail_storage_service_flags flags);
 struct auth_master_connection *
 mail_storage_service_get_auth_conn(struct mail_storage_service_ctx *ctx);
 /* Set auth connection (instead of creating a new one automatically). */
 void mail_storage_service_set_auth_conn(struct mail_storage_service_ctx *ctx,
 					struct auth_master_connection *conn);
-int mail_storage_service_read_settings(struct mail_storage_service_ctx *ctx,
-				       const struct mail_storage_service_input *input,
-				       struct setting_parser_context **parser_r,
-				       const char **error_r) ATTR_NULL(2);
 /* Read settings and initialize context to use them. Do nothing if service is
    already initialized. This is mainly necessary when calling _get_auth_conn()
    or _all_init(). */
@@ -105,10 +154,6 @@ int mail_storage_service_lookup(struct mail_storage_service_ctx *ctx,
 				const struct mail_storage_service_input *input,
 				struct mail_storage_service_user **user_r,
 				const char **error_r);
-/* The next mail_storage_service_lookup() will save the userdb fields into the
-   given pointer, allocated from the given pool. */
-void mail_storage_service_save_userdb_fields(struct mail_storage_service_ctx *ctx,
-					     pool_t pool, const char *const **userdb_fields_r);
 /* Returns 0 if ok, -1 if fatal error, -2 if error is user-specific. */
 int mail_storage_service_next(struct mail_storage_service_ctx *ctx,
 			      struct mail_storage_service_user *user,
@@ -120,8 +165,7 @@ int mail_storage_service_next_with_session_suffix(struct mail_storage_service_ct
 						  const char *session_id_postfix,
 						  struct mail_user **mail_user_r,
 						   const char **error_r);
-void mail_storage_service_restrict_setenv(struct mail_storage_service_ctx *ctx,
-					  struct mail_storage_service_user *user);
+void mail_storage_service_restrict_setenv(struct mail_storage_service_user *user);
 /* Combine lookup() and next() into one call. */
 int mail_storage_service_lookup_next(struct mail_storage_service_ctx *ctx,
 				     const struct mail_storage_service_input *input,
@@ -129,6 +173,13 @@ int mail_storage_service_lookup_next(struct mail_storage_service_ctx *ctx,
 				     const char **error_r);
 void mail_storage_service_user_ref(struct mail_storage_service_user *user);
 void mail_storage_service_user_unref(struct mail_storage_service_user **user);
+/* Duplicate service user. It still uses the same memory pool as the original
+   user. */
+struct mail_storage_service_user *
+mail_storage_service_user_dup(const struct mail_storage_service_user *user);
+/* Return userdb fields for the user. */
+const char *const *
+mail_storage_service_user_get_userdb_fields(struct mail_storage_service_user *user);
 /* Initialize iterating through all users. */
 void mail_storage_service_all_init(struct mail_storage_service_ctx *ctx);
 /* Initialize iterating through all users with a user mask hint to the
@@ -150,18 +201,14 @@ void mail_storage_service_io_activate_user(struct mail_storage_service_user *use
    log prefix. */
 void mail_storage_service_io_deactivate_user(struct mail_storage_service_user *user);
 
-/* Return settings struct for the given root. The settings contain all the
-   changes done by userdb lookups. */
-void *mail_storage_service_user_get_set(struct mail_storage_service_user *user,
-					const struct setting_parser_info *root);
-const struct mail_storage_settings *
-mail_storage_service_user_get_mail_set(struct mail_storage_service_user *user);
+/* Return the user settings. They contain all the changes done by userdb
+   lookups. */
+const struct mail_user_settings *
+mail_storage_service_user_get_set(struct mail_storage_service_user *user);
 const struct mail_storage_service_input *
 mail_storage_service_user_get_input(struct mail_storage_service_user *user);
-struct setting_parser_context *
-mail_storage_service_user_get_settings_parser(struct mail_storage_service_user *user);
-const struct master_service_ssl_settings *
-mail_storage_service_user_get_ssl_settings(struct mail_storage_service_user *user);
+struct settings_instance *
+mail_storage_service_user_get_settings_instance(struct mail_storage_service_user *user);
 struct mail_storage_service_ctx *
 mail_storage_service_user_get_service_ctx(struct mail_storage_service_user *user);
 pool_t mail_storage_service_user_get_pool(struct mail_storage_service_user *user);
@@ -172,22 +219,17 @@ mail_storage_service_user_get_event(const struct mail_storage_service_user *user
 const char *
 mail_storage_service_user_get_username(const struct mail_storage_service_user *user);
 
-/* Return all service settings roots. This includes the roots given to
-   mail_storage_service_init() as well as all dynamically created
-   mail_storage_classes. */
-const struct setting_parser_info *const *
-mail_storage_service_get_set_roots(struct mail_storage_service_ctx *ctx);
 const char *
 mail_storage_service_get_log_prefix(struct mail_storage_service_ctx *ctx);
-const struct var_expand_table *
-mail_storage_service_get_var_expand_table(struct mail_storage_service_ctx *ctx,
-					  struct mail_storage_service_input *input);
+enum mail_storage_service_flags
+mail_storage_service_get_flags(struct mail_storage_service_ctx *ctx);
+
+const struct var_expand_params *
+mail_storage_service_get_var_expand_params(struct mail_storage_service_ctx *ctx,
+					   struct mail_storage_service_input *input);
 const char *mail_storage_service_fields_var_expand(const char *data,
 						   const char *const *fields);
-/* Updates settings for storage service user, forwards return value of settings_parse_keyvalue() */
-int mail_storage_service_user_set_setting(struct mail_storage_service_user *user,
-					  const char *key,
-					  const char *value,
-					  const char **error_r);
+void mail_storage_service_restore_privileges(uid_t old_uid, const char *old_cwd,
+					     struct event *event);
 
 #endif

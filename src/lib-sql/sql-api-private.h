@@ -15,6 +15,7 @@ enum sql_db_state {
 	SQL_DB_STATE_BUSY
 };
 
+/* <settings checks> */
 /* Minimum delay between reconnecting to same server */
 #define SQL_CONNECT_MIN_DELAY 1
 /* Maximum time to avoiding reconnecting to same server */
@@ -30,6 +31,7 @@ enum sql_db_state {
 #define SQL_QUERY_TIMEOUT_SECS 60
 /* Default max. number of connections to create per host */
 #define SQL_DEFAULT_CONNECTION_LIMIT 5
+/* </settings checks> */
 
 #define SQL_DB_IS_READY(db) \
 	((db)->state == SQL_DB_STATE_IDLE)
@@ -43,6 +45,10 @@ enum sql_db_state {
 #define SQL_TRANSACTION_FINISHED "sql_transaction_finished"
 
 #define SQL_QUERY_FINISHED_FMT "Finished query '%s' in %u msecs"
+
+/* Used by sqlpool to set event_set_ptr(), so sql drivers' init() functions can
+   check if the caller is sqlpool. */
+#define SQLPOOL_EVENT_PTR "sqlpool_event"
 
 struct sql_db_module_register {
 	unsigned int id;
@@ -65,9 +71,8 @@ struct sql_transaction_query {
 };
 
 struct sql_db_vfuncs {
-	struct sql_db *(*init)(const char *connect_string);
-	int (*init_full)(const struct sql_settings *set, struct sql_db **db_r,
-			 const char **error);
+	int (*init)(struct event *event, struct sql_db **db_r,
+		    const char **error_r);
 	void (*deinit)(struct sql_db *db);
 	void (*unref)(struct sql_db *db);
 	void (*wait) (struct sql_db *db);
@@ -204,7 +209,8 @@ struct sql_statement {
 	const char *query_template;
 	ARRAY_TYPE(const_string) args;
 
-	/* Tell the driver to not log this query with expanded values. */
+	/* Tell the driver to not log this query with expanded values.
+	   This works only for prepared statements. */
 	bool no_log_expanded_values;
 };
 
@@ -238,6 +244,8 @@ struct sql_transaction_context {
 
 	/* commit() must use this query list if head is non-NULL. */
 	struct sql_transaction_query *head, *tail;
+
+	bool non_atomic;
 };
 
 ARRAY_DEFINE_TYPE(sql_drivers, const struct sql_db *);
@@ -246,10 +254,12 @@ extern ARRAY_TYPE(sql_drivers) sql_drivers;
 extern struct sql_result sql_not_connected_result;
 
 void sql_init_common(struct sql_db *db);
-struct sql_db *
-driver_sqlpool_init(const char *connect_string, const struct sql_db *driver);
-int driver_sqlpool_init_full(const struct sql_settings *set, const struct sql_db *driver,
-			     struct sql_db **db_r, const char **error_r);
+
+struct sql_db *driver_sqlpool_init(const struct sql_db *driver,
+				   struct event *event_parent,
+				   const char *filter_name,
+				   const ARRAY_TYPE(const_string) *hostnames,
+				   unsigned int connection_limit);
 
 void sql_db_set_state(struct sql_db *db, enum sql_db_state state);
 
@@ -267,4 +277,20 @@ struct event_passthrough *
 sql_query_finished_event(struct sql_db *db, struct event *event, const char *query,
 			 bool success, int *duration_r);
 struct event_passthrough *sql_transaction_finished_event(struct sql_transaction_context *ctx);
+
+void sql_drivers_init_without_drivers(void);
+void sql_drivers_deinit_without_drivers(void);
+
+void sql_drivers_init_all(void);
+void sql_drivers_deinit_all(void);
+
+void driver_cassandra_init(void);
+void driver_cassandra_deinit(void);
+void driver_mysql_init(void);
+void driver_mysql_deinit(void);
+void driver_pgsql_init(void);
+void driver_pgsql_deinit(void);
+void driver_sqlite_init(void);
+void driver_sqlite_deinit(void);
+
 #endif

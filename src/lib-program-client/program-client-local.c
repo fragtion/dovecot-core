@@ -49,7 +49,7 @@ program_client_local_exited(struct program_client_local *plclient);
 static void
 exec_child(const char *bin_path, const char *const *args,
 	   ARRAY_TYPE(const_string) *envs, int in_fd, int out_fd,
-	   int *extra_fds, bool drop_stderr, struct event *event)
+	   int *extra_fds, struct event *event)
 {
 	ARRAY_TYPE(const_string) exec_args;
 
@@ -70,14 +70,6 @@ exec_child(const char *bin_path, const char *const *args,
 	if (out_fd != STDOUT_FILENO && out_fd != dev_null_fd &&
 	    (out_fd != in_fd) && close(out_fd) < 0)
 		e_error(event, "close(out_fd) failed: %m");
-
-	/* Drop stderr if requested */
-	if (drop_stderr) {
-		if (dup2(dev_null_fd, STDERR_FILENO) < 0) {
-			i_fatal("program %s: "
-				"dup2(stderr) failed: %m", bin_path);
-		}
-	}
 
 	/* Setup extra fds */
 	if (extra_fds != NULL) {
@@ -255,16 +247,8 @@ program_client_local_connect(struct program_client *pclient)
 			}
 		}
 
-		/* if we want to allow root, then we will not drop
-		   root privileges */
-		restrict_access(&pclient->set.restrict_set,
-				(pclient->set.allow_root ?
-					RESTRICT_ACCESS_FLAG_ALLOW_ROOT : 0),
-				pclient->set.home);
-
 		exec_child(plclient->bin_path, pclient->args, &pclient->envs,
-			   fd_in[0], fd_out[1], child_extra_fds,
-			   pclient->set.drop_stderr, event);
+			   fd_in[0], fd_out[1], child_extra_fds, event);
 		i_unreached();
 	}
 
@@ -431,7 +415,7 @@ program_client_local_kill(struct program_client_local *plclient)
 	e_debug(pclient->event,
 		"Execution timed out after %u milliseconds: "
 		"Sending TERM signal",
-		pclient->set.input_idle_timeout_msecs);
+		pclient->params.input_idle_timeout_msecs);
 
 	/* send sigterm, keep on waiting */
 	plclient->sent_term = TRUE;
@@ -457,7 +441,8 @@ program_client_local_disconnect(struct program_client *pclient, bool force)
 	struct program_client_local *plclient =
 		(struct program_client_local *) pclient;
 	pid_t pid = plclient->pid;
-	unsigned long runtime, timeout = 0;
+	long long runtime;
+	unsigned long timeout = 0;
 
 	if (plclient->exited) {
 		program_client_local_exited(plclient);
@@ -484,8 +469,8 @@ program_client_local_disconnect(struct program_client *pclient, bool force)
 
 	/* Calculate timeout */
 	runtime = timeval_diff_msecs(&ioloop_timeval, &pclient->start_time);
-	if (force || (pclient->set.input_idle_timeout_msecs > 0 &&
-		      runtime >= pclient->set.input_idle_timeout_msecs)) {
+	if (force || (pclient->params.input_idle_timeout_msecs > 0 &&
+		      runtime >= pclient->params.input_idle_timeout_msecs)) {
 		e_debug(pclient->event,
 			"Terminating program immediately");
 
@@ -493,11 +478,11 @@ program_client_local_disconnect(struct program_client *pclient, bool force)
 		return;
 	}
 
-	if (runtime < pclient->set.input_idle_timeout_msecs)
-		timeout = pclient->set.input_idle_timeout_msecs - runtime;
+	if (runtime > 0 && runtime < pclient->params.input_idle_timeout_msecs)
+		timeout = pclient->params.input_idle_timeout_msecs - runtime;
 
 	e_debug(pclient->event,
-		"Waiting for program to finish after %lu msecs "
+		"Waiting for program to finish after %lld msecs "
 		"(timeout = %lu msecs)", runtime, timeout);
 
 	if (timeout == 0)
@@ -532,19 +517,19 @@ program_client_local_switch_ioloop(struct program_client *pclient)
 }
 
 struct program_client *
-program_client_local_create(const char *bin_path,
+program_client_local_create(struct event *event, const char *bin_path,
 			    const char *const *args,
-			    const struct program_client_settings *set)
+			    const struct program_client_parameters *params)
 {
 	struct program_client_local *plclient;
 	const char *label;
 	pool_t pool;
 
-	label = t_strconcat("exec:", bin_path, NULL);
+	label = t_strconcat("fork:", bin_path, NULL);
 
 	pool = pool_alloconly_create("program client local", 1024);
 	plclient = p_new(pool, struct program_client_local, 1);
-	program_client_init(&plclient->client, pool, label, args, set);
+	program_client_init(&plclient->client, pool, event, label, args, params);
 	plclient->client.connect = program_client_local_connect;
 	plclient->client.close_output = program_client_local_close_output;
 	plclient->client.switch_ioloop = program_client_local_switch_ioloop;

@@ -14,10 +14,10 @@ struct dict_transaction_context dict_transaction_unsupported =
         .dict = &dict_driver_fail,
 };
 
-static int dict_fail_init(struct dict *dict_driver ATTR_UNUSED,
-			  const char *uri ATTR_UNUSED,
-			  const struct dict_settings *set ATTR_UNUSED,
-			  struct dict **dict_r ATTR_UNUSED, const char **error_r)
+static int
+dict_fail_init(const struct dict *dict_driver ATTR_UNUSED,
+	       struct event *event ATTR_UNUSED,
+	       struct dict **dict_r ATTR_UNUSED, const char **error_r)
 {
 	*error_r = "Unsupported operation (dict does not support this feature)";
 	return -1;

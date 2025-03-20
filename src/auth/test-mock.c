@@ -10,7 +10,7 @@ bool worker, worker_restart_request;
 static struct passdb_module *mock_passdb_mod = NULL;
 static pool_t mock_pool;
 
-void auth_module_load(const char *names ATTR_UNUSED)
+void auth_module_load(const char *name ATTR_UNUSED)
 {
 }
 void auth_refresh_proctitle(void) {
@@ -43,24 +43,6 @@ static struct passdb_module_interface mock_interface = {
 	.lookup_credentials = passdb_mock_lookup_credentials,
 };
 
-struct auth_passdb_settings mock_passdb_set = {
-	.name = "mock",
-	.driver = "mock",
-	.args = "",
-	.default_fields = "",
-	.override_fields = "",
-	.mechanisms = "",
-	.username_filter = "",
-	.skip = "never",
-	.result_success = "return-ok",
-	.result_failure = "continue",
-	.result_internalfail = "continue",
-	.deny = FALSE,
-	.pass = FALSE,
-	.master = FALSE,
-	.auth_verbose = "default"
-};
-
 void passdb_mock_mod_init(void)
 {
 	if (mock_passdb_mod != NULL)
@@ -73,10 +55,7 @@ void passdb_mock_mod_init(void)
 	struct auth_passdb_settings set = {
 		.name = "mock",
 		.driver = "mock",
-		.args = "",
-		.default_fields = "",
-		.override_fields = "",
-		.mechanisms = "",
+		.mechanisms_filter = ARRAY_INIT,
 		.username_filter = "",
 
 		.skip = "never",
@@ -85,11 +64,11 @@ void passdb_mock_mod_init(void)
 		.result_internalfail = "continue",
 
 		.deny = FALSE,
-		.pass = FALSE,
 		.master = FALSE,
-		.auth_verbose = "default"
 	};
-	mock_passdb_mod = passdb_preinit(mock_pool, &set);
+	struct event *event = event_create(NULL);
+	mock_passdb_mod = passdb_preinit(mock_pool, event, &set);
+	event_unref(&event);
 	passdb_init(mock_passdb_mod);
 }
 
@@ -103,7 +82,7 @@ void passdb_mock_mod_deinit(void)
 struct auth_passdb *passdb_mock(void)
 {
 	struct auth_passdb *ret = i_new(struct auth_passdb, 1);
-	ret->set = &mock_passdb_set;
+	ret->name = "mock";
 	ret->passdb = mock_passdb_mod;
 	return ret;
 }

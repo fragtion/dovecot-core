@@ -4,6 +4,7 @@
 struct mail_user_settings;
 
 struct lda_settings {
+	pool_t pool;
 	const char *hostname;
 	const char *rejection_subject;
 	const char *rejection_reason;
@@ -14,6 +15,9 @@ struct lda_settings {
 	bool quota_full_tempfail;
 	bool lda_mailbox_autocreate;
 	bool lda_mailbox_autosubscribe;
+
+	/* generated */
+	bool parsed_want_storage_id;
 };
 
 extern const struct setting_parser_info lda_setting_parser_info;

@@ -9,9 +9,10 @@ struct imap_arg;
 
 struct imapc_mailbox_list {
 	struct mailbox_list list;
-	const struct imapc_settings *set;
+	const struct imapc_settings *set; /* points to client->set */
 	struct imapc_storage_client *client;
 	struct mailbox_list *index_list;
+	struct settings_instance *index_list_set_instance;
 
 	/* mailboxes are stored as vnames */
 	struct mailbox_tree_context *mailboxes, *tmp_subscriptions;

@@ -123,7 +123,7 @@ log_fdpass_input(void *context ATTR_UNUSED)
 static void main_init(void)
 {
 	const struct master_service_settings *set =
-		master_service_settings_get(master_service);
+		master_service_get_service_settings(master_service);
 
 	/* delay dying until all of our clients are gone */
 	master_service_set_die_with_master(master_service, FALSE);
@@ -161,9 +161,8 @@ int main(int argc, char *argv[])
 					     &argc, &argv, "");
 	if (master_getopt(master_service) > 0)
 		return FATAL_DEFAULT;
-	if (master_service_settings_read_simple(master_service,
-						NULL, &error) < 0)
-		i_fatal("Error reading configuration: %s", error);
+	if (master_service_settings_read_simple(master_service, &error) < 0)
+		i_fatal("%s", error);
 	master_service_init_log(master_service);
 
 	restrict_access_by_env(RESTRICT_ACCESS_FLAG_ALLOW_ROOT, NULL);

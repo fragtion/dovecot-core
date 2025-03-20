@@ -11,9 +11,10 @@
 #include "randgen.h"
 #include "restrict-access.h"
 #include "write-full.h"
-#include "settings-parser.h"
+#include "settings.h"
 #include "master-interface.h"
 #include "master-service.h"
+#include "master-service-settings.h"
 #include "master-admin-client.h"
 #include "login-server.h"
 #include "mail-user.h"
@@ -24,6 +25,7 @@
 #include "imap-commands.h"
 #include "imap-feature.h"
 #include "imap-fetch.h"
+#include "imap-list.h"
 
 #include <stdio.h>
 #include <unistd.h>
@@ -242,14 +244,16 @@ client_add_input_finalize(struct client *client)
 }
 
 int client_create_from_input(const struct mail_storage_service_input *input,
-			     int fd_in, int fd_out, bool unhibernated,
+			     const struct imap_logout_stats *stats,
+			     int fd_in, int fd_out,
+			     enum client_create_flags flags,
 			     struct client **client_r, const char **error_r)
 {
 	struct mail_storage_service_input service_input;
 	struct mail_user *mail_user;
 	struct client *client;
 	struct imap_settings *imap_set;
-	struct smtp_submit_settings *smtp_set;
+	struct smtp_submit_settings *smtp_set = NULL;
 	struct event *event;
 
 	event = event_create(NULL);
@@ -280,17 +284,25 @@ int client_create_from_input(const struct mail_storage_service_input *input,
 
 	restrict_access_allow_coredumps(TRUE);
 
-	smtp_set = settings_parser_get_root_set(mail_user->set_parser,
-			&smtp_submit_setting_parser_info);
-	imap_set = settings_parser_get_root_set(mail_user->set_parser,
-			&imap_setting_parser_info);
+	if (settings_get(mail_user->event, &smtp_submit_setting_parser_info, 0,
+			 &smtp_set, error_r) < 0 ||
+	    settings_get(mail_user->event, &imap_setting_parser_info, 0,
+			 &imap_set, error_r) < 0) {
+		settings_free(smtp_set);
+		mail_user_deinit(&mail_user);
+		event_unref(&event);
+		return -1;
+	}
 	if (imap_set->verbose_proctitle)
 		verbose_proctitle = TRUE;
 
-	client = client_create(fd_in, fd_out, unhibernated,
+	client = client_create(fd_in, fd_out, flags,
 			       event, mail_user, imap_set, smtp_set);
 	client->userdb_fields = input->userdb_fields == NULL ? NULL :
 		p_strarray_dup(client->pool, input->userdb_fields);
+	/* For imap_logout_format statistics: */
+	if (stats != NULL)
+		client->logout_stats = *stats;
 	event_unref(&event);
 	*client_r = client;
 	return 0;
@@ -315,8 +327,8 @@ static void main_stdio_run(const char *username)
 	if ((value = getenv("LOCAL_IP")) != NULL)
 		(void)net_addr2ip(value, &input.local_ip);
 
-	if (client_create_from_input(&input, STDIN_FILENO, STDOUT_FILENO,
-				     FALSE, &client, &error) < 0)
+	if (client_create_from_input(&input, NULL, STDIN_FILENO, STDOUT_FILENO,
+				     0, &client, &error) < 0)
 		i_fatal("%s", error);
 
 	input_base64 = getenv("CLIENT_INPUT");
@@ -354,6 +366,7 @@ login_request_finished(const struct login_server_request *request,
 	struct client *client;
 	struct imap_login_request imap_request;
 	enum login_request_flags flags = request->auth_req.flags;
+	enum client_create_flags create_flags = 0;
 	const char *error;
 
 	i_zero(&input);
@@ -367,13 +380,15 @@ login_request_finished(const struct login_server_request *request,
 	input.session_id = request->session_id;
 	if ((flags & LOGIN_REQUEST_FLAG_END_CLIENT_SECURED_TLS) != 0)
 		input.end_client_tls_secured = TRUE;
+	if ((flags & LOGIN_REQUEST_FLAG_MULTIPLEX_OUTPUT) != 0)
+		create_flags |= CLIENT_CREATE_FLAG_MULTIPLEX_OUTPUT;
 
 	client_parse_imap_login_request(request->data,
 					request->auth_req.data_size,
 					&imap_request);
 
-	if (client_create_from_input(&input, request->fd, request->fd,
-				     FALSE, &client, &error) < 0) {
+	if (client_create_from_input(&input, NULL, request->fd, request->fd,
+				     create_flags, &client, &error) < 0) {
 		int fd = request->fd;
 		struct ostream *output =
 			o_stream_create_fd_autoclose(&fd, IO_BLOCK_SIZE);
@@ -446,7 +461,7 @@ master_admin_cmd_kick_user(const char *user, const guid_128_t conn_guid)
 		if (strcmp(client->user->username, user) == 0 &&
 		    (guid_128_is_empty(conn_guid) ||
 		     guid_128_cmp(client->anvil_conn_guid, conn_guid) == 0))
-			client_kick(client);
+			client_kick(client, FALSE);
 	}
 	return count;
 }
@@ -474,11 +489,6 @@ static void client_connected(struct master_service_connection *conn)
 
 int main(int argc, char *argv[])
 {
-	static const struct setting_parser_info *set_roots[] = {
-		&smtp_submit_setting_parser_info,
-		&imap_setting_parser_info,
-		NULL
-	};
 	struct login_server_settings login_set;
 	enum master_service_flags service_flags = 0;
 	enum mail_storage_service_flags storage_service_flags =
@@ -491,6 +501,7 @@ int main(int argc, char *argv[])
 		 */
 		MAIL_STORAGE_SERVICE_FLAG_NO_NAMESPACES;
 	const char *username = NULL, *auth_socket_path = "auth-master";
+	const char *error;
 	int c;
 
 	i_zero(&login_set);
@@ -538,17 +549,20 @@ int main(int argc, char *argv[])
 	master_admin_clients_init(&admin_callbacks);
 	master_service_set_die_callback(master_service, imap_die);
 
+	if (master_service_settings_read_simple(master_service, &error) < 0)
+		i_fatal("%s", error);
+
 	/* plugins may want to add commands, so this needs to be called early */
 	commands_init();
 	imap_fetch_handlers_init();
 	imap_features_init();
 	clients_init();
 	imap_master_clients_init();
+	imap_list_init();
 	/* this is needed before settings are read */
 	verbose_proctitle = !IS_STANDALONE() &&
 		getenv(MASTER_VERBOSE_PROCTITLE_ENV) != NULL;
 
-	const char *error;
 	if (t_abspath(auth_socket_path, &login_set.auth_socket_path, &error) < 0)
 		i_fatal("t_abspath(%s) failed: %s", auth_socket_path, error);
 
@@ -566,7 +580,7 @@ int main(int argc, char *argv[])
 
 	storage_service =
 		mail_storage_service_init(master_service,
-					  set_roots, storage_service_flags);
+					  storage_service_flags);
 	master_service_init_finish(master_service);
 	/* NOTE: login_set.*_socket_path are now invalid due to data stack
 	   having been freed */
@@ -591,6 +605,7 @@ int main(int argc, char *argv[])
 		login_server_deinit(&login_server);
 	mail_storage_service_deinit(&storage_service);
 
+	imap_list_deinit();
 	imap_fetch_handlers_deinit();
 	imap_features_deinit();
 

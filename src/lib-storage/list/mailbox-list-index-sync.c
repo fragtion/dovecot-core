@@ -61,7 +61,8 @@ mailbox_list_index_node_add(struct mailbox_list_index_sync_context *ctx,
 {
 	struct mailbox_list_index_node *node;
 	char *dup_name;
-	mailbox_list_name_unescape(&name, ctx->list->set.storage_name_escape_char);
+	mailbox_list_name_unescape(&name,
+		ctx->list->mail_set->mailbox_list_storage_escape_char[0]);
 
 	node = p_new(ctx->ilist->mailbox_pool,
 		     struct mailbox_list_index_node, 1);
@@ -295,6 +296,7 @@ mailbox_list_index_sync_list(struct mailbox_list_index_sync_context *sync_ctx)
 	struct mailbox_list_iterate_context *iter;
 	const struct mailbox_info *info;
 	enum mailbox_list_index_flags flags;
+	enum mailbox_list_iter_flags iter_flags;
 	const char *patterns[2];
 	struct mailbox_list_index_node *node;
 	uint32_t seq;
@@ -303,14 +305,18 @@ mailbox_list_index_sync_list(struct mailbox_list_index_sync_context *sync_ctx)
 	/* clear EXISTS-flags, so after sync we know what can be expunged */
 	mailbox_list_index_node_clear_exists(sync_ctx->ilist->mailbox_tree);
 
+	iter_flags = MAILBOX_LIST_ITER_RAW_LIST |
+		     MAILBOX_LIST_ITER_NO_AUTO_BOXES;
+	if (sync_ctx->ilist->index_created)
+		iter_flags |= MAILBOX_LIST_ITER_FORCE_RESYNC;
+
 	/* don't include autocreated mailboxes in index until they're
 	   actually created. this index may be used by multiple users, so
 	   we also want to ignore ACLs here. */
 	patterns[0] = "*"; patterns[1] = NULL;
 	iter = sync_ctx->ilist->module_ctx.super.
 		iter_init(sync_ctx->list, patterns,
-			  MAILBOX_LIST_ITER_RAW_LIST |
-			  MAILBOX_LIST_ITER_NO_AUTO_BOXES);
+			  iter_flags);
 
 	sync_ctx->syncing_list = TRUE;
 	while ((info = sync_ctx->ilist->module_ctx.super.iter_next(iter)) != NULL) T_BEGIN {
@@ -344,6 +350,7 @@ mailbox_list_index_sync_list(struct mailbox_list_index_sync_context *sync_ctx)
 
 	/* successfully listed everything, expunge any unseen mailboxes */
 	sync_expunge_nonexistent(sync_ctx, sync_ctx->ilist->mailbox_tree);
+	sync_ctx->ilist->index_created = FALSE;
 	return 0;
 }
 

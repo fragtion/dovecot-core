@@ -6,12 +6,16 @@
 #include "str.h"
 #include "http-client.h"
 #include "http-url.h"
-#include "json-parser.h"
+#include "json-istream.h"
 #include "oauth2.h"
 #include "oauth2-private.h"
 
 static void oauth2_request_free(struct oauth2_request *req)
 {
+	json_istream_destroy(&req->json_istream);
+	io_remove(&req->io);
+	i_stream_unref(&req->is);
+
 	timeout_remove(&req->to_delayed_error);
 	pool_unref(&req->pool);
 }
@@ -85,50 +89,48 @@ static int request_field_cmp(const char *key, const struct oauth2_field *field)
 
 void oauth2_request_parse_json(struct oauth2_request *req)
 {
-	enum json_type type;
-	const char *token, *error;
+	struct json_node jnode;
+	struct json_istream *jinput = req->json_istream;
+	const char *error;
 	int ret;
 
-	while((ret = json_parse_next(req->parser, &type, &token)) > 0) {
-		if (req->field_name == NULL) {
-			if (type != JSON_TYPE_OBJECT_KEY) break;
-			/* cannot use t_strdup because we might
-			   have to read more */
-			req->field_name = p_strdup(req->pool, token);
-		} else if (type < JSON_TYPE_STRING) {
-			/* this should be last allocation */
-			p_free(req->pool, req->field_name);
-			json_parse_skip(req->parser);
-		} else {
+	ret = 1;
+	while (ret > 0) {
+		ret = json_istream_read_next(jinput, &jnode);
+		if (ret <= 0)
+			break;
+		i_assert(jnode.name != NULL);
+		if (json_node_is_singular(&jnode)) {
 			if (!array_is_created(&req->fields))
 				p_array_init(&req->fields, req->pool, 4);
 			struct oauth2_field *field =
 				array_append_space(&req->fields);
-			field->name = req->field_name;
-			req->field_name = NULL;
-			field->value = p_strdup(req->pool, token);
+			field->name = p_strdup(req->pool, jnode.name);
+			field->value = p_strdup(req->pool,
+						json_node_get_str(&jnode));
 		}
 	}
 
-	/* read more */
-	if (ret == 0) return;
-
-	io_remove(&req->io);
-
-	if (ret > 0) {
-		(void)json_parser_deinit(&req->parser, &error);
-		error = "Invalid response data";
-	} else if (i_stream_read_eof(req->is) &&
-		   req->is->v_offset == 0 && req->is->stream_errno == 0) {
-		/* discard error, empty response is OK. */
-		(void)json_parser_deinit(&req->parser, &error);
-		error = NULL;
-	} else if (json_parser_deinit(&req->parser, &error) == 0) {
-		error = NULL;
-	} else {
-		i_assert(error != NULL);
+	if (ret == 0) {
+		/* need more data */
+		return;
 	}
 
+	if (i_stream_read_eof(req->is) &&
+	    req->is->v_offset == 0 && req->is->stream_errno == 0) {
+		/* discard error, empty response is OK. */
+		error = NULL;
+	} else {
+		ret = json_istream_finish(&req->json_istream, &error);
+		i_assert(ret != 0);
+		if (ret < 0) {
+			error = t_strdup_printf("Invalid JSON in response: %s",
+						error);
+		}
+	}
+
+	json_istream_destroy(&req->json_istream);
+	io_remove(&req->io);
 	i_stream_unref(&req->is);
 
 	/* check if fields contain error now */
@@ -171,7 +173,8 @@ oauth2_request_response(const struct http_response *response,
 	}
 
 	p_array_init(&req->fields, req->pool, 1);
-	req->parser = json_parser_init(req->is);
+	req->json_istream = json_istream_create_object(
+		req->is, NULL, JSON_PARSER_FLAG_NUMBERS_AS_STRING);
 	req->json_parsed_cb = oauth2_request_continue;
 	req->io = io_add_istream(req->is, oauth2_request_parse_json, req);
 	oauth2_request_parse_json(req);
@@ -193,9 +196,9 @@ oauth2_request_set_headers(struct oauth2_request *req,
 {
 	if (!req->set->send_auth_headers)
 		return;
-	if (input->service != NULL) {
+	if (input->protocol != NULL) {
 		http_client_request_add_header(
-			req->req, "X-Dovecot-Auth-Service", input->service);
+			req->req, "X-Dovecot-Auth-Protocol", input->protocol);
 	}
 	if (input->local_ip.family != 0) {
 		http_client_request_add_header(
@@ -220,7 +223,8 @@ oauth2_request_start(const struct oauth2_settings *set,
 		     const char *method,
 		     const char *url,
 		     const string_t *payload,
-		     bool add_auth_bearer)
+		     bool add_auth_bearer,
+		     bool no_token)
 {
 	pool_t pool = (p == NULL) ?
 		pool_alloconly_create_clean("oauth2 request", 1024) : p;
@@ -232,7 +236,7 @@ oauth2_request_start(const struct oauth2_settings *set,
 	req->req_callback = callback;
 	req->req_context = context;
 
-	if (!oauth2_valid_token(input->token)) {
+	if (!no_token && !oauth2_valid_token(input->token)) {
 		req->to_delayed_error =
 			timeout_add_short(0, oauth2_request_fail, req);
 		return req;
@@ -261,8 +265,6 @@ oauth2_request_start(const struct oauth2_settings *set,
 					       t_strdup_printf("Bearer %s",
 							       input->token));
 	}
-	http_client_request_set_timeout_msecs(req->req,
-					      req->set->timeout_msecs);
 	http_client_request_submit(req->req);
 
 	return req;
@@ -280,7 +282,8 @@ oauth2_refresh_start(const struct oauth2_settings *set,
 	http_url_escape_param(payload, input->token);
 
 	return oauth2_request_start(set, input, callback, context, NULL,
-				    "POST", set->refresh_url, NULL, FALSE);
+				    "POST", set->refresh_url, NULL, FALSE,
+				    FALSE);
 }
 
 #undef oauth2_introspection_start
@@ -328,7 +331,7 @@ oauth2_introspection_start(const struct oauth2_settings *set,
 	}
 
 	return oauth2_request_start(set, input, callback, context, p,
-				    method, url, payload, TRUE);
+				    method, url, payload, TRUE, FALSE);
 }
 
 #undef oauth2_token_validation_start
@@ -344,7 +347,7 @@ oauth2_token_validation_start(const struct oauth2_settings *set,
 	http_url_escape_param(enc, input->token);
 
 	return oauth2_request_start(set, input, callback, context,
-				    NULL, "GET", str_c(enc), NULL, TRUE);
+				    NULL, "GET", str_c(enc), NULL, TRUE, FALSE);
 }
 
 #undef oauth2_passwd_grant_start
@@ -377,13 +380,44 @@ oauth2_passwd_grant_start(const struct oauth2_settings *set,
 
 	return oauth2_request_start(set, input, callback, context,
 				    pool, "POST", set->grant_url,
-				    payload, FALSE);
+				    payload, FALSE, FALSE);
+}
+
+#undef oauth2_client_secret_start
+struct oauth2_request*
+oauth2_client_secret_start(const struct oauth2_settings *set,
+			  const struct oauth2_request_input *input,
+			  const char *resource,
+			  oauth2_request_callback_t *callback,
+			  void *context)
+{
+	pool_t pool = pool_alloconly_create_clean("oauth2 request", 1024);
+	string_t *payload = str_new(pool, 128);
+
+	str_append(payload, "grant_type=client_credentials");
+	if (*set->client_id != '\0') {
+		str_append(payload, "&client_id=");
+		http_url_escape_param(payload, set->client_id);
+	}
+	if (*set->client_secret != '\0') {
+		str_append(payload, "&client_secret=");
+		http_url_escape_param(payload, set->client_secret);
+	}
+	str_append(payload, "&resource=");
+	http_url_escape_param(payload, resource);
+
+	return oauth2_request_start(set, input, callback, context,
+				    pool, "POST", set->grant_url,
+				    payload, FALSE, TRUE);
 }
 
 void oauth2_request_abort(struct oauth2_request **_req)
 {
 	struct oauth2_request *req = *_req;
 	*_req = NULL;
+
+	if (req == NULL)
+		return;
 
 	http_client_request_abort(&req->req);
 	oauth2_request_free(req);

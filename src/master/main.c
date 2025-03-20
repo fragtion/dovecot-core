@@ -13,6 +13,7 @@
 #include "time-util.h"
 #include "execv-const.h"
 #include "restrict-process-size.h"
+#include "settings.h"
 #include "master-instance.h"
 #include "master-service-private.h"
 #include "master-service-settings.h"
@@ -74,11 +75,6 @@ static ARRAY(struct master_delayed_error) delayed_errors;
 static pool_t delayed_errors_pool;
 static failure_callback_t *orig_fatal_callback;
 static failure_callback_t *orig_error_callback;
-
-static const struct setting_parser_info *set_roots[] = {
-	&master_setting_parser_info,
-	NULL
-};
 
 void process_exec(const char *cmd)
 {
@@ -417,29 +413,37 @@ sig_settings_reload(const siginfo_t *si ATTR_UNUSED,
 	}
 
 	i_zero(&input);
-	input.roots = set_roots;
 	input.config_path = services_get_config_socket_path(services);
+	input.no_service_filter = TRUE;
 	input.never_exec = TRUE;
 	input.reload_config = TRUE;
 	input.return_config_fd = TRUE;
 	if (master_service_settings_read(master_service, &input,
 					 &output, &error) < 0) {
-		i_error("Error reading configuration: %s", error);
+		i_error("%s", error);
+		i_sd_notify(0, "READY=1");
+		return;
+	}
+	if (settings_get(master_service_get_event(master_service),
+			 &master_setting_parser_info, 0,
+			 &set, &error) < 0) {
+		i_close_fd(&output.config_fd);
+		i_error("%s", error);
 		i_sd_notify(0, "READY=1");
 		return;
 	}
 	i_close_fd(&global_config_fd);
 	global_config_fd = output.config_fd;
 	fd_close_on_exec(global_config_fd, TRUE);
-	set = master_service_settings_get_root_set(master_service,
-						   &master_setting_parser_info);
 
 	if (services_create(set, &new_services, &error) < 0) {
 		/* new configuration is invalid, keep the old */
 		i_error("Config reload failed: %s", error);
 		i_sd_notify(0, "READY=1");
+		settings_free(set);
 		return;
 	}
+	settings_free(set);
 	new_services->config->config_file_path =
 		p_strdup(new_services->pool,
 			 services->config->config_file_path);
@@ -497,27 +501,28 @@ static void sig_die(const siginfo_t *si, void *context ATTR_UNUSED)
 	master_service_stop(master_service);
 }
 
-static struct master_settings *master_settings_read(void)
+static const struct master_settings *master_settings_read(void)
 {
 	struct master_service_settings_input input;
 	struct master_service_settings_output output;
 	const char *error;
 
 	i_zero(&input);
-	input.roots = set_roots;
+	input.no_service_filter = TRUE;
 	input.preserve_environment = TRUE;
+	input.check_full_config = TRUE;
 	input.always_exec = TRUE;
 	input.return_config_fd = TRUE;
 	if (master_service_settings_read(master_service, &input, &output,
 					 &error) < 0)
-		i_fatal("Error reading configuration: %s", error);
+		i_fatal("%s", error);
 	global_config_fd = output.config_fd;
 	fd_close_on_exec(global_config_fd, TRUE);
-	return master_service_settings_get_root_set(master_service,
-						    &master_setting_parser_info);
+	return settings_get_or_fatal(master_service_get_event(master_service),
+				     &master_setting_parser_info);
 }
 
-static void main_log_startup(char **protocols)
+static void main_log_startup(const char *const *protocols)
 {
 #define STARTUP_STRING PACKAGE_NAME" v"DOVECOT_VERSION_FULL" starting up"
 	string_t *str = t_str_new(128);
@@ -529,7 +534,7 @@ static void main_log_startup(char **protocols)
 		str_append(str, " without any protocols");
 	else {
 		str_printfa(str, " for %s",
-			    t_strarray_join((const char **)protocols, ", "));
+			    t_strarray_join(protocols, ", "));
 	}
 
 	core_dumps_disabled = restrict_get_core_limit(&core_limit) == 0 &&
@@ -572,7 +577,7 @@ static void main_init(const struct master_settings *set)
 	/* deny file access from everyone else except owner */
         (void)umask(0077);
 
-	main_log_startup(set->protocols_split);
+	main_log_startup(settings_boollist_get(&set->protocols));
 
 	lib_signals_init();
         lib_signals_ignore(SIGPIPE, TRUE);
@@ -716,6 +721,9 @@ static void print_build_options(void)
 #ifdef IOLOOP_NOTIFY_KQUEUE
 		" notify=kqueue"
 #endif
+#ifdef DOVECOT_PRO_EDITION
+	        " pro"
+#endif
 		" openssl"
 	        " io_block_size=%u"
 #ifdef SQL_DRIVER_PLUGINS
@@ -739,7 +747,7 @@ static void print_build_options(void)
 #ifdef PASSDB_BSDAUTH
 		" bsdauth"
 #endif
-#ifdef PASSDB_LDAP
+#ifdef HAVE_LDAP
 		" ldap"
 #endif
 #ifdef PASSDB_PAM
@@ -755,14 +763,11 @@ static void print_build_options(void)
 		" sql"
 #endif
 	"\nUserdb:"
-#ifdef USERDB_LDAP
+#ifdef HAVE_LDAP
 		" ldap"
 #ifndef BUILTIN_LDAP
 		"(plugin)"
 #endif
-#endif
-#ifdef USERDB_NSS
-		" nss"
 #endif
 #ifdef USERDB_PASSWD
 		" passwd"
@@ -784,7 +789,7 @@ static void print_build_options(void)
 
 int main(int argc, char *argv[])
 {
-	struct master_settings *set;
+	const struct master_settings *set;
 	const char *error, *doveconf_arg = NULL;
 	failure_callback_t *orig_info_callback, *orig_debug_callback;
 	bool foreground = FALSE, ask_key_pass = FALSE;
@@ -903,16 +908,18 @@ int main(int argc, char *argv[])
 			t_askpass("Give the password for SSL keys: ");
 	}
 
-	if (dup2(dev_null_fd, STDIN_FILENO) < 0)
-		i_fatal("dup2(dev_null_fd) failed: %m");
-	if (!foreground && dup2(dev_null_fd, STDOUT_FILENO) < 0)
-		i_fatal("dup2(dev_null_fd) failed: %m");
-
 	pidfile_path =
 		i_strconcat(set->base_dir, "/"MASTER_PID_FILE_NAME, NULL);
 
 	lib_set_clean_exit(TRUE);
 	master_service_init_log(master_service);
+
+	if (dup2(dev_null_fd, STDIN_FILENO) < 0)
+		i_fatal("dup2(dev_null_fd) failed: %m");
+	if (!i_failure_have_stdout_logs() &&
+	    dup2(dev_null_fd, STDOUT_FILENO) < 0)
+		i_fatal("dup2(dev_null_fd) failed: %m");
+
 	startup_early_errors_flush();
 	i_get_failure_handlers(&orig_fatal_callback, &orig_error_callback,
 			       &orig_info_callback, &orig_debug_callback);
@@ -923,9 +930,9 @@ int main(int argc, char *argv[])
 	master_settings_do_fixes(set);
 	fatal_log_check(set);
 
-	const struct master_service_settings *service_set =
-		master_service_settings_get(master_service);
-	master_service_import_environment(service_set->import_environment);
+	const char *import_environment =
+		master_service_get_import_environment_keyvals(master_service);
+	master_service_import_environment(import_environment);
 	master_service_env_clean();
 
 	/* create service structures from settings. if there are any errors in
@@ -953,6 +960,7 @@ int main(int argc, char *argv[])
 
 	T_BEGIN {
 		main_init(set);
+		settings_free(set);
 	} T_END;
 	master_service_run(master_service, NULL);
 	main_deinit();

@@ -9,6 +9,7 @@
 #include "read-full.h"
 #include "write-full.h"
 #include "str.h"
+#include "settings.h"
 #include "maildir-storage.h"
 #include "mailbox-list-private.h"
 #include "quota-private.h"
@@ -158,7 +159,6 @@ static bool maildir_set_next_path(struct maildir_list_context *ctx)
 static const char *
 maildir_list_next(struct maildir_list_context *ctx, time_t *mtime_r)
 {
-	struct quota_rule *rule;
 	struct stat st;
 
 	for (;;) {
@@ -167,9 +167,23 @@ maildir_list_next(struct maildir_list_context *ctx, time_t *mtime_r)
 			if (ctx->info == NULL)
 				return NULL;
 
-			rule = quota_root_rule_find(ctx->root->root.set,
-						    ctx->info->vname);
-			if (rule != NULL && rule->ignore) {
+			const struct quota_root_settings *set;
+			bool quota_ignore = FALSE;
+			const char *error;
+			struct event *event =
+				mail_storage_mailbox_create_event(
+					ctx->root->root.backend.event,
+					ctx->info->ns->list, ctx->info->vname);
+			if (settings_get(event, &quota_root_setting_parser_info,
+					 0, &set, &error) < 0)
+				e_error(event, "%s", error);
+			else {
+				quota_ignore = set->quota_ignore;
+				settings_free(set);
+			}
+			event_unref(&event);
+
+			if (quota_ignore) {
 				/* mailbox not included in quota */
 				continue;
 			}
@@ -235,11 +249,8 @@ maildirs_check_have_changed(struct maildir_quota_root *root,
 
 static int maildirsize_write(struct maildir_quota_root *root, const char *path)
 {
-	const struct mail_storage_settings *set =
-		root->maildirsize_ns->mail_set;
 	struct quota_root *_root = &root->root;
-	struct mail_namespace *const *namespaces;
-	unsigned int i, count;
+	struct mail_namespace *inbox_ns;
 	struct mailbox_permissions perm;
 	const char *p, *dir;
 	string_t *str, *temp_path;
@@ -248,23 +259,14 @@ static int maildirsize_write(struct maildir_quota_root *root, const char *path)
 	i_assert(root->fd == -1);
 
 	/* figure out what permissions we should use for maildirsize.
-	   use the inbox namespace's permissions if possible. */
-	perm.file_create_mode = 0600; perm.dir_create_mode = 0700;
-	perm.file_create_gid = (gid_t)-1;
-	perm.file_create_gid_origin = "default";
-	namespaces = array_get(&root->root.quota->namespaces, &count);
-	i_assert(count > 0);
-	for (i = 0; i < count; i++) {
-		if ((namespaces[i]->flags & NAMESPACE_FLAG_INBOX_USER) == 0)
-			continue;
+	   use the inbox namespace's permissions. */
+	inbox_ns = mail_namespace_find_inbox(root->root.quota->user->namespaces);
+	mailbox_list_get_root_permissions(inbox_ns->list, &perm);
 
-		mailbox_list_get_root_permissions(namespaces[i]->list,
-						  &perm);
-		break;
-	}
-
-	dotlock_settings.use_excl_lock = set->dotlock_use_excl;
-	dotlock_settings.nfs_flush = set->mail_nfs_storage;
+	dotlock_settings.use_excl_lock =
+		inbox_ns->list->mail_set->dotlock_use_excl;
+	dotlock_settings.nfs_flush =
+		inbox_ns->list->mail_set->mail_nfs_storage;
 
 	temp_path = t_str_new(128);
 	str_append(temp_path, path);
@@ -356,11 +358,6 @@ static int maildirsize_recalculate_namespace(struct maildir_quota_root *root,
 
 static void maildirsize_rebuild_later(struct maildir_quota_root *root)
 {
-	if (!root->root.set->force_default_rule) {
-		/* FIXME: can't unlink(), because the limits would be lost. */
-		return;
-	}
-
 	if (unlink(root->maildirsize_path) < 0 &&
 	    errno != ENOENT && errno != ESTALE)
 		e_error(root->root.backend.event,
@@ -393,11 +390,8 @@ static int maildirsize_recalculate(struct maildir_quota_root *root,
 	maildirsize_recalculate_init(root);
 
 	/* count mails from all namespaces */
-	namespaces = array_get(&root->root.quota->namespaces, &count);
+	namespaces = array_get(&root->root.namespaces, &count);
 	for (i = 0; i < count; i++) {
-		if (!quota_root_is_namespace_visible(&root->root, namespaces[i]))
-			continue;
-
 		if (maildirsize_recalculate_namespace(root, namespaces[i], error_r) < 0) {
 			ret = -1;
 			break;
@@ -407,10 +401,6 @@ static int maildirsize_recalculate(struct maildir_quota_root *root,
 	if (ret == 0) {
 		/* check if any of the directories have changed */
 		for (i = 0; i < count; i++) {
-			if (!quota_root_is_namespace_visible(&root->root,
-							   namespaces[i]))
-				continue;
-
 			ret = maildirs_check_have_changed(root, namespaces[i],
 						root->recalc_last_stamp,
 						error_r);
@@ -484,20 +474,10 @@ static int maildirsize_parse(struct maildir_quota_root *root,
 	if (message_count_limit >= (1ULL << 63))
 		message_count_limit = (1ULL << 63) - 1;
 
-	if (root->root.bytes_limit == (int64_t)message_bytes_limit &&
-	    root->root.count_limit == (int64_t)message_count_limit) {
-		/* limits haven't changed */
-	} else if (root->root.set->force_default_rule) {
-		/* we know the limits and they've changed.
-		   the file must be rewritten. */
+	if (root->root.bytes_limit != (int64_t)message_bytes_limit ||
+	    root->root.count_limit != (int64_t)message_count_limit) {
+		/* the limits have changed. the file must be rewritten. */
 		return 0;
-	} else {
-		/* we're using limits from the file. */
-		root->root.bytes_limit = message_bytes_limit;
-		root->root.count_limit = message_count_limit;
-		quota_root_recalculate_relative_rules(root->root.set,
-						      message_bytes_limit,
-						      message_count_limit);
 	}
 
 	if (*lines == NULL) {
@@ -669,9 +649,9 @@ static bool maildirquota_limits_init(struct maildir_quota_root *root)
 		if ((storage->class_flags &
 		     MAIL_STORAGE_CLASS_FLAG_NOQUOTA) == 0) {
 			e_warning(root->root.backend.event,
-				  "Namespace '%s' is not Maildir, "
+				  "Namespace %s is not Maildir, "
 				  "skipping for Maildir++ quota",
-				  root->maildirsize_ns->prefix);
+				  root->maildirsize_ns->set->name);
 		}
 		root->maildirsize_path = NULL;
 		return FALSE;
@@ -715,17 +695,6 @@ maildirquota_refresh(struct maildir_quota_root *root, bool *recalculated_r,
 
 	ret = maildirquota_read_limits(root, error_r);
 	if (ret == 0) {
-		if (root->root.bytes_limit == 0 &&
-		    root->root.count_limit == 0 &&
-		    root->root.set->default_rule.bytes_limit == 0 &&
-		    root->root.set->default_rule.count_limit == 0) {
-			/* no quota */
-			if (!root->root.set->force_default_rule)
-				return 0;
-			/* explicitly specified 0 as quota. keep the quota
-			   updated even if it's not enforced. */
-		}
-
 		ret = maildirsize_recalculate(root, error_r);
 		if (ret == 0)
 			*recalculated_r = TRUE;
@@ -781,11 +750,10 @@ static struct quota_root *maildir_quota_alloc(void)
 	return &root->root;
 }
 
-static int maildir_quota_init(struct quota_root *_root, const char *args,
-			      const char **error_r)
+static int maildir_quota_init(struct quota_root *_root ATTR_UNUSED,
+			      const char **error_r ATTR_UNUSED)
 {
-	event_set_append_log_prefix(_root->backend.event, "quota-maildir: ");
-	return quota_root_default_init(_root, args, error_r);
+	return 0;
 }
 
 static void maildir_quota_deinit(struct quota_root *_root)
@@ -796,66 +764,15 @@ static void maildir_quota_deinit(struct quota_root *_root)
 	i_free(root);
 }
 
-static bool
-maildir_quota_parse_rule(struct quota_root_settings *root_set ATTR_UNUSED,
-			 struct quota_rule *rule,
-			 const char *str, const char **error_r)
-{
-	uint64_t bytes, count;
-
-	if (strcmp(str, "NOQUOTA") == 0) {
-		bytes = 0;
-		count = 0;
-	} else if (!maildir_parse_limit(str, &bytes, &count)) {
-		*error_r = t_strdup_printf(
-			"quota-maildir: Invalid Maildir++ quota rule \"%s\"",
-			str);
-		return FALSE;
-	}
-
-	rule->bytes_limit = bytes;
-	rule->count_limit = count;
-	return TRUE;
-}
-
-static int maildir_quota_init_limits(struct quota_root *_root,
-				     const char **error_r)
-{
-	struct maildir_quota_root *root = (struct maildir_quota_root *)_root;
-	const char *error;
-
-	if (maildirquota_read_limits(root, &error) < 0) {
-		*error_r = t_strdup_printf(
-			"quota-maildir: Failed to read limits: %s", error);
-		return -1;
-	}
-	return 0;
-}
-
 static void
-maildir_quota_root_namespace_added(struct quota_root *_root,
-				   struct mail_namespace *ns)
+maildir_quota_namespace_added(struct quota_root *_root,
+			      struct mail_namespace *ns)
 {
 	struct maildir_quota_root *root = (struct maildir_quota_root *)_root;
 
-	if (root->maildirsize_ns == NULL)
+	if (root->maildirsize_ns == NULL ||
+	    root->maildirsize_ns->type != MAIL_NAMESPACE_TYPE_PRIVATE)
 		root->maildirsize_ns = ns;
-}
-
-static void
-maildir_quota_namespace_added(struct quota *quota, struct mail_namespace *ns)
-{
-	struct quota_root **roots;
-	unsigned int i, count;
-
-	roots = array_get_modifiable(&quota->roots, &count);
-	for (i = 0; i < count; i++) {
-		if (roots[i]->backend.name == quota_backend_maildir.name &&
-		    ((roots[i]->ns_prefix == NULL &&
-		      ns->type == MAIL_NAMESPACE_TYPE_PRIVATE) ||
-		     roots[i]->ns == ns))
-			maildir_quota_root_namespace_added(roots[i], ns);
-	}
 }
 
 static const char *const *
@@ -945,8 +862,6 @@ struct quota_backend quota_backend_maildir = {
 		.alloc = maildir_quota_alloc,
 		.init = maildir_quota_init,
 		.deinit = maildir_quota_deinit,
-		.parse_rule = maildir_quota_parse_rule,
-		.init_limits = maildir_quota_init_limits,
 		.namespace_added = maildir_quota_namespace_added,
 		.get_resources = maildir_quota_root_get_resources,
 		.get_resource = maildir_quota_get_resource,

@@ -348,6 +348,7 @@ static void pool_alloconly_unref(pool_t *pool)
 	if (--apool->refcount > 0)
 		return;
 
+	pool_external_refs_unref(&apool->pool);
 	pool_alloconly_destroy(apool);
 }
 
@@ -465,6 +466,8 @@ static void *pool_alloconly_realloc(pool_t pool, void *mem,
 	struct alloconly_pool *apool =
 		container_of(pool, struct alloconly_pool, pool);
 	unsigned char *new_mem;
+
+	i_assert(old_size < SIZE_MAX);
 
 	if (new_size <= old_size)
 		return mem;

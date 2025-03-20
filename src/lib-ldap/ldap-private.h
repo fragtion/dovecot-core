@@ -1,7 +1,7 @@
 #ifndef LDAP_PRIVATE_H
 #define LDAP_PRIVATE_H
 
-#include "iostream-ssl.h"
+#include "ssl-settings.h"
 #include "ldap-client.h"
 
 #include <ldap.h>
@@ -59,8 +59,8 @@ struct ldap_connection {
 	BerValue cred; /* needed for SASL */
 	BerVarray scred;
 
-	struct ldap_client_settings set;
-	struct ssl_iostream_settings ssl_set;
+	const struct ldap_client_settings *set;
+	const struct ssl_settings *ssl_set;
 
 	struct aqueue *request_queue;
 	ARRAY(struct ldap_op_queue_entry *) request_array;
@@ -102,11 +102,13 @@ struct ldap_search_iterator {
 
 int ldap_connection_init(struct ldap_client *client,
 			 const struct ldap_client_settings *set,
+			 const struct ssl_settings *ssl_set,
 			 struct ldap_connection **conn_r, const char **error_r);
 void ldap_connection_deinit(struct ldap_connection **_conn);
 void ldap_connection_switch_ioloop(struct ldap_connection *conn);
 bool ldap_connection_have_settings(struct ldap_connection *conn,
-				   const struct ldap_client_settings *set);
+				   const struct ldap_client_settings *set,
+				   const struct ssl_settings *ssl_set);
 
 void ldap_connection_search_start(struct ldap_connection *conn,
 				  const struct ldap_search_input *input,
@@ -120,6 +122,7 @@ void ldap_connection_compare_start(struct ldap_connection *conn,
 void ldap_connection_kill(struct ldap_connection *conn);
 int ldap_connection_check(struct ldap_connection *conn);
 void ldap_connection_queue_request(struct ldap_connection *conn, struct ldap_op_queue_entry *req);
+struct event *ldap_client_get_event(struct ldap_client *client);
 
 int ldap_entry_init(struct ldap_entry *obj, struct ldap_result *result, LDAPMessage *message);
 

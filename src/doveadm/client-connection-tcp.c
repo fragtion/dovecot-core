@@ -18,6 +18,7 @@
 #include "doveadm-print.h"
 #include "doveadm-protocol.h"
 #include "client-connection-private.h"
+#include "settings.h"
 
 #include <unistd.h>
 
@@ -471,7 +472,8 @@ client_connection_tcp_input(struct client_connection_tcp *conn)
 		conn->io_setup = TRUE;
 		if (conn->minor_version >= DOVEADM_PROTOCOL_MIN_VERSION_MULTIPLEX) {
                         struct ostream *os = conn->output;
-                        conn->output = o_stream_create_multiplex(os, SIZE_MAX);
+			conn->output = o_stream_create_multiplex(os, SIZE_MAX,
+				OSTREAM_MULTIPLEX_FORMAT_PACKET);
                         o_stream_set_name(conn->output, o_stream_get_name(os));
                         o_stream_set_no_error_handling(conn->output, TRUE);
                         o_stream_unref(&os);
@@ -503,9 +505,15 @@ client_connection_tcp_init_ssl(struct client_connection_tcp *conn)
 {
 	const char *error;
 
-	if (master_service_ssl_init(master_service,
-				    &conn->input, &conn->output,
-				    &conn->ssl_iostream, &error) < 0) {
+	struct ssl_iostream_server_autocreate_parameters parameters = {
+		.event_parent = conn->conn.event,
+		.application_protocols = (const char *const[]) {
+			"doveadm", NULL
+		}
+	};
+	if (io_stream_autocreate_ssl_server(&parameters,
+					    &conn->input, &conn->output,
+					    &conn->ssl_iostream, &error) < 0) {
 		e_error(conn->conn.event, "SSL init failed: %s", error);
 		return -1;
 	}
@@ -574,6 +582,7 @@ client_connection_tcp_create(int fd, int listen_fd, bool ssl)
 	pool = pool_alloconly_create("doveadm client", 1024*16);
 	conn = p_new(pool, struct client_connection_tcp, 1);
 	conn->conn.event = event_create(NULL);
+	settings_event_add_filter_name(conn->conn.event, DOVEADM_SERVER_FILTER);
 	event_set_append_log_prefix(conn->conn.event, "tcp: ");
 	conn->fd = fd;
 

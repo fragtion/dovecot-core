@@ -115,8 +115,12 @@ void test_expect_no_more_errors(void);
 void test_end(void);
 
 void test_out(const char *name, bool success);
-void test_out_quiet(const char *name, bool success); /* only prints failures */
 void test_out_reason(const char *name, bool success, const char *reason)
+	ATTR_NULL(3);
+
+/* These only print failures */
+void test_out_quiet(const char *name, bool success);
+void test_out_reason_quiet(const char *name, bool success, const char *reason)
 	ATTR_NULL(3);
 
 int test_run(void (*const test_functions[])(void)) ATTR_WARN_UNUSED_RESULT;
@@ -172,5 +176,9 @@ void test_fatal_set_callback(test_fatal_callback_t *callback, void *context);
 void test_forked_end(void);
 /* If a fork() wants to exit(), then this will avoid valgrind leak errors */
 void test_exit(int status) ATTR_NORETURN;
+
+/* Create a temporary file, unlink it immediately and return the fd. The
+   function handles failures by calling i_fatal(). */
+int test_create_temp_fd(void);
 
 #endif

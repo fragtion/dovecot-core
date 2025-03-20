@@ -1,13 +1,14 @@
 #ifndef PASSDB_H
 #define PASSDB_H
 
-#include "md5.h"
-
 #define IS_VALID_PASSWD(pass) \
 	((pass)[0] != '\0' && (pass)[0] != '*' && (pass)[0] != '!')
 
+#define STATIC_PASS_SCHEME "PLAIN"
+
 struct auth_request;
 struct auth_passdb_settings;
+struct passdb_module;
 
 enum passdb_result {
 	PASSDB_RESULT_INTERNAL_FAILURE = -1,
@@ -36,7 +37,10 @@ typedef void set_credentials_callback_t(bool success,
 struct passdb_module_interface {
 	const char *name;
 
-	struct passdb_module *(*preinit)(pool_t pool, const char *args);
+	/* Create a new passdb_module based on the settings looked up via the
+	   given event. */
+	int (*preinit)(pool_t pool, struct event *event,
+		       struct passdb_module **module_r, const char **error_r);
 	void (*init)(struct passdb_module *module);
 	void (*deinit)(struct passdb_module *module);
 
@@ -56,7 +60,6 @@ struct passdb_module_interface {
 };
 
 struct passdb_module {
-	const char *args;
 	/* The default caching key for this module, or NULL if caching isn't
 	   wanted. This is updated by settings in auth_passdb. */
 	const char *default_cache_key;
@@ -72,10 +75,6 @@ struct passdb_module {
 
 	/* number of time init() has been called */
 	int init_refcount;
-
-	/* WARNING: avoid adding anything here that isn't based on args.
-	   if you do, you need to change passdb.c:passdb_find() also to avoid
-	   accidentally merging wrong passdbs. */
 
 	struct passdb_module_interface iface;
 };
@@ -100,19 +99,16 @@ void passdb_handle_credentials(enum passdb_result result,
                                struct auth_request *auth_request);
 
 struct passdb_module *
-passdb_preinit(pool_t pool, const struct auth_passdb_settings *set);
+passdb_preinit(pool_t pool, struct event *event,
+	       const struct auth_passdb_settings *set);
 void passdb_init(struct passdb_module *passdb);
 void passdb_deinit(struct passdb_module *passdb);
 
 void passdb_register_module(struct passdb_module_interface *iface);
 void passdb_unregister_module(struct passdb_module_interface *iface);
 
-void passdbs_generate_md5(unsigned char md5[STATIC_ARRAY MD5_RESULTLEN]);
-
 void passdbs_init(void);
 void passdbs_deinit(void);
-
-const char *passdb_oauth2_get_oidc_url(struct passdb_module *passdb);
 
 #include "auth-request.h"
 

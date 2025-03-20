@@ -772,7 +772,7 @@ static void client_connection_init(const struct ip_addr *ip, in_port_t port)
 	struct client_connection *conn;
 	pool_t pool;
 
-	pool = pool_alloconly_create("client connection", 512);
+	pool = pool_alloconly_create("client connection", 1024);
 	conn = p_new(pool, struct client_connection, 1);
 	conn->pool = pool;
 
@@ -839,10 +839,8 @@ static void test_client_run(unsigned int index)
 static void test_server_defaults(struct http_server_settings *http_set)
 {
 	/* server settings */
-	i_zero(http_set);
+	http_server_settings_init(null_pool, http_set);
 	http_set->max_client_idle_time_msecs = 5*1000;
-	http_set->max_pipelined_requests = 1;
-	http_set->debug = debug;
 }
 
 /* client connection */
@@ -884,13 +882,15 @@ static void test_server_timeout(void *context ATTR_UNUSED)
 static void test_server_run(const struct http_server_settings *http_set)
 {
 	struct timeout *to;
+	struct event *event = event_create(NULL);
+	event_set_forced_debug(event, debug);
 
 	to = timeout_add(SERVER_MAX_TIMEOUT_MSECS, test_server_timeout, NULL);
 
 	/* open server socket */
 	io_listen = io_add(fd_listen, IO_READ, server_connection_accept, NULL);
 
-	http_server = http_server_init(http_set);
+	http_server = http_server_init((struct http_server_settings*) http_set, event);
 
 	io_loop_run(ioloop);
 
@@ -899,6 +899,7 @@ static void test_server_run(const struct http_server_settings *http_set)
 	timeout_remove(&to);
 
 	http_server_deinit(&http_server);
+	event_unref(&event);
 }
 
 /*

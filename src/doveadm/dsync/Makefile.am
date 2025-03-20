@@ -10,7 +10,8 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-mail \
 	-I$(top_srcdir)/src/lib-imap \
 	-I$(top_srcdir)/src/lib-index \
-	-I$(top_srcdir)/src/lib-storage
+	-I$(top_srcdir)/src/lib-storage \
+	-I$(top_srcdir)/src/lib-var-expand
 
 libdsync_la_SOURCES = \
 	dsync-brain.c \
@@ -34,8 +35,8 @@ libdsync_la_SOURCES = \
 	dsync-transaction-log-scan.c
 
 libdovecot_dsync_la_SOURCES =
-libdovecot_dsync_la_LIBADD = libdsync.la ../../lib-storage/libdovecot-storage.la ../../lib-dovecot/libdovecot.la
-libdovecot_dsync_la_DEPENDENCIES = libdsync.la
+libdovecot_dsync_la_LIBADD = libdsync.la $(LIBDOVECOT_STORAGE) $(LIBDOVECOT)
+libdovecot_dsync_la_DEPENDENCIES = libdsync.la $(LIBDOVECOT_STORAGE_DEPS) $(LIBDOVECOT_DEPS)
 libdovecot_dsync_la_LDFLAGS = -export-dynamic
 
 pkginc_libdir = $(pkgincludedir)

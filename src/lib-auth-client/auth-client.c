@@ -21,6 +21,7 @@ auth_client_init(const char *auth_socket_path, unsigned int client_pid,
 	client->connect_timeout_msecs = AUTH_CONNECT_TIMEOUT_MSECS;
 	client->clist = auth_client_connection_list_init();
 
+	i_array_init(&client->available_auth_mechs, 8);
 	client->event = event_create(NULL);
 	event_add_category(client->event, &event_category_auth_client);
 	event_set_append_log_prefix(client->event, "auth-client: ");
@@ -33,12 +34,18 @@ auth_client_init(const char *auth_socket_path, unsigned int client_pid,
 void auth_client_deinit(struct auth_client **_client)
 {
 	struct auth_client *client = *_client;
+	struct auth_mech_desc *mech_desc;
 
+	if (client == NULL)
+		return;
 	*_client = NULL;
 
 	auth_client_connection_deinit(&client->conn);
 	connection_list_deinit(&client->clist);
 	event_unref(&client->event);
+	array_foreach_modifiable(&client->available_auth_mechs, mech_desc)
+		i_free(mech_desc->name);
+	array_free(&client->available_auth_mechs);
 	i_free(client->auth_socket_path);
 	i_free(client);
 }
@@ -57,7 +64,7 @@ void auth_client_disconnect(struct auth_client *client, const char *reason)
 bool auth_client_is_connected(struct auth_client *client)
 {
 	/* handshake_received isn't unset immediately after disconnection */
-	return client->conn->conn.handshake_received &&
+	return connection_handshake_received(&client->conn->conn) &&
 		client->conn->connected;
 }
 
@@ -84,9 +91,7 @@ const struct auth_mech_desc *
 auth_client_get_available_mechs(struct auth_client *client,
 				unsigned int *mech_count)
 {
-	i_assert(auth_client_is_connected(client));
-
-	return array_get(&client->conn->available_auth_mechs, mech_count);
+	return array_get(&client->available_auth_mechs, mech_count);
 }
 
 const struct auth_mech_desc *
@@ -94,7 +99,7 @@ auth_client_find_mech(struct auth_client *client, const char *name)
 {
 	const struct auth_mech_desc *mech;
 
-	array_foreach(&client->conn->available_auth_mechs, mech) {
+	array_foreach(&client->available_auth_mechs, mech) {
 		if (strcasecmp(mech->name, name) == 0)
 			return mech;
 	}

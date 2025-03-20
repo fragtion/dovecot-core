@@ -1,6 +1,8 @@
 #ifndef AUTH_SCRAM_CLIENT_H
 #define AUTH_SCRAM_CLIENT_H
 
+#include "auth-scram.h"
+
 enum auth_scram_client_state {
 	AUTH_SCRAM_CLIENT_STATE_INIT = 0,
 	AUTH_SCRAM_CLIENT_STATE_CLIENT_FIRST,
@@ -11,12 +13,22 @@ enum auth_scram_client_state {
 	AUTH_SCRAM_CLIENT_STATE_END,
 };
 
+struct auth_scram_client_settings {
+	const struct hash_method *hash_method;
+
+	/* Credentials (not copied; must persist externally) */
+	const char *authid, *authzid, *password;
+
+	/* Channel binding (not copied; must persist externally) */
+	enum auth_scram_cbind_server_support cbind_support;
+	const char *cbind_type;
+	const buffer_t *cbind_data;
+};
+
 struct auth_scram_client {
 	pool_t pool;
-	const struct hash_method *hmethod;
-	
-	/* Credentials */
-	const char *authid, *authzid, *password;
+
+	struct auth_scram_client_settings set;
 
 	enum auth_scram_client_state state;
 
@@ -33,11 +45,8 @@ struct auth_scram_client {
 	unsigned char *server_signature;
 };
 
-
 void auth_scram_client_init(struct auth_scram_client *client_r, pool_t pool,
-			    const struct hash_method *hmethod,
-			    const char *authid, const char *authzid,
-			    const char *password);
+			    const struct auth_scram_client_settings *set);
 void auth_scram_client_deinit(struct auth_scram_client *client);
 
 /* Returns TRUE if client is still due to send first output. */

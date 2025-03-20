@@ -10,8 +10,14 @@
 #include "connection.h"
 #include "stats-client.h"
 
-#define STATS_CLIENT_TIMEOUT_MSECS (5*1000)
+#define STATS_CLIENT_HANDSHAKE_TIMEOUT_MSECS (5*1000)
+#define STATS_CLIENT_DEINIT_TIMEOUT_MSECS (60*1000)
 #define STATS_CLIENT_RECONNECT_INTERVAL_MSECS (10*1000)
+
+enum stats_timeout_type {
+	STATS_CLIENT_HANDSHAKE_WAIT,
+	STATS_CLIENT_DEINIT_WAIT,
+};
 
 struct stats_client {
 	struct connection conn;
@@ -21,7 +27,7 @@ struct stats_client {
 	struct timeval wait_started;
 	bool handshaked;
 	bool handshake_received_at_least_once;
-	bool silent_notfound_errors;
+	bool silent_errors;
 };
 
 static struct connection_list *stats_clients;
@@ -106,11 +112,11 @@ static void stats_client_destroy(struct connection *conn)
 		/* waiting for stats handshake to finish */
 		io_loop_stop(client->ioloop);
 	} else if (conn->connect_finished.tv_sec != 0) {
-		int msecs_since_connected =
+		long long msecs_since_connected =
 			timeval_diff_msecs(&ioloop_timeval,
 					   &conn->connect_finished);
 		if (msecs_since_connected >= STATS_CLIENT_RECONNECT_INTERVAL_MSECS) {
-			/* reconnect immdiately */
+			/* reconnect immediately */
 			reconnect_msecs = 0;
 		} else {
 			/* wait for reconnect interval since we last
@@ -198,6 +204,14 @@ stats_client_send_event(struct stats_client *client, struct event *event,
 	if (!client->handshaked)
 		return;
 
+	if (event->sending_name == NULL) {
+		/* At least for now don't even try to send unnamed events.
+		   They are most likely not actually wanted. We could later on
+		   support them if necessary by explicitly requiring e.g.
+		   "event=" in the filter. */
+		return;
+	}
+
 	if (!event_filter_match(client->filter, event, ctx))
 		return;
 
@@ -207,8 +221,12 @@ stats_client_send_event(struct stats_client *client, struct event *event,
 	if (++recursion == 0)
 		o_stream_cork(client->conn.output);
 	struct event *global_event = event_get_global();
-	if (global_event != NULL)
+	if (global_event != NULL) {
+		/* Global event can contain e.g. reason_code. Send it as a
+		   separate BEGIN event, which can be referred to in a later
+		   EVENT. */
 		stats_event_write(client, global_event, NULL, ctx, str, TRUE);
+	}
 
 	stats_event_write(client, event, global_event, ctx, str, FALSE);
 	o_stream_nsend(client->conn.output, str_data(str), str_len(str));
@@ -297,17 +315,29 @@ static void stats_global_deinit(void)
 	connection_list_deinit(&stats_clients);
 }
 
-static void stats_client_timeout(struct stats_client *client)
+static void stats_client_handshake_timeout(struct stats_client *client)
 {
-	int diff_msecs = timeval_diff_msecs(&ioloop_timeval,
-					    &client->wait_started);
+	long long diff_msecs = timeval_diff_msecs(&ioloop_timeval,
+						  &client->wait_started);
 	e_error(client->conn.event, "Timeout waiting for handshake response "
-		"(waited %d.%03d secs%s)", diff_msecs / 1000, diff_msecs % 1000,
+		"(waited %lld.%03lld secs%s)",
+		diff_msecs / 1000, diff_msecs % 1000,
 		client->conn.version_received ? ", version received" : "");
 	io_loop_stop(client->ioloop);
 }
 
-static void stats_client_wait(struct stats_client *client)
+static void stats_client_deinit_timeout(struct stats_client *client)
+{
+	long long diff_msecs = timeval_diff_msecs(&ioloop_timeval,
+						  &client->wait_started);
+	e_error(client->conn.event, "Timeout waiting for flushing outputs"
+		"(waited %lld.%03lld secs) - discarding the rest of the queued statistics",
+		diff_msecs / 1000, diff_msecs % 1000);
+	io_loop_stop(client->ioloop);
+}
+
+static void stats_client_wait(struct stats_client *client,
+			      enum stats_timeout_type type)
 {
 	struct ioloop *prev_ioloop = current_ioloop;
 	struct timeout *to;
@@ -316,7 +346,13 @@ static void stats_client_wait(struct stats_client *client)
 
 	client->ioloop = io_loop_create();
 	client->wait_started = ioloop_timeval;
-	to = timeout_add(STATS_CLIENT_TIMEOUT_MSECS, stats_client_timeout, client);
+	if (type == STATS_CLIENT_HANDSHAKE_WAIT)
+		to = timeout_add(STATS_CLIENT_HANDSHAKE_TIMEOUT_MSECS,
+				 stats_client_handshake_timeout, client);
+	else
+		to = timeout_add(STATS_CLIENT_DEINIT_TIMEOUT_MSECS,
+				 stats_client_deinit_timeout, client);
+
 	connection_switch_ioloop(&client->conn);
 	io_loop_run(client->ioloop);
 	io_loop_set_current(prev_ioloop);
@@ -346,16 +382,19 @@ static void stats_client_connect(struct stats_client *client)
 		/* read the handshake so the global debug filter is updated */
 		stats_client_send_registered_categories(client);
 		if (!client->handshake_received_at_least_once)
-			stats_client_wait(client);
-	} else if (!client->silent_notfound_errors ||
-		   (errno != ENOENT && errno != ECONNREFUSED)) {
+			stats_client_wait(client, STATS_CLIENT_HANDSHAKE_WAIT);
+	} else if (!client->silent_errors ||
+		   (errno != ENOENT && errno != ECONNREFUSED &&
+		    !ENOACCESS(errno))) {
 		e_error(client->conn.event,
+			"net_connect_unix(%s) failed: %m", client->conn.name);
+	} else {
+		e_debug(client->conn.event,
 			"net_connect_unix(%s) failed: %m", client->conn.name);
 	}
 }
 
-struct stats_client *
-stats_client_init(const char *path, bool silent_notfound_errors)
+struct stats_client *stats_client_init(const char *path, bool silent_errors)
 {
 	struct stats_client *client;
 
@@ -363,9 +402,31 @@ stats_client_init(const char *path, bool silent_notfound_errors)
 		stats_global_init();
 
 	client = i_new(struct stats_client, 1);
-	client->silent_notfound_errors = silent_notfound_errors;
+	client->silent_errors = silent_errors;
 	connection_init_client_unix(stats_clients, &client->conn, path);
 	stats_client_connect(client);
+	return client;
+}
+
+struct stats_client *
+stats_client_init_unittest(buffer_t *buf, const char *filter)
+{
+	struct stats_client *client;
+	const char *error;
+
+	if (stats_clients == NULL)
+		stats_global_init();
+
+	client = i_new(struct stats_client, 1);
+	connection_init_client_unix(stats_clients, &client->conn, "(unit test)");
+	client->conn.output = o_stream_create_buffer(buf);
+	o_stream_set_no_error_handling(client->conn.output, TRUE);
+	client->handshaked = TRUE;
+
+	client->filter = event_filter_create();
+	if (!event_filter_import(client->filter, filter, &error))
+		i_panic("Failed to import unit test event filter: %s", error);
+	event_set_global_debug_send_filter(client->filter);
 	return client;
 }
 
@@ -394,12 +455,13 @@ void stats_client_deinit(struct stats_client **_client)
 					    stats_client_deinit_callback,
 					    &client->conn);
 		o_stream_uncork(client->conn.output);
-		stats_client_wait(client);
+		stats_client_wait(client, STATS_CLIENT_DEINIT_WAIT);
 	}
 
 	event_filter_unref(&client->filter);
 	connection_deinit(&client->conn);
 	timeout_remove(&client->to_reconnect);
+	o_stream_unref(&client->conn.output);
 	i_free(client);
 
 	if (stats_clients->connections == NULL)

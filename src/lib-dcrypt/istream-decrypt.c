@@ -207,7 +207,7 @@ i_stream_decrypt_read_header_v1(struct decrypt_istream *stream,
 	hash->init(hctx);
 	hash->loop(hctx, secret->data, secret->used);
 	hash->result(hctx, hres);
-	safe_memset(buffer_get_modifiable_data(secret, 0), 0, secret->used);
+	buffer_clear_safe(secret);
 
 	/* NB! The old code was broken and used this kind of IV - it is not
 	   correct, but we need to stay compatible with old data */
@@ -272,7 +272,7 @@ i_stream_decrypt_read_header_v1(struct decrypt_istream *stream,
 		"\x0\x0\x0\x0\x0\x0\x0\x0\x0\x0\x0\x0\x0\x0\x0\x0", 16);
 	dcrypt_ctx_sym_set_key(stream->ctx_sym, key->data, key->used);
 
-	safe_memset(buffer_get_modifiable_data(key, 0), 0, key->used);
+	buffer_clear_safe(key);
 
 	if (!dcrypt_ctx_sym_init(stream->ctx_sym, &error)) {
 		io_stream_set_error(&stream->istream.iostream,
@@ -328,7 +328,7 @@ i_stream_decrypt_der(const unsigned char **_data, const unsigned char *end,
 
 static ssize_t
 i_stream_decrypt_key(struct decrypt_istream *stream, const char *malg,
-		     unsigned int rounds, const unsigned char *data,
+		     const char *calg, unsigned int rounds, const unsigned char *data,
 		     const unsigned char *end, buffer_t *key, size_t key_len)
 {
 	const char *error;
@@ -460,45 +460,64 @@ i_stream_decrypt_key(struct decrypt_istream *stream, const char *malg,
 				"Key decryption error: corrupted header");
 			return -1;
 		}
-
-		/* use shared secret and peer key to generate decryption key,
-		   AES-256-CBC has 32 byte key and 16 byte IV */
-		if (!dcrypt_pbkdf2(secret->data, secret->used,
-				   peer_key.data, peer_key.used,
-				   malg, rounds, temp_key, 32+16, &error)) {
-			safe_memset(buffer_get_modifiable_data(secret, 0),
-				    0, secret->used);
+		struct dcrypt_context_symmetric *dctx;
+		if (!dcrypt_ctx_sym_create(calg, DCRYPT_MODE_DECRYPT,
+					    &dctx, &error)) {
+			buffer_clear_safe(temp_key);
 			io_stream_set_error(&stream->istream.iostream,
 					    "Key decryption error: %s", error);
 			return -1;
 		}
+		size_t ek_iv_len = dcrypt_ctx_sym_get_iv_length(dctx);
+		size_t ek_key_len = dcrypt_ctx_sym_get_key_length(dctx);
+		size_t ek_tag_len = 0;
+		if ((stream->flags & IO_STREAM_ENC_SAME_CALG) != 0 &&
+		    (stream->flags & IO_STREAM_ENC_INTEGRITY_AEAD) != 0)
+			ek_tag_len = IOSTREAM_TAG_SIZE;
+		/* use shared secret and peer key to generate decryption key */
+		if (!dcrypt_pbkdf2(secret->data, secret->used,
+				   peer_key.data, peer_key.used,
+				   malg, rounds, temp_key,
+				   ek_key_len + ek_iv_len + ek_tag_len,
+				   &error)) {
+			buffer_clear_safe(secret);
+			io_stream_set_error(&stream->istream.iostream,
+					    "Key decryption error: %s", error);
+			dcrypt_ctx_sym_destroy(&dctx);
+			return -1;
+		}
 
-		safe_memset(buffer_get_modifiable_data(secret, 0),
-			    0, secret->used);
-		if (temp_key->used != 32+16) {
-			safe_memset(buffer_get_modifiable_data(temp_key, 0),
-				    0, temp_key->used);
+		buffer_clear_safe(secret);
+		if (temp_key->used != ek_key_len + ek_iv_len + ek_tag_len) {
+			buffer_clear_safe(temp_key);
 			io_stream_set_error(&stream->istream.iostream,
 					    "Cannot perform key decryption: "
 					    "invalid temporary key");
-			return -1;
-		}
-		struct dcrypt_context_symmetric *dctx;
-		if (!dcrypt_ctx_sym_create("AES-256-CBC", DCRYPT_MODE_DECRYPT,
-					   &dctx, &error)) {
-			safe_memset(buffer_get_modifiable_data(temp_key, 0),
-				    0, temp_key->used);
-			io_stream_set_error(&stream->istream.iostream,
-					    "Key decryption error: %s", error);
+			dcrypt_ctx_sym_destroy(&dctx);
 			return -1;
 		}
 		const unsigned char *ptr = temp_key->data;
+		if (ek_tag_len > 0) {
+			if (eklen < ek_tag_len) {
+				buffer_clear_safe(temp_key);
+				io_stream_set_error(&stream->istream.iostream,
+						    "Cannot perform key decryption: "
+						    "Missing TAG from encrypted key");
+				dcrypt_ctx_sym_destroy(&dctx);
+				return -1;
+			}
+			/* extract ek_aad_len bytes from encrypted_key */
+			const unsigned char *tag =
+				CONST_PTR_OFFSET(encrypted_key, eklen - ek_tag_len);
+			dcrypt_ctx_sym_set_tag(dctx, tag, ek_tag_len);
+			eklen -= ek_tag_len;
+		}
 
-		/* we use ephemeral_key for IV */
-		dcrypt_ctx_sym_set_key(dctx, ptr, 32);
-		dcrypt_ctx_sym_set_iv(dctx, ptr+32, 16);
-		safe_memset(buffer_get_modifiable_data(temp_key, 0),
-			    0, temp_key->used);
+		dcrypt_ctx_sym_set_key(dctx, ptr, ek_key_len);
+		dcrypt_ctx_sym_set_iv(dctx, ptr + ek_key_len, ek_iv_len);
+		if (ek_tag_len > 0)
+			dcrypt_ctx_sym_set_aad(dctx, ptr + ek_key_len + ek_iv_len, ek_tag_len);
+		buffer_clear_safe(temp_key);
 
 		int ec = 0;
 		if (!dcrypt_ctx_sym_init(dctx, &error) ||
@@ -514,7 +533,7 @@ i_stream_decrypt_key(struct decrypt_istream *stream, const char *malg,
 		if (key->used != key_len) {
 			io_stream_set_error(&stream->istream.iostream,
 					    "Cannot perform key decryption: "
-					    "invalid key length");
+					    "invalid key length (%zu != %zu)", key->used, key_len);
 			ec = -1;
 		}
 
@@ -530,7 +549,7 @@ i_stream_decrypt_key(struct decrypt_istream *stream, const char *malg,
 	/* make sure we were able to decrypt the encrypted key correctly */
 	const struct hash_method *hash = hash_method_lookup(t_str_lcase(malg));
 	if (hash == NULL) {
-		safe_memset(buffer_get_modifiable_data(key, 0), 0, key->used);
+		buffer_clear_safe(key);
 		io_stream_set_error(&stream->istream.iostream,
 				    "Decryption error: "
 				     "unsupported hash algorithm: %s", malg);
@@ -553,7 +572,7 @@ i_stream_decrypt_key(struct decrypt_istream *stream, const char *malg,
 
 	/* do the comparison */
 	if (memcmp(ekhash, hres, I_MIN(ekhash_len, sizeof(hres))) != 0) {
-		safe_memset(buffer_get_modifiable_data(key, 0), 0, key->used);
+		buffer_clear_safe(key);
 		io_stream_set_error(&stream->istream.iostream,
 				    "Decryption error: "
 				    "corrupted header ekhash");
@@ -624,8 +643,12 @@ i_stream_decrypt_header_contents(struct decrypt_istream *stream,
 		dcrypt_ctx_sym_get_iv_length(stream->ctx_sym) + tagsize;
 	buffer_t *keydata = t_buffer_create(kl);
 
+	const char *ek_calg = "AES-256-CBC";
+	if ((stream->flags & IO_STREAM_ENC_SAME_CALG) != 0)
+		ek_calg = calg;
+
 	/* try to decrypt the keydata with a private key */
-	if ((ret = i_stream_decrypt_key(stream, malg, rounds, data,
+	if ((ret = i_stream_decrypt_key(stream, malg, ek_calg, rounds, data,
 					end, keydata, kl)) <= 0)
 		return ret;
 
@@ -671,8 +694,7 @@ i_stream_decrypt_header_contents(struct decrypt_istream *stream,
 		stream->use_mac = FALSE;
 	}
 	/* destroy private key data */
-	safe_memset(buffer_get_modifiable_data(keydata, 0), 0, keydata->used);
-	buffer_set_used_size(keydata, 0);
+	buffer_clear_safe(keydata);
 	return failed ? -1 : 1;
 }
 
@@ -900,9 +922,7 @@ i_stream_decrypt_read(struct istream_private *stream)
 				continue;
 			} else {
 				/* clean up buffer */
-				safe_memset(buffer_get_modifiable_data(dstream->buf, 0),
-					    0, dstream->buf->used);
-				buffer_set_used_size(dstream->buf, 0);
+				buffer_clear_safe(dstream->buf);
 				i_stream_skip(stream->parent, hret);
 			}
 
@@ -920,11 +940,14 @@ i_stream_decrypt_read(struct istream_private *stream)
 					return -1;
 				}
 				check_mac = TRUE;
+			} else if (size < dstream->ftr || decrypt_size < dstream->ftr) {
+				return 0;
 			} else {
 				/* ignore footer's length of data until we
 				   reach EOF */
 				size -= dstream->ftr;
 			}
+			i_assert(decrypt_size >= dstream->ftr);
 			decrypt_size -= dstream->ftr;
 			if ((dstream->flags & IO_STREAM_ENC_INTEGRITY_HMAC) ==
 				IO_STREAM_ENC_INTEGRITY_HMAC) {

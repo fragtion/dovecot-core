@@ -32,10 +32,12 @@ enum dict_data_type {
 };
 
 struct dict_settings {
-	const char *base_dir;
-	/* set to parent event, if exists */
-	struct event *event_parent;
+	pool_t pool;
+	const char *dict_name;
+	const char *dict_driver;
+	ARRAY_TYPE(const_string) dicts;
 };
+extern const struct setting_parser_info dict_setting_parser_info;
 
 struct dict_op_settings {
 	const char *username;
@@ -97,10 +99,16 @@ void dict_drivers_unregister_builtin(void);
 void dict_drivers_register_all(void);
 void dict_drivers_unregister_all(void);
 
-/* Open dictionary with given URI (type:data).
-   Returns 0 if ok, -1 if URI is invalid. */
-int dict_init(const char *uri, const struct dict_settings *set,
-	      struct dict **dict_r, const char **error_r);
+/* Initialize the dict by pulling settings automatically using the event.
+   The event parameter is used as the parent event. Returns 1 if ok, 0 if
+   dict_driver setting is empty (error_r is also set), -1 if settings lookup or
+   driver initialization failed. */
+int dict_init_auto(struct event *event, struct dict **dict_r,
+		   const char **error_r);
+/* Initialize a specific named dict. This is intended to be used only by the
+   dict server. */
+int dict_init_filter_auto(struct event *event, const char *dict_name,
+			  struct dict **dict_r, const char **error_r);
 /* Close dictionary. */
 void dict_deinit(struct dict **dict);
 /* Wait for all pending asynchronous operations to finish. */
@@ -178,6 +186,9 @@ dict_transaction_begin(struct dict *dict, const struct dict_op_settings *set);
    dict-sql with Cassandra backend does anything with this. */
 void dict_transaction_set_timestamp(struct dict_transaction_context *ctx,
 				    const struct timespec *ts);
+/* Don't require changes in transaction to be atomic. It's fine if in a failure
+   case any set of the changes gets written. */
+void dict_transaction_set_non_atomic(struct dict_transaction_context *ctx);
 
 /* Set hide_log_values for the transaction. Currently only
    dict-sql with Cassandra backend does anything with this. */

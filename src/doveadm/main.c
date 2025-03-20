@@ -14,12 +14,16 @@
 #include "doveadm-mail.h"
 #include "doveadm-print-private.h"
 #include "ostream.h"
+#include "http-server.h"
+#include "settings.h"
 
 const struct doveadm_print_vfuncs *doveadm_print_vfuncs_all[] = {
 	&doveadm_print_server_vfuncs,
 	&doveadm_print_json_vfuncs,
 	NULL
 };
+
+static struct http_server *doveadm_http_server;
 
 struct client_connection *doveadm_client;
 int doveadm_exit_code = 0;
@@ -41,7 +45,8 @@ static void client_connected(struct master_service_connection *conn)
 	master_service_client_connection_accept(conn);
 	type = master_service_connection_get_type(conn);
 	if (strcmp(type, "http") == 0) {
-		doveadm_client = client_connection_http_create(conn->fd, conn->ssl);
+		doveadm_client = client_connection_http_create(doveadm_http_server,
+							       conn->fd, conn->ssl);
 	} else {
 		doveadm_client = client_connection_tcp_create(conn->fd, conn->listen_fd,
 							  conn->ssl);
@@ -60,11 +65,23 @@ static void main_preinit(void)
 	restrict_access_allow_coredumps(TRUE);
 }
 
+static void doveadm_http_server_init(void)
+{
+	const char *error;
+
+	struct event *event =
+		event_create(master_service_get_event(master_service));
+	settings_event_add_filter_name(event, DOVEADM_SERVER_FILTER);
+	if (http_server_init_auto(event, &doveadm_http_server, &error) < 0)
+		i_fatal("http_server_init() failed: %s", error);
+	event_unref(&event);
+
+}
+
 static void main_init(void)
 {
 	doveadm_server = TRUE;
 
-	doveadm_settings_init();
 	doveadm_cmds_init();
 	doveadm_register_auth_server_commands();
 	doveadm_dump_init();
@@ -80,7 +97,7 @@ static void main_init(void)
 	   mail_plugins have been loaded. */
 	doveadm_load_modules();
 
-	doveadm_server_init();
+	doveadm_http_server_init();
 	if (doveadm_verbose_proctitle)
 		process_title_set("[idling]");
 }
@@ -88,6 +105,7 @@ static void main_init(void)
 static void main_deinit(void)
 {
 	doveadm_server_deinit();
+	http_server_deinit(&doveadm_http_server);
 	doveadm_mail_deinit();
 	doveadm_dump_deinit();
 	doveadm_unload_modules();

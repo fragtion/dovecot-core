@@ -157,9 +157,7 @@ static void test_event_flatten_one_parent(void)
 		.key = "abc",
 		.value_type = EVENT_FIELD_VALUE_TYPE_INTMAX,
 		.value = {
-			.str = NULL,
 			.intmax = 42,
-			.timeval = {0,0},
 		}
 	};
 	static struct event_field exp_2int[2] = {
@@ -168,8 +166,6 @@ static void test_event_flatten_one_parent(void)
 			.value_type = EVENT_FIELD_VALUE_TYPE_INTMAX,
 			.value = {
 				.intmax = 42,
-				.str = NULL,
-				.timeval = {0,0},
 			}
 		},
 		{
@@ -177,8 +173,6 @@ static void test_event_flatten_one_parent(void)
 			.value_type = EVENT_FIELD_VALUE_TYPE_INTMAX,
 			.value = {
 				.intmax = 49,
-				.str = NULL,
-				.timeval = {0,0},
 			}
 		},
 	};
@@ -188,8 +182,6 @@ static void test_event_flatten_one_parent(void)
 			.value_type = EVENT_FIELD_VALUE_TYPE_STR,
 			.value = {
 				.str = "foo",
-				.intmax = 0,
-				.timeval = {0,0},
 			}
 		},
 		{
@@ -197,8 +189,6 @@ static void test_event_flatten_one_parent(void)
 			.value_type = EVENT_FIELD_VALUE_TYPE_INTMAX,
 			.value = {
 				.intmax = 49,
-				.str = NULL,
-				.timeval = {0,0},
 			}
 		},
 	};
@@ -208,8 +198,6 @@ static void test_event_flatten_one_parent(void)
 			.value_type = EVENT_FIELD_VALUE_TYPE_STR,
 			.value = {
 				.str = "foo",
-				.intmax = 0,
-				.timeval = {0,0},
 			}
 		},
 		{
@@ -217,14 +205,14 @@ static void test_event_flatten_one_parent(void)
 			.value_type = EVENT_FIELD_VALUE_TYPE_INTMAX,
 			.value = {
 				.intmax = 49,
-				.str = NULL,
-				.timeval = {0,0},
 			}
 		},
 		{
 			.key = "cba",
 			.value_type = EVENT_FIELD_VALUE_TYPE_STRLIST,
 			.value = {
+				/* this test is using str field instead of
+				   strlist for simplicity */
 				.str = "one,two,three",
 			},
 		},
@@ -234,14 +222,6 @@ static void test_event_flatten_one_parent(void)
 	struct event *e;
 
 	test_begin("event flatten: one parent");
-
-	t_array_init(&exp_1str1int1strlist[0].value.strlist, 3);
-	const char *str = "one";
-	array_push_back(&exp_1str1int1strlist[0].value.strlist, &str);
-	str = "two";
-	array_push_back(&exp_1str1int1strlist[0].value.strlist, &str);
-	str = "three";
-	array_push_back(&exp_1str1int1strlist[0].value.strlist, &str);
 
 	parent = event_create(NULL);
 
@@ -282,8 +262,6 @@ static void test_event_flatten_override_parent_field(void)
 		.value_type = EVENT_FIELD_VALUE_TYPE_INTMAX,
 		.value = {
 			.intmax = 42,
-			.str = NULL,
-			.timeval = {0,0},
 		}
 	};
 	static struct event_field exp_str = {
@@ -291,8 +269,6 @@ static void test_event_flatten_override_parent_field(void)
 		.value_type = EVENT_FIELD_VALUE_TYPE_STR,
 		.value = {
 			.str = "def",
-			.intmax = 0,
-			.timeval = {0,0},
 		}
 	};
 	static struct event_field exp_2str[2] = {
@@ -301,8 +277,6 @@ static void test_event_flatten_override_parent_field(void)
 			.value_type = EVENT_FIELD_VALUE_TYPE_STR,
 			.value = {
 				.str = "def",
-				.intmax = 0,
-				.timeval = {0,0},
 			}
 		},
 		{
@@ -310,8 +284,6 @@ static void test_event_flatten_override_parent_field(void)
 			.value_type = EVENT_FIELD_VALUE_TYPE_STR,
 			.value = {
 				.str = "bar",
-				.intmax = 0,
-				.timeval = {0,0},
 			}
 		},
 	};

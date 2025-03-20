@@ -26,11 +26,11 @@ static const char *pclient_test_io_string =
 	"dis parturient montes, nascetur ridiculus mus. Aliquam \n"
 	"laoreet arcu a hendrerit consequat. Duis vitae erat tellus.";
 
-static struct program_client_settings pc_set = {
+static struct program_client_parameters pc_params = {
 	.client_connect_timeout_msecs = 1000,
 	.input_idle_timeout_msecs = 5000,
-	.debug = FALSE,
 };
+static struct event *event;
 
 static struct test_server {
 	struct ioloop *ioloop;
@@ -174,7 +174,7 @@ static void test_program_run(struct test_client *client)
 
 static void test_program_input(struct test_client *client)
 {
-	const char *line = "";
+	const char *line = NULL;
 	int ret = 0;
 
 	while (ret >= 0) {
@@ -289,7 +289,8 @@ static void test_program_success(void)
 
 	test_begin("test_program_success");
 
-	pc = program_client_unix_create(TEST_SOCKET, args, &pc_set, FALSE);
+	pc_params.no_reply = FALSE;
+	pc = program_client_unix_create(event, TEST_SOCKET, args, &pc_params);
 
 	buffer_t *output = buffer_create_dynamic(default_pool, 16);
 	struct ostream *os = test_ostream_create(output);
@@ -315,7 +316,8 @@ static void test_program_io_common(const char *const *args)
 	struct program_client *pc;
 	int ret;
 
-	pc = program_client_unix_create(TEST_SOCKET, args, &pc_set, FALSE);
+	pc_params.no_reply = FALSE;
+	pc = program_client_unix_create(event, TEST_SOCKET, args, &pc_params);
 
 	struct istream *is = test_istream_create(pclient_test_io_string);
 	program_client_set_input(pc, is);
@@ -370,7 +372,8 @@ static void test_program_failure(void)
 
 	test_begin("test_program_failure");
 
-	pc = program_client_unix_create(TEST_SOCKET, args, &pc_set, FALSE);
+	pc_params.no_reply = FALSE;
+	pc = program_client_unix_create(event, TEST_SOCKET, args, &pc_params);
 
 	buffer_t *output = buffer_create_dynamic(default_pool, 16);
 	struct ostream *os = test_ostream_create(output);
@@ -401,7 +404,8 @@ static void test_program_noreply(void)
 
 	test_begin("test_program_noreply");
 
-	pc = program_client_unix_create(TEST_SOCKET, args, &pc_set, TRUE);
+	pc_params.no_reply = TRUE;
+	pc = program_client_unix_create(event, TEST_SOCKET, args, &pc_params);
 
 	program_client_run_async(pc, test_program_async_callback, &ret);
 
@@ -425,7 +429,8 @@ static void test_program_sync(void)
 
 	test_begin("test_program_sync");
 
-	pc = program_client_unix_create(TEST_SOCKET, args, &pc_set, TRUE);
+	pc_params.no_reply = TRUE;
+	pc = program_client_unix_create(event, TEST_SOCKET, args, &pc_params);
 	ret = program_client_run(pc);
 	test_assert(ret == 1);
 
@@ -450,8 +455,9 @@ static void test_program_async_wait(void)
 
 	test_begin("test_program_async_wait");
 
-	test_globals.async_client = program_client_unix_create(TEST_SOCKET,
-			args, &pc_set, TRUE);
+	pc_params.no_reply = TRUE;
+	test_globals.async_client = program_client_unix_create(event, TEST_SOCKET,
+			args, &pc_params);
 
 	program_client_run_async(test_globals.async_client,
 				 test_program_async_wait_finish,
@@ -478,10 +484,11 @@ int main(int argc, char *argv[])
 
 	lib_init();
 
+	event = event_create(NULL);
 	while ((c = getopt(argc, argv, "D")) > 0) {
 		switch (c) {
 		case 'D':
-			pc_set.debug = TRUE;
+			event_set_forced_debug(event, TRUE);
 			break;
 		default:
 			i_fatal("Usage: %s [-D]", argv[0]);
@@ -490,6 +497,7 @@ int main(int argc, char *argv[])
 
 	ret = test_run(tests);
 
+	event_unref(&event);
 	lib_deinit();
 	return ret;
 }

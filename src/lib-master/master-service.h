@@ -8,6 +8,7 @@
 #include <stdio.h> /* for getopt() opt* variables in Solaris */
 
 #define MASTER_SERVICE_SHUTTING_DOWN_MSG "Server shutting down"
+#define MASTER_SERVICE_USER_KICKED_MSG "User kicked"
 
 enum master_service_flags {
 	/* stdin/stdout already contains a client which we want to serve */
@@ -110,6 +111,8 @@ master_service_avail_overflow_callback_t(bool kill, struct timeval *created_r);
 
 extern struct master_service *master_service;
 
+typedef void master_service_killed_callback_t(void *);
+
 extern const struct option master_service_helpopt;
 
 const char *master_service_getopt_string(void);
@@ -141,9 +144,10 @@ bool master_service_parse_option(struct master_service *service,
 void master_service_init_finish(struct master_service *service);
 
 /* import_environment is a space-separated list of environment keys or
-   key=values. The key=values are immediately added to the environment.
-   All the keys are added to DOVECOT_PRESERVE_ENVS environment so they're
-   preserved by master_service_env_clean(). */
+   key=values. If the values contain %variables they are expanded and
+   immediately added to the environment, this can i_fatal() if the %variables
+   are invalid. All the keys are added to DOVECOT_PRESERVE_ENVS environment so
+   they're preserved by master_service_env_clean(). */
 void master_service_import_environment(const char *import_environment);
 /* Clean environment from everything except the ones listed in
    DOVECOT_PRESERVE_ENVS environment. */
@@ -178,6 +182,19 @@ void master_service_set_die_callback(struct master_service *service,
    even called if the master service code knows that we're handling clients. */
 void master_service_set_idle_die_callback(struct master_service *service,
 					  bool (*callback)(void));
+/* Set a callback that gets called when the service is killed, but not dead yet.
+   The callback is currently called only when running in main ioloop and
+   receiving SIGINT or SIGTERM. Note that the ioloop is always stopped anyway
+   when this happens. */
+void master_service_set_killed_callback(struct master_service *service,
+					master_service_killed_callback_t *callback,
+					void *context);
+#define master_service_set_killed_callback(service, callback, context) \
+	master_service_set_killed_callback(service, \
+		1 ? (master_service_killed_callback_t *)callback : \
+		CALLBACK_TYPECHECK(callback, void (*)(typeof(context))), \
+		context)
+
 /* Call the given callback when there are no available connections and master
    has indicated that it can't create any more processes to handle requests. */
 void master_service_set_avail_overflow_callback(struct master_service *service,
@@ -193,18 +210,20 @@ unsigned int master_service_get_client_limit(struct master_service *service);
 unsigned int master_service_get_process_limit(struct master_service *service);
 /* Returns service { process_min_avail } */
 unsigned int master_service_get_process_min_avail(struct master_service *service);
-/* Returns the service's idle_kill timeout in seconds. Normally master handles
-   sending the kill request when the process has no clients, but some services
-   with permanent client connections may need to handle this themselves. */
-unsigned int master_service_get_idle_kill_secs(struct master_service *service);
+/* Returns the service's idle_kill_interval timeout in seconds. Normally master
+   handles sending the kill request when the process has no clients, but some
+   services with permanent client connections may need to handle this
+   themselves. */
+unsigned int
+master_service_get_idle_kill_interval_secs(struct master_service *service);
 
 /* Set maximum number of client connections we will handle before shutting
    down. */
-void master_service_set_service_count(struct master_service *service,
-				      unsigned int count);
+void master_service_set_restart_request_count(struct master_service *service,
+					      unsigned int count);
 /* Returns the number of client connections we will handle before shutting
    down. The value is decreased only after connection has been closed. */
-unsigned int master_service_get_service_count(struct master_service *service);
+unsigned int master_service_get_restart_request_count(struct master_service *service);
 /* Return the number of listener sockets. */
 unsigned int master_service_get_socket_count(struct master_service *service);
 /* Returns the name of the listener socket, or "" if none is specified. */
@@ -221,10 +240,15 @@ const char *master_service_get_config_path(struct master_service *service);
 const char *master_service_get_version_string(struct master_service *service);
 /* Returns name of the service, as given in name parameter to _init(). */
 const char *master_service_get_name(struct master_service *service);
+/* Returns the root event created for the service. */
+struct event *master_service_get_event(struct master_service *service);
 /* Returns name of the service, as given in the configuration file. For example
    service name=auth, but configured_name=auth-worker. This is preferred in
    e.g. log prefixes. */
 const char *master_service_get_configured_name(struct master_service *service);
+/* Returns the settings root. */
+struct settings_root *
+master_service_get_settings_root(struct master_service *service);
 
 /* Start the service. Blocks until finished */
 void master_service_run(struct master_service *service,
@@ -242,6 +266,9 @@ int master_service_get_kill_signal(struct master_service *service);
 /* Returns the timestamp when the stop signal was received. */
 void master_service_get_kill_time(struct master_service *service,
 				  struct timeval *tv_r);
+/* Returns TRUE if we've received USER-KILL-SIGNAL that matched the current
+   user. */
+bool master_service_is_user_kicked(struct master_service *service);
 /* Returns TRUE if our master process is already stopped. This process may or
    may not be dying itself. Returns FALSE always if the process was started
    standalone. */
@@ -290,6 +317,11 @@ bool version_string_verify(const char *line, const char *service_name,
 bool version_string_verify_full(const char *line, const char *service_name,
 				unsigned int major_version,
 				unsigned int *minor_version_r);
+/* Compare number[.number[...]] style version numbers. Assert-crash if the
+   version strings are invalid. */
+int version_cmp(const char *version1, const char *version2);
+/* Returns TRUE if version string is a valid number[.number[...]] string. */
+bool version_is_valid(const char *version);
 
 /* Sets process shutdown filter */
 void master_service_set_process_shutdown_filter(struct master_service *service,

@@ -613,7 +613,7 @@ sync_rename_lower_ts(struct dsync_mailbox_tree_sync_ctx *ctx,
 	   and remote_node2. They have identical names. We also know that
 	   local_node1&remote_node1 and local_node2&remote_node2 are "the same"
 	   either because their GUIDs or (in case of one being a directory)
-	   their childrens' GUIDs match. We don't know where local_node2 or
+	   their children's GUIDs match. We don't know where local_node2 or
 	   remote_node1 are located in the mailbox tree, or if they exist
 	   at all. Note that node1 and node2 may be the same node pointers. */
 	i_assert(strcmp(local_node1->name, remote_node2->name) == 0);
@@ -802,8 +802,8 @@ sync_find_branch(struct dsync_mailbox_tree *tree,
 	for (node = dir_node->first_child; node != NULL; node = node->next) {
 		if (dsync_mailbox_node_is_dir(node)) {
 			other_node = sync_find_branch(tree, other_tree, node);
-			if (other_node != NULL)
-				return other_node;
+			if (other_node != NULL && other_node->parent != NULL)
+				return other_node->parent;
 		} else {
 			guid_p = node->mailbox_guid;
 			other_node = hash_table_lookup(other_tree->guid_hash,
@@ -987,7 +987,7 @@ sync_rename_temp_mailbox_node(struct dsync_mailbox_tree *tree,
 
 	/* The name is currently <oldname>-<temp>. Both sides need to
 	   use equivalent names, so we'll replace the <temp> if possible
-	   with a) mailbox GUID, b) sha1 of childrens' (GUID|name)s. In the
+	   with a) mailbox GUID, b) sha1 of children's (GUID|name)s. In the
 	   very unlikely case of such name already existing, just increase
 	   the last letters until it's not found. */
 	new_suffix = mailbox_node_generate_suffix(node);

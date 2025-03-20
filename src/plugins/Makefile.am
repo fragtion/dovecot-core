@@ -20,7 +20,6 @@ SUBDIRS = \
 	fts \
 	last-login \
 	lazy-expunge \
-	listescape \
 	notify \
 	notify-status \
 	push-notification \
@@ -40,5 +39,4 @@ SUBDIRS = \
 	$(DICT_LDAP) \
 	$(APPARMOR) \
 	fs-compress \
-	var-expand-crypt \
 	charset-alias

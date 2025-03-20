@@ -4,7 +4,6 @@
 #include "array.h"
 #include "str.h"
 #include "strescape.h"
-#include "mailbox-list-iter.h"
 #include "imap-utf7.h"
 #include "imap-quote.h"
 #include "imap-match.h"
@@ -12,12 +11,19 @@
 #include "imap-commands.h"
 #include "imap-list.h"
 
+struct cmd_list_return_flag {
+	const struct imap_list_return_flag *flag;
+
+	void *context;
+};
+
 struct cmd_list_context {
 	struct client_command_context *cmd;
 	struct mail_user *user;
 
 	enum mailbox_list_iter_flags list_flags;
 	struct imap_status_items status_items;
+	ARRAY(struct cmd_list_return_flag) return_flags;
 
 	struct mailbox_list_iterate_context *list_iter;
 
@@ -122,6 +128,9 @@ parse_return_flags(struct cmd_list_context *ctx, const struct imap_arg *args)
 	enum mailbox_list_iter_flags list_flags = 0;
 	const struct imap_arg *list_args;
 	const char *str;
+	const struct imap_list_return_flag *flag;
+	void *flag_context;
+	int ret;
 
 	while (!IMAP_ARG_IS_EOL(args)) {
 		if (!imap_arg_get_atom(args, &str)) {
@@ -143,6 +152,19 @@ parse_return_flags(struct cmd_list_context *ctx, const struct imap_arg *args)
 				return FALSE;
 			ctx->used_status = TRUE;
 			args++;
+		} else if ((ret = imap_list_return_flag_parse(
+			ctx->cmd, str, &args, &flag, &flag_context)) > 0) {
+			struct cmd_list_return_flag *flag_data;
+
+			if (!array_is_created(&ctx->return_flags)) {
+				p_array_init(&ctx->return_flags,
+					     ctx->cmd->pool, 8);
+			}
+			flag_data = array_append_space(&ctx->return_flags);
+			flag_data->flag = flag;
+			flag_data->context = flag_context;
+		} else if (ret < 0) {
+			return FALSE;
 		} else {
 			/* skip also optional list value */
 			client_send_command_error(ctx->cmd,
@@ -180,34 +202,60 @@ static void list_reply_append_ns_sep_param(string_t *str, char sep)
 }
 
 static void
-list_send_status(struct cmd_list_context *ctx, const char *name,
-		 const char *mutf7_name, enum mailbox_info_flags flags)
+list_send_status(struct cmd_list_context *ctx,
+		 const struct imap_list_return_flag_params *params)
 {
+	enum mailbox_info_flags mbox_flags = params->mbox_flags;
+	enum mailbox_list_iter_flags list_flags = params->list_flags;
 	struct imap_status_result result;
-	struct mail_namespace *ns;
 
-	if ((flags & (MAILBOX_NONEXISTENT | MAILBOX_NOSELECT)) != 0) {
+	if ((mbox_flags & (MAILBOX_NONEXISTENT | MAILBOX_NOSELECT)) != 0) {
 		/* doesn't exist, don't even try to get STATUS */
 		return;
 	}
-	if ((flags & MAILBOX_SUBSCRIBED) == 0 &&
-	    (ctx->list_flags & MAILBOX_LIST_ITER_SELECT_SUBSCRIBED) != 0) {
+	if ((mbox_flags & MAILBOX_SUBSCRIBED) == 0 &&
+	    (list_flags & MAILBOX_LIST_ITER_SELECT_SUBSCRIBED) != 0) {
 		/* listing subscriptions, but only child is subscribed */
+		i_assert((mbox_flags & MAILBOX_CHILD_SUBSCRIBED) != 0);
 		return;
 	}
 
-	/* if we're listing subscriptions and there are subscriptions=no
-	   namespaces, ctx->ns may not point to correct one */
-	ns = mail_namespace_find(ctx->user->namespaces, name);
-	if (imap_status_get(ctx->cmd, ns, name,
+	if (imap_status_get(ctx->cmd, params->ns, params->name,
 			    &ctx->status_items, &result) < 0) {
 		client_send_line(ctx->cmd->client,
 				 t_strconcat("* ", result.errstr, NULL));
 		return;
 	}
 
-	imap_status_send(ctx->cmd->client, mutf7_name,
+	imap_status_send(ctx->cmd->client, params->mutf7_name,
 			 &ctx->status_items, &result);
+}
+
+static bool
+list_has_options(struct cmd_list_context *ctx)
+{
+	if (ctx->used_status)
+		return TRUE;
+	return array_is_created(&ctx->return_flags);
+}
+
+static void
+list_send_options(struct cmd_list_context *ctx,
+		  const struct imap_list_return_flag_params *params)
+{
+	struct client_command_context *cmd = ctx->cmd;
+
+	if (ctx->used_status)
+		list_send_status(ctx, params);
+
+	if (array_is_created(&ctx->return_flags)) {
+		const struct cmd_list_return_flag *rflag;
+
+		array_foreach(&ctx->return_flags, rflag) {
+			imap_list_return_flag_send(cmd, rflag->flag,
+						   rflag->context, params);
+		}
+	}
 }
 
 static bool cmd_list_continue(struct client_command_context *cmd)
@@ -256,10 +304,30 @@ static bool cmd_list_continue(struct client_command_context *cmd)
 		imap_append_astring(str, str_c(mutf7_name));
 		mailbox_childinfo2str(ctx, str, flags);
 
+		/* send LIST/LSUB response */
 		ret = client_send_line_next(ctx->cmd->client, str_c(str));
-		if (ctx->used_status) T_BEGIN {
-			list_send_status(ctx, name, str_c(mutf7_name), flags);
-		} T_END;
+		if (ret < 0)
+			return TRUE;
+
+		/* send optional responses (if any) */
+		if (list_has_options(ctx)) {
+			struct imap_list_return_flag_params params = {
+				.name = name,
+				.mutf7_name = str_c(mutf7_name),
+				.mbox_flags = flags,
+				.list_flags = ctx->list_flags,
+			};
+
+			/* if we're listing subscriptions and there are
+			   subscriptions=no namespaces, ctx->ns may not point to
+			   correct one */
+			params.ns = mail_namespace_find(ctx->user->namespaces,
+							params.name);
+
+			T_BEGIN {
+				list_send_options(ctx, &params);
+			} T_END;
+		}
 		if (ret == 0) {
 			/* buffer is full, continue later */
 			return FALSE;

@@ -5,7 +5,9 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-mail \
 	-I$(top_srcdir)/src/lib-imap \
 	-I$(top_srcdir)/src/lib-index \
+	-I$(top_srcdir)/src/lib-settings \
 	-I$(top_srcdir)/src/lib-storage \
+	-I$(top_srcdir)/src/lib-var-expand \
 	-I$(top_srcdir)/src/plugins/fts
 
 NOPLUGIN_LDFLAGS =
@@ -24,13 +26,14 @@ lib21_fts_solr_plugin_la_LIBADD = \
 
 lib21_fts_solr_plugin_la_SOURCES = \
 	fts-backend-solr.c \
-	fts-backend-solr-old.c \
 	fts-solr-plugin.c \
+	fts-solr-settings.c \
 	solr-response.c \
 	solr-connection.c
 
 noinst_HEADERS = \
 	fts-solr-plugin.h \
+	fts-solr-settings.h \
 	solr-response.h \
 	solr-connection.h
 

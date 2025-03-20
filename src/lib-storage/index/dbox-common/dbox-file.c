@@ -56,13 +56,11 @@ void dbox_file_set_corrupted(struct dbox_file *file, const char *reason, ...)
 		return;
 
 	va_start(args, reason);
-	mail_storage_set_critical(&file->storage->storage,
+	file->storage->v.set_file_corrupted(file, t_strdup_printf(
 		"Corrupted dbox file %s (around offset=%"PRIuUOFF_T"): %s",
 		file->cur_path, file->input == NULL ? 0 : file->input->v_offset,
-		t_strdup_vprintf(reason, args));
+		t_strdup_vprintf(reason, args)));
 	va_end(args);
-
-	file->storage->v.set_file_corrupted(file);
 }
 
 void dbox_file_init(struct dbox_file *file)
@@ -177,7 +175,7 @@ static int dbox_file_open_fd(struct dbox_file *file, bool try_altpath)
 	/* try the primary path first */
 	path = file->primary_path;
 	while ((file->fd = open(path, flags)) == -1) {
-		if (errno == EACCES && flags == O_RDWR) {
+		if (ENOACCESS(errno) && flags == O_RDWR) {
 			flags = O_RDONLY;
 			continue;
 		}

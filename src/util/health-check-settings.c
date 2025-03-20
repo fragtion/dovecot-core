@@ -10,20 +10,15 @@ struct service_settings health_check_service_settings = {
 	.protocol = "",
 	.type = "",
 	.executable = "script -p health-check.sh",
-	.user = "$default_internal_user",
+	.user = "$SET:default_internal_user",
 	.group = "",
 	.privileged_group = "",
-	.extra_groups = "",
+	.extra_groups = ARRAY_INIT,
 	.chroot = "",
 
 	.drop_priv_before_exec = TRUE,
 
-	.process_min_avail = 0,
-	.process_limit = 0,
 	.client_limit = 1,
-	.service_count = 0,
-	.idle_kill = 0,
-	.vsz_limit = UOFF_T_MAX,
 
 	.unix_listeners = ARRAY_INIT,
 	.fifo_listeners = ARRAY_INIT,

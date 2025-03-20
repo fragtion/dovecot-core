@@ -204,8 +204,7 @@ http_client_queue_fail(struct http_client_queue *queue,
 static bool
 http_client_queue_is_last_connect_ip(struct http_client_queue *queue)
 {
-	const struct http_client_settings *set =
-		&queue->client->set;
+	const struct http_client_settings *set = queue->client->set;
 	struct http_client_host *host = queue->host;
 	unsigned int ips_count = http_client_host_get_ips_count(host);
 
@@ -213,8 +212,8 @@ http_client_queue_is_last_connect_ip(struct http_client_queue *queue)
 	i_assert(queue->ips_connect_idx < ips_count);
 	i_assert(queue->ips_connect_start_idx < ips_count);
 
-	/* If a maximum connect attempts > 1 is set, enforce it directly */
-	if (set->max_connect_attempts > 1 &&
+	/* If a maximum connect attempts > 0 is set, enforce it directly */
+	if (set->max_connect_attempts > 0 &&
 		queue->connect_attempts >= set->max_connect_attempts)
 		return TRUE;
 
@@ -266,7 +265,7 @@ http_client_queue_soft_connect_timeout(struct http_client_queue *queue)
 		return;
 	}
 
-	/* If our our previous connection attempt takes longer than the
+	/* If our previous connection attempt takes longer than the
 	   soft_connect_timeout, we start a connection attempt to the next IP in
 	   parallel */
 	https_name = http_client_peer_addr_get_https_name(addr);
@@ -415,7 +414,7 @@ http_client_queue_connection_attempt(struct http_client_queue *queue)
 		/* Start soft connect time-out
 		   (but only if we have another IP left) */
 		if (queue->addr.type != HTTP_CLIENT_PEER_ADDR_UNIX) {
-			msecs = client->set.soft_connect_timeout_msecs;
+			msecs = client->set->soft_connect_timeout_msecs;
 			if (!http_client_queue_is_last_connect_ip(queue) &&
 			    msecs > 0 && queue->to_connect == NULL) {
 				queue->to_connect = timeout_add_to(
@@ -461,7 +460,7 @@ void http_client_queue_connection_success(struct http_client_queue *queue,
 
 	if (http_client_host_ready(host) &&
 	    queue->addr.type != HTTP_CLIENT_PEER_ADDR_UNIX) {
-		/* We achieved at least one connection the the addr->ip */
+		/* We achieved at least one connection the addr->ip */
 		if (!http_client_host_get_ip_idx(
 			host, &addr->a.tcp.ip, &queue->ips_connect_start_idx)) {
 			/* list of IPs changed during connect */
@@ -507,13 +506,11 @@ void http_client_queue_connection_failure(struct http_client_queue *queue,
 					  struct http_client_peer *peer,
 					  const char *reason)
 {
-	const struct http_client_settings *set =
-		&queue->client->set;
+	const struct http_client_settings *set = queue->client->set;
 	const struct http_client_peer_addr *addr = &peer->shared->addr;
 	const char *https_name = http_client_peer_addr_get_https_name(addr);
 	struct http_client_host *host = queue->host;
 	unsigned int ips_count = http_client_host_get_ips_count(host);
-	struct http_client_peer *const *peer_idx;
 	unsigned int num_requests =
 		array_count(&queue->queued_requests) +
 		array_count(&queue->queued_urgent_requests);
@@ -532,24 +529,16 @@ void http_client_queue_connection_failure(struct http_client_queue *queue,
 		i_assert(queue->cur_peer == NULL || queue->cur_peer == peer);
 		queue->cur_peer = NULL;
 	} else {
-		bool found = FALSE;
+		unsigned int idx;
 
 		i_assert(queue->cur_peer == NULL);
 
 		/* We're still doing the initial connections to this hport. if
 		   we're also doing parallel connections with soft timeouts
 		   (pending_peer_count>1), wait for them to finish first. */
-		array_foreach(&queue->pending_peers, peer_idx) {
-			if (*peer_idx == peer) {
-				array_delete(&queue->pending_peers,
-					     array_foreach_idx(
-						&queue->pending_peers,
-						peer_idx), 1);
-				found = TRUE;
-				break;
-			}
-		}
-		i_assert(found);
+		if (!array_lsearch_ptr_idx(&queue->pending_peers, peer, &idx))
+			i_unreached();
+		array_delete(&queue->pending_peers, idx, 1);
 		if (array_count(&queue->pending_peers) > 0) {
 			e_debug(queue->event,
 				"Waiting for remaining pending peers.");
@@ -588,11 +577,11 @@ void http_client_queue_connection_failure(struct http_client_queue *queue,
 				"Failed to set up any connection; "
 				"failing all queued requests");
 			if (queue->connect_attempts > 1) {
-				unsigned int total_msecs =
+				long long total_msecs =
 					timeval_diff_msecs(&ioloop_timeval,
 							   &queue->first_connect_time);
 				reason = t_strdup_printf(
-					"%s (%u attempts in %u.%03u secs)",
+					"%s (%u attempts in %lld.%03lld secs)",
 					reason, queue->connect_attempts,
 					total_msecs/1000, total_msecs%1000);
 			}
@@ -615,21 +604,16 @@ void http_client_queue_connection_failure(struct http_client_queue *queue,
 void http_client_queue_peer_disconnected(struct http_client_queue *queue,
 					 struct http_client_peer *peer)
 {
-	struct http_client_peer *const *peer_idx;
+	unsigned int idx;
 
 	if (queue->cur_peer == peer) {
 		queue->cur_peer = NULL;
 		return;
 	}
 
-	array_foreach(&queue->pending_peers, peer_idx) {
-		if (*peer_idx == peer) {
-			array_delete(&queue->pending_peers,
-				     array_foreach_idx(&queue->pending_peers,
-						       peer_idx), 1);
-			break;
-		}
-	}
+	if (!array_lsearch_ptr_idx(&queue->pending_peers, peer, &idx))
+		i_unreached();
+	array_delete(&queue->pending_peers, idx, 1);
 }
 
 /*
@@ -647,23 +631,12 @@ void http_client_queue_drop_request(struct http_client_queue *queue,
 
 	/* Drop from queue */
 	if (req->urgent) {
-		reqs = array_get_modifiable(&queue->queued_urgent_requests,
-					    &count);
-		for (i = 0; i < count; i++) {
-			if (reqs[i] == req) {
-				array_delete(&queue->queued_urgent_requests,
-					     i, 1);
-				break;
-			}
-		}
+		if (array_lsearch_ptr_idx(&queue->queued_urgent_requests,
+					   req, &i))
+			array_delete(&queue->queued_urgent_requests, i, 1);
 	} else {
-		reqs = array_get_modifiable(&queue->queued_requests, &count);
-		for (i = 0; i < count; i++) {
-			if (reqs[i] == req) {
-				array_delete(&queue->queued_requests, i, 1);
-				break;
-			}
-		}
+		if (array_lsearch_ptr_idx(&queue->queued_requests, req, &i))
+			array_delete(&queue->queued_requests, i, 1);
 	}
 
 	/* Drop from delay queue */
@@ -976,7 +949,7 @@ void http_client_queue_submit_request(struct http_client_queue *queue,
 				       TIMEOUT_CMP_MARGIN_USECS) > 0) {
 			e_debug(queue->event,
 				"Delayed request %s%s submitted "
-				"(time remaining: %d msecs)",
+				"(time remaining: %lld msecs)",
 				http_client_request_label(req),
 				(req->urgent ? " (urgent)" : ""),
 				timeval_diff_msecs(&req->release_time,

@@ -50,9 +50,15 @@ enum smtp_capability {
 	SMTP_CAPABILITY_VRFY                = BIT(10),
 	SMTP_CAPABILITY_ETRN                = BIT(11),
 	SMTP_CAPABILITY_XCLIENT             = BIT(12),
-
+#ifdef EXPERIMENTAL_MAIL_UTF8
+	SMTP_CAPABILITY_SMTPUTF8            = BIT(13),
+#endif
 	SMTP_CAPABILITY__ORCPT              = BIT(24),
 };
+
+#ifndef EXPERIMENTAL_MAIL_UTF8
+#  define SMTP_CAPABILITY_SMTPUTF8	0
+#endif
 
 struct smtp_capability_name {
 	const char *name;
@@ -98,6 +104,8 @@ struct smtp_proxy_data {
 	const char *session;
 	/* CLIENT-TRANSPORT */
 	const char *client_transport;
+	/* DESTNAME */
+	const char *local_name;
 
 	/* TTL: send as this -1, so the default 0 means "don't send it" */
 	unsigned int ttl_plus_1;

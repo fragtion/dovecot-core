@@ -5,6 +5,7 @@
 #ifdef HAVE_BZLIB
 
 #include "ostream-private.h"
+#include "settings.h"
 #include "ostream-zlib.h"
 #include <bzlib.h>
 
@@ -20,50 +21,49 @@ struct bzlib_ostream {
 	bool flushed:1;
 };
 
-/* in bzlib, level is actually block size. From bzlib manual:
+struct bzlib_settings {
+	pool_t pool;
+	unsigned int compress_bz2_block_size_100k;
+};
 
-   The block size affects both the compression ratio achieved,
-   and the amount of memory needed for compression and decompression.
+static bool bzlib_settings_check(void *_set, pool_t pool, const char **error_r);
 
-   BlockSize 1 through BlockSize 9 specify the block size to be 100,000 bytes
-   through 900,000 bytes respectively. The default is to use the maximum block
-   size.
+#undef DEF
+#define DEF(type, name) \
+	SETTING_DEFINE_STRUCT_##type(#name, name, struct bzlib_settings)
+static const struct setting_define bzlib_setting_defines[] = {
+	DEF(UINT, compress_bz2_block_size_100k),
 
-   Larger block sizes give rapidly diminishing marginal returns.
-   Most of the compression comes from the first two or three hundred k of
-   block size, a fact worth bearing in mind when using bzip2 on small machines.
-   It is also important to appreciate that the decompression memory
-   requirement is set at compression time by the choice of block size.
+	SETTING_DEFINE_LIST_END
+};
+static const struct bzlib_settings bzlib_default_settings = {
+	.compress_bz2_block_size_100k = 9,
+};
 
-   * In general, try and use the largest block size memory constraints
-     allow, since that maximises the compression achieved.
-   * Compression and decompression speed are virtually unaffected by block
-     size.
+const struct setting_parser_info bzlib_setting_parser_info = {
+	.name = "bzlib",
 
-   Another significant point applies to files which fit in a single block -
-   that means most files you'd encounter using a large block size. The
-   amount of real memory touched is proportional to the size of the file,
-   since the file is smaller than a block. For example, compressing a file
-   20,000 bytes long with the flag BlockSize 9 will cause the compressor to
-   allocate around 7600k of memory, but only touch 400k + 20000 * 8 = 560 kbytes
-   of it. Similarly, the decompressor will allocate 3700k but only
-   touch 100k + 20000 * 4 = 180 kbytes.
-*/
+	.defines = bzlib_setting_defines,
+	.defaults = &bzlib_default_settings,
 
-int compression_get_min_level_bz2(void)
+	.struct_size = sizeof(struct bzlib_settings),
+	.pool_offset1 = 1 + offsetof(struct bzlib_settings, pool),
+#ifndef CONFIG_BINARY
+	.check_func = bzlib_settings_check,
+#endif
+};
+
+static bool bzlib_settings_check(void *_set, pool_t pool ATTR_UNUSED,
+				 const char **error_r)
 {
-	return 1;
-}
+	struct bzlib_settings *set = _set;
 
-int compression_get_default_level_bz2(void)
-{
-	/* default is maximum level */
-	return 9;
-}
-
-int compression_get_max_level_bz2(void)
-{
-	return 9;
+	if (set->compress_bz2_block_size_100k < 1 ||
+	    set->compress_bz2_block_size_100k > 9) {
+		*error_r = "compress_bz2_block_size_100k must be between 1..9";
+		return FALSE;
+	}
+	return TRUE;
 }
 
 static void o_stream_bzlib_close(struct iostream_private *stream,
@@ -268,7 +268,7 @@ o_stream_bzlib_sendv(struct ostream_private *stream,
 	return bytes;
 }
 
-struct ostream *o_stream_create_bz2(struct ostream *output, int level)
+static struct ostream *o_stream_create_bz2(struct ostream *output, int level)
 {
 	struct bzlib_ostream *zstream;
 	int ret;
@@ -304,4 +304,19 @@ struct ostream *o_stream_create_bz2(struct ostream *output, int level)
 	return o_stream_create(&zstream->ostream, output,
 			       o_stream_get_fd(output));
 }
+
+struct ostream *
+o_stream_create_bz2_auto(struct ostream *output, struct event *event)
+{
+	const struct bzlib_settings *set;
+	const char *error;
+
+	if (settings_get(event, &bzlib_setting_parser_info, 0,
+			 &set, &error) < 0)
+		return o_stream_create_error_str(EIO, "%s", error);
+	int block_size = set->compress_bz2_block_size_100k;
+	settings_free(set);
+	return o_stream_create_bz2(output, block_size);
+}
+
 #endif

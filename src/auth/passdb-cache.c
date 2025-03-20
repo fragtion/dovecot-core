@@ -86,7 +86,7 @@ bool passdb_cache_verify_plain(struct auth_request *request, const char *key,
 
 	if (*value == '\0') {
 		/* negative cache entry */
-		auth_request_log_unknown_user(request, AUTH_SUBSYS_DB);
+		auth_request_db_log_unknown_user(request);
 		*result_r = PASSDB_RESULT_USER_UNKNOWN;
 		auth_request_verify_plain_callback_finish(*result_r, request);
 		return TRUE;
@@ -125,9 +125,9 @@ bool passdb_cache_verify_plain(struct auth_request *request, const char *key,
 		scheme = password_get_scheme(&cached_pw);
 		i_assert(scheme != NULL);
 
-		ret = auth_request_password_verify_log(request, password, cached_pw,
-						   scheme, AUTH_SUBSYS_DB,
-						   !(node->last_success || neg_expired));
+		ret = auth_request_db_password_verify_log(
+			request, password, cached_pw, scheme,
+			!(node->last_success || neg_expired));
 
 		if (ret == PASSDB_RESULT_PASSWORD_MISMATCH &&
 		    (node->last_success || neg_expired)) {

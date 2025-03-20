@@ -7,11 +7,15 @@
 #include "strescape.h"
 #include "connection.h"
 #include "ostream.h"
+#include "settings.h"
+#include "settings-parser.h"
 #include "master-service.h"
 #include "stats-metrics.h"
 #include "stats-settings.h"
+#include "event-exporter.h"
 #include "client-reader.h"
 #include "client-writer.h"
+#include "event-exporter.h"
 
 struct reader_client {
 	struct connection conn;
@@ -155,6 +159,7 @@ static int
 reader_client_input_metrics_add(struct reader_client *client,
 				const char *const *args)
 {
+	ARRAY_TYPE(stats_metric_settings_group_by) group_by;
 	const char *error;
 
 	if (str_array_length(args) < 7) {
@@ -162,17 +167,49 @@ reader_client_input_metrics_add(struct reader_client *client,
 		return -1;
 	}
 
-	struct stats_metric_settings set = {
-		.metric_name = args[0],
-		.description = args[1],
-		.fields = args[2],
-		.group_by = args[3],
-		.filter = args[4],
-		.exporter = args[5],
-		.exporter_include = args[6],
-	};
+	pool_t pool = pool_alloconly_create("dynamic stats metrics", 128);
+	struct stats_metric_settings *set =
+		settings_defaults_dup(pool, &stats_metric_setting_parser_info);
+	set->name = p_strdup(pool, args[0]);
+	set->description = p_strdup(pool, args[1]);
+	set->filter = p_strdup(pool, args[4]);
+	set->exporter = p_strdup(pool, args[5]);
+
+	if (!parse_legacy_metric_group_by(pool, args[3], &group_by, &error)) {
+		e_error(client->conn.event,
+			"METRICS-ADD: Invalid metric_group_by: %s", error);
+		pool_unref(&pool);
+		return -1;
+	}
+
+	p_array_init(&set->fields, pool, 4);
+	if (settings_parse_boollist_string(args[2], pool, &set->fields,
+					   &error) < 0) {
+		e_error(client->conn.event,
+			"METRICS-ADD: Invalid metric_fields: %s", error);
+		pool_unref(&pool);
+		return -1;
+	}
+	settings_boollist_finish(&set->fields, FALSE);
+
+	p_array_init(&set->exporter_include, pool, 1);
+	if (settings_parse_boollist_string(args[6], pool,
+					   &set->exporter_include, &error) < 0) {
+		e_error(client->conn.event,
+			"METRICS-ADD: metric_exporter_include parsing error: %s", error);
+		pool_unref(&pool);
+		return -1;
+	}
+	settings_boollist_finish(&set->exporter_include, FALSE);
+
+	if (!stats_metric_setting_parser_info.check_func(set, pool, &error)) {
+		e_error(client->conn.event, "METRICS-ADD: %s", error);
+		pool_unref(&pool);
+		return -1;
+	}
+
 	o_stream_cork(client->conn.output);
-	if (stats_metrics_add_dynamic(stats_metrics, &set, &error)) {
+	if (stats_metrics_add_dynamic(stats_metrics, set, &group_by, &error)) {
 		client_writer_update_connections();
 		o_stream_nsend(client->conn.output, "+", 1);
 	} else {
@@ -180,6 +217,8 @@ reader_client_input_metrics_add(struct reader_client *client,
 		o_stream_nsend_str(client->conn.output, "METRICS-ADD: ");
 		o_stream_nsend_str(client->conn.output, error);
 	}
+	settings_free(set);
+
 	o_stream_nsend(client->conn.output, "\n", 1);
 	o_stream_uncork(client->conn.output);
 	return 1;
@@ -223,6 +262,10 @@ reader_client_input_args(struct connection *conn, const char *const *args)
 		return reader_client_input_metrics_remove(client, args);
 	else if (strcmp(cmd, "DUMP-RESET") == 0)
 		return reader_client_input_dump_reset(client, args);
+	else if (strcmp(cmd, "REOPEN") == 0) {
+		event_exporters_reopen();
+		o_stream_nsend(client->conn.output, "+\n", 2);
+	}
 	return 1;
 }
 

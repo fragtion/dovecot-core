@@ -9,9 +9,10 @@
 #include "http-client-private.h"
 #include "istream.h"
 #include "iostream-ssl.h"
+#include "settings.h"
+#include "settings-parser.h"
 #include "master-service.h"
 #include "master-service-settings.h"
-#include "master-service-ssl-settings.h"
 
 #define DLUA_DOVECOT_HTTP "http"
 #define DLUA_HTTP_CLIENT "struct http_client"
@@ -88,15 +89,18 @@ static int dlua_http_request_remove_header(lua_State *L)
 
 static int dlua_http_request_set_payload(lua_State *L)
 {
-	DLUA_REQUIRE_ARGS(L, 2);
+	DLUA_REQUIRE_ARGS_IN(L, 2, 3);
 
 	struct http_client_request *req = dlua_check_http_request(L, 1);
 	struct istream *payload_istream;
 
 	const char *payload = luaL_checkstring(L, 2);
+	bool do_sync = FALSE;
+	if (lua_gettop(L) >= 3)
+		do_sync = lua_toboolean(L, 3);
 	payload_istream = i_stream_create_copy_from_data(payload,
 			strlen(payload));
-	http_client_request_set_payload(req, payload_istream, TRUE);
+	http_client_request_set_payload(req, payload_istream, do_sync);
 	i_stream_unref(&payload_istream);
 	return 0;
 }
@@ -165,6 +169,11 @@ static struct http_client *dlua_check_http_client(lua_State *L, int arg)
 static int dlua_http_client_gc(lua_State *L)
 {
 	struct http_client **_client = lua_touserdata(L, 1);
+	struct event *event = event_get_parent((*_client)->event);
+	struct settings_instance *instance =
+		event_get_ptr(event, SETTINGS_EVENT_INSTANCE);
+	i_assert(instance != NULL);
+	settings_instance_free(&instance);
 	http_client_deinit(_client);
 	return 0;
 }
@@ -382,9 +391,6 @@ static int dlua_http_request_new(lua_State *L)
 		return -1;
 	}
 
-	if (http_url->have_ssl && client->set.ssl == NULL) {
-		return luaL_error(L, "TLS not enabled, cannot submit https request");
-	}
 	http_req = http_client_request_url(client, method, http_url,
 					   dlua_http_request_callback, L);
 
@@ -415,61 +421,40 @@ static void dlua_push_http_client(lua_State *L, struct http_client *client)
 	luaL_setfuncs(L, dovecot_http_client_methods, 0);
 }
 
-#define CLIENT_SETTING_STR(field) \
-	if (dlua_table_get_string_by_str(L, -1, #field, &(set->field)) < 0) { \
-		*error_r = t_strdup_printf("%s: string expected", #field); return -1; }
-#define CLIENT_SETTING_UINT(field) \
-	if (dlua_table_get_uint_by_str(L, -1, #field, &(set->field)) < 0) { \
-		*error_r = t_strdup_printf("%s: non-negative number expected", #field); return -1; }
-#define CLIENT_SETTING_BOOL(field) \
-	if (dlua_table_get_bool_by_str(L, -1, #field, &(set->field)) < 0) { \
-		*error_r = t_strdup_printf("%s: boolean expected", #field); return -1; }
-
-static int parse_client_settings(lua_State *L, struct http_client_settings *set,
+static int parse_client_settings(lua_State *L, struct settings_instance *instance,
 				 const char **error_r)
 {
-	struct http_url *parsed_url;
-	const char *proxy_url;
-	const struct master_service_settings *master_set =
-		master_service_settings_get(master_service);
-	/* need to figure out socket dir */
-	set->dns_client_socket_path = t_strconcat(master_set->base_dir, "/dns-client", NULL);
-	CLIENT_SETTING_STR(user_agent);
-	CLIENT_SETTING_STR(rawlog_dir);
-	CLIENT_SETTING_UINT(max_idle_time_msecs);
-/* FIXME: Enable when asynchronous calls are supported
-*	CLIENT_SETTING_UINT(max_parallel_connections);
-*	CLIENT_SETTING_UINT(max_pipelined_requests);
-*/
-	CLIENT_SETTING_BOOL(no_auto_redirect);
-	CLIENT_SETTING_BOOL(no_auto_retry);
-	CLIENT_SETTING_UINT(max_redirects);
-	CLIENT_SETTING_UINT(max_attempts);
-	CLIENT_SETTING_UINT(max_connect_attempts);
-	CLIENT_SETTING_UINT(connect_backoff_time_msecs);
-	CLIENT_SETTING_UINT(connect_backoff_max_time_msecs);
-	CLIENT_SETTING_UINT(request_absolute_timeout_msecs);
-	CLIENT_SETTING_UINT(request_timeout_msecs);
-	CLIENT_SETTING_UINT(connect_timeout_msecs);
-	CLIENT_SETTING_UINT(soft_connect_timeout_msecs);
-	CLIENT_SETTING_UINT(max_auto_retry_delay_secs);
-	CLIENT_SETTING_BOOL(debug);
-
-	if (dlua_table_get_string_by_str(L, -1, "proxy_url", &proxy_url) > 0) {
-		if (http_url_parse(proxy_url, NULL, HTTP_URL_ALLOW_USERINFO_PART,
-				   pool_datastack_create(), &parsed_url, error_r) < 0) {
-			*error_r = t_strdup_printf("proxy_url is invalid: %s",
-						   *error_r);
-			return -1;
-		}
-		set->proxy_url = parsed_url;
-		set->proxy_username = parsed_url->user;
-		set->proxy_password = parsed_url->password;
+	if (!lua_istable(L, -1)) {
+		*error_r = t_strdup_printf("Table expected");
+		return -1;
 	}
 
-	lua_getfield(L, -1, "event_parent");
-	if (!lua_isnil(L, -1))
-		set->event_parent = dlua_check_event(L, -1);
+	lua_pushnil(L);
+	*error_r = NULL;
+
+	while (*error_r == NULL && lua_next(L, -2) != 0) {
+		const char *key = lua_tostring(L, -2);
+		const char *value = lua_tostring(L, -1);
+		const char *real_key;
+		unsigned int idx ATTR_UNUSED;
+		/* ignore event_parent */
+		if (strcmp(key, "event_parent") == 0) {
+			lua_pop(L, 1);
+			continue;
+		}
+		real_key = t_strconcat("http_client_", key, NULL);
+		if (setting_parser_info_find_key(&http_client_setting_parser_info, real_key, &idx)) {
+			settings_override(instance, real_key, value, SETTINGS_OVERRIDE_TYPE_CODE);
+		} else if (setting_parser_info_find_key(&ssl_setting_parser_info, key, &idx)) {
+			settings_override(instance, key, value, SETTINGS_OVERRIDE_TYPE_CODE);
+		} else {
+			*error_r = t_strdup_printf("%s is unknown setting", key);
+		}
+		lua_pop(L, 1);
+	}
+
+	if (*error_r != NULL)
+		return -1;
 
 	return 0;
 }
@@ -479,24 +464,41 @@ static int dlua_http_client_new(lua_State *L)
 	DLUA_REQUIRE_ARGS(L, 1);
 	luaL_checktype(L, 1, LUA_TTABLE);
 
+	struct dlua_script *script = dlua_script_from_state(L);
+	struct event *event_parent = script->event;
+
+	if (dlua_table_get_by_str(L, 1, LUA_TTABLE, "event_parent") == 1) {
+		event_parent = dlua_check_event(L, -1);
+		lua_pop(L, 1);
+	}
+
 	struct http_client *client;
-	struct http_client_settings http_set;
-	struct ssl_iostream_settings ssl_set;
+	struct event *event = event_create(event_parent);
 	const char *error;
+	struct settings_root *root = settings_root_find(event);
+	struct settings_instance *instance = settings_instance_new(root);
+	bool fail = FALSE;
 
-	i_zero(&http_set);
+	event_set_ptr(event, SETTINGS_EVENT_INSTANCE, instance);
+	if (parse_client_settings(L, instance, &error) < 0 ||
+	    http_client_init_auto(event, &client, &error) < 0)
+		fail = TRUE;
 
-	if (parse_client_settings(L, &http_set, &error) < 0)
-		luaL_error(L, "Invalid HTTP client setting: %s", error);
+	event_unref(&event);
 
-	const struct master_service_ssl_settings *master_ssl_set =
-		master_service_settings_get_root_set(master_service,
-			&master_service_ssl_setting_parser_info);
-	master_service_ssl_client_settings_to_iostream_set(master_ssl_set,
-		pool_datastack_create(), &ssl_set);
-	http_set.ssl = &ssl_set;
+	if (fail) {
+		settings_instance_free(&instance);
+		/* Convert the error into something readable by dropping
+		   out several prefixes and the http_client_ prefix from
+		   the setting name, so that it will match what was provided
+		   in the constructor.
+		*/
+		(void)str_begins(error,
+				 "http_client settings: Failed to override configuration from hardcoded: Invalid http_client_",
+				 &error);
+		return luaL_error(L, "Invalid HTTP client setting: %s", error);
+	}
 
-	client = http_client_init(&http_set);
 	dlua_push_http_client(L, client);
 	return 1;
 }

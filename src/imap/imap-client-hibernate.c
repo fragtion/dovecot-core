@@ -3,12 +3,14 @@
 #include "imap-common.h"
 #include "fdpass.h"
 #include "net.h"
+#include "istream.h"
 #include "ostream.h"
 #include "write-full.h"
 #include "base64.h"
 #include "str.h"
 #include "strescape.h"
 #include "master-service.h"
+#include "compression.h"
 #include "mailbox-watch.h"
 #include "imap-state.h"
 #include "imap-client.h"
@@ -19,6 +21,7 @@
 #define IMAP_HIBERNATE_SEND_TIMEOUT_SECS 10
 #define IMAP_HIBERNATE_HANDSHAKE "VERSION\timap-hibernate\t1\t0\n"
 
+#ifdef BUILD_IMAP_HIBERNATE
 static int
 imap_hibernate_handshake(int fd, const char *path, const char **error_r)
 {
@@ -55,7 +58,7 @@ static void imap_hibernate_write_cmd(struct client *client, string_t *cmd,
 
 	str_append_tabescaped(cmd, user->username);
 	str_append_c(cmd, '\t');
-	str_append_tabescaped(cmd, user->set->mail_log_prefix);
+	str_append_tabescaped(cmd, user->set->unexpanded_mail_log_prefix);
 	str_printfa(cmd, "\tidle_notify_interval=%u",
 		    client->set->imap_idle_notify_interval);
 	if (fstat(client->fd_in, &peer_st) == 0) {
@@ -79,6 +82,8 @@ static void imap_hibernate_write_cmd(struct client *client, string_t *cmd,
 		str_printfa(cmd, "\trip=%s", net_ip2addr(user->conn.remote_ip));
 	if (user->conn.remote_port != 0)
 		str_printfa(cmd, "\trport=%u", user->conn.remote_port);
+	if (client->multiplex_output != NULL)
+		str_append(cmd, "\tmultiplex_ostream");
 	if (client->userdb_fields != NULL) {
 		string_t *userdb_fields = t_str_new(256);
 		unsigned int i;
@@ -112,6 +117,27 @@ static void imap_hibernate_write_cmd(struct client *client, string_t *cmd,
 		str_append(cmd, "\tnotify_fd");
 	str_append(cmd, "\tstate=");
 	base64_encode(state->data, state->used, cmd);
+
+	/* For imap_logout_format statistics: */
+	str_printfa(cmd,
+		   "\tfetch_hdr_count=%u\tfetch_hdr_bytes=%"PRIu64
+		   "\tfetch_body_count=%u\tfetch_body_bytes=%"PRIu64
+		   "\tdeleted_count=%u\texpunged_count=%u\ttrashed_count=%u"
+		   "\tautoexpunged_count=%u\tappend_count=%u"
+		   "\tinput_bytes_extra=%"PRIuUOFF_T
+		   "\toutput_bytes_extra=%"PRIuUOFF_T,
+		   client->logout_stats.fetch_hdr_count,
+		   client->logout_stats.fetch_hdr_bytes,
+		   client->logout_stats.fetch_body_count,
+		   client->logout_stats.fetch_body_bytes,
+		   client->logout_stats.deleted_count,
+		   client->logout_stats.expunged_count,
+		   client->logout_stats.trashed_count,
+		   client->logout_stats.autoexpunged_count,
+		   client->logout_stats.append_count,
+		   i_stream_get_absolute_offset(client->input) + client->logout_stats.input_bytes_extra,
+		   client->output->offset + client->logout_stats.output_bytes_extra);
+
 	str_append_c(cmd, '\n');
 }
 
@@ -204,14 +230,11 @@ imap_hibernate_process_send(struct client *client, const buffer_t *state,
 	*fd_r = fd;
 	return 0;
 }
+#endif
 
 bool imap_client_hibernate(struct client **_client, const char **reason_r)
 {
 	struct client *client = *_client;
-	buffer_t *state;
-	const char *error;
-	int ret, fd_notify = -1, fd_hibernate = -1;
-
 	*reason_r = NULL;
 
 	if (client->fd_in != client->fd_out) {
@@ -219,6 +242,12 @@ bool imap_client_hibernate(struct client **_client, const char **reason_r)
 		*reason_r = "stdio clients can't be hibernated";
 		return FALSE;
 	}
+
+#ifdef BUILD_IMAP_HIBERNATE
+	buffer_t *state;
+	const char *error;
+	int ret, fd_notify = -1, fd_hibernate = -1;
+
 	if (o_stream_get_buffer_used_size(client->output) > 0) {
 		/* wait until we've sent the pending output to client */
 		*reason_r = "output pending to client";
@@ -291,4 +320,8 @@ bool imap_client_hibernate(struct client **_client, const char **reason_r)
 		net_disconnect(fd_hibernate);
 	buffer_free(&state);
 	return ret > 0;
+#else
+	*reason_r = "imap hibernation is not enabled";
+	return FALSE;
+#endif
 }

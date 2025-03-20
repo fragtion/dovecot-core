@@ -235,7 +235,7 @@ void io_loop_context_unref(struct ioloop_context **ctx);
    The ioloop context is a global state, so only a single context can be active
    at a time. The callbacks are guaranteed to be called only at their proper
    states, i.e. activate() callback is called only when switching from
-   no context to the active context, and deactive() is called only when
+   no context to the active context, and deactivate() is called only when
    switching from previously activated context into no context. No context is
    active at a time when the ioloop is destroyed. */
 void io_loop_context_add_callbacks(struct ioloop_context *ctx,
@@ -320,5 +320,11 @@ uint64_t io_loop_get_wait_usecs(struct ioloop *ioloop);
 /* Return all io conditions added for the given fd. This needs to scan through
    all the file ios in the ioloop. */
 enum io_condition io_loop_find_fd_conditions(struct ioloop *ioloop, int fd);
+
+#ifdef IOLOOP_KQUEUE
+void io_loop_recreate(struct ioloop *ioloop);
+#else
+#  define io_loop_recreate(x)
+#endif
 
 #endif

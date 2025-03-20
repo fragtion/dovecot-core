@@ -4,7 +4,7 @@ doveadm_moduledir = $(moduledir)/doveadm
 AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib \
 	-I$(top_srcdir)/src/lib-settings \
-	-I$(top_srcdir)/src/lib-fts \
+	-I$(top_srcdir)/src/lib-language \
 	-I$(top_srcdir)/src/lib-ssl-iostream \
 	-I$(top_srcdir)/src/lib-http \
 	-I$(top_srcdir)/src/lib-mail \
@@ -13,6 +13,7 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-storage \
 	-I$(top_srcdir)/src/lib-storage/index \
 	-I$(top_srcdir)/src/lib-doveadm \
+	-I$(top_srcdir)/src/lib-var-expand \
 	-I$(top_srcdir)/src/doveadm
 
 NOPLUGIN_LDFLAGS =
@@ -22,7 +23,7 @@ lib20_fts_plugin_la_LDFLAGS = -module -avoid-version
 module_LTLIBRARIES = \
 	lib20_fts_plugin.la
 
-lib20_fts_plugin_la_LIBADD = ../../lib-fts/libfts.la
+lib20_fts_plugin_la_LIBADD = ../../lib-language/libdovecot-language.la
 
 lib20_fts_plugin_la_SOURCES = \
 	fts-api.c \
@@ -36,6 +37,7 @@ lib20_fts_plugin_la_SOURCES = \
 	fts-search.c \
 	fts-search-args.c \
 	fts-search-serialize.c \
+	fts-settings.c \
 	fts-storage.c \
 	fts-user.c
 
@@ -43,6 +45,7 @@ pkginc_libdir=$(pkgincludedir)
 pkginc_lib_HEADERS = \
 	fts-api.h \
 	fts-api-private.h \
+	fts-settings.h \
 	fts-indexer.h \
 	fts-parser.h \
 	fts-storage.h \

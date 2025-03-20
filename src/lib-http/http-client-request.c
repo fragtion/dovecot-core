@@ -123,8 +123,32 @@ http_client_request_new(struct http_client *client, const char *method,
 				     EVENT_REASON_CODE);
 
 	/* Default to client-wide settings: */
-	req->max_attempts = client->set.max_attempts;
-	req->attempt_timeout_msecs = client->set.request_timeout_msecs;
+	req->max_attempts = client->set->request_max_attempts;
+	req->attempt_timeout_msecs = client->set->request_timeout_msecs;
+	if (strcasecmp(method, "GET") == 0 ||
+	    strcasecmp(method, "HEAD") == 0) {
+		if (client->set->read_request_max_attempts != 0)
+			req->max_attempts = client->set->read_request_max_attempts;
+		if (client->set->read_request_timeout_msecs != 0) {
+			req->attempt_timeout_msecs =
+				client->set->read_request_timeout_msecs;
+		}
+	} else if (strcasecmp(method, "PUT") == 0 ||
+		   strcasecmp(method, "POST") == 0) {
+		if (client->set->write_request_max_attempts != 0)
+			req->max_attempts = client->set->write_request_max_attempts;
+		if (client->set->write_request_timeout_msecs != 0) {
+			req->attempt_timeout_msecs =
+				client->set->write_request_timeout_msecs;
+		}
+	} else if (strcasecmp(method, "DELETE") == 0) {
+		if (client->set->delete_request_max_attempts != 0)
+			req->max_attempts = client->set->delete_request_max_attempts;
+		if (client->set->delete_request_timeout_msecs != 0) {
+			req->attempt_timeout_msecs =
+				client->set->delete_request_timeout_msecs;
+		}
+	}
 
 	req->state = HTTP_REQUEST_STATE_NEW;
 	return req;
@@ -243,7 +267,8 @@ void http_client_request_set_event(struct http_client_request *req,
 {
 	event_unref(&req->event);
 	req->event = event_create(event);
-	event_set_forced_debug(req->event, req->client->set.debug);
+	event_add_category(req->event, &event_category_http_client);
+	event_set_forced_debug(req->event, event_want_debug(req->client->event));
 	event_strlist_copy_recursive(req->event, event_get_global(),
 				     EVENT_REASON_CODE);
 	http_client_request_update_event(req);
@@ -287,14 +312,16 @@ void http_client_request_ref(struct http_client_request *req)
 bool http_client_request_unref(struct http_client_request **_req)
 {
 	struct http_client_request *req = *_req;
-	struct http_client *client = req->client;
 
-	i_assert(req->refcount > 0);
-
+	if (req == NULL)
+		return FALSE;
 	*_req = NULL;
 
+	i_assert(req->refcount > 0);
 	if (--req->refcount > 0)
 		return TRUE;
+
+	struct http_client *client = req->client;
 
 	if (client == NULL) {
 		e_debug(req->event, "Free (client already destroyed)");
@@ -535,6 +562,11 @@ const char *http_client_request_lookup_header(struct http_client_request *req,
 			 next_pos - value_pos - 2);
 }
 
+const char *http_client_request_retrieve_headers(struct http_client_request *req)
+{
+	return str_c(req->headers);
+}
+
 void http_client_request_set_date(struct http_client_request *req, time_t date)
 {
 	i_assert(req->state == HTTP_REQUEST_STATE_NEW ||
@@ -718,9 +750,9 @@ int http_client_request_delay_from_response(
 		return 0;  /* no delay */
 	if (retry_after < ioloop_time)
 		return 0;  /* delay already expired */
-	max = (req->client->set.max_auto_retry_delay_secs == 0 ?
+	max = (req->client->set->max_auto_retry_delay_secs == 0 ?
 	       req->attempt_timeout_msecs / 1000 :
-	       req->client->set.max_auto_retry_delay_secs);
+	       req->client->set->max_auto_retry_delay_secs);
 	if ((unsigned int)(retry_after - ioloop_time) > max)
 		return -1; /* delay too long */
 	req->release_time.tv_sec = retry_after;
@@ -762,7 +794,7 @@ void http_client_request_get_stats(struct http_client_request *req,
 				   struct http_client_request_stats *stats_r)
 {
 	struct http_client *client = req->client;
-	int diff_msecs;
+	long long diff_msecs;
 	uint64_t wait_usecs;
 
 	i_zero(stats_r);
@@ -894,10 +926,11 @@ static void http_client_request_do_submit(struct http_client_request *req)
 {
 	struct http_client *client = req->client;
 	struct http_client_host *host;
-	const char *proxy_socket_path = client->set.proxy_socket_path;
-	const struct http_url *proxy_url = client->set.proxy_url;
+	const char *proxy_socket_path = client->set->proxy_socket_path;
+	const struct http_url *proxy_url = client->set->parsed_proxy_url;
 	bool have_proxy =
-		((proxy_socket_path != NULL) || (proxy_url != NULL) ||
+		((proxy_socket_path != NULL && proxy_socket_path[0] != '\0') ||
+		 (proxy_url != NULL) ||
 		 (req->host_socket != NULL) || (req->host_url != NULL));
 	const char *authority, *target;
 
@@ -925,12 +958,13 @@ static void http_client_request_do_submit(struct http_client_request *req)
 			/* Specific normal proxy */
 			req->host_socket = NULL;
 		} else if (req->origin_url.have_ssl &&
-			   !client->set.no_ssl_tunnel &&
+			   client->set->proxy_ssl_tunnel &&
 			   !req->connect_tunnel) {
 			/* Tunnel to origin server */
 			req->host_url = &req->origin_url;
 			req->ssl_tunnel = TRUE;
-		} else if (proxy_socket_path != NULL) {
+		} else if (proxy_socket_path != NULL &&
+			   proxy_socket_path[0] != '\0') {
 			/* Proxy on unix socket */
 			req->host_socket = proxy_socket_path;
 			req->host_url = NULL;
@@ -972,10 +1006,10 @@ static void http_client_request_do_submit(struct http_client_request *req)
 			req->timeout_time = ioloop_timeval;
 			timeval_add_msecs(&req->timeout_time,
 					  req->timeout_msecs);
-		} else if (client->set.request_absolute_timeout_msecs > 0) {
+		} else if (client->set->request_absolute_timeout_msecs > 0) {
 			req->timeout_time = ioloop_timeval;
 			timeval_add_msecs(&req->timeout_time,
-				client->set.request_absolute_timeout_msecs);
+				client->set->request_absolute_timeout_msecs);
 		}
 	}
 
@@ -1155,8 +1189,8 @@ http_client_request_continue_payload(struct http_client_request **_req,
 		prev_ioloop = current_ioloop;
 		client_ioloop = io_loop_create();
 		prev_client_ioloop = http_client_switch_ioloop(client);
-		if (client->set.dns_client != NULL)
-			dns_client_switch_ioloop(client->set.dns_client);
+		if (client->dns_client != NULL)
+			dns_client_switch_ioloop(client->dns_client);
 
 		client->waiting = TRUE;
 		while (req->state < HTTP_REQUEST_STATE_PAYLOAD_IN) {
@@ -1170,7 +1204,8 @@ http_client_request_continue_payload(struct http_client_request **_req,
 			io_loop_run(client_ioloop);
 
 			if (req->state == HTTP_REQUEST_STATE_PAYLOAD_OUT &&
-				req->payload_input->eof) {
+			    req->payload_input != NULL &&
+			    req->payload_input->eof) {
 				i_stream_unref(&req->payload_input);
 				req->payload_input = NULL;
 				break;
@@ -1183,8 +1218,8 @@ http_client_request_continue_payload(struct http_client_request **_req,
 		else
 			io_loop_set_current(prev_ioloop);
 		(void)http_client_switch_ioloop(client);
-		if (client->set.dns_client != NULL)
-			dns_client_switch_ioloop(client->set.dns_client);
+		if (client->dns_client != NULL)
+			dns_client_switch_ioloop(client->dns_client);
 		io_loop_set_current(client_ioloop);
 		io_loop_destroy(&client_ioloop);
 	}
@@ -1359,7 +1394,7 @@ int http_client_request_send_more(struct http_client_request *req,
 static int
 http_client_request_send_real(struct http_client_request *req, bool pipelined)
 {
-	const struct http_client_settings *set = &req->client->set;
+	const struct http_client_settings *set = req->client->set;
 	struct http_client_connection *conn = req->conn;
 	string_t *rtext = t_str_new(256);
 	struct const_iovec iov[3];
@@ -1398,7 +1433,8 @@ http_client_request_send_real(struct http_client_request *req, bool pipelined)
 		str_append(rtext, "\r\n");
 	}
 	if (http_client_request_to_proxy(req) &&
-		set->proxy_username != NULL && set->proxy_password != NULL) {
+	    set->proxy_username != NULL && set->proxy_username[0] != '\0' &&
+	    set->proxy_password != NULL) {
 		struct http_auth_credentials auth_creds;
 
 		http_auth_basic_credentials_init(&auth_creds,
@@ -1408,9 +1444,10 @@ http_client_request_send_real(struct http_client_request *req, bool pipelined)
 		http_auth_create_credentials(rtext, &auth_creds);
 		str_append(rtext, "\r\n");
 	}
-	if (!req->have_hdr_user_agent && req->client->set.user_agent != NULL) {
+	if (!req->have_hdr_user_agent && req->client->set->user_agent != NULL &&
+	    req->client->set->user_agent[0] != '\0') {
 		str_printfa(rtext, "User-Agent: %s\r\n",
-			    req->client->set.user_agent);
+			    req->client->set->user_agent);
 	}
 	if (!req->have_hdr_expect && req->payload_sync) {
 		str_append(rtext, "Expect: 100-continue\r\n");
@@ -1525,6 +1562,119 @@ int http_client_request_send(struct http_client_request *req, bool pipelined)
 	return ret;
 }
 
+static const char *
+http_client_request_add_event_headers(struct http_client_request *req,
+				      const struct http_response *response)
+{
+	if (req->event_headers == NULL)
+		return "";
+
+	string_t *str = t_str_new(128);
+	for (unsigned int i = 0; req->event_headers[i] != NULL; i++) {
+		const char *hdr_name = req->event_headers[i];
+		const char *value =
+			http_response_header_get(response, hdr_name);
+
+		if (value == NULL)
+			continue;
+
+		str_append(str, str_len(str) == 0 ? " (" : ", ");
+		event_add_str(req->event,
+			      t_strconcat("http_hdr_", hdr_name, NULL), value);
+		str_printfa(str, "%s:%s", hdr_name, value);
+	}
+	if (str_len(str) > 0)
+		str_append_c(str, ')');
+	return str_c(str);
+}
+
+static int
+http_client_request_1xx_response(struct http_client_request *req,
+				 struct http_response *resp)
+{
+	struct http_client_connection *conn = req->conn;
+
+	/* RFC 7231, Section 6.2:
+
+	   A client MUST be able to parse one or more 1xx responses received
+	   prior to a final response, even if the client does not expect one.
+	   A user agent MAY ignore unexpected 1xx responses.
+	 */
+
+	if (req->payload_sync && resp->status == 100) {
+		struct http_client_peer_shared *pshared = conn->ppool->peer;
+
+		if (req->payload_sync_continue) {
+			e_debug(req->event,
+				"Got 100-continue response after timeout");
+			return 0;
+		}
+
+		pshared->no_payload_sync = FALSE;
+		pshared->seen_100_response = TRUE;
+		req->payload_sync_continue = TRUE;
+
+		e_debug(req->event,
+			"Got expected 100-continue response");
+
+		if (req->state == HTTP_REQUEST_STATE_ABORTED) {
+			e_debug(req->event,
+				"Request aborted before sending payload was complete.");
+			http_client_connection_close(&conn);
+			return -1;
+		}
+
+		i_assert(conn->output_locked);
+		if (conn->conn.output != NULL)
+			o_stream_set_flush_pending(conn->conn.output, TRUE);
+		return -1;
+	}
+
+	/* Ignore other 1xx for now */
+	e_debug(req->event,
+		"Got unexpected %u response; ignoring", resp->status);
+	return 0;
+}
+
+int http_client_request_check_response(struct http_client_request *req,
+				       struct http_response *resp,
+				       bool *early_r)
+{
+	struct http_client_connection *conn = req->conn;
+
+	if (resp->status / 100 == 1)
+		return http_client_request_1xx_response(req, resp);
+	if (!req->payload_sync && !req->payload_finished &&
+	    req->state == HTTP_REQUEST_STATE_PAYLOAD_OUT) {
+		/* Got early response from server while we're still sending
+		   request payload. we cannot recover from this reliably, so we
+		   stop sending payload and close the connection once the
+		   response is processed */
+		e_debug(req->event,
+			"Got early input from server; "
+			"request payload not completely sent "
+			"(will close connection)");
+		o_stream_unset_flush_callback(conn->conn.output);
+		conn->output_broken = *early_r = TRUE;
+	}
+
+	const char *suffix =
+		http_client_request_add_event_headers(req, resp);
+	e_debug(req->event,
+		"Got %u response: %s%s (took %lld ms + %lld ms in queue)",
+		resp->status, resp->reason, suffix,
+		timeval_diff_msecs(&req->response_time, &req->sent_time),
+		timeval_diff_msecs(&req->sent_time, &req->submit_time));
+
+	/* Make sure connection output is unlocked if 100-continue failed */
+	if (req->payload_sync && !req->payload_sync_continue &&
+	    array_count(&conn->request_wait_list) == 1) {
+		e_debug(req->event, "Unlocked output");
+		conn->output_locked = FALSE;
+	}
+	return 1;
+}
+
 bool http_client_request_callback(struct http_client_request *req,
 				  struct http_response *response)
 {
@@ -1543,11 +1693,11 @@ bool http_client_request_callback(struct http_client_request *req,
 		struct http_response response_copy = *response;
 
 		if (req->attempts > 0 && !req->preserve_exact_reason) {
-			unsigned int total_msecs =
+			long long total_msecs =
 				timeval_diff_msecs(&ioloop_timeval,
 						   &req->submit_time);
 			response_copy.reason = t_strdup_printf(
-				"%s (%u retries in %u.%03u secs)",
+				"%s (%u retries in %lld.%03lld secs)",
 				response_copy.reason, req->attempts,
 				total_msecs/1000, total_msecs%1000);
 		}
@@ -1632,6 +1782,8 @@ void http_client_request_error(struct http_client_request **_req,
 
 	*_req = NULL;
 
+	if (req->state >= HTTP_REQUEST_STATE_ABORTED)
+		return;
 	i_assert(req->delayed_error_status == 0);
 	i_assert(req->state < HTTP_REQUEST_STATE_FINISHED);
 
@@ -1772,15 +1924,15 @@ void http_client_request_redirect(struct http_client_request *req,
 		return;
 	}
 
-	i_assert(req->redirects <= req->client->set.max_redirects);
-	if (++req->redirects > req->client->set.max_redirects) {
-		if (req->client->set.max_redirects > 0) {
+	i_assert(req->redirects <= req->client->set->request_max_redirects);
+	if (++req->redirects > req->client->set->request_max_redirects) {
+		if (req->client->set->request_max_redirects > 0) {
 			http_client_request_error(
 				&req,
 				HTTP_CLIENT_REQUEST_ERROR_INVALID_REDIRECT,
 				t_strdup_printf(
 					"Redirected more than %d times",
-					req->client->set.max_redirects));
+					req->client->set->request_max_redirects));
 		} else {
 			http_client_request_error(
 				&req,
@@ -1862,7 +2014,7 @@ void http_client_request_resubmit(struct http_client_request *req)
 void http_client_request_retry(struct http_client_request *req,
 			       unsigned int status, const char *error)
 {
-	if (req->client == NULL || req->client->set.no_auto_retry ||
+	if (req->client == NULL || !req->client->set->auto_retry ||
 	    !http_client_request_try_retry(req))
 		http_client_request_error(&req, status, error);
 }

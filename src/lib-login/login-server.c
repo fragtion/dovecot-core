@@ -12,6 +12,7 @@
 #include "master-service-private.h"
 #include "login-server.h"
 #include "login-server-auth.h"
+#include "doc.h"
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -130,7 +131,7 @@ login_server_event_log_callback(struct login_server_connection *conn,
 			        const char *message)
 {
 	string_t *str = t_str_new(128);
-	str_printfa(str, "%s (connection created %d msecs ago", message,
+	str_printfa(str, "%s (connection created %lld msecs ago", message,
 		timeval_diff_msecs(&ioloop_timeval, &conn->create_time));
 	if (conn->requests != NULL) {
 		struct login_server_request *request = conn->requests;
@@ -138,7 +139,7 @@ login_server_event_log_callback(struct login_server_connection *conn,
 		str_append(str, ", ");
 		if (request->next != NULL)
 			str_printfa(str, "%u requests, first ", conn->refcount-1);
-		str_printfa(str, "request created %d msecs ago: ",
+		str_printfa(str, "request created %lld msecs ago: ",
 			    timeval_diff_msecs(&ioloop_timeval,
 					       &request->create_time));
 		str_printfa(str, "session=%s, rip=%s, auth_pid=%ld, "
@@ -151,7 +152,7 @@ login_server_event_log_callback(struct login_server_connection *conn,
 		if (request->postlogin_request != NULL) {
 			struct login_server_postlogin *pl =
 				request->postlogin_request;
-			str_printfa(str, ", post-login script %s started %d msecs ago",
+			str_printfa(str, ", post-login script %s started %lld msecs ago",
 				    pl->socket_path,
 				    timeval_diff_msecs(&ioloop_timeval,
 						       &pl->create_time));
@@ -267,7 +268,7 @@ static void login_server_auth_finish(struct login_server_request *request,
 	bool close_sockets;
 
 	close_sockets = service->master_status.available_count == 0 &&
-		service->service_count_left == 1;
+		service->restart_request_count_left == 1;
 
 	request->conn->login_success = TRUE;
 	server->callback(request, auth_args[0], auth_args+1);
@@ -375,7 +376,7 @@ static int login_server_postlogin(struct login_server_request *request,
 	if (fd == -1) {
 		e_error(request->conn->event, "net_connect_unix(%s) failed: %m%s",
 			   socket_path, errno != EAGAIN ? "" :
-			   " - https://doc.dovecot.org/admin_manual/errors/socket_unavailable/");
+			   " - " DOC_LINK("core/admin/errors.html#unix-socket-resource-temporarily-unavailable"));
 		return -1;
 	}
 
@@ -492,7 +493,8 @@ static void login_server_conn_input(struct login_server_connection *conn)
 	struct login_server_request *request;
 	struct login_server *server = conn->server;
 	unsigned char data[LOGIN_REQUEST_MAX_DATA_SIZE];
-	size_t i, session_len = 0;
+	unsigned char *ptr;
+	char *session_id;
 	int ret, client_fd;
 
 	ret = login_server_conn_read_request(conn, &req, data, &client_fd);
@@ -506,25 +508,29 @@ static void login_server_conn_input(struct login_server_connection *conn)
 	}
 	fd_close_on_exec(client_fd, TRUE);
 
-	/* extract the session ID from the request data */
-	for (i = 0; i < req.data_size; i++) {
-		if (data[i] == '\0') {
-			session_len = i++;
-			break;
-		}
+	/* lookup session ID */
+	if ((ptr = memchr(data, '\0', req.data_size)) != NULL) {
+		session_id = i_strdup_until(data, ptr);
+		ptr++;
+		req.data_size -= ptr - data; /* include NUL */
+	} else {
+		ptr = data;
+		session_id = i_strdup("");
 	}
+
 	io_loop_time_refresh();
 
 	/* @UNSAFE: we have a request. do userdb lookup for it. */
-	req.data_size -= i;
 	request = i_malloc(MALLOC_ADD(sizeof(struct login_server_request),
 				      req.data_size));
 	request->create_time = ioloop_timeval;
 	request->conn = conn;
 	request->fd = client_fd;
+	request->session_id = session_id;
+
+	if (req.data_size > 0)
+		memcpy(request->data, ptr, req.data_size);
 	request->auth_req = req;
-	request->session_id = i_strndup(data, session_len);
-	memcpy(request->data, data+i, req.data_size);
 	conn->refcount++;
 	DLLIST_PREPEND(&conn->requests, request);
 	login_server_proctitle_refresh(conn->server);

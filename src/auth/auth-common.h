@@ -3,6 +3,7 @@
 
 #include "lib.h"
 #include "auth.h"
+#include "connection.h"
 
 extern bool worker, worker_restart_request;
 extern time_t process_start_time;
@@ -12,6 +13,6 @@ extern struct event *auth_event;
 
 void auth_refresh_proctitle(void);
 void auth_worker_refresh_proctitle(const char *state);
-void auth_module_load(const char *names);
+void auth_module_load(const char *name);
 
 #endif

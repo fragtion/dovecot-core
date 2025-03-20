@@ -10,6 +10,7 @@
 #include "istream.h"
 #include "ostream.h"
 #include "connection.h"
+#include "settings.h"
 #include "dns-lookup.h"
 #include "iostream-rawlog.h"
 #include "iostream-ssl.h"
@@ -38,8 +39,8 @@ struct smtp_server *smtp_server_init(const struct smtp_server_settings *set)
 	server->set.rawlog_dir = p_strdup_empty(pool, set->rawlog_dir);
 
 	if (set->ssl != NULL) {
-		server->set.ssl =
-			ssl_iostream_settings_dup(server->pool, set->ssl);
+		server->set.ssl = set->ssl;
+		pool_ref(server->set.ssl->pool);
 	}
 
 	if (set->hostname != NULL && *set->hostname != '\0')
@@ -113,8 +114,7 @@ void smtp_server_deinit(struct smtp_server **_server)
 
 	connection_list_deinit(&server->conn_list);
 
-	if (server->ssl_ctx != NULL)
-		ssl_iostream_context_unref(&server->ssl_ctx);
+	settings_free(server->set.ssl);
 	event_unref(&server->event);
 	pool_unref(&server->pool);
 	*_server = NULL;
@@ -134,20 +134,4 @@ void smtp_server_switch_ioloop(struct smtp_server *server)
 
 		smtp_server_connection_switch_ioloop(conn);
 	}
-}
-
-int smtp_server_init_ssl_ctx(struct smtp_server *server, const char **error_r)
-{
-	const char *error;
-
-	if (server->ssl_ctx != NULL || server->set.ssl == NULL)
-		return 0;
-
-	if (ssl_iostream_server_context_cache_get(server->set.ssl,
-		&server->ssl_ctx, &error) < 0) {
-		*error_r = t_strdup_printf("Couldn't initialize SSL context: %s",
-					   error);
-		return -1;
-	}
-	return 0;
 }

@@ -14,6 +14,7 @@
 #include "safe-mkstemp.h"
 #include "base64.h"
 #include "str.h"
+#include "settings.h"
 #include "dns-lookup.h"
 #include "pop3c-client.h"
 
@@ -58,7 +59,6 @@ struct pop3c_client {
 	pool_t pool;
 	struct event *event;
 	struct pop3c_client_settings set;
-	struct ssl_iostream_context *ssl_ctx;
 	struct ip_addr ip;
 
 	int fd;
@@ -95,7 +95,6 @@ pop3c_client_init(const struct pop3c_client_settings *set,
 		  struct event *event_parent)
 {
 	struct pop3c_client *client;
-	const char *error;
 	pool_t pool;
 
 	pool = pool_alloconly_create("pop3c client", 1024);
@@ -118,17 +117,7 @@ pop3c_client_init(const struct pop3c_client_settings *set,
 	client->set.temp_path_prefix = p_strdup(pool, set->temp_path_prefix);
 	client->set.rawlog_dir = p_strdup(pool, set->rawlog_dir);
 	client->set.ssl_mode = set->ssl_mode;
-
-	if (set->ssl_mode != POP3C_CLIENT_SSL_MODE_NONE) {
-		ssl_iostream_settings_init_from(client->pool, &client->set.ssl_set, &set->ssl_set);
-		client->set.ssl_set.verbose_invalid_cert = !client->set.ssl_set.allow_invalid_cert;
-		if (ssl_iostream_client_context_cache_get(&set->ssl_set,
-							  &client->ssl_ctx,
-							  &error) < 0) {
-			e_error(client->event,
-				"Couldn't initialize SSL context: %s", error);
-		}
-	}
+	client->set.ssl_allow_invalid_cert = set->ssl_allow_invalid_cert;
 	return client;
 }
 
@@ -213,8 +202,6 @@ void pop3c_client_deinit(struct pop3c_client **_client)
 	struct pop3c_client *client = *_client;
 
 	pop3c_client_disconnect(client);
-	if (client->ssl_ctx != NULL)
-		ssl_iostream_context_unref(&client->ssl_ctx);
 	event_unref(&client->event);
 	pool_unref(&client->pool);
 }
@@ -539,7 +526,7 @@ static int pop3c_client_ssl_handshaked(const char **error_r, void *context)
 					     client->set.host, &error) == 0) {
 		e_debug(client->event, "SSL handshake successful");
 		return 0;
-	} else if (client->set.ssl_set.allow_invalid_cert) {
+	} else if (ssl_iostream_get_allow_invalid_cert(client->ssl_iostream)) {
 		e_debug(client->event,
 			"SSL handshake successful, "
 			"ignoring invalid certificate: %s",
@@ -555,11 +542,6 @@ static int pop3c_client_ssl_init(struct pop3c_client *client)
 {
 	const char *error;
 
-	if (client->ssl_ctx == NULL) {
-		e_error(client->event, "No SSL context");
-		return -1;
-	}
-
 	e_debug(client->event, "Starting SSL handshake");
 
 	if (client->raw_input != client->input) {
@@ -572,10 +554,20 @@ static int pop3c_client_ssl_init(struct pop3c_client *client)
 		client->output = client->raw_output;
 	}
 
-	if (io_stream_create_ssl_client(client->ssl_ctx, client->set.host,
-					&client->set.ssl_set, client->event,
-					&client->input, &client->output,
-					&client->ssl_iostream, &error) < 0) {
+	enum ssl_iostream_flags ssl_flags = 0;
+	if (client->set.ssl_allow_invalid_cert)
+		ssl_flags |= SSL_IOSTREAM_FLAG_ALLOW_INVALID_CERT;
+	const struct ssl_iostream_client_autocreate_parameters parameters = {
+		.event_parent = client->event,
+		.host = client->set.host,
+		.flags = ssl_flags,
+		.application_protocols = (const char *const[]) {
+			"pop3", NULL
+		},
+	};
+	if (io_stream_autocreate_ssl_client(&parameters,
+					    &client->input, &client->output,
+					    &client->ssl_iostream, &error) < 0) {
 		e_error(client->event,
 			"Couldn't initialize SSL client: %s", error);
 		return -1;
@@ -648,6 +640,9 @@ static void
 pop3c_dns_callback(const struct dns_lookup_result *result,
 		   struct pop3c_client *client)
 {
+	/* We ended up here because dns_lookup_abort() was used */
+	if (result->ret == EAI_CANCELED)
+		return;
 	client->dns_lookup = NULL;
 
 	if (result->ret != 0) {
@@ -881,7 +876,8 @@ pop3c_client_cmd_stream_async(struct pop3c_client *client, const char *cmdline,
 	cmd = pop3c_client_cmd_line_async(client, cmdline, callback, context);
 
 	input = i_stream_create_chain(&cmd->chain, POP3C_MAX_INBUF_SIZE);
-	inputs[0] = i_stream_create_dot(input, TRUE);
+	inputs[0] = i_stream_create_dot(input, ISTREAM_DOT_NO_TRIM |
+					       ISTREAM_DOT_LOOSE_EOT);
 	inputs[1] = NULL;
 	cmd->input = i_stream_create_seekable(inputs, POP3C_MAX_INBUF_SIZE,
 					      seekable_fd_callback, client);

@@ -4,6 +4,7 @@
 #include "array.h"
 #include "str.h"
 #include "dict.h"
+#include "settings.h"
 #include "mail-user.h"
 #include "mail-namespace.h"
 #include "acl-api-private.h"
@@ -34,31 +35,20 @@ struct acl_lookup_dict_iter {
 	bool failed:1;
 };
 
-struct acl_lookup_dict *acl_lookup_dict_init(struct mail_user *user)
+int acl_lookup_dict_init(struct mail_user *user, struct acl_lookup_dict **dict_r,
+			 const char **error_r)
 {
 	struct acl_lookup_dict *dict;
-	const char *uri, *error;
 
 	dict = i_new(struct acl_lookup_dict, 1);
 	dict->user = user;
 	dict->event = event_create(user->event);
+	*dict_r = dict;
+
 	event_add_category(dict->event, &event_category_acl);
 	event_set_append_log_prefix(dict->event, "acl: ");
-
-	uri = mail_user_plugin_getenv(user, "acl_shared_dict");
-	if (uri != NULL) {
-		struct dict_settings dict_set;
-
-		i_zero(&dict_set);
-		dict_set.base_dir = user->set->base_dir;
-		dict_set.event_parent = user->event;
-		if (dict_init(uri, &dict_set, &dict->dict, &error) < 0)
-			e_error(dict->event, "dict_init(%s) failed: %s", uri, error);
-	} else {
-		e_debug(dict->event, "No acl_shared_dict setting - "
-			"shared mailbox listing is disabled");
-	}
-	return dict;
+	settings_event_add_filter_name(dict->event, "acl_sharing_map");
+	return dict_init_auto(dict->event, &dict->dict, error_r);
 }
 
 void acl_lookup_dict_deinit(struct acl_lookup_dict **_dict)
@@ -111,7 +101,6 @@ acl_rights_is_same_user(const struct acl_rights *right, struct mail_user *user)
 static int acl_lookup_dict_rebuild_add_backend(struct mail_namespace *ns,
 					       ARRAY_TYPE(const_string) *ids)
 {
-	struct acl_mailbox_list *alist = ACL_LIST_CONTEXT(ns->list);
 	struct acl_backend *backend;
 	struct acl_mailbox_list_context *ctx;
 	struct acl_object *aclobj;
@@ -122,11 +111,14 @@ static int acl_lookup_dict_rebuild_add_backend(struct mail_namespace *ns,
 	int ret = 0;
 
 	if ((ns->flags & NAMESPACE_FLAG_NOACL) != 0 || ns->owner == NULL ||
-	    alist == NULL || alist->ignore_acls)
+	    ACL_LIST_CONTEXT(ns->list) == NULL)
+		return 0;
+
+	backend = acl_mailbox_list_get_backend(ns->list);
+	if (backend->set->acl_ignore)
 		return 0;
 
 	id = t_str_new(128);
-	backend = acl_mailbox_list_get_backend(ns->list);
 	ctx = acl_backend_nonowner_lookups_iter_init(backend);
 	while (acl_backend_nonowner_lookups_iter_next(ctx, &name)) {
 		aclobj = acl_object_init_from_name(backend, name);
@@ -308,12 +300,12 @@ static void acl_lookup_dict_iterate_read(struct acl_lookup_dict_iter *iter)
 }
 
 struct acl_lookup_dict_iter *
-acl_lookup_dict_iterate_visible_init(struct acl_lookup_dict *dict)
+acl_lookup_dict_iterate_visible_init(struct acl_lookup_dict *dict,
+				     const ARRAY_TYPE(const_string) *groups)
 {
 	struct acl_user *auser = ACL_USER_CONTEXT(dict->user);
 	struct acl_lookup_dict_iter *iter;
 	const char *id;
-	unsigned int i;
 	pool_t pool;
 
 	i_assert(auser != NULL);
@@ -334,9 +326,10 @@ acl_lookup_dict_iterate_visible_init(struct acl_lookup_dict *dict)
 		pool_alloconly_create("acl lookup dict iter values", 1024);
 
 	/* get all groups we belong to */
-	if (auser->groups != NULL) {
-		for (i = 0; auser->groups[i] != NULL; i++) {
-			id = p_strconcat(pool, "group/", auser->groups[i],
+	if (array_is_created(groups)) {
+		const char *group;
+		array_foreach_elem(groups, group) {
+			id = p_strconcat(pool, "group/", group,
 					 NULL);
 			array_push_back(&iter->iter_ids, &id);
 		}

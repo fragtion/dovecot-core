@@ -1,6 +1,7 @@
 /* Copyright (c) 2019 Dovecot authors, see the included COPYING file */
 
 #include "test-stats-common.h"
+#include "settings.h"
 #include <time.h>
 #include <unistd.h>
 
@@ -17,28 +18,35 @@ pool_t test_pool;
 struct stats_metrics *stats_metrics = NULL;
 time_t stats_startup_time;
 
+static struct stats_settings *stats_set;
+static struct settings_root *set_root;
 static bool callback_added = FALSE;
 
-static struct stats_settings *read_settings(const char *const settings[])
+static struct stats_settings *read_settings(const char *const settings[],
+					    struct event **event_r)
 {
 	const char *error;
-	struct setting_parser_context *ctx =
-		settings_parser_init(test_pool, &stats_setting_parser_info, 0);
+
+	set_root = settings_root_init();
 	for (unsigned int i = 0; settings[i] != NULL; i++) {
-		if (settings_parse_line(ctx, settings[i]) <= 0)
-			i_fatal("Failed to parse settings: %s",
-				settings_parser_get_error(ctx));
+		const char *key, *value;
+		t_split_key_value_eq(settings[i], &key, &value);
+		settings_root_override(set_root, key, value,
+				       SETTINGS_OVERRIDE_TYPE_CODE);
 	}
-	if (!settings_parser_check(ctx, test_pool, &error))
-		i_fatal("Failed to parse settings: %s",
-			error);
-	struct stats_settings *set = settings_parser_get(ctx);
-	settings_parser_unref(&ctx);
+	struct stats_settings *set;
+	struct event *event = event_create(NULL);
+	event_set_ptr(event, SETTINGS_EVENT_ROOT, set_root);
+	if (settings_get(event, &stats_setting_parser_info, 0, &set, &error) < 0)
+		i_fatal("%s", error);
+	*event_r = event;
 	return set;
 }
 
 void test_init(const char *const settings_blob[])
 {
+	const char *error;
+
 	if (!callback_added) {
 		event_register_callback(test_stats_callback);
 		callback_added = TRUE;
@@ -52,13 +60,19 @@ void test_init(const char *const settings_blob[])
 	stats_event_category_register(test_category.name, NULL);
 	stats_event_category_register(child_test_category.name,
 				      &test_category);
-	struct stats_settings *set = read_settings(settings_blob);
-	stats_metrics = stats_metrics_init(set);
+
+	struct event *event;
+	stats_set = read_settings(settings_blob, &event);
+	if (stats_metrics_init(event, stats_set, &stats_metrics, &error) < 0)
+		i_fatal("%s", error);
+	event_unref(&event);
 }
 
 void test_deinit(void)
 {
 	stats_metrics_deinit(&stats_metrics);
+	settings_free(stats_set);
+	settings_root_deinit(&set_root);
 	stats_event_categories_deinit();
 	pool_unref(&test_pool);
 }

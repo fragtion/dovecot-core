@@ -8,6 +8,7 @@
 #include "safe-mkstemp.h"
 #include "test-common.h"
 #include "unlink-directory.h"
+#include "settings.h"
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -28,13 +29,23 @@ static void test_fs_posix(void)
 	int ret;
 	const char *error;
 	struct fs *fs;
-	struct fs_settings fs_set;
+	struct fs_parameters fs_params;
 
 	test_begin("test-fs-posix filesystem");
-	i_zero(&fs_set);
-	ret = fs_init("posix", t_strdup_printf("prefix=%s/", testdir), &fs_set, &fs, &error);
-	test_out_quiet("fs_init() failed", ret >= 0);
-	if (ret < 0) {
+	i_zero(&fs_params);
+
+	const char *const settings[] = {
+		"fs", "posix",
+		"fs/posix/fs_driver", "posix",
+		"fs_posix_prefix", t_strconcat(testdir, "/", NULL),
+		NULL
+	};
+	struct settings_simple test_set;
+	settings_simple_init(&test_set, settings);
+	ret = fs_init_auto(test_set.event, &fs_params, &fs, &error);
+	test_out_quiet("fs_init() failed", ret > 0);
+	if (ret <= 0) {
+		settings_simple_deinit(&test_set);
 		test_end();
 		goto error_no_fs;
 	}
@@ -126,6 +137,7 @@ static void test_fs_posix(void)
 	test_end();
 
 	fs_deinit(&fs);
+	settings_simple_deinit(&test_set);
 
 error_no_fs:
 	if (unlink_directory(testdir, UNLINK_DIRECTORY_FLAG_RMDIR, &unlink_err) < 0)

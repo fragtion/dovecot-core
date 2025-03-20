@@ -4,15 +4,12 @@
 #include "auth.h"
 #include "str.h"
 #include "ioloop.h"
+#include "master-service.h"
 #include "auth-common.h"
 #include "auth-request.h"
 #include "auth-request-handler-private.h"
 #include "auth-settings.h"
 #include "mech-digest-md5-private.h"
-#include "otp.h"
-#include "mech-otp-common.h"
-#include "settings-parser.h"
-#include "password-scheme.h"
 #include "auth-token.h"
 
 #include <unistd.h>
@@ -24,7 +21,6 @@ extern const struct mech_module mech_anonymous;
 extern const struct mech_module mech_apop;
 extern const struct mech_module mech_cram_md5;
 extern const struct mech_module mech_digest_md5;
-extern const struct mech_module mech_dovecot_token;
 extern const struct mech_module mech_external;
 extern const struct mech_module mech_login;
 extern const struct mech_module mech_oauthbearer;
@@ -33,9 +29,6 @@ extern const struct mech_module mech_plain;
 extern const struct mech_module mech_scram_sha1;
 extern const struct mech_module mech_scram_sha256;
 extern const struct mech_module mech_xoauth2;
-
-static struct auth_settings set;
-static struct mechanisms_register *mech_reg;
 
 struct test_case {
 	const struct mech_module *mech;
@@ -54,6 +47,7 @@ verify_plain_continue_mock_callback(struct auth_request *request,
 {
 	request->passdb_success = TRUE;
 	callback(PASSDB_RESULT_OK, request);
+	io_loop_stop(current_ioloop);
 }
 
 static void
@@ -87,68 +81,32 @@ auth_client_request_mock_callback(const char *reply ATTR_UNUSED,
 {
 }
 
-static void test_mechs_init(void)
-{
-	const char *const services[] = {NULL};
-	process_start_time = time(NULL);
-
-	/* Copy default settings */
-	set = *(const struct auth_settings *)auth_setting_parser_info.defaults;
-	global_auth_settings = &set;
-	global_auth_settings->base_dir = ".";
-	memset((&set)->username_chars_map, 1, sizeof((&set)->username_chars_map));
-	set.username_format = "";
-
-	t_array_init(&set.passdbs, 2);
-	struct auth_passdb_settings *mock_set = t_new(struct auth_passdb_settings, 1);
-	*mock_set = mock_passdb_set;
-	array_push_back(&set.passdbs, &mock_set);
-	mock_set = t_new(struct auth_passdb_settings, 1);
-	*mock_set = mock_passdb_set;
-	mock_set->master = TRUE;
-	array_push_back(&set.passdbs, &mock_set);
-	t_array_init(&set.userdbs, 1);
-
-	/* For tests of digest-md5. */
-	set.realms_arr = t_strsplit_spaces("example.com ", " ");
-	/* For tests of mech-anonymous. */
-	set.anonymous_username = "anonuser";
-
-	mech_init(global_auth_settings);
-	mech_reg = mech_register_init(global_auth_settings);
-	passdbs_init();
-	userdbs_init();
-	passdb_mock_mod_init();
-	password_schemes_init();
-	password_schemes_allow_weak(TRUE);
-
-	auths_preinit(&set, pool_datastack_create(), mech_reg, services);
-	auths_init();
-	auth_token_init();
-}
-
 static void test_mech_prepare_request(struct auth_request **request_r,
 				      const struct mech_module *mech,
 				      struct auth_request_handler *handler,
 				      unsigned int running_test,
 				      const struct test_case *test_case)
 {
-	global_auth_settings->ssl_username_from_cert = test_case->set_cert_username;
-	struct auth *auth = auth_default_service();
+	struct auth *auth = auth_default_protocol();
 
 	struct auth_request *request = auth_request_new(mech,  NULL);
+	struct auth_settings *new_set =
+		p_memdup(request->pool, global_auth_settings,
+			 sizeof(*global_auth_settings));
+	new_set->ssl_username_from_cert = test_case->set_cert_username;
+
 	request->handler = handler;
 	request->id = running_test+1;
 	request->mech_password = NULL;
 	request->state = AUTH_REQUEST_STATE_NEW;
-	request->set = global_auth_settings;
+	request->set = new_set;
+	request->protocol_set = global_auth_settings;
 	request->connect_uid = running_test;
 	request->passdb = auth->passdbs;
 	request->userdb = auth->userdbs;
 	handler->refcount = 1;
 
-	auth_fields_add(request->fields.extra_fields, "nodelay", "", 0);
-	auth_request_ref(request);
+	request->failure_nodelay = TRUE;
 	auth_request_state_count[AUTH_REQUEST_STATE_NEW] = 1;
 
 	if (test_case->set_username_before_test || test_case->set_cert_username)
@@ -254,7 +212,7 @@ static void test_mechs(void)
 		{&mech_apop, UCHAR_LEN("1.1.1\0testuser\0tooshort"), NULL, NULL, FALSE, FALSE, FALSE},
 		{&mech_apop, UCHAR_LEN("1.1.1\0testuser\0responseoflen16-"), NULL, NULL, FALSE, FALSE, FALSE},
 		{&mech_apop, UCHAR_LEN("1.1.1"), NULL, NULL, FALSE, FALSE, FALSE},
-		{&mech_otp, UCHAR_LEN("somebody\0testuser"), "testuser", "otp(testuser): unsupported response type", FALSE, TRUE, FALSE},
+		{&mech_otp, UCHAR_LEN("somebody\0testuser"), "testuser", "unsupported response type", FALSE, TRUE, FALSE},
 		{&mech_cram_md5, UCHAR_LEN("testuser\0response"), "testuser", NULL, FALSE, FALSE, FALSE},
 		{&mech_plain, UCHAR_LEN("testuser\0"), "testuser", NULL, FALSE, FALSE, FALSE},
 
@@ -298,7 +256,7 @@ static void test_mechs(void)
 		{&mech_plain, UCHAR_LEN("failing\0withthis"), NULL, NULL, FALSE, FALSE, FALSE},
 		{&mech_otp, UCHAR_LEN("someb\0ody\0testuser"), NULL, "invalid input", FALSE, FALSE, FALSE},
 		/* phase 2 */
-		{&mech_otp, UCHAR_LEN("someb\0ody\0testuser"), "testuser", "otp(testuser): unsupported response type", FALSE, TRUE, FALSE},
+		{&mech_otp, UCHAR_LEN("someb\0ody\0testuser"), "testuser", "unsupported response type", FALSE, TRUE, FALSE},
 		{&mech_scram_sha1, UCHAR_LEN("c=biws,r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,p=v0X8v3Bz2T0CJGbJQyF0X+HI4Ts="), NULL, NULL, FALSE, FALSE, FALSE},
 		{&mech_scram_sha1, UCHAR_LEN("iws0X8v3Bz2T0CJGbJQyF0X+HI4Ts=,,,,"), NULL, NULL, FALSE, FALSE, FALSE},
 		{&mech_scram_sha1, UCHAR_LEN("n,a=masteruser,,"), NULL, NULL, FALSE, FALSE, FALSE},
@@ -308,7 +266,7 @@ static void test_mechs(void)
 		{&mech_scram_sha256, UCHAR_LEN("broken\0input"), NULL, NULL, FALSE, FALSE, FALSE},
 	};
 
-	test_mechs_init();
+	test_auth_init();
 
 	string_t *d_token = t_str_new(32);
 	str_append_data(d_token, UCHAR_LEN("service\0pid\0testuser\0session\0"));
@@ -341,8 +299,8 @@ static void test_mechs(void)
 			test_expect_error_string(test_case->expect_error);
 
 		request->state = AUTH_REQUEST_STATE_NEW;
-		unsigned char *input_dup = test_case->len == 0 ? NULL :
-			i_memdup(test_case->in, test_case->len);
+		unsigned char *input_dup = i_malloc(I_MAX(test_case->len, 1));
+		memcpy(input_dup, test_case->in, test_case->len);
 		request->initial_response = input_dup;
 		request->initial_response_len = test_case->len;
 		auth_request_initial(request);
@@ -379,37 +337,39 @@ static void test_mechs(void)
 		else
 			test_assert_idx(request->failed == TRUE, running_test);
 
-		event_unref(&request->event);
-		event_unref(&request->mech_event);
 		i_free(input_dup);
-		mech->auth_free(request);
+		auth_request_unref(&request);
 
 		test_end();
 	} T_END;
-	mech_otp_deinit();
-	auths_deinit();
-	auth_token_deinit();
-	password_schemes_deinit();
-	passdb_mock_mod_deinit();
-	passdbs_deinit();
-	userdbs_deinit();
-	event_unref(&auth_event);
-	mech_deinit(global_auth_settings);
-	mech_register_deinit(&mech_reg);
-	auths_free();
-	i_unlink("auth-token-secret.dat");
+
+	test_expect_error_string("oauth2 failed: aborted");
+	test_auth_deinit();
 }
 
-int main(void)
+int main(int argc, char *argv[])
 {
 	static void (*const test_functions[])(void) = {
 		test_mechs,
 		NULL
 	};
+	const enum master_service_flags service_flags =
+		MASTER_SERVICE_FLAG_NO_CONFIG_SETTINGS |
+		MASTER_SERVICE_FLAG_STANDALONE |
+		MASTER_SERVICE_FLAG_STD_CLIENT |
+		MASTER_SERVICE_FLAG_DONT_SEND_STATS;
+	int ret;
+
+	master_service = master_service_init("test-mech",
+					     service_flags, &argc, &argv, "");
+
+	master_service_init_finish(master_service);
 
 	struct ioloop *ioloop = io_loop_create();
 	io_loop_set_current(ioloop);
-	int ret = test_run(test_functions);
+	ret = test_run(test_functions);
 	io_loop_destroy(&ioloop);
+
+	master_service_deinit(&master_service);
 	return ret;
 }

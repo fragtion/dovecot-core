@@ -1001,7 +1001,7 @@ test_client_auth_parallel(const char *mech, const char *username,
 
 	i_zero(&info);
 	info.mech = mech;
-	info.service = "test";
+	info.protocol = "test";
 	info.session_id = "23423dfd243daaa223";
 	info.flags = AUTH_REQUEST_FLAG_CONN_SECURED;
 
@@ -1028,7 +1028,7 @@ test_client_auth_parallel(const char *mech, const char *username,
 		base64_encode(str_data(resp), str_len(resp), resp_b64);
 		info.initial_resp_base64 = str_c(resp_b64);
 	} else if (strcasecmp(mech, "LOGIN") == 0) {
-		/* no intial response */
+		/* no initial response */
 	} else {
 		i_unreached();
 	}
@@ -1082,7 +1082,7 @@ static void server_connection_init(int fd)
 
 	net_set_nonblock(fd, TRUE);
 
-	pool = pool_alloconly_create("server connection", 256);
+	pool = pool_alloconly_create("server connection", 512);
 	conn = p_new(pool, struct server_connection, 1);
 	conn->pool = pool;
 

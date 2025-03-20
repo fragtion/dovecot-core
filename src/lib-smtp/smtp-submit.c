@@ -8,6 +8,7 @@
 #include "ostream.h"
 #include "iostream-temp.h"
 #include "iostream-ssl.h"
+#include "settings.h"
 #include "master-service.h"
 #include "program-client.h"
 #include "smtp-client.h"
@@ -29,9 +30,7 @@ static struct event_category event_category_smtp_submit = {
 struct smtp_submit_session {
 	pool_t pool;
 	struct smtp_submit_settings set;
-	struct ssl_iostream_settings ssl_set;
 	struct event *event;
-	bool allow_root:1;
 };
 
 struct smtp_submit {
@@ -67,7 +66,7 @@ smtp_submit_session_init(const struct smtp_submit_input *input,
 	struct smtp_submit_session *session;
 	pool_t pool;
 
-	pool = pool_alloconly_create("smtp submit session", 128);
+	pool = pool_alloconly_create("smtp submit session", 512);
 	session = p_new(pool, struct smtp_submit_session, 1);
 	session->pool = pool;
 
@@ -81,13 +80,8 @@ smtp_submit_session_init(const struct smtp_submit_input *input,
 	session->set.submission_ssl =
 		p_strdup_empty(pool, set->submission_ssl);
 
-	if (input->ssl != NULL) {
-		ssl_iostream_settings_init_from(pool, &session->ssl_set,
-						input->ssl);
-	}
-	session->allow_root = input->allow_root;
-
 	session->event = event_create(input->event_parent);
+	event_set_forced_debug(session->event, set->mail_debug);
 	event_add_category(session->event, &event_category_smtp_submit);
 
 	return session;
@@ -110,7 +104,7 @@ smtp_submit_init(struct smtp_submit_session *session,
 	struct smtp_submit *subm;
 	pool_t pool;
 
-	pool = pool_alloconly_create("smtp submit", 256);
+	pool = pool_alloconly_create("smtp submit", 1024);
 	subm = p_new(pool, struct smtp_submit, 1);
 	subm->session = session;
 	subm->pool = pool;
@@ -332,7 +326,6 @@ smtp_submit_send_host(struct smtp_submit *subm)
 	smtp_set.connect_timeout_msecs = set->submission_timeout*1000;
 	smtp_set.command_timeout_msecs = set->submission_timeout*1000;
 	smtp_set.debug = set->mail_debug;
-	smtp_set.ssl = &subm->session->ssl_set;
 	smtp_set.event_parent = subm->event;
 
 	ssl_mode = SMTP_CLIENT_SSL_MODE_NONE;
@@ -391,7 +384,7 @@ smtp_submit_send_sendmail(struct smtp_submit *subm)
 	ARRAY_TYPE(const_string) args;
 	struct smtp_address *rcpt;
 	unsigned int i;
-	struct program_client_settings pc_set;
+	struct program_client_parameters pc_params;
 	struct program_client *pc;
 
 	sendmail_args = t_strsplit(set->sendmail_path, " ");
@@ -414,16 +407,12 @@ smtp_submit_send_sendmail(struct smtp_submit *subm)
 	}
 	array_append_zero(&args);
 
-	i_zero(&pc_set);
-	pc_set.client_connect_timeout_msecs = set->submission_timeout * 1000;
-	pc_set.input_idle_timeout_msecs = set->submission_timeout * 1000;
-	pc_set.debug = set->mail_debug;
-	pc_set.event = subm->event;
-	pc_set.allow_root = subm->session->allow_root;
-	restrict_access_init(&pc_set.restrict_set);
+	i_zero(&pc_params);
+	pc_params.client_connect_timeout_msecs = set->submission_timeout * 1000;
+	pc_params.input_idle_timeout_msecs = set->submission_timeout * 1000;
 
-	pc = program_client_local_create
-		(sendmail_bin, array_front(&args), &pc_set);
+	pc = program_client_local_create(subm->event, sendmail_bin,
+					 array_front(&args), &pc_params);
 
 	program_client_set_input(pc, subm->input);
 	i_stream_unref(&subm->input);

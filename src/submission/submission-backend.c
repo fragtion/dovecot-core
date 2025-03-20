@@ -139,7 +139,7 @@ void submission_backend_fail(struct submission_backend *backend,
 
 	if (backend == client->backend_default) {
 		/* default backend: fail the whole client */
-		client_destroy(&client, enh_code, reason);
+		client_destroy(&client, enh_code, reason, reason);
 		return;
 	}
 
@@ -303,12 +303,9 @@ static void
 submission_backend_add_pending(struct submission_backend *backend)
 {
 	struct client *client = backend->client;
-	struct submission_backend *pending_backend;
 
-	array_foreach_elem(&client->pending_backends, pending_backend) {
-		if (backend == pending_backend)
-			return;
-	}
+	if (array_lsearch_ptr(&client->pending_backends, backend) != NULL)
+		return;
 
 	array_push_back(&client->pending_backends, &backend);
 }

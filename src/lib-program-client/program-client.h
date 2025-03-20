@@ -12,56 +12,70 @@ enum program_client_exit_status {
 	PROGRAM_CLIENT_EXIT_STATUS_SUCCESS = 1,
 };
 
-struct program_client_settings {
+struct program_client_parameters {
 	unsigned int client_connect_timeout_msecs;
 	unsigned int input_idle_timeout_msecs;
-	/* initialize with
-	   restrict_access_init(&set.restrict_set);
-	*/
-	struct restrict_access_settings restrict_set;
 	const char *dns_client_socket_path;
-	const char *home;
+	/* Append extra args to execute_args */
+	const char *const *append_args;
 
-	/* Event to use for the program client. */
-	struct event *event;
-
-	bool allow_root:1;
-	bool debug:1;
-	bool drop_stderr:1;
 	/* use o_stream_dot, which is mainly useful to make sure that an
 	   unexpectedly closed connection doesn't cause the partial input to
 	   be accepted as valid and complete program input. This is always
 	   enabled for 'net' program clients, which may likely encounter
 	   unexpected connection termination. */
 	bool use_dotstream:1;
+	bool no_reply:1;
 };
+
+struct program_client_settings {
+	pool_t pool;
+	/* Currently only a single execution is allowed */
+	ARRAY_TYPE(const_string) execute;
+	const char *execute_name;
+	const char *execute_driver;
+	const char *execute_args;
+
+	/* driver-specific: */
+	const char *execute_fork_path;
+	const char *execute_unix_socket_path;
+	const char *execute_tcp_host;
+	in_port_t execute_tcp_port;
+
+	const char *base_dir;
+};
+extern const struct setting_parser_info program_client_setting_parser_info;
 
 typedef void program_client_fd_callback_t(void *context, struct istream *input);
 typedef void program_client_callback_t(enum program_client_exit_status status,
 				       void *context);
 
 struct program_client *
-program_client_local_create(const char *bin_path, const char *const *args,
-			    const struct program_client_settings *set)
+program_client_local_create(struct event *event,
+			    const char *bin_path, const char *const *args,
+			    const struct program_client_parameters *params)
 			    ATTR_NULL(3);
 struct program_client *
-program_client_unix_create(const char *socket_path, const char *const *args,
-			   const struct program_client_settings *set,
-			   bool noreply) ATTR_NULL(3);
+program_client_unix_create(struct event *event,
+			   const char *socket_path, const char *const *args,
+			   const struct program_client_parameters *params);
 struct program_client *
-program_client_net_create(const char *host, in_port_t port,
+program_client_net_create(struct event *event,
+			  const char *host, in_port_t port,
 			  const char *const *args,
-			  const struct program_client_settings *set,
-			  bool noreply) ATTR_NULL(4);
+			  const struct program_client_parameters *params);
 struct program_client *
-program_client_net_create_ips(const struct ip_addr *ips, size_t ips_count,
+program_client_net_create_ips(struct event *event,
+			      const struct ip_addr *ips, size_t ips_count,
 			      in_port_t port, const char *const *args,
-			      const struct program_client_settings *set,
-			      bool noreply) ATTR_NULL(5);
-int program_client_create(const char *uri, const char *const *args,
-			  const struct program_client_settings *set,
-			  bool noreply, struct program_client **pc_r,
-			  const char **error_r) ATTR_NULL(3);
+			      const struct program_client_parameters *params);
+int program_client_create(struct event *event, const char *uri,
+			  const char *const *args,
+			  const struct program_client_parameters *params,
+			  struct program_client **pc_r, const char **error_r);
+int program_client_create_auto(struct event *event,
+			       const struct program_client_parameters *params,
+			       struct program_client **pc_r, const char **error_r);
 
 void program_client_destroy(struct program_client **_pclient);
 

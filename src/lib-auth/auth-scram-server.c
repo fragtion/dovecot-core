@@ -17,7 +17,6 @@
 #include "strfuncs.h"
 #include "strnum.h"
 
-#include "auth-scram.h"
 #include "auth-scram-server.h"
 
 /* s-nonce length */
@@ -37,10 +36,26 @@ auth_scram_server_set_login_username(struct auth_scram_server *server,
 						   error_r);
 }
 
+static void
+auth_scram_server_start_channel_binding(struct auth_scram_server *server,
+					const char *type)
+{
+	i_assert(server->backend->start_channel_binding != NULL);
+	server->backend->start_channel_binding(server, type);
+}
+
+static int
+auth_scram_server_accept_channel_binding(struct auth_scram_server *server,
+					 buffer_t **data_r)
+{
+	i_assert(server->backend->accept_channel_binding != NULL);
+	return server->backend->accept_channel_binding(server, data_r);
+}
+
 static int
 auth_scram_server_credentials_lookup(struct auth_scram_server *server)
 {
-	const struct hash_method *hmethod = server->hash_method;
+	const struct hash_method *hmethod = server->set.hash_method;
 	struct auth_scram_key_data *kdata = &server->key_data;
 	pool_t pool = server->pool;
 
@@ -50,25 +65,27 @@ auth_scram_server_credentials_lookup(struct auth_scram_server *server)
 	kdata->stored_key = p_malloc(pool, hmethod->digest_size);
 	kdata->server_key = p_malloc(pool, hmethod->digest_size);
 
+	i_assert(server->backend->credentials_lookup != NULL);
 	return server->backend->credentials_lookup(server, kdata);
 }
 
 void auth_scram_server_init(struct auth_scram_server *server_r, pool_t pool,
-			    const struct hash_method *hmethod,
+			    const struct auth_scram_server_settings *set,
 			    const struct auth_scram_server_backend *backend)
 {
 	pool_ref(pool);
 
+	i_assert(set->hash_method != NULL);
+
 	i_zero(server_r);
 	server_r->pool = pool;
-	server_r->hash_method = hmethod;
-
+	server_r->set = *set;
 	server_r->backend = backend;
 }
 
 void auth_scram_server_deinit(struct auth_scram_server *server)
 {
-	i_assert(server->hash_method != NULL);
+	i_assert(server->set.hash_method != NULL);
 	if (server->proof != NULL)
 		buffer_clear_safe(server->proof);
 	auth_scram_key_data_clear(&server->key_data);
@@ -171,12 +188,45 @@ auth_scram_parse_client_first(struct auth_scram_server *server,
 
 	/* gs2-cbind-flag  = ("p=" cb-name) / "n" / "y"
 	 */
+	enum auth_scram_cbind_server_support cbind_support =
+		server->set.cbind_support;
+
 	switch (gs2_cbind_flag[0]) {
 	case 'p':
-		*error_r = "Channel binding not supported";
-		return -1;
+		if (gs2_cbind_flag[1] != '=' || gs2_cbind_flag[2] == '\0') {
+			*error_r = "Invalid GS2 header";
+			return -1;
+		}
+		if (cbind_support == AUTH_SCRAM_CBIND_SERVER_SUPPORT_NONE) {
+			*error_r = "Channel binding not supported";
+			return -1;
+		}
+		auth_scram_server_start_channel_binding(server,
+							&gs2_cbind_flag[2]);
+		break;
 	case 'y':
+		/* RFC 5802, Section 6:
+
+		   If the flag is set to "y" and the server supports channel
+		   binding, the server MUST fail authentication. This is because
+		   if the client sets the channel binding flag to "y", then the
+		   client must have believed that the server did not support
+		   channel binding -- if the server did in fact support channel
+		   binding, then this is an indication that there has been a
+		   downgrade attack (e.g., an attacker changed the server's
+		   mechanism list to exclude the -PLUS suffixed SCRAM mechanism
+		   name(s)).
+		*/
+		if (cbind_support != AUTH_SCRAM_CBIND_SERVER_SUPPORT_NONE) {
+			*error_r = "Potential downgrade attack detected";
+			return -1;
+		}
+		break;
 	case 'n':
+		if (cbind_support == AUTH_SCRAM_CBIND_SERVER_SUPPORT_REQUIRED) {
+			*error_r = "Channel binding required";
+			return -1;
+		}
 		break;
 	default:
 		*error_r = "Invalid GS2 header";
@@ -241,7 +291,7 @@ auth_scram_parse_client_first(struct auth_scram_server *server,
 static string_t *
 auth_scram_get_server_first(struct auth_scram_server *server)
 {
-	const struct hash_method *hmethod = server->hash_method;
+	const struct hash_method *hmethod = server->set.hash_method;
 	struct auth_scram_key_data *kdata = &server->key_data;
 	unsigned char snonce[SCRAM_SERVER_NONCE_LEN+1];
 	string_t *str;
@@ -290,7 +340,7 @@ auth_scram_get_server_first(struct auth_scram_server *server)
 static bool
 auth_scram_server_verify_credentials(struct auth_scram_server *server)
 {
-	const struct hash_method *hmethod = server->hash_method;
+	const struct hash_method *hmethod = server->set.hash_method;
 	struct auth_scram_key_data *kdata = &server->key_data;
 	struct hmac_context ctx;
 	const char *auth_message;
@@ -339,8 +389,10 @@ auth_scram_parse_client_final(struct auth_scram_server *server,
 			      const unsigned char *data, size_t size,
 			      const char **error_r)
 {
-	const struct hash_method *hmethod = server->hash_method;
-	const char **fields, *cbind_input, *nonce_str;
+	const struct hash_method *hmethod = server->set.hash_method;
+	const char **fields, *nonce_str;
+	const void *cbind_input;
+	size_t cbind_input_size;
 	unsigned int field_count;
 	string_t *str;
 
@@ -368,12 +420,32 @@ auth_scram_parse_client_final(struct auth_scram_server *server,
 	                     ;; gs2-cbind-flag of "p" and MUST be absent
 	                     ;; for "y" or "n".
 	 */
-	cbind_input = server->gs2_header;
-	str = t_str_new(2 + MAX_BASE64_ENCODED_SIZE(strlen(cbind_input)));
-	str_append(str, "c=");
-	base64_encode(cbind_input, strlen(cbind_input), str);
+	if (server->gs2_header[0] != 'p') {
+		cbind_input = server->gs2_header;
+		cbind_input_size = strlen(server->gs2_header);
+	} else {
+		buffer_t *cbind_data;
 
-	if (strcmp(fields[0], str_c(str)) != 0) {
+		if (auth_scram_server_accept_channel_binding(server,
+							     &cbind_data) < 0) {
+			*error_r = "Channel binding failed";
+			return -1;
+		}
+
+		size_t gs2_header_len = strlen(server->gs2_header);
+		buffer_t *cbind_buf;
+
+		cbind_buf = t_buffer_create(gs2_header_len + cbind_data->used);
+		buffer_append(cbind_buf, server->gs2_header, gs2_header_len);
+		buffer_append_buf(cbind_buf, cbind_data, 0, SIZE_MAX);
+		cbind_input = cbind_buf->data;
+		cbind_input_size = cbind_buf->used;
+	}
+	str = t_str_new(2 + MAX_BASE64_ENCODED_SIZE(cbind_input_size));
+	str_append(str, "c=");
+	base64_encode(cbind_input, cbind_input_size, str);
+
+	if (!str_equals_timing_almost_safe(fields[0], str_c(str))) {
 		*error_r = "Invalid channel binding data";
 		return -1;
 	}
@@ -384,7 +456,7 @@ auth_scram_parse_client_final(struct auth_scram_server *server,
 	   s-nonce         = printable
 	 */
 	nonce_str = t_strconcat("r=", server->cnonce, server->snonce, NULL);
-	if (strcmp(fields[1], nonce_str) != 0) {
+	if (!str_equals_timing_almost_safe(fields[1], nonce_str)) {
 		*error_r = "Wrong nonce";
 		return -1;
 	}
@@ -420,7 +492,7 @@ auth_scram_parse_client_final(struct auth_scram_server *server,
 static string_t *
 auth_scram_get_server_final(struct auth_scram_server *server)
 {
-	const struct hash_method *hmethod = server->hash_method;
+	const struct hash_method *hmethod = server->set.hash_method;
 	struct auth_scram_key_data *kdata = &server->key_data;
 	struct hmac_context ctx;
 	const char *auth_message;

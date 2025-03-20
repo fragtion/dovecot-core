@@ -18,8 +18,8 @@ static void test_http_client_request_headers(void)
 	struct http_client_request *req;
 
 	test_begin("http client request headers");
-	i_zero(&set);
-	client = http_client_init(&set);
+	http_client_settings_init(null_pool, &set);
+	client = http_client_init(&set, NULL);
 	req = http_client_request(client, "GET", "host", "target",
 				  test_http_client_request_callback, NULL);
 

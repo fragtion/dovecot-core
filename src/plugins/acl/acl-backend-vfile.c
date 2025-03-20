@@ -5,6 +5,7 @@
 #include "array.h"
 #include "istream.h"
 #include "nfs-workarounds.h"
+#include "settings.h"
 #include "mailbox-list-private.h"
 #include "acl-global-file.h"
 #include "acl-cache.h"
@@ -29,52 +30,26 @@ static struct acl_backend *acl_backend_vfile_alloc(void)
 }
 
 static int
-acl_backend_vfile_init(struct acl_backend *_backend, const char *data)
+acl_backend_vfile_init(struct acl_backend *_backend, const char **error_r)
 {
 	struct event *event = _backend->event;
-	struct acl_backend_vfile *backend =
-		(struct acl_backend_vfile *)_backend;
 	struct stat st;
-	const char *value, *const *tmp;
-	const char *global_path;
 
-	tmp = t_strsplit(data, ":");
-	global_path = t_strdup_empty(*tmp);
-	backend->cache_secs = ACL_VFILE_DEFAULT_CACHE_SECS;
+	const char *global_path = _backend->set->acl_global_path;
 
-	if (*tmp != NULL)
-		tmp++;
-	for (; *tmp != NULL; tmp++) {
-		if (str_begins(*tmp, "cache_secs=", &value)) {
-			if (str_to_uint(value, &backend->cache_secs) < 0) {
-				e_error(event,
-					"acl vfile: Invalid cache_secs value: %s",
-					*tmp + 11);
-				return -1;
-			}
-		} else {
-			e_error(event, "acl vfile: Unknown parameter: %s", *tmp);
-			return -1;
-		}
-	}
-	if (global_path != NULL) {
+	if (*global_path != '\0') {
 		if (stat(global_path, &st) < 0) {
-			e_error(event,
-				"acl vfile: stat(%s) failed: %m", global_path);
+			*error_r = t_strdup_printf("stat(%s) failed: %m", global_path);
 			return -1;
 		} else if (S_ISDIR(st.st_mode)) {
-			e_error(event,
-				"acl vfile: Global ACL directories are no longer supported");
+			*error_r = t_strdup_printf("Global ACL directories are no longer supported");
 			return -1;
 		} else {
 			_backend->global_file =	acl_global_file_init(
-				global_path, backend->cache_secs, event);
+				global_path, _backend->set->acl_cache_ttl / 1000, event);
+			e_debug(event, "vfile: Deprecated Global ACL file: %s", global_path);
 		}
 	}
-	if (_backend->global_file == NULL)
-		e_debug(event, "acl vfile: Global ACLs disabled");
-	else
-		e_debug(event, "acl vfile: Global ACL file: %s", global_path);
 
 	_backend->cache =
 		acl_cache_init(_backend,
@@ -85,7 +60,7 @@ acl_backend_vfile_init(struct acl_backend *_backend, const char *data)
 static void acl_backend_vfile_deinit(struct acl_backend *_backend)
 {
 	struct acl_backend_vfile *backend =
-		(struct acl_backend_vfile *)_backend;
+		container_of(_backend, struct acl_backend_vfile, backend);
 
 	if (backend->acllist_pool != NULL) {
 		array_free(&backend->acllist);
@@ -109,7 +84,7 @@ acl_backend_vfile_get_local_dir(struct acl_backend *backend,
 	if (*name == '\0')
 		name = NULL;
 
-	if (backend->globals_only)
+	if (backend->set->acl_globals_only)
 		return NULL;
 
 	/* ACL files are very important. try to keep them among the main
@@ -284,7 +259,7 @@ acl_backend_vfile_read(struct acl_object *aclobj, const char *path,
 		if (errno == ENOENT || errno == ENOTDIR) {
 			e_debug(event, "acl vfile: file %s not found", path);
 			validity->last_mtime = ACL_VFILE_VALIDITY_MTIME_NOTFOUND;
-		} else if (errno == EACCES) {
+		} else if (ENOACCESS(errno)) {
 			e_debug(event, "acl vfile: no access to file %s", path);
 
 			acl_object_remove_all_access(aclobj);
@@ -420,7 +395,7 @@ acl_backend_vfile_refresh(struct acl_object *aclobj, const char *path,
 			  struct acl_vfile_validity *validity)
 {
 	struct acl_backend_vfile *backend =
-		(struct acl_backend_vfile *)aclobj->backend;
+		container_of(aclobj->backend, struct acl_backend_vfile, backend);
 	struct event *event = backend->backend.event;
 	struct stat st;
 	int ret;
@@ -438,7 +413,7 @@ acl_backend_vfile_refresh(struct acl_object *aclobj, const char *path,
 			/* if the file used to exist, we have to re-read it */
 			return validity->last_mtime != ACL_VFILE_VALIDITY_MTIME_NOTFOUND ? 1 : 0;
 		}
-		if (errno == EACCES)
+		if (ENOACCESS(errno))
 			return validity->last_mtime != ACL_VFILE_VALIDITY_MTIME_NOACCESS ? 1 : 0;
 		e_error(event, "stat(%s) failed: %m", path);
 		return -1;
@@ -469,7 +444,7 @@ acl_backend_global_file_refresh(struct acl_object *_aclobj,
 				struct acl_vfile_validity *validity)
 {
 	struct acl_backend_vfile *backend =
-		(struct acl_backend_vfile *)_aclobj->backend;
+		container_of(_aclobj->backend, struct acl_backend_vfile, backend);
 	struct stat st;
 
 	if (acl_global_file_refresh(_aclobj->backend->global_file) < 0)
@@ -483,9 +458,10 @@ acl_backend_global_file_refresh(struct acl_object *_aclobj,
 
 static int acl_backend_vfile_object_refresh_cache(struct acl_object *_aclobj)
 {
-	struct acl_object_vfile *aclobj = (struct acl_object_vfile *)_aclobj;
+	struct acl_object_vfile *aclobj =
+		container_of(_aclobj, struct acl_object_vfile, aclobj);
 	struct acl_backend_vfile *backend =
-		(struct acl_backend_vfile *)_aclobj->backend;
+		container_of(_aclobj->backend, struct acl_backend_vfile, backend);
 	struct acl_backend_vfile_validity *old_validity;
 	struct acl_backend_vfile_validity validity;
 	time_t mtime;
@@ -524,6 +500,10 @@ static int acl_backend_vfile_object_refresh_cache(struct acl_object *_aclobj)
 		validity.global_validity.last_mtime = st.st_mtime;
 		validity.global_validity.last_size = st.st_size;
 	}
+
+	if (acl_backend_get_mailbox_acl(_aclobj->backend, _aclobj) < 0)
+		return -1;
+
 	if (acl_backend_vfile_read_with_retry(_aclobj, aclobj->local_path,
 					      &validity.local_validity) < 0)
 		return -1;
@@ -560,21 +540,22 @@ static int acl_backend_vfile_object_last_changed(struct acl_object *_aclobj,
 	return 0;
 }
 
-struct acl_backend_vfuncs acl_backend_vfile = {
-	acl_backend_vfile_alloc,
-	acl_backend_vfile_init,
-	acl_backend_vfile_deinit,
-	acl_backend_vfile_nonowner_iter_init,
-	acl_backend_vfile_nonowner_iter_next,
-	acl_backend_vfile_nonowner_iter_deinit,
-	acl_backend_vfile_nonowner_lookups_rebuild,
-	acl_backend_vfile_object_init,
-	acl_backend_vfile_object_init_parent,
-	acl_backend_vfile_object_deinit,
-	acl_backend_vfile_object_refresh_cache,
-	acl_backend_vfile_object_update,
-	acl_backend_vfile_object_last_changed,
-	acl_default_object_list_init,
-	acl_default_object_list_next,
-	acl_default_object_list_deinit
+const struct acl_backend_vfuncs acl_backend_vfile = {
+	.name = "vfile",
+	.alloc = acl_backend_vfile_alloc,
+	.init = acl_backend_vfile_init,
+	.deinit = acl_backend_vfile_deinit,
+	.nonowner_lookups_iter_init = acl_backend_vfile_nonowner_iter_init,
+	.nonowner_lookups_iter_next = acl_backend_vfile_nonowner_iter_next,
+	.nonowner_lookups_iter_deinit = acl_backend_vfile_nonowner_iter_deinit,
+	.nonowner_lookups_rebuild = acl_backend_vfile_nonowner_lookups_rebuild,
+	.object_init = acl_backend_vfile_object_init,
+	.object_init_parent = acl_backend_vfile_object_init_parent,
+	.object_deinit = acl_backend_vfile_object_deinit,
+	.object_refresh_cache = acl_backend_vfile_object_refresh_cache,
+	.object_update = acl_backend_vfile_object_update,
+	.last_changed = acl_backend_vfile_object_last_changed,
+	.object_list_init = acl_default_object_list_init,
+	.object_list_next = acl_default_object_list_next,
+	.object_list_deinit = acl_default_object_list_deinit
 };

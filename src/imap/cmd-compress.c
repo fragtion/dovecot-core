@@ -4,8 +4,10 @@
 #include "imap-commands.h"
 #include "istream.h"
 #include "ostream.h"
+#include "ostream-multiplex.h"
 #include "iostream-rawlog.h"
 #include "str.h"
+#include "strescape.h"
 #include "compression.h"
 
 static void client_skip_line(struct client *client)
@@ -47,7 +49,6 @@ bool cmd_compress(struct client_command_context *cmd)
 	struct istream *old_input;
 	struct ostream *old_output;
 	const char *mechanism;
-	int level;
 
 	/* <mechanism> */
 	if (!client_read_args(cmd, 0, 0, &args))
@@ -75,6 +76,36 @@ bool cmd_compress(struct client_command_context *cmd)
 	}
 
 	client_skip_line(client);
+
+	/* Client cannot assume that COMPRESS works and just start sending
+	   compressed data pipelined. Add an explicit sanity check for this. */
+	if (i_stream_get_data_size(client->input) > 0) {
+		client_send_tagline(cmd, "BAD Client did not wait for COMPRESS reply before sending more data");
+		return TRUE;
+	}
+
+	if (client->multiplex_output != NULL) {
+		/* Let imap-login process handle the COMPRESS. It's the one
+		   that will send the tagged reply to the client. */
+		client->compress_handler = handler;
+		if (client->side_channel_output == NULL) {
+			client->side_channel_output =
+				o_stream_multiplex_add_channel(
+					client->multiplex_output, 1);
+			o_stream_set_no_error_handling(
+				client->side_channel_output, TRUE);
+		}
+		string_t *str = t_str_new(64);
+		str_append(str, "compress\t");
+		str_append_tabescaped(str, handler->name);
+		str_append_c(str, '\t');
+		str_append_tabescaped(str, cmd->tag);
+		str_append_c(str, '\n');
+		o_stream_nsend(client->side_channel_output,
+			       str_data(str), str_len(str));
+		return TRUE;
+	}
+
 	client_send_tagline(cmd, "OK Begin compression.");
 
 	uoff_t prev_out_offset = client->output->offset;
@@ -104,11 +135,10 @@ bool cmd_compress(struct client_command_context *cmd)
 		i_assert(client->input->v_offset == prev_in_offset);
 	}
 
-	level = handler->get_default_level();
 	old_input = client->input;
 	old_output = client->output;
 	client->input = handler->create_istream(old_input);
-	client->output = handler->create_ostream(old_output, level);
+	client->output = handler->create_ostream_auto(old_output, cmd->event);
 	/* preserve output offset so that the bytes out counter in logout
 	   message doesn't get reset here */
 	client->output->offset = old_output->offset;

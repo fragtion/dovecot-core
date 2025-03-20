@@ -682,9 +682,10 @@ int mdbox_purge(struct mail_storage *_storage)
 	} T_END;
 	mdbox_purge_free(&ctx);
 
-	if (storage->corrupted) {
+	if (storage->corrupted_reason != NULL) {
 		/* purging found corrupted files */
-		(void)mdbox_storage_rebuild(storage);
+		(void)mdbox_storage_rebuild(storage, NULL,
+					    MDBOX_REBUILD_REASON_CORRUPTED);
 		ret = -1;
 	}
 	return ret;

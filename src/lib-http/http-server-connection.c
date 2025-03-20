@@ -17,6 +17,7 @@
 #include "http-date.h"
 #include "http-url.h"
 #include "http-request-parser.h"
+#include "settings.h"
 
 #include "http-server-private.h"
 
@@ -114,7 +115,7 @@ void http_server_connection_start_idle_timeout(
 	struct http_server_connection *conn)
 {
 	unsigned int timeout_msecs =
-		conn->server->set.max_client_idle_time_msecs;
+		conn->set->max_client_idle_time_msecs;
 
 	if (conn->to_idle == NULL && timeout_msecs > 0) {
 		conn->to_idle = timeout_add(timeout_msecs,
@@ -149,13 +150,13 @@ bool http_server_connection_shut_down(struct http_server_connection *conn)
 
 static void http_server_connection_ready(struct http_server_connection *conn)
 {
-	const struct http_server_settings *set = &conn->server->set;
+	const struct http_server_settings *set = conn->set;
 	struct http_url base_url;
 	struct stat st;
 
-	if (conn->server->set.rawlog_dir != NULL &&
-	    stat(conn->server->set.rawlog_dir, &st) == 0) {
-		iostream_rawlog_create(conn->server->set.rawlog_dir,
+	if (set->rawlog_dir != NULL &&
+	    stat(set->rawlog_dir, &st) == 0) {
+		iostream_rawlog_create(set->rawlog_dir,
 				       &conn->conn.input, &conn->conn.output);
 	}
 
@@ -166,8 +167,15 @@ static void http_server_connection_ready(struct http_server_connection *conn)
 		base_url.host.name = my_hostname;
 	base_url.have_ssl = conn->ssl;
 
+	const struct http_request_limits limits = {
+		.max_target_length = set->request_max_target_length,
+		.max_payload_size = set->request_max_payload_size,
+		.header.max_size = set->request_hdr_max_size,
+		.header.max_field_size = set->request_hdr_max_field_size,
+		.header.max_fields = set->request_hdr_max_fields,
+	};
 	conn->http_parser = http_request_parser_init(
-		conn->conn.input, &base_url, &conn->server->set.request_limits,
+		conn->conn.input, &base_url, &limits,
 		HTTP_REQUEST_PARSE_FLAG_STRICT);
 	o_stream_set_finish_via_child(conn->conn.output, FALSE);
 	o_stream_set_flush_callback(conn->conn.output,
@@ -265,7 +273,7 @@ static bool
 http_server_connection_handle_request(struct http_server_connection *conn,
 				      struct http_server_request *req)
 {
-	const struct http_server_settings *set = &conn->server->set;
+	const struct http_server_settings *set = conn->set;
 	unsigned int old_refcount;
 	struct istream *payload;
 
@@ -354,29 +362,39 @@ static int
 http_server_connection_ssl_init(struct http_server_connection *conn)
 {
 	struct http_server *server = conn->server;
+	struct ssl_iostream_context *ssl_ctx;
 	const char *error;
 	int ret;
-
-	if (http_server_init_ssl_ctx(server, &error) < 0) {
-		e_error(conn->event, "Couldn't initialize SSL: %s", error);
-		return -1;
-	}
 
 	e_debug(conn->event, "Starting SSL handshake");
 
 	http_server_connection_input_halt(conn);
-	if (server->ssl_ctx == NULL) {
-		ret = master_service_ssl_init(master_service,
-					      &conn->conn.input,
-					      &conn->conn.output,
-					      &conn->ssl_iostream, &error);
+	const char *const names[] = {
+		"http/1.1",
+		NULL
+	};
+	if (server->ssl_set == NULL) {
+		const struct ssl_iostream_server_autocreate_parameters parameters = {
+			.event_parent = server->event,
+			.application_protocols = names,
+		};
+		ret = io_stream_autocreate_ssl_server(&parameters,
+						      &conn->conn.input,
+						      &conn->conn.output,
+						      &conn->ssl_iostream,
+						      &error);
+	} else if ((ret = ssl_iostream_server_context_cache_get(server->ssl_set,
+								&ssl_ctx, &error)) < 0) {
+		/* pass */
 	} else {
-		ret = io_stream_create_ssl_server(server->ssl_ctx,
-						  server->set.ssl,
+		if (ret > 0)
+			ssl_iostream_context_set_application_protocols(ssl_ctx, names);
+		ret = io_stream_create_ssl_server(ssl_ctx,
 						  server->event,
 						  &conn->conn.input,
 						  &conn->conn.output,
 						  &conn->ssl_iostream, &error);
+		ssl_iostream_context_unref(&ssl_ctx);
 	}
 	if (ret < 0) {
 		e_error(conn->event,
@@ -400,7 +418,7 @@ static bool
 http_server_connection_pipeline_is_full(struct http_server_connection *conn)
 {
 	return ((conn->request_queue_count >=
-		 conn->server->set.max_pipelined_requests) ||
+		 conn->set->max_pipelined_requests) ||
 		conn->server->shutting_down);
 }
 
@@ -415,7 +433,7 @@ http_server_connection_pipeline_handle_full(struct http_server_connection *conn)
 		e_debug(conn->event, "Pipeline full "
 			"(%u requests pending; %u maximum)",
 			conn->request_queue_count,
-			conn->server->set.max_pipelined_requests);
+			conn->set->max_pipelined_requests);
 	}
 	http_server_connection_input_halt(conn);
 }
@@ -567,7 +585,7 @@ static void http_server_connection_input(struct connection *_conn)
 	if (conn->request_queue_tail != NULL &&
 	    conn->request_queue_tail->state == HTTP_SERVER_REQUEST_STATE_NEW) {
 		if (conn->request_queue_count >
-		    conn->server->set.max_pipelined_requests) {
+		    conn->set->max_pipelined_requests) {
 			/* Pipeline full */
 			http_server_connection_pipeline_handle_full(conn);
 			return;
@@ -576,7 +594,7 @@ static void http_server_connection_input(struct connection *_conn)
 		req = conn->request_queue_tail;
 	} else {
 		if (conn->request_queue_count >=
-		    conn->server->set.max_pipelined_requests) {
+		    conn->set->max_pipelined_requests) {
 			/* Pipeline full */
 			http_server_connection_pipeline_handle_full(conn);
 			return;
@@ -822,7 +840,7 @@ http_server_connection_send_responses(struct http_server_connection *conn)
 	/* Accept more requests if possible */
 	if (conn->incoming_payload == NULL &&
 	    (conn->request_queue_count <
-	     conn->server->set.max_pipelined_requests) &&
+	     conn->set->max_pipelined_requests) &&
 	    !conn->server->shutting_down)
 		http_server_connection_input_resume(conn);
 
@@ -971,7 +989,6 @@ http_server_connection_create(struct http_server *server,
 			      const struct http_server_callbacks *callbacks,
 			      void *context)
 {
-	const struct http_server_settings *set = &server->set;
 	struct http_server_connection *conn;
 	struct event *conn_event;
 
@@ -980,6 +997,8 @@ http_server_connection_create(struct http_server *server,
 	conn = i_new(struct http_server_connection, 1);
 	conn->refcount = 1;
 	conn->server = server;
+	conn->set = server->set;
+	pool_ref(server->set->pool);
 	conn->ioloop = current_ioloop;
 	conn->ssl = ssl;
 	conn->callbacks = callbacks;
@@ -990,19 +1009,19 @@ http_server_connection_create(struct http_server *server,
 		net_set_nonblock(fd_out, TRUE);
 	(void)net_set_tcp_nodelay(fd_out, TRUE);
 
-	if (set->socket_send_buffer_size > 0 &&
+	if (conn->set->socket_send_buffer_size > 0 &&
 	    net_set_send_buffer_size(fd_out,
-				     set->socket_send_buffer_size) < 0) {
+				     conn->set->socket_send_buffer_size) < 0) {
 		e_error(conn->event,
 			"net_set_send_buffer_size(%zu) failed: %m",
-			set->socket_send_buffer_size);
+			conn->set->socket_send_buffer_size);
 	}
-	if (set->socket_recv_buffer_size > 0 &&
+	if (conn->set->socket_recv_buffer_size > 0 &&
 	    net_set_recv_buffer_size(fd_in,
-				     set->socket_recv_buffer_size) < 0) {
+				     conn->set->socket_recv_buffer_size) < 0) {
 		e_error(conn->event,
 			"net_set_recv_buffer_size(%zu) failed: %m",
-			set->socket_recv_buffer_size);
+			conn->set->socket_recv_buffer_size);
 	}
 
 	conn_event = event_create(server->event);
@@ -1095,6 +1114,7 @@ bool http_server_connection_unref(struct http_server_connection **_conn)
 						    conn->disconnect_reason);
 	} T_END;
 
+	settings_free(conn->set);
 	i_free(conn->disconnect_reason);
 	i_free(conn);
 	return FALSE;
@@ -1114,6 +1134,8 @@ void http_server_connection_close(struct http_server_connection **_conn,
 				  const char *reason)
 {
 	struct http_server_connection *conn = *_conn;
+	if (conn == NULL)
+		return;
 
 	http_server_connection_disconnect(conn, reason);
 	http_server_connection_unref(_conn);

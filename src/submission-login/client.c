@@ -1,23 +1,18 @@
 /* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
 
 #include "login-common.h"
-#include "base64.h"
-#include "buffer.h"
+#include "array.h"
 #include "ioloop.h"
 #include "istream.h"
 #include "ostream.h"
-#include "randgen.h"
-#include "hostpid.h"
-#include "safe-memset.h"
-#include "str.h"
-#include "strescape.h"
+#include "settings.h"
 #include "master-service.h"
-#include "master-service-ssl-settings.h"
+#include "ssl-settings.h"
 #include "client.h"
 #include "client-authenticate.h"
-#include "auth-client.h"
 #include "submission-proxy.h"
 #include "submission-login-settings.h"
+#include "settings-parser.h"
 
 /* Disconnect client when it sends too many bad commands */
 #define CLIENT_MAX_BAD_COMMANDS 10
@@ -32,14 +27,20 @@ client_parse_backend_capabilities(struct submission_client *subm_client )
 	const struct submission_login_settings *set = subm_client->set;
 	const char *const *str;
 
-	if (set->submission_backend_capabilities == NULL) {
+	if (array_is_empty(&set->submission_backend_capabilities)) {
 		subm_client->backend_capabilities = SMTP_CAPABILITY_8BITMIME;
+#ifdef EXPERIMENTAL_MAIL_UTF8
+		if (subm_client->set->mail_utf8_extensions)
+			subm_client->backend_capabilities |= SMTP_CAPABILITY_SMTPUTF8;
+#endif
 		return;
 	}
 
 	subm_client->backend_capabilities = SMTP_CAPABILITY_NONE;
-	str = t_strsplit_spaces(set->submission_backend_capabilities, " ,");
+	str = settings_boollist_get(&set->submission_backend_capabilities);
 	for (; *str != NULL; str++) {
+		if (strcmp(*str, "none") == 0)
+			continue;
 		enum smtp_capability cap = smtp_capability_find_by_name(*str);
 
 		if (cap == SMTP_CAPABILITY_NONE) {
@@ -82,6 +83,17 @@ static int submission_login_start_tls(void *conn_ctx,
 	return 0;
 }
 
+static int
+submission_client_reload_config(struct client *client,
+				const char **error_r ATTR_UNUSED)
+{
+	struct submission_client *subm_client =
+		container_of(client, struct submission_client, common);
+	smtp_server_connection_set_greeting(subm_client->conn,
+					    client->set->login_greeting);
+	return 0;
+}
+
 static struct client *submission_client_alloc(pool_t pool)
 {
 	struct submission_client *subm_client;
@@ -90,37 +102,48 @@ static struct client *submission_client_alloc(pool_t pool)
 	return &subm_client->common;
 }
 
-static void submission_client_create(struct client *client,
-				     void **other_sets)
+static int submission_client_create(struct client *client)
 {
 	static const char *const xclient_extensions[] =
 		{ "FORWARD", NULL };
 	struct submission_client *subm_client =
 		container_of(client, struct submission_client, common);
 	struct smtp_server_settings smtp_set;
+	const char *error;
 
-	subm_client->set = other_sets[0];
+	if (settings_get(client->event, &submission_login_setting_parser_info,
+			 0, &subm_client->set, &error) < 0) {
+		e_error(client->event, "%s", error);
+		return -1;
+	}
+
 	client_parse_backend_capabilities(subm_client);
 
 	i_zero(&smtp_set);
 	smtp_set.capabilities = SMTP_CAPABILITY_SIZE |
 		SMTP_CAPABILITY_ENHANCEDSTATUSCODES | SMTP_CAPABILITY_AUTH |
 		SMTP_CAPABILITY_XCLIENT;
+#ifdef EXPERIMENTAL_MAIL_UTF8
+	if (subm_client->set->mail_utf8_extensions)
+		smtp_set.capabilities |= SMTP_CAPABILITY_SMTPUTF8;
+#endif
 	if (client_is_tls_enabled(client))
 		smtp_set.capabilities |= SMTP_CAPABILITY_STARTTLS;
 	smtp_set.hostname = subm_client->set->hostname;
 	smtp_set.login_greeting = client->set->login_greeting;
 	smtp_set.tls_required = !client->connection_secured &&
-		(strcmp(client->ssl_set->ssl, "required") == 0);
+		(strcmp(client->ssl_server_set->ssl, "required") == 0);
 	smtp_set.xclient_extensions = xclient_extensions;
 	smtp_set.command_limits.max_parameters_size = LOGIN_MAX_INBUF_SIZE;
 	smtp_set.command_limits.max_auth_size = LOGIN_MAX_AUTH_BUF_SIZE;
 	smtp_set.debug = event_want_debug(client->event);
+	smtp_set.event_parent = client->event;
 
 	subm_client->conn = smtp_server_connection_create_from_streams(
 		smtp_server, client->input, client->output,
 		&client->real_remote_ip, client->real_remote_port,
 		&smtp_set, &smtp_callbacks, subm_client);
+	return 0;
 }
 
 static void submission_client_destroy(struct client *client)
@@ -130,6 +153,7 @@ static void submission_client_destroy(struct client *client)
 
 	if (subm_client->conn != NULL)
 		smtp_server_connection_close(&subm_client->conn, NULL);
+	settings_free(subm_client->set);
 	i_free_and_null(subm_client->proxy_xclient);
 }
 
@@ -138,8 +162,10 @@ static void submission_client_notify_auth_ready(struct client *client)
 	struct submission_client *subm_client =
 		container_of(client, struct submission_client, common);
 
+	i_assert(client->io == NULL);
 	client->banner_sent = TRUE;
-	smtp_server_connection_start(subm_client->conn);
+	if (!smtp_server_connection_is_started(subm_client->conn))
+		smtp_server_connection_start(subm_client->conn);
 }
 
 static void
@@ -188,6 +214,10 @@ client_connection_cmd_xclient(void *context,
 		client->common.session_id =
 			p_strdup(client->common.pool, data->session);
 	}
+	if (data->local_name != NULL) {
+		client->common.local_name =
+			p_strdup(client->common.preproxy_pool, data->local_name);
+	}
 	if (data->client_transport != NULL) {
 		client->common.end_client_tls_secured_set = TRUE;
 		client->common.end_client_tls_secured =
@@ -213,8 +243,7 @@ static void client_connection_disconnect(void *context, const char *reason)
 	struct submission_client *client = context;
 
 	client->pending_auth = NULL;
-	client_disconnect(&client->common, reason,
-			  !client->common.login_success);
+	client_disconnect(&client->common, reason);
 }
 
 static void client_connection_free(void *context)
@@ -242,7 +271,6 @@ static void submission_login_die(void)
 
 static void submission_login_preinit(void)
 {
-	login_set_roots = submission_login_setting_roots;
 }
 
 static void submission_login_init(void)
@@ -293,6 +321,7 @@ static struct client_vfuncs submission_client_vfuncs = {
 	.alloc = submission_client_alloc,
 	.create = submission_client_create,
 	.destroy = submission_client_destroy,
+	.reload_config = submission_client_reload_config,
 	.notify_auth_ready = submission_client_notify_auth_ready,
 	.notify_disconnect = submission_client_notify_disconnect,
 	.auth_send_challenge = submission_client_auth_send_challenge,
@@ -319,6 +348,10 @@ static struct login_binary submission_login_binary = {
 
 	.sasl_support_final_reply = FALSE,
 	.anonymous_login_acceptable = FALSE,
+
+	.application_protocols = (const char *const[]) {
+		"submission", NULL
+	},
 };
 
 int main(int argc, char *argv[])

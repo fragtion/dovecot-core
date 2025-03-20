@@ -39,7 +39,7 @@ static void
 http_client_host_shared_check_idle(struct http_client_host_shared *hshared)
 {
 	struct http_client_host *host;
-	int timeout = 0;
+	long long timeout = 0;
 
 	if (hshared->destroyed)
 		return;
@@ -66,7 +66,7 @@ http_client_host_shared_check_idle(struct http_client_host_shared *hshared)
 					  http_client_host_shared_idle_timeout,
 					  hshared);
 
-	e_debug(hshared->event, "Host is idle (timeout = %u msecs)", timeout);
+	e_debug(hshared->event, "Host is idle (timeout = %lld msecs)", timeout);
 }
 
 static void
@@ -115,6 +115,9 @@ static void
 http_client_host_shared_dns_callback(const struct dns_lookup_result *result,
 				     struct http_client_host_shared *hshared)
 {
+	/* We ended up here because dns_lookup_abort() was used */
+	if (result->ret == EAI_CANCELED)
+		return;
 	struct http_client_host *host;
 
 	hshared->dns_lookup = NULL;
@@ -161,8 +164,8 @@ http_client_host_shared_lookup(struct http_client_host_shared *hshared)
 		dns_set.ioloop = cctx->ioloop;
 		dns_set.event_parent = hshared->event;
 		(void)dns_lookup(hshared->name, &dns_set,
-				 http_client_host_shared_dns_callback,
-				 hshared, &hshared->dns_lookup);
+				 http_client_host_shared_dns_callback, hshared,
+				 &hshared->dns_lookup);
 	} else {
 		struct ip_addr *ips;
 		unsigned int ips_count;

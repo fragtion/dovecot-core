@@ -13,7 +13,6 @@
 #include <stdio.h>
 
 #define GLOBAL_TEMP_PREFIX ".temp."
-#define MAILBOX_LIST_INDEX_DEFAULT_ESCAPE_CHAR '^'
 
 struct index_mailbox_list {
 	struct mailbox_list list;
@@ -39,7 +38,6 @@ static struct mailbox_list *index_list_alloc(void)
 	list = p_new(pool, struct index_mailbox_list, 1);
 	list->list = index_mailbox_list;
 	list->list.pool = pool;
-	list->list.set.storage_name_escape_char = MAILBOX_LIST_INDEX_DEFAULT_ESCAPE_CHAR;
 
 	list->temp_prefix = p_strconcat(pool, GLOBAL_TEMP_PREFIX,
 					my_hostname, ".", my_pid, ".", NULL);
@@ -49,7 +47,7 @@ static struct mailbox_list *index_list_alloc(void)
 static int index_list_init(struct mailbox_list *_list, const char **error_r)
 {
 	if (!_list->mail_set->mailbox_list_index) {
-		*error_r = "LAYOUT=index requires mailbox_list_index=yes";
+		*error_r = "mailbox_list_layout=index requires mailbox_list_index=yes";
 		return -1;
 	}
 	return 0;
@@ -68,7 +66,7 @@ static char index_list_get_hierarchy_sep(struct mailbox_list *list)
 
 	if (sep == '\0')
 		sep = MAILBOX_LIST_INDEX_HIERARCHY_SEP;
-	if (sep == list->set.storage_name_escape_char) {
+	if (sep == list->mail_set->mailbox_list_storage_escape_char[0]) {
 		/* Separator conflicts with the escape character.
 		   Use something else. */
 		if (sep != MAILBOX_LIST_INDEX_HIERARCHY_SEP)
@@ -110,8 +108,8 @@ index_get_guid_path(struct mailbox_list *_list, const char *root_dir,
 		    const guid_128_t mailbox_guid)
 {
 	return t_strdup_printf("%s/%s%s", root_dir,
-			       _list->set.mailbox_dir_name,
-			       guid_128_to_string(mailbox_guid));
+		_list->mail_set->parsed_mailbox_root_directory_prefix,
+		guid_128_to_string(mailbox_guid));
 }
 
 static int
@@ -129,8 +127,8 @@ index_list_get_path(struct mailbox_list *_list, const char *name,
 
 	if (name == NULL) {
 		/* return root directories */
-		return mailbox_list_set_get_root_path(&_list->set, type,
-						      path_r) ? 1 : 0;
+		return mailbox_list_default_get_root_path(_list, type,
+							  path_r) ? 1 : 0;
 	}
 	/* consistently use mailbox_dir_name as part of all mailbox
 	   directories (index/control/etc) */
@@ -146,7 +144,7 @@ index_list_get_path(struct mailbox_list *_list, const char *name,
 	default:
 		break;
 	}
-	if (!mailbox_list_set_get_root_path(&_list->set, type, &root_dir))
+	if (!mailbox_list_default_get_root_path(_list, type, &root_dir))
 		return 0;
 
 	if (list->create_mailbox_name != NULL &&
@@ -218,15 +216,17 @@ static int index_list_set_subscribed(struct mailbox_list *_list,
 	struct index_mailbox_list *list = (struct index_mailbox_list *)_list;
 	const char *path;
 
-	if (_list->set.subscription_fname == NULL) {
+	if (_list->mail_set->mailbox_subscriptions_filename[0] == '\0') {
 		mailbox_list_set_error(_list, MAIL_ERROR_NOTPOSSIBLE,
 				       "Subscriptions not supported");
 		return -1;
 	}
 
-	path = t_strconcat(_list->set.control_dir != NULL ?
-			   _list->set.control_dir : _list->set.root_dir,
-			   "/", _list->set.subscription_fname, NULL);
+	path = t_strconcat(_list->mail_set->mail_control_path[0] != '\0' ?
+			   _list->mail_set->mail_control_path :
+			   _list->mail_set->mail_path,
+			   "/", _list->mail_set->mailbox_subscriptions_filename,
+			   NULL);
 	return subsfile_set_subscribed(_list, path, list->temp_prefix,
 				       name, set);
 }
@@ -454,9 +454,9 @@ index_list_mailbox_update(struct mailbox *box,
 
 	/* rename the directory */
 	if (!guid_128_is_empty(update->mailbox_guid) && old_path != NULL &&
-	    mailbox_list_set_get_root_path(&box->list->set,
-					   MAILBOX_LIST_PATH_TYPE_DIR,
-					   &root_dir)) {
+	    mailbox_list_default_get_root_path(box->list,
+					       MAILBOX_LIST_PATH_TYPE_DIR,
+					       &root_dir)) {
 		new_path = index_get_guid_path(box->list, root_dir,
 					       update->mailbox_guid);
 		if (strcmp(old_path, new_path) == 0)
@@ -563,7 +563,7 @@ static int index_list_mailbox_open(struct mailbox *box)
 	   we don't keep rewriting the name just in case some backend switches
 	   between separators when accessed different ways. */
 
-	/* Get the current mailbox name with \0 separators and unesacped. */
+	/* Get the current mailbox name with \0 separators and unescaped. */
 	size_t box_name_len;
 	const unsigned char *box_zerosep_name =
 		mailbox_name_hdr_encode(box->list, box->name, &box_name_len);
@@ -640,11 +640,11 @@ index_list_try_delete(struct mailbox_list *_list, const char *name,
 	    strcmp(path, mailbox_path) == 0)
 		return;
 
-	if (*_list->set.maildir_name == '\0' &&
+	if (_list->mail_set->mailbox_directory_name[0] == '\0' &&
 	    (_list->flags & MAILBOX_LIST_FLAG_MAILBOX_FILES) == 0) {
 		/* this directory may contain also child mailboxes' data.
 		   we don't want to delete that. */
-		bool rmdir_path = *_list->set.maildir_name != '\0';
+		bool rmdir_path = _list->mail_set->mailbox_directory_name[0] != '\0';
 		if (mailbox_list_delete_mailbox_nonrecursive(_list, name, path,
 							     rmdir_path) < 0)
 			return;
@@ -773,7 +773,7 @@ index_list_delete_mailbox(struct mailbox_list *_list, const char *name)
 		if (index_list_delete_entry(list, name, TRUE) < 0)
 			return -1;
 	}
-	if (!_list->set.keep_noselect && ret == 0)
+	if (_list->mail_set->mailbox_list_drop_noselect && ret == 0)
 		(void)index_list_try_delete_nonexistent_parent(_list, name);
 
 	return ret;
@@ -892,7 +892,7 @@ index_list_rename_mailbox(struct mailbox_list *_oldlist, const char *oldname,
 
 	ret = mailbox_list_index_sync_end(&sync_ctx, TRUE);
 
-	if (!_oldlist->set.keep_noselect && ret == 0)
+	if (_oldlist->mail_set->mailbox_list_drop_noselect && ret == 0)
                (void)index_list_try_delete_nonexistent_parent(_oldlist, oldname);
 
 	return ret;

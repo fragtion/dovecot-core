@@ -21,7 +21,6 @@
 #include "mail-cache.h"
 
 #include <stdio.h>
-#include <stddef.h>
 #include <time.h>
 #include <sys/stat.h>
 #include <ctype.h>
@@ -309,7 +308,7 @@ void mail_index_ext_register_resize_defaults(struct mail_index *index,
 bool mail_index_ext_lookup(struct mail_index *index, const char *name,
 			   uint32_t *ext_id_r)
 {
-        const struct mail_index_registered_ext *extensions;
+	const struct mail_index_registered_ext *extensions;
 	unsigned int i, count;
 
 	extensions = array_get(&index->extensions, &count);
@@ -489,7 +488,7 @@ int mail_index_try_open_only(struct mail_index *index)
 	i_assert(index->fd == -1);
 	i_assert(!MAIL_INDEX_IS_IN_MEMORY(index));
 
-        /* Note that our caller must close index->fd by itself. */
+	/* Note that our caller must close index->fd by itself. */
 	if (index->readonly)
 		errno = EACCES;
 	else {
@@ -497,7 +496,7 @@ int mail_index_try_open_only(struct mail_index *index)
 		index->readonly = FALSE;
 	}
 
-	if (index->fd == -1 && errno == EACCES) {
+	if (index->fd == -1 && ENOACCESS(errno)) {
 		index->fd = open(index->filepath, O_RDONLY);
 		index->readonly = TRUE;
 	}
@@ -519,7 +518,7 @@ mail_index_try_open(struct mail_index *index)
 {
 	int ret;
 
-        i_assert(index->fd == -1);
+	i_assert(index->fd == -1);
 
 	if (MAIL_INDEX_IS_IN_MEMORY(index))
 		return 0;
@@ -539,7 +538,7 @@ mail_index_try_open(struct mail_index *index)
 int mail_index_create_tmp_file(struct mail_index *index,
 			       const char *path_prefix, const char **path_r)
 {
-        mode_t old_mask;
+	mode_t old_mask;
 	const char *path;
 	int fd;
 
@@ -611,6 +610,7 @@ static int mail_index_open_files(struct mail_index *index,
 			index->map->hdr.indexid = index->indexid;
 		}
 		index->initial_create = FALSE;
+		index->initial_created = TRUE;
 	}
 	if (ret >= 0) {
 		ret = index->map != NULL ? 1 : mail_index_try_open(index);
@@ -726,7 +726,7 @@ int mail_index_open_or_create(struct mail_index *index,
 	flags |= MAIL_INDEX_OPEN_FLAG_CREATE;
 	ret = mail_index_open(index, flags);
 	i_assert(ret != 0);
-	return ret < 0 ? -1 : 0;
+	return ret < 0 ? -1 : (index->initial_created ? 1 : 0);
 }
 
 void mail_index_close_file(struct mail_index *index)
@@ -876,21 +876,36 @@ struct mail_cache *mail_index_get_cache(struct mail_index *index)
 	return index->cache;
 }
 
-void mail_index_set_error(struct mail_index *index, const char *fmt, ...)
+static void ATTR_FORMAT(2,0)
+mail_index_set_verror(struct mail_index *index, const char *fmt, va_list args)
 {
-	va_list va;
-
 	i_free(index->last_error.text);
 
 	if (fmt == NULL)
 		index->last_error.text = NULL;
 	else {
-		va_start(va, fmt);
-		index->last_error.text = i_strdup_vprintf(fmt, va);
-		va_end(va);
-
+		index->last_error.text = i_strdup_vprintf(fmt, args);
 		e_error(index->event, "%s", index->last_error.text);
 	}
+}
+
+void mail_index_set_error(struct mail_index *index, const char *fmt, ...)
+{
+	va_list args;
+	va_start(args, fmt);
+	mail_index_set_verror(index, fmt, args);
+	va_end(args);
+}
+
+void mail_index_set_error_code(struct mail_index *index,
+			       enum mail_index_error_code code,
+			       const char *fmt, ...)
+{
+	va_list args;
+	va_start(args, fmt);
+	mail_index_set_verror(index, fmt, args);
+	index->last_error.code = code;
+	va_end(args);
 }
 
 void mail_index_set_error_nolog(struct mail_index *index, const char *str)
@@ -1015,7 +1030,7 @@ void mail_index_fchown(struct mail_index *index, int fd, const char *path)
 		   really matter. ignore silently. */
 		return;
 	}
-	if (errno != EPERM)
+	if (!ENOACCESS(errno))
 		mail_index_file_set_syscall_error(index, path, "fchown()");
 	else {
 		mail_index_set_error(index, "%s",
@@ -1081,19 +1096,21 @@ void mail_index_file_set_syscall_error(struct mail_index *index,
 	}
 
 	if (ENOSPACE(errno)) {
-		index->last_error.nodiskspace = TRUE;
+		index->last_error.code = MAIL_INDEX_ERROR_CODE_NO_SPACE;
 		if ((index->flags & MAIL_INDEX_OPEN_FLAG_NEVER_IN_MEMORY) == 0)
 			return;
 	}
 
-	if (errno == EACCES) {
+	if (ENOACCESS(errno)) {
 		function = t_strcut(function, '(');
 		if (strcmp(function, "creat") == 0 ||
 		    str_begins_with(function, "file_dotlock_"))
 			errstr = eacces_error_get_creating(function, filepath);
 		else
 			errstr = eacces_error_get(function, filepath);
-		mail_index_set_error(index, "%s", errstr);
+
+		mail_index_set_error_code(index, MAIL_INDEX_ERROR_CODE_NO_ACCESS,
+					  "%s", errstr);
 	} else {
 		const char *suffix = errno != EFBIG ? "" :
 			" (process was started with ulimit -f limit)";
@@ -1102,8 +1119,11 @@ void mail_index_file_set_syscall_error(struct mail_index *index,
 	}
 }
 
-const char *mail_index_get_error_message(struct mail_index *index)
+const char *mail_index_get_last_error(struct mail_index *index,
+				      enum mail_index_error_code *code_r)
 {
+	if (code_r != NULL)
+		*code_r = index->last_error.code;
 	return index->last_error.text;
 }
 

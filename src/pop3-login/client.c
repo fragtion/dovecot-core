@@ -3,21 +3,19 @@
 #include "login-common.h"
 #include "base64.h"
 #include "buffer.h"
+#include "connection.h"
 #include "ioloop.h"
 #include "istream.h"
 #include "ostream.h"
 #include "randgen.h"
 #include "hostpid.h"
-#include "safe-memset.h"
 #include "str.h"
-#include "strescape.h"
 #include "master-service.h"
 #include "pop3-protocol.h"
 #include "client.h"
 #include "client-authenticate.h"
 #include "auth-client.h"
 #include "pop3-proxy.h"
-#include "pop3-login-settings.h"
 
 #include <ctype.h>
 
@@ -70,6 +68,13 @@ static bool cmd_xclient(struct pop3_client *client, const char *args)
 			client->common.end_client_tls_secured_set = TRUE;
 			client->common.end_client_tls_secured =
 				str_begins_with(value, CLIENT_TRANSPORT_TLS);
+		} else if (str_begins_icase(*tmp, "DESTNAME=", &value)) {
+			if (!connection_is_valid_dns_name(value))
+				args_ok = FALSE;
+			else {
+				client->common.local_name =
+					p_strdup(client->common.preproxy_pool, value);
+			}
 		} else if (str_begins_icase(*tmp, "FORWARD=", &value)) {
 			if (!client_forward_decode_base64(&client->common, value))
 				args_ok = FALSE;
@@ -207,9 +212,9 @@ static struct client *pop3_client_alloc(pool_t pool)
 	return &pop3_client->common;
 }
 
-static void pop3_client_create(struct client *client ATTR_UNUSED,
-			       void **other_sets ATTR_UNUSED)
+static int pop3_client_create(struct client *client ATTR_UNUSED)
 {
+	return 0;
 }
 
 static void pop3_client_destroy(struct client *client)
@@ -252,6 +257,7 @@ static void pop3_client_notify_auth_ready(struct client *client)
 	struct pop3_client *pop3_client = (struct pop3_client *)client;
 	string_t *str;
 
+	i_assert(client->io == NULL);
 	client->io = io_add_istream(client->input, client_input, client);
 
 	str = t_str_new(128);
@@ -335,7 +341,6 @@ static void pop3_login_die(void)
 
 static void pop3_login_preinit(void)
 {
-	login_set_roots = pop3_login_setting_roots;
 }
 
 static void pop3_login_init(void)
@@ -385,6 +390,10 @@ static struct login_binary pop3_login_binary = {
 
 	.sasl_support_final_reply = FALSE,
 	.anonymous_login_acceptable = TRUE,
+
+	.application_protocols = (const char* const[]) {
+		"pop3", NULL
+	},
 };
 
 int main(int argc, char *argv[])

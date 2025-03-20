@@ -2,6 +2,7 @@
 
 #include "lib.h"
 #include "ioloop.h"
+#include "settings.h"
 #include "dict.h"
 #include "index-storage.h"
 
@@ -33,10 +34,9 @@ static int
 index_storage_get_user_dict(struct mail_storage *err_storage,
 			    struct mail_user *user, struct dict **dict_r)
 {
-	struct dict_settings dict_set;
 	struct mail_namespace *ns;
-	struct mail_storage *attr_storage;
 	const char *error;
+	int ret;
 
 	if (user->_attr_dict != NULL) {
 		*dict_r = user->_attr_dict;
@@ -54,25 +54,25 @@ index_storage_get_user_dict(struct mail_storage *err_storage,
 			"Mailbox attributes not available for this mailbox");
 		return -1;
 	}
-	attr_storage = mail_namespace_get_default_storage(ns);
 
-	if (*attr_storage->set->mail_attribute_dict == '\0') {
+	struct event *event = event_create(user->event);
+	settings_event_add_filter_name(event, "mail_attribute");
+	ret = dict_init_auto(event, &user->_attr_dict, &error);
+	event_unref(&event);
+
+	if (ret < 0) {
+		mail_storage_set_critical(err_storage,
+			"mail_attribute: dict_init_auto() failed: %s",
+			error);
+		user->attr_dict_failed = TRUE;
+		return -1;
+	}
+	if (ret == 0) {
 		mail_storage_set_error(err_storage, MAIL_ERROR_NOTPOSSIBLE,
 				       "Mailbox attributes not enabled");
 		return -1;
 	}
 
-	i_zero(&dict_set);
-	dict_set.base_dir = user->set->base_dir;
-	dict_set.event_parent = user->event;
-	if (dict_init(attr_storage->set->mail_attribute_dict, &dict_set,
-		      &user->_attr_dict, &error) < 0) {
-		mail_storage_set_critical(err_storage,
-			"mail_attribute_dict: dict_init(%s) failed: %s",
-			attr_storage->set->mail_attribute_dict, error);
-		user->attr_dict_failed = TRUE;
-		return -1;
-	}
 	*dict_r = user->_attr_dict;
 	return 0;
 }
@@ -85,12 +85,12 @@ index_storage_get_dict(struct mailbox *box, enum mail_attribute_type type_flags,
 	struct mail_storage *storage = box->storage;
 	struct mail_namespace *ns;
 	struct mailbox_metadata metadata;
-	struct dict_settings set;
 	const char *error;
+	int ret;
 
 	if ((type_flags & MAIL_ATTRIBUTE_TYPE_FLAG_VALIDATED) != 0) {
 		/* IMAP METADATA support isn't enabled, so don't allow using
-		   mail_attribute_dict. */
+		   the mail_attribute's dict. */
 		mail_storage_set_error(storage, MAIL_ERROR_NOTPOSSIBLE,
 				       "Generic mailbox attributes not enabled");
 		return -1;
@@ -120,27 +120,29 @@ index_storage_get_dict(struct mailbox *box, enum mail_attribute_type type_flags,
 		*dict_r = storage->_shared_attr_dict;
 		return 0;
 	}
-	if (*storage->set->mail_attribute_dict == '\0') {
-		mail_storage_set_error(storage, MAIL_ERROR_NOTPOSSIBLE,
-				       "Mailbox attributes not enabled");
-		return -1;
-	}
 	if (storage->shared_attr_dict_failed) {
 		mail_storage_set_internal_error(storage);
 		return -1;
 	}
 
-	i_zero(&set);
-	set.base_dir = storage->user->set->base_dir;
-	set.event_parent = storage->user->event;
-	if (dict_init(storage->set->mail_attribute_dict, &set,
-		      &storage->_shared_attr_dict, &error) < 0) {
+	struct event *event = event_create(storage->event);
+	settings_event_add_filter_name(event, "mail_attribute");
+	ret = dict_init_auto(event, &storage->_shared_attr_dict, &error);
+	event_unref(&event);
+
+	if (ret < 0) {
 		mail_storage_set_critical(storage,
-			"mail_attribute_dict: dict_init(%s) failed: %s",
-			storage->set->mail_attribute_dict, error);
+			"mail_attribute: dict_init_auto() failed: %s",
+			error);
 		storage->shared_attr_dict_failed = TRUE;
 		return -1;
 	}
+	if (ret == 0) {
+		mail_storage_set_error(storage, MAIL_ERROR_NOTPOSSIBLE,
+				       "Mailbox attributes not enabled");
+		return -1;
+	}
+
 	*dict_r = storage->_shared_attr_dict;
 	return 0;
 }
@@ -281,8 +283,10 @@ index_storage_attribute_iter_init(struct mailbox *box,
 	iter = i_new(struct index_storage_attribute_iter, 1);
 	iter->iter.box = box;
 	if (index_storage_get_dict(box, type_flags, &dict, &mailbox_prefix) < 0) {
-		if (mailbox_get_last_mail_error(box) == MAIL_ERROR_NOTPOSSIBLE)
+		if (mailbox_get_last_mail_error(box) == MAIL_ERROR_NOTPOSSIBLE) {
+			mail_storage_clear_error(box->storage);
 			iter->dict_disabled = TRUE;
+		}
 	} else {
 		iter->prefix = i_strdup(key_get_prefixed(type_flags, mailbox_prefix,
 							 prefix));

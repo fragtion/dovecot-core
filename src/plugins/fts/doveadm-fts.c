@@ -6,9 +6,10 @@
 #include "mail-namespace.h"
 #include "mail-search.h"
 #include "mailbox-list-iter.h"
-#include "fts-tokenizer.h"
-#include "fts-filter.h"
-#include "fts-language.h"
+#include "lang-tokenizer.h"
+#include "lang-filter.h"
+#include "lang-user.h"
+#include "language.h"
 #include "fts-storage.h"
 #include "fts-search-args.h"
 #include "fts-user.h"
@@ -34,7 +35,7 @@ static int
 cmd_search_box(struct doveadm_mail_cmd_context *ctx,
 	       const struct mailbox_info *info)
 {
-	struct event *event = info->ns->user->event;
+	struct event *event = mailbox_list_get_event(info->ns->list);
 	struct mailbox *box;
 	struct fts_backend *backend;
 	struct fts_result result;
@@ -186,8 +187,8 @@ cmd_fts_tokenize_run(struct doveadm_mail_cmd_context *_ctx,
 
 	struct mail_namespace *ns = mail_namespace_find_inbox(user->namespaces);
 	struct fts_backend *backend;
-	struct fts_user_language *user_lang;
-	const struct fts_language *lang = NULL;
+	struct language_user *user_lang;
+	const struct language *lang = NULL;
 	int ret, ret2;
 	bool final = FALSE;
 
@@ -199,30 +200,30 @@ cmd_fts_tokenize_run(struct doveadm_mail_cmd_context *_ctx,
 	}
 
 	if (ctx->language == NULL) {
-		struct fts_language_list *lang_list =
-			fts_user_get_language_list(user);
-		enum fts_language_result result;
+		struct language_list *lang_list =
+			lang_user_get_language_list(user);
+		enum language_detect_result result;
 		const char *error;
 
-		result = fts_language_detect(lang_list,
+		result = language_detect(lang_list,
 		    (const unsigned char *)ctx->tokens, strlen(ctx->tokens),
                     &lang, &error);
 		if (lang == NULL)
-			lang = fts_language_list_get_first(lang_list);
+			lang = language_list_get_first(lang_list);
 		switch (result) {
-		case FTS_LANGUAGE_RESULT_SHORT:
+		case LANGUAGE_DETECT_RESULT_SHORT:
 			e_warning(user->event,
 				  "Text too short, can't detect its language - assuming %s",
 				  lang->name);
 			break;
-		case FTS_LANGUAGE_RESULT_UNKNOWN:
+		case LANGUAGE_DETECT_RESULT_UNKNOWN:
 			e_warning(user->event,
 				  "Can't detect its language - assuming %s",
 				  lang->name);
 			break;
-		case FTS_LANGUAGE_RESULT_OK:
+		case LANGUAGE_DETECT_RESULT_OK:
 			break;
-		case FTS_LANGUAGE_RESULT_ERROR:
+		case LANGUAGE_DETECT_RESULT_ERROR:
 			e_error(user->event,
 				"Language detection library initialization failed: %s",
 				error);
@@ -232,7 +233,7 @@ cmd_fts_tokenize_run(struct doveadm_mail_cmd_context *_ctx,
 			i_unreached();
 		}
 	} else {
-		lang = fts_language_find(ctx->language);
+		lang = language_find(ctx->language);
 		if (lang == NULL) {
 			e_error(user->event,
 				"Unknown language: %s", ctx->language);
@@ -240,7 +241,7 @@ cmd_fts_tokenize_run(struct doveadm_mail_cmd_context *_ctx,
 			return -1;
 		}
 	}
-	user_lang = fts_user_language_find(user, lang);
+	user_lang = lang_user_language_find(user, lang);
 	if (user_lang == NULL) {
 		e_error(user->event,
 			"Language not enabled for user: %s", ctx->language);
@@ -248,22 +249,22 @@ cmd_fts_tokenize_run(struct doveadm_mail_cmd_context *_ctx,
 		return -1;
 	}
 
-	fts_tokenizer_reset(user_lang->index_tokenizer);
+	lang_tokenizer_reset(user_lang->index_tokenizer);
 	for (;;) {
 		const char *token, *error;
 
 		if (!final) {
-			ret = fts_tokenizer_next(user_lang->index_tokenizer,
+			ret = lang_tokenizer_next(user_lang->index_tokenizer,
 				(const unsigned char *)ctx->tokens, strlen(ctx->tokens),
 				&token, &error);
 		} else {
-			ret = fts_tokenizer_final(user_lang->index_tokenizer,
+			ret = lang_tokenizer_final(user_lang->index_tokenizer,
 						  &token, &error);
 		}
 		if (ret < 0)
 			break;
 		if (ret > 0 && user_lang->filter != NULL) {
-			ret2 = fts_filter_filter(user_lang->filter, &token, &error);
+			ret2 = lang_filter(user_lang->filter, &token, &error);
 			if (ret2 > 0)
 				doveadm_print(token);
 			else if (ret2 < 0)

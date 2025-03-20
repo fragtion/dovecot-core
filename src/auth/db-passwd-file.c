@@ -14,6 +14,8 @@
 #include "str.h"
 #include "eacces-error.h"
 #include "ioloop.h"
+#include "path-util.h"
+#include "settings.h"
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -22,6 +24,55 @@
 
 #define PARSE_TIME_STARTUP_WARN_SECS 60
 #define PARSE_TIME_RELOAD_WARN_SECS 10
+
+#undef DEF
+#define DEF(type, name) \
+	SETTING_DEFINE_STRUCT_##type(#name, name, struct passwd_file_settings)
+
+static const struct setting_define passwd_file_setting_defines[] = {
+	{ .type = SET_FILTER_NAME, .key = "passdb_passwd_file", },
+	{ .type = SET_FILTER_NAME, .key = "userdb_passwd_file", },
+	DEF(STR_NOVARS, passwd_file_path),
+
+	SETTING_DEFINE_LIST_END
+};
+
+static const struct passwd_file_settings passwd_file_default_settings = {
+	.passwd_file_path = "",
+};
+
+static const struct setting_keyvalue passwd_file_default_settings_keyvalue[] = {
+	{ "passdb_passwd_file/passdb_default_password_scheme", "CRYPT" },
+	{ NULL, NULL }
+};
+
+const struct setting_parser_info passwd_file_setting_parser_info = {
+	.name = "passwd_file",
+
+	.defines = passwd_file_setting_defines,
+	.defaults = &passwd_file_default_settings,
+	.default_settings = passwd_file_default_settings_keyvalue,
+
+	.struct_size = sizeof(struct passwd_file_settings),
+	.pool_offset1 = 1 + offsetof(struct passwd_file_settings, pool),
+};
+
+static int db_passwd_file_expand(const char *key, const char **value_r,
+				 void *context, const char **error_r)
+{
+	struct auth_fields *pwd_fields = context;
+	*value_r = auth_fields_find(pwd_fields, key);
+	if (*value_r == NULL) {
+		*error_r = t_strdup_printf("No such field '%s'", key);
+		return -1;
+	}
+	return 0;
+}
+
+const struct var_expand_provider db_passwd_file_var_expand_fn[] = {
+	{ .key = "passwd_file", .func = db_passwd_file_expand },
+	VAR_EXPAND_TABLE_END
+};
 
 static struct db_passwd_file *passwd_files;
 
@@ -123,24 +174,14 @@ passwd_file_add(struct passwd_file *pw, const char *username,
 	if (*args != NULL)
 		args++;
 
-	if (*args != NULL && **args == '\0') {
-		/* old format, this field is empty and next field may
-		   contain MAIL */
-		args++;
-		if (*args != NULL && **args != '\0' && pw->db->userdb) {
-			extra_fields =
-                                t_strconcat("userdb_mail=",
-                                            t_strarray_join(args, ":"), NULL);
-		}
-	} else if (*args != NULL) {
-		/* new format, contains a space separated list of
-		   extra fields */
+	if (*args != NULL) {
+		/* space separated list of extra fields */
                 extra_fields = t_strarray_join(args, ":");
         }
 
         if (extra_fields != NULL) {
-                pu->extra_fields =
-                        p_strsplit_spaces(pw->pool, extra_fields, " ");
+		pu->extra_fields = (const char *const *)
+			p_strsplit_spaces(pw->pool, extra_fields, " ");
         }
 
 	hash_table_insert(pw->users, user, pu);
@@ -271,8 +312,8 @@ static int passwd_file_sync(struct auth_request *request,
 			e_error(authdb_event(request),
 				"%s", eacces_error_get("stat", pw->path));
 		} else if (errno == ENOENT) {
-			auth_request_log_info(request, "passwd-file",
-					      "missing passwd file: %s", pw->path);
+			e_info(authdb_event(request),
+			       "missing passwd file: %s", pw->path);
 			ret = 0;
 		} else {
 			e_error(authdb_event(request),
@@ -320,9 +361,8 @@ static void db_passwd_file_set_userdb(struct db_passwd_file *db)
 struct db_passwd_file *
 db_passwd_file_init(const char *path, bool userdb, bool debug)
 {
+	const char *error;
 	struct db_passwd_file *db;
-	const char *p;
-	bool percents = FALSE;
 
 	db = db_passwd_file_find(path);
 	if (db != NULL) {
@@ -339,30 +379,18 @@ db_passwd_file_init(const char *path, bool userdb, bool debug)
 	db->event = event_create(auth_event);
 	event_set_forced_debug(db->event, debug);
 
-	for (p = path; *p != '\0'; p++) {
-		if (*p == '%' && p[1] != '\0') {
-			if (var_get_key(++p) == '%')
-				percents = TRUE;
-			else
-				db->vars = TRUE;
-		}
-	}
+	struct var_expand_program *prog;
+	if (var_expand_program_create(path, &prog, &error) < 0)
+		i_fatal("Invalid path '%s' for passwd-file", error);
 
-	if (percents && !db->vars) {
-		/* just extra escaped % chars. remove them. */
-		struct var_expand_table empty_table[1] = {
-			{ .key = '\0' },
-		};
-		string_t *dest;
-		const char *error;
-
-		dest = t_str_new(256);
-		if (var_expand(dest, path, empty_table, &error) <= 0)
-			i_unreached();
-		path = str_c(dest);
-	}
-
+	const char *const *vars = var_expand_program_variables(prog);
 	db->path = i_strdup(path);
+
+	if (*vars != NULL) {
+		db->vars = TRUE;
+		db->prog = prog;
+	} else
+		var_expand_program_free(&prog);
 	if (db->vars) {
 		hash_table_create(&db->files, default_pool, 0,
 				  str_hash, strcmp);
@@ -405,6 +433,7 @@ void db_passwd_file_unref(struct db_passwd_file **_db)
 			break;
 		}
 	}
+	var_expand_program_free(&db->prog);
 
 	if (db->default_file != NULL)
 		passwd_file_free(db->default_file);
@@ -420,19 +449,28 @@ void db_passwd_file_unref(struct db_passwd_file **_db)
 	i_free(db);
 }
 
-static const char *
-path_fix(const char *path,
-	 const struct auth_request *auth_request ATTR_UNUSED)
+int db_passwd_fix_path(const char *path, const char **path_r,
+		       const char *orig_path, const char **error_r)
 {
+	/* normalize path */
+	const char *normalized;
+	if (t_normpath(path, &normalized, error_r) < 0)
+		return -1;
+
+	/* check base path */
 	const char *p;
+	if (*orig_path != '%' &&
+	    (p = strstr(orig_path, "%{")) != NULL) {
+		ptrdiff_t len = p - orig_path;
+		if (strncmp(orig_path, normalized, len) != 0) {
+			*error_r = t_strdup_printf("Path is outside '%s'",
+					t_strdup_until(orig_path, p));
+			return -1;
+		}
+	}
 
-	p = strchr(path, '/');
-	if (p == NULL)
-		return path;
-
-	/* most likely this is an invalid request. just cut off the '/' and
-	   everything after it. */
-	return t_strdup_until(path, p);
+	*path_r = normalized;
+	return 0;
 }
 
 int db_passwd_file_lookup(struct db_passwd_file *db,
@@ -448,15 +486,25 @@ int db_passwd_file_lookup(struct db_passwd_file *db,
 	if (!db->vars)
 		pw = db->default_file;
 	else {
+		const struct var_expand_params params = {
+			.table = auth_request_get_var_expand_table(request),
+			.providers = auth_request_var_expand_providers,
+			.context = request,
+			.event = authdb_event(request),
+		};
 		dest = t_str_new(256);
-		if (auth_request_var_expand(dest, db->path, request, path_fix,
-					    &error) <= 0) {
+		if (var_expand_program_execute(dest, db->prog, &params, &error) < 0) {
 			e_error(authdb_event(request),
 				"Failed to expand passwd-file path %s: %s",
 				db->path, error);
 			return -1;
 		}
-
+		const char *path;
+		if (db_passwd_fix_path(str_c(dest), &path, db->path, &error) < 0) {
+			e_info(authdb_event(request), "Failed to normalize path: %s",
+				error);
+			return 0;
+		}
 		pw = hash_table_lookup(db->files, str_c(dest));
 		if (pw == NULL) {
 			/* doesn't exist yet. create lookup for it. */
@@ -471,7 +519,7 @@ int db_passwd_file_lookup(struct db_passwd_file *db,
 
 	username = t_str_new(256);
 	if (auth_request_var_expand(username, username_format, request,
-				    auth_request_str_escape, &error) <= 0) {
+				    auth_request_str_escape, &error) < 0) {
 		e_error(authdb_event(request),
 			"Failed to expand username_format=%s: %s",
 			username_format, error);
@@ -484,7 +532,7 @@ int db_passwd_file_lookup(struct db_passwd_file *db,
 
 	*user_r = hash_table_lookup(pw->users, str_c(username));
 	if (*user_r == NULL) {
-		auth_request_log_unknown_user(request, AUTH_SUBSYS_DB);
+		auth_request_db_log_unknown_user(request);
 		return 0;
 	}
 	return 1;

@@ -53,6 +53,7 @@ struct mechanisms_register {
 
 	struct mech_module_list *modules;
 	buffer_t *handshake;
+	buffer_t *handshake_cbind;
 };
 
 extern const struct mech_module mech_dovecot_token;
@@ -73,5 +74,7 @@ mech_register_find(const struct mechanisms_register *reg, const char *name);
 
 void mech_init(const struct auth_settings *set);
 void mech_deinit(const struct auth_settings *set);
+
+void mech_oauth2_initialize(void);
 
 #endif

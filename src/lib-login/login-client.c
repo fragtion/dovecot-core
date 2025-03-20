@@ -9,6 +9,7 @@
 #include "time-util.h"
 #include "master-service-private.h"
 #include "login-client.h"
+#include "doc.h"
 
 #include <unistd.h>
 #include <sys/stat.h>
@@ -92,7 +93,7 @@ login_connection_event_callback(struct login_connection *conn,
 				const char *message)
 {
 	string_t *str = t_str_new(128);
-	str_printfa(str, "%s (client-pid=%u, client-id=%u, rip=%s, created %u msecs ago, received %u/%zu bytes)",
+	str_printfa(str, "%s (client-pid=%u, client-id=%u, rip=%s, created %lld msecs ago, received %u/%zu bytes)",
 		message, conn->client_pid, conn->auth_id,
 		net_ip2addr(&conn->remote_ip),
 		timeval_diff_msecs(&ioloop_timeval, &conn->create_time),
@@ -233,7 +234,7 @@ void login_client_request(struct login_client_list *list,
 	if (conn->fd == -1) {
 		e_error(conn->event, "net_connect_unix(%s) failed: %m%s",
 			conn->path, errno != EAGAIN ? "" :
-			" - https://doc.dovecot.org/admin_manual/errors/socket_unavailable/");
+			" - " DOC_LINK("core/admin/errors.html#unix-socket-resource-temporarily-unavailable"));
 		login_connection_deinit(&conn);
 		return;
 	}

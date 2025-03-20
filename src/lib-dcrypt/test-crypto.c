@@ -13,10 +13,14 @@
 #include "randgen.h"
 #include "test-common.h"
 #include "hex-binary.h"
-#include "json-parser.h"
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <stdio.h>
+#include <openssl/evp.h>
+
+#if defined(NID_X25519)
+# define HAVE_X25519
+#endif
 
 static void test_cipher_test_vectors(void)
 {
@@ -692,37 +696,52 @@ static void test_get_info_invalid_keys(void)
 {
 	test_begin("test_get_info_invalid_keys");
 
-	const char *key =
-		"1:716:030131D8A5FD5167947A0AE9CB112ADED6526654635A"
-		"A5887051EE2364414B60FF32EBA8FA0BBE9485DBDE8794BBBC"
-		"B44BBFC0D662A4287A848BA570D4E5E45A11FE0F:d0cfaca5d"
-		"335f9edc41c84bb47465184cb0e2ec3931bebfcea4dd433615"
-		"e77a0";
-	const char *error = NULL;
+	static const struct {
+		const char *key;
+		const char *error;
+	} invalid_keys[] = {
+		{
+			.key = "1:716:030131D8A5FD5167947A0AE9CB112ADED6526654635A"
+			       "A5887051EE2364414B60FF32EBA8FA0BBE9485DBDE8794BBBC"
+			       "B44BBFC0D662A4287A848BA570D4E5E45A11FE0F:d0cfaca5d"
+			       "335f9edc41c84bb47465184cb0e2ec3931bebfcea4dd433615"
+			       "e77a0",
+			.error = "tab",
+		},
+		{
+			.key = "2\t305e301006072a8648ce3d020106052b81040026034a000"
+			       "203fcc90034fa03d6fb79a0fc8b3b43c3398f68e7602930736"
+			       "0cdcb9e27bb7e84b3c19dfb7244763bc4d442d216f09b7b794"
+			       "5ed9d182f3156550e9ee30b237a0217dbf79d28975f31\t867"
+			       "06b69d1f640011a65d26a42f2ba20a619173644e1cc7475eb1"
+			       "d90966e84dc",
+			.error = "colon",
+		},
+		{
+			.key = "2",
+			.error = "Unknown",
+		},
+		{
+			.key = "{"
+			       "\"kty\":\"invalid\""
+			       "}",
+			.error = "Unsupported JWK key type",
+		},
+		{
+			.key = "{"
+			       "}",
+			.error = "Missing kty parameter",
+		},
+	};
 
-	test_assert(dcrypt_key_string_get_info(key, NULL, NULL,
-			NULL, NULL, NULL, NULL, &error) == FALSE);
-	test_assert(error != NULL && strstr(error, "tab") != NULL);
-
-	key =
-		"2\t305e301006072a8648ce3d020106052b81040026034a000"
-		"203fcc90034fa03d6fb79a0fc8b3b43c3398f68e7602930736"
-		"0cdcb9e27bb7e84b3c19dfb7244763bc4d442d216f09b7b794"
-		"5ed9d182f3156550e9ee30b237a0217dbf79d28975f31\t867"
-		"06b69d1f640011a65d26a42f2ba20a619173644e1cc7475eb1"
-		"d90966e84dc";
-	error = NULL;
-
-	test_assert(dcrypt_key_string_get_info(key, NULL, NULL,
-			NULL, NULL, NULL, NULL, &error) == FALSE);
-	test_assert(error != NULL && strstr(error, "colon") != NULL);
-
-	key = "2";
-	error = NULL;
-
-	test_assert(dcrypt_key_string_get_info(key, NULL, NULL,
-			NULL, NULL, NULL, NULL, &error) == FALSE);
-	test_assert(error != NULL && strstr(error, "Unknown") != NULL);
+	for (size_t i = 0; i < N_ELEMENTS(invalid_keys); i++) {
+		const char *error = NULL;
+		test_assert(dcrypt_key_string_get_info(
+				    invalid_keys[i].key, NULL, NULL, NULL, NULL,
+				    NULL, NULL, &error) == FALSE);
+		test_assert(error != NULL &&
+			    strstr(error, invalid_keys[i].error) != NULL);
+	}
 
 	test_end();
 }
@@ -879,32 +898,329 @@ static void test_load_invalid_keys(void)
 {
 	test_begin("test_load_invalid_keys");
 
-	const char *error = NULL;
-	const char *key =
-		"1:716:0301EB00973C4EFC8FCECA4EA33E941F50B561199A51"
-		"59BCB6C2EED9DD1D62D65E38A254979D89E28F0C28883E71EE"
-		"2AD264CD16B863FA094A8F6F69A56B62E8918040:7c9a1039e"
-		"a2e4fed73e81dd3ffc3fa22ea4a28352939adde7bf8ea858b0"
-		"0fa4f";
-	struct dcrypt_public_key *pub_key = NULL;
+	static const struct {
+		const char *key;
+		const char *error;
+		bool public;
+	} invalid_keys[] = {
+		{
+			.key = "1:716:0301EB00973C4EFC8FCECA4EA33E941F50B561199A51"
+			       "59BCB6C2EED9DD1D62D65E38A254979D89E28F0C28883E71EE"
+			       "2AD264CD16B863FA094A8F6F69A56B62E8918040:7c9a1039e"
+			       "a2e4fed73e81dd3ffc3fa22ea4a28352939adde7bf8ea858b0"
+			       "0fa4f",
+			.error =
+				"Dovecot v1 key format uses tab to separate fields",
+			.public = TRUE,
+		},
+		{
+			.key = "2:305e301006072a8648ce3d020106052b81040026034a0002"
+			       "03fcc90034fa03d6fb79a0fc8b3b43c3398f68e76029307360"
+			       "cdcb9e27bb7e84b3c19dfb7244763bc4d442d216f09b7b7945"
+			       "ed9d182f3156550e9ee30b237a0217dbf79d28975f31:86706"
+			       "b69d1f640011a65d26a42f2ba20a619173644e1cc7475eb1d9"
+			       "0966e84dc",
+			.error = "key is not private",
+			.public = FALSE,
+		},
+		/* JWT ECDSA: Missing kty */
+		{
+			.key = "{"
+			       "\"d\":\"gSGuVf7wU1eT_QTyIuT57UgKm8gh5NYi6TaGTLOOZ28\","
+			       "\"use\":\"sig\","
+			       "\"crv\":\"P-256\","
+			       "\"x\":\"-TjShNC76Uconyoo25WUmm9BuuDn5gmx2T14d6i5vgQ\","
+			       "\"y\":\"V3zIBTnVTKY14HZP9a2lXgReyq6-EeOrCoZf76KUlEc\","
+			       "\"alg\":\"ES256\""
+			       "}",
+			.error = "Missing kty parameter",
+			.public = FALSE,
+		},
+		/* JWT ECDSA: Missing curve */
+		{
+			.key = "{"
+			       "\"kty\":\"EC\","
+			       "\"d\":\"gSGuVf7wU1eT_QTyIuT57UgKm8gh5NYi6TaGTLOOZ28\","
+			       "\"use\":\"sig\","
+			       "\"x\":\"-TjShNC76Uconyoo25WUmm9BuuDn5gmx2T14d6i5vgQ\","
+			       "\"y\":\"V3zIBTnVTKY14HZP9a2lXgReyq6-EeOrCoZf76KUlEc\","
+			       "\"alg\":\"ES256\""
+			       "}",
+			.error = "Missing crv parameter",
+			.public = FALSE,
+		},
+		/* JWT ECDSA: Unsupported curve */
+		{
+			.key = "{"
+			       "\"kty\":\"EC\","
+			       "\"d\":\"gSGuVf7wU1eT_QTyIuT57UgKm8gh5NYi6TaGTLOOZ28\","
+			       "\"use\":\"sig\","
+			       "\"crv\":\"secp384k5\","
+			       "\"x\":\"-TjShNC76Uconyoo25WUmm9BuuDn5gmx2T14d6i5vgQ\","
+			       "\"y\":\"V3zIBTnVTKY14HZP9a2lXgReyq6-EeOrCoZf76KUlEc\","
+			       "\"alg\":\"ES256\""
+			       "}",
+			.error = "Unsupported curve: secp384k5",
+			.public = FALSE,
+		},
+		/* JWT ECDSA: Wrong curve for key */
+		{
+			.key = "{"
+			       "\"kty\":\"EC\","
+			       "\"d\":\"gSGuVf7wU1eT_QTyIuT57UgKm8gh5NYi6TaGTLOOZ28\","
+			       "\"use\":\"sig\","
+			       "\"crv\":\"P-384\","
+			       "\"x\":\"-TjShNC76Uconyoo25WUmm9BuuDn5gmx2T14d6i5vgQ\","
+			       "\"y\":\"V3zIBTnVTKY14HZP9a2lXgReyq6-EeOrCoZf76KUlEc\","
+			       "\"alg\":\"ES256\""
+			       "}",
+			.error = "point is not on curve",
+			.public = FALSE,
+		},
+		/* JWT ECDSA: Missing private key */
+		{
+			.key = "{"
+			       "\"kty\":\"EC\","
+			       "\"use\":\"sig\","
+			       "\"crv\":\"P-256\","
+			       "\"x\":\"-TjShNC76Uconyoo25WUmm9BuuDn5gmx2T14d6i5vgQ\","
+			       "\"y\":\"V3zIBTnVTKY14HZP9a2lXgReyq6-EeOrCoZf76KUlEc\","
+			       "\"alg\":\"ES256\""
+			       "}",
+			.error = "key is not private",
+			.public = FALSE,
+		},
+		/* JWT ECDSA: Missing public key */
+		{
+			.key = "{"
+			       "\"kty\":\"EC\","
+			       "\"d\":\"gSGuVf7wU1eT_QTyIuT57UgKm8gh5NYi6TaGTLOOZ28\","
+			       "\"use\":\"sig\","
+			       "\"crv\":\"P-256\","
+			       "\"alg\":\"ES256\""
+			       "}",
+			.error = "Missing x parameter",
+			.public = FALSE,
+		},
+		/* JWT ECDSA: Missing x */
+		{
+			.key = "{"
+			       "\"kty\":\"EC\","
+			       "\"d\":\"gSGuVf7wU1eT_QTyIuT57UgKm8gh5NYi6TaGTLOOZ28\","
+			       "\"use\":\"sig\","
+			       "\"crv\":\"P-256\","
+			       "\"y\":\"V3zIBTnVTKY14HZP9a2lXgReyq6-EeOrCoZf76KUlEc\","
+			       "\"alg\":\"ES256\""
+			       "}",
+			.error = "Missing x parameter",
+			.public = FALSE,
+		},
+		/* JWT ECDSA: Missing y */
+		{
+			.key = "{"
+			       "\"kty\":\"EC\","
+			       "\"d\":\"gSGuVf7wU1eT_QTyIuT57UgKm8gh5NYi6TaGTLOOZ28\","
+			       "\"use\":\"sig\","
+			       "\"crv\":\"P-256\","
+			       "\"x\":\"-TjShNC76Uconyoo25WUmm9BuuDn5gmx2T14d6i5vgQ\","
+			       "\"alg\":\"ES256\""
+			       "}",
+			.error = "Missing y parameter",
+			.public = FALSE,
+		},
+		/* JWT ECDSA: d does not match x,y */
+		{
+			.key = "{"
+			       "\"kty\":\"EC\","
+			       "\"d\":\"I_HrrKbVygrMsHcF3jDmQzXorfnzWb9ZGgZshvjOo9k\","
+			       "\"use\":\"sig\","
+			       "\"crv\":\"P-256\","
+			       "\"x\":\"-TjShNC76Uconyoo25WUmm9BuuDn5gmx2T14d6i5vgQ\","
+			       "\"y\":\"V3zIBTnVTKY14HZP9a2lXgReyq6-EeOrCoZf76KUlEc\","
+			       "\"alg\":\"ES256\""
+			       "}",
+#ifdef HAVE_OPENSSL3
+			.error = "Private key did not match with public key",
+#else
+			.error = "invalid private key",
+#endif
+			.public = FALSE,
+		},
+		/* JWT ECDSA: x,y does not match d */
+		{
+			.key = "{"
+			       "\"kty\":\"EC\","
+			       "\"d\":\"gSGuVf7wU1eT_QTyIuT57UgKm8gh5NYi6TaGTLOOZ28\","
+			       "\"use\":\"sig\","
+			       "\"crv\":\"P-256\","
+			       "\"x\":\"YlM4gDHMvdBUG7jD9rle5H2xQrYFdd2CeL_UnF9TyVQ\","
+			       "\"y\":\"GNg7QEUgyjyE7DBc8ciuu9JAg9bJlaFvP2gLpexrjsw\","
+			       "\"alg\":\"ES256\""
+			       "}",
+#ifdef HAVE_OPENSSL3
+			.error = "Private key did not match with public key",
+#else
+			.error = "invalid private key",
+#endif
+			.public = FALSE,
+		},
+		/* JWT ECDSA: y does not match d, x */
+		{
+			.key = "{"
+			       "\"kty\":\"EC\","
+			       "\"d\":\"gSGuVf7wU1eT_QTyIuT57UgKm8gh5NYi6TaGTLOOZ28\","
+			       "\"use\":\"sig\","
+			       "\"crv\":\"P-256\","
+			       "\"x\":\"-TjShNC76Uconyoo25WUmm9BuuDn5gmx2T14d6i5vgQ\","
+			       "\"y\":\"GNg7QEUgyjyE7DBc8ciuu9JAg9bJlaFvP2gLpexrjsw\","
+			       "\"alg\":\"ES256\""
+			       "}",
+			.error = "point is not on curve",
+			.public = FALSE,
+		},
+		/* JWT RSA: Missing d */
+		{
+			.key = "{"
+			       "\"p\": \"0Il4JCQvWtDxyVEHd18rqxhXzdzIaJ3Xq5311ppIXs-oNCe2G2eTAE-CRiePOE0aQ0rl0fjkEeL8kRZZa17npQ\","
+			       "\"kty\": \"RSA\","
+			       "\"q\": \"stp6wLoE3XI3oITZO73DkhpDpuNpZ4uMHCg8GCcj784xhLtlPF_hiPgNMgT7tS4JFHFwn7V5GEG3Rk8ThDVvPQ\","
+			       "\"e\": \"AQAB\","
+			       "\"use\": \"sig\","
+			       "\"n\": \"kbGOl_HS6aYs8Ya2Y-OMlK8YcaGldcLanU6wF8nCI0WnedR_DnzZllDhWr7o8h0J5BKuL7Hop_8rn5zSEva213_Zpy3cE5DdrWtdpGyyz9cTceuhukvFSBfw_D4HOQdigRYwerl8Oq6kqCYDL5ui-TmYDLbL_oVdXshfMsU2vVE\""
+			       "}",
+			.error = "key is not private",
+			.public = FALSE,
+		},
+		/* JWT RSA: Missing e */
+		{
+			.key = "{"
+			       "\"p\": \"0Il4JCQvWtDxyVEHd18rqxhXzdzIaJ3Xq5311ppIXs-oNCe2G2eTAE-CRiePOE0aQ0rl0fjkEeL8kRZZa17npQ\","
+			       "\"kty\": \"RSA\","
+			       "\"q\": \"stp6wLoE3XI3oITZO73DkhpDpuNpZ4uMHCg8GCcj784xhLtlPF_hiPgNMgT7tS4JFHFwn7V5GEG3Rk8ThDVvPQ\","
+			       "\"d\": \"CqxINudXPRiYWEU3HVAxHz9IeiKOXXcdzsJR8hwsparXnvwrJqOMyQ85ww0TQZFRBS09J29QDOaLipDRbuQ19q0c7k0ek_sIrrzx9iulSCPdrbhdw0LS48HfsJxoD5xFg8E5BtDAjnd0P3eUrtG3R1rZXpvnlMd6-kLW-WAyGnE\","
+			       "\"use\": \"sig\","
+			       "\"n\": \"kbGOl_HS6aYs8Ya2Y-OMlK8YcaGldcLanU6wF8nCI0WnedR_DnzZllDhWr7o8h0J5BKuL7Hop_8rn5zSEva213_Zpy3cE5DdrWtdpGyyz9cTceuhukvFSBfw_D4HOQdigRYwerl8Oq6kqCYDL5ui-TmYDLbL_oVdXshfMsU2vVE\""
+			       "}",
+			.error = "Missing e parameter",
+			.public = FALSE,
+		},
+		/* JWT RSA: Missing n */
+		{
+			.key = "{"
+			       "\"p\": \"0Il4JCQvWtDxyVEHd18rqxhXzdzIaJ3Xq5311ppIXs-oNCe2G2eTAE-CRiePOE0aQ0rl0fjkEeL8kRZZa17npQ\","
+			       "\"kty\": \"RSA\","
+			       "\"q\": \"stp6wLoE3XI3oITZO73DkhpDpuNpZ4uMHCg8GCcj784xhLtlPF_hiPgNMgT7tS4JFHFwn7V5GEG3Rk8ThDVvPQ\","
+			       "\"d\": \"CqxINudXPRiYWEU3HVAxHz9IeiKOXXcdzsJR8hwsparXnvwrJqOMyQ85ww0TQZFRBS09J29QDOaLipDRbuQ19q0c7k0ek_sIrrzx9iulSCPdrbhdw0LS48HfsJxoD5xFg8E5BtDAjnd0P3eUrtG3R1rZXpvnlMd6-kLW-WAyGnE\","
+			       "\"e\": \"AQAB\","
+			       "\"use\": \"sig\""
+			       "}",
+			.error = "Missing n parameter",
+			.public = FALSE,
+		},
+		/* JWT RSA: Mismatch p,q and d */
+		{
+			.key = "{"
+			       "\"p\": \"7v5Z9uz-SES2yQ1lWTvYIqxW7B6avGJcI6W_t5c5JDzLxmT3OQ-kw9oJV7oYvFVagIVgmTgP1ymvbcfYzDSKKQ\","
+			       "\"kty\": \"RSA\","
+			       "\"q\": \"sdZWMrIiOa8XJFtRkHKZE5sp6PTvTH1H52Zcr7O14j39zMmR-i9GL1-uI_EQGBA0TK-zxnZ-incUm2cWirwVbw\","
+			       "\"d\": \"CqxINudXPRiYWEU3HVAxHz9IeiKOXXcdzsJR8hwsparXnvwrJqOMyQ85ww0TQZFRBS09J29QDOaLipDRbuQ19q0c7k0ek_sIrrzx9iulSCPdrbhdw0LS48HfsJxoD5xFg8E5BtDAjnd0P3eUrtG3R1rZXpvnlMd6-kLW-WAyGnE\","
+			       "\"e\": \"AQAB\","
+			       "\"use\": \"sig\","
+			       "\"n\": \"kbGOl_HS6aYs8Ya2Y-OMlK8YcaGldcLanU6wF8nCI0WnedR_DnzZllDhWr7o8h0J5BKuL7Hop_8rn5zSEva213_Zpy3cE5DdrWtdpGyyz9cTceuhukvFSBfw_D4HOQdigRYwerl8Oq6kqCYDL5ui-TmYDLbL_oVdXshfMsU2vVE\""
+			       "}",
+			.error = "Cannot derive rsa primes",
+			.public = FALSE,
+		},
+		/* JWT RSA: Mismatch n and p,q,d */
+		{
+			.key = "{"
+			       "\"p\": \"0Il4JCQvWtDxyVEHd18rqxhXzdzIaJ3Xq5311ppIXs-oNCe2G2eTAE-CRiePOE0aQ0rl0fjkEeL8kRZZa17npQ\","
+			       "\"kty\": \"RSA\","
+			       "\"q\": \"stp6wLoE3XI3oITZO73DkhpDpuNpZ4uMHCg8GCcj784xhLtlPF_hiPgNMgT7tS4JFHFwn7V5GEG3Rk8ThDVvPQ\","
+			       "\"d\": \"CqxINudXPRiYWEU3HVAxHz9IeiKOXXcdzsJR8hwsparXnvwrJqOMyQ85ww0TQZFRBS09J29QDOaLipDRbuQ19q0c7k0ek_sIrrzx9iulSCPdrbhdw0LS48HfsJxoD5xFg8E5BtDAjnd0P3eUrtG3R1rZXpvnlMd6-kLW-WAyGnE\","
+			       "\"e\": \"AQAB\","
+			       "\"use\": \"sig\","
+			       "\"n\": \"pgX1S7R5QI9c2Y7X6KXgUyJdOLJP3DZWBR-NR7w96rHOayKeAHKPiyg9vyGzV8rB_uePbmrnhBAZ42IDlXW_AieJGhPLYkH34d4FX8cC7mmWWXXjolajZWoW5pCg2Ilkk47R1osXGkS6Ta97ODtAvzw7PAJq1jFFPjYXVmo5RMc\""
+			       "}",
+			.error = "Cannot derive rsa primes",
+			.public = FALSE,
+		},
+		/* JWT RSA: Mismatch e */
+		{
+			.key = "{" \
+				"\"p\": \"0Il4JCQvWtDxyVEHd18rqxhXzdzIaJ3Xq5311ppIXs-oNCe2G2eTAE-CRiePOE0aQ0rl0fjkEeL8kRZZa17npQ\"," \
+				"\"kty\": \"RSA\"," \
+				"\"q\": \"stp6wLoE3XI3oITZO73DkhpDpuNpZ4uMHCg8GCcj784xhLtlPF_hiPgNMgT7tS4JFHFwn7V5GEG3Rk8ThDVvPQ\"," \
+				"\"d\": \"CqxINudXPRiYWEU3HVAxHz9IeiKOXXcdzsJR8hwsparXnvwrJqOMyQ85ww0TQZFRBS09J29QDOaLipDRbuQ19q0c7k0ek_sIrrzx9iulSCPdrbhdw0LS48HfsJxoD5xFg8E5BtDAjnd0P3eUrtG3R1rZXpvnlMd6-kLW-WAyGnE\"," \
+				"\"e\": \"AQAC\"," \
+				"\"use\": \"sig\"," \
+				"\"n\": \"kbGOl_HS6aYs8Ya2Y-OMlK8YcaGldcLanU6wF8nCI0WnedR_DnzZllDhWr7o8h0J5BKuL7Hop_8rn5zSEva213_Zpy3cE5DdrWtdpGyyz9cTceuhukvFSBfw_D4HOQdigRYwerl8Oq6kqCYDL5ui-TmYDLbL_oVdXshfMsU2vVE\"" \
+			"}",
+			.error = "Cannot derive rsa primes",
+			.public = FALSE,
+		},
+#ifdef HAVE_X25519
+		/* JWT EdDSA: Missing d */
+		{
+			.key = "{"
+			       "\"kty\": \"OKP\","
+			       "\"use\": \"sig\","
+			       "\"crv\": \"X25519\","
+			       "\"x\": \"JCyCLQ6SqDZbqfzu-HCmet3dQI-iGLChRcYEshx7vns\""
+			       "}",
+			.error = "key is not private",
+			.public = FALSE,
+		},
+		/* JWT EdDSA: Missing x*/
+		{
+			.key = "{"
+			       "\"kty\": \"OKP\","
+			       "\"d\": \"LnPo87ilJKiaF1u6Q59QRUvxJlMs_CJshtLiB29hhlA\","
+			       "\"use\": \"sig\","
+			       "\"crv\": \"X25519\""
+			       "}",
+			.error = "Missing x parameter",
+			.public = FALSE,
+		},
+		/* JWT EdDSA: Curve mismatch */
+		{
+			.key = "{"
+			       "\"kty\": \"OKP\","
+			       "\"d\": \"LnPo87ilJKiaF1u6Q59QRUvxJlMs_CJshtLiB29hhlA\","
+			       "\"use\": \"sig\","
+			       "\"crv\": \"X448\","
+			       "\"x\": \"JCyCLQ6SqDZbqfzu-HCmet3dQI-iGLChRcYEshx7vns\""
+			       "}",
+#ifdef HAVE_OPENSSL3
+			.error = "Unknown error",
+#else
+			.error = "key setup failed",
+#endif
+			.public = FALSE,
+		},
+#endif
+	};
 
-	bool ret = dcrypt_key_load_public(&pub_key, key, &error);
-	test_assert(ret == FALSE);
-	test_assert(error != NULL);
-
-	error = NULL;
-	key =
-		"2:305e301006072a8648ce3d020106052b81040026034a0002"
-		"03fcc90034fa03d6fb79a0fc8b3b43c3398f68e76029307360"
-		"cdcb9e27bb7e84b3c19dfb7244763bc4d442d216f09b7b7945"
-		"ed9d182f3156550e9ee30b237a0217dbf79d28975f31:86706"
-		"b69d1f640011a65d26a42f2ba20a619173644e1cc7475eb1d9"
-		"0966e84dc";
-	struct dcrypt_private_key *priv_key = NULL;
-
-	ret = dcrypt_key_load_private(&priv_key, key, NULL, NULL, &error);
-	test_assert(ret == FALSE);
-	test_assert(error != NULL);
+	for (size_t i = 0; i < N_ELEMENTS(invalid_keys); i++) {
+		struct dcrypt_keypair pair;
+		i_zero(&pair);
+		bool ret;
+		const char *error = NULL;
+		if (invalid_keys[i].public) {
+			ret = dcrypt_key_load_public(
+				&pair.pub, invalid_keys[i].key, &error);
+		} else {
+			ret = dcrypt_key_load_private(&pair.priv,
+						      invalid_keys[i].key, NULL,
+						      NULL, &error);
+		}
+		test_assert_idx(ret == FALSE, i);
+		test_assert_idx(error != NULL, i);
+		test_assert_idx(error != NULL && strstr(error, invalid_keys[i].error) != NULL,
+				i);
+		if (ret)
+			dcrypt_keypair_unref(&pair);
+	}
 
 	test_end();
 }
@@ -1189,30 +1505,16 @@ static void test_static_verify_ecdsa(void)
 	test_end();
 }
 
-static void test_jwk_keys(void)
+static void test_jwk_key(const char *jwk_key_json_in, const char *jwk_key_json_out,
+			 const char *pem_key)
 {
-	/* Make sure this matches what comes out from store private */
-	const char *jwk_key_json = "{\"kty\":\"EC\","
-	  "\"crv\":\"P-256\","
-	  "\"x\":\"Kp0Y4-Wpt-D9t_2XenFIj0LmvaZByLG69yOisek4aMI\","
-	  "\"y\":\"wjEPB5BhH5SRPw1cCN5grWrLCphrW19fCFR8p7c9O5o\","
-	  "\"use\":\"sig\","
-	  "\"kid\":\"123\","
-	  "\"d\":\"Po2z9rs86J2Qb_xWprr4idsWNPlgKf3G8-mftnE2ync\"}";
-	/* Acquired using another tool */
-	const char *pem_key =
-"-----BEGIN PUBLIC KEY-----\n"
-"MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEKp0Y4+Wpt+D9t/2XenFIj0LmvaZB\n"
-"yLG69yOisek4aMLCMQ8HkGEflJE/DVwI3mCtassKmGtbX18IVHyntz07mg==\n"
-"-----END PUBLIC KEY-----\n";
-	test_begin("test_jwk_keys");
 	const char *error ATTR_UNUSED;
 	struct dcrypt_keypair pair;
 	buffer_t *pem = t_buffer_create(256);
 	i_zero(&pair);
 
-	test_assert(dcrypt_key_load_public(&pair.pub, jwk_key_json, &error));
-	test_assert(dcrypt_key_load_private(&pair.priv, jwk_key_json, NULL, NULL, &error));
+	test_assert(dcrypt_key_load_public(&pair.pub, jwk_key_json_in, &error));
+	test_assert(dcrypt_key_load_private(&pair.priv, jwk_key_json_in, NULL, NULL, &error));
 
 	/* test accessors */
 	test_assert_strcmp(dcrypt_key_get_id_public(pair.pub), "123");
@@ -1229,9 +1531,170 @@ static void test_jwk_keys(void)
 
 	str_truncate(pem, 0);
 	test_assert(dcrypt_key_store_private(pair.priv, DCRYPT_FORMAT_JWK, NULL, pem, NULL, NULL, &error));
-	test_assert_strcmp(str_c(pem), jwk_key_json);
+	test_assert_strcmp(str_c(pem), jwk_key_json_out);
 
 	dcrypt_keypair_unref(&pair);
+}
+
+static void test_jwk_keys(void)
+{
+	/* Make sure to get PEM output using something else */
+	struct {
+		const char *json_in;
+		const char *json_out;
+		const char *pem;
+	} cases[] = {
+		{
+			.json_in = "{\"kty\":\"EC\","
+				"\"crv\":\"P-256\","
+				"\"x\":\"Kp0Y4-Wpt-D9t_2XenFIj0LmvaZByLG69yOisek4aMI\","
+				"\"y\":\"wjEPB5BhH5SRPw1cCN5grWrLCphrW19fCFR8p7c9O5o\","
+				"\"use\":\"sig\","
+				"\"kid\":\"123\","
+				"\"d\":\"Po2z9rs86J2Qb_xWprr4idsWNPlgKf3G8-mftnE2ync\"}",
+			.json_out = "{\"kty\":\"EC\","
+				"\"crv\":\"P-256\","
+				"\"x\":\"Kp0Y4-Wpt-D9t_2XenFIj0LmvaZByLG69yOisek4aMI\","
+				"\"y\":\"wjEPB5BhH5SRPw1cCN5grWrLCphrW19fCFR8p7c9O5o\","
+				"\"use\":\"sig\","
+				"\"kid\":\"123\","
+				"\"d\":\"Po2z9rs86J2Qb_xWprr4idsWNPlgKf3G8-mftnE2ync\"}",
+			.pem = "-----BEGIN PUBLIC KEY-----\n"
+			       "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEKp0Y4+Wpt+D9t/2XenFIj0LmvaZB\n"
+			       "yLG69yOisek4aMLCMQ8HkGEflJE/DVwI3mCtassKmGtbX18IVHyntz07mg==\n"
+			       "-----END PUBLIC KEY-----\n",
+		},
+		{ .json_in = "{\"kty\":\"RSA\","
+			  "\"n\":\"vvznTCNpPXQW_HND7U3gGEzSiu_kgRrv2fUCD1HqycgLlz2bToo"
+			  "OQjPLnx-2I1d6kw4PjSCGnLxVRMkFF7IK0SoJ1pN5vYbTX3R3Ns"
+			  "D2WnQQubjLiQKlj7S18n-jyL7T4-hDGRG4tqEa_5LwAptooOD64"
+			  "3JeJJYF8scVeKNYtR8\","
+			  "\"e\":\"AQAB\","
+			  "\"use\":\"sig\","
+			  "\"kid\":\"123\","
+			  "\"d\":\"igf0DpYFKHHvbvLLZAWFcWqMO_fW2Owj7w1hOLtGiiD3J45R4Xhr"
+			  "h7MxdcaQd4hwwTlHSgL45uxCYB08ffyiTXq9RQyiA9bZC8Xz9gP"
+			  "MzjzztG7uCY8us24wu_B0vdi-UPcV8Qe3P7zu2nlpvJFMmnW5C9"
+			  "0sWZO--MwshVWtjlk\"}",
+		  .json_out = "{\"kty\":\"RSA\","
+			  "\"n\":\"vvznTCNpPXQW_HND7U3gGEzSiu_kgRrv2fUCD1HqycgLlz2bTooOQjPLnx"
+			  "-2I1d6kw4PjSCGnLxVRMkFF7IK0SoJ1pN5vYbTX3R3NsD2WnQQubjLiQKlj7S18n-j"
+			  "yL7T4-hDGRG4tqEa_5LwAptooOD643JeJJYF8scVeKNYtR8\","
+			  "\"e\":\"AQAB\",\"use\":\"sig\",\"kid\":\"123\","
+			  "\"d\":\"igf0DpYFKHHvbvLLZAWFcWqMO_fW2Owj7w1hOLtGiiD3J45R4Xhrh7Mxdca"
+			  "Qd4hwwTlHSgL45uxCYB08ffyiTXq9RQyiA9bZC8Xz9gPMzjzztG7uCY8us24wu_B0vd"
+			  "i-UPcV8Qe3P7zu2nlpvJFMmnW5C90sWZO--MwshVWtjlk\",\"p\":\"7WD6fHlqSGf"
+			  "ukEULSrEwD77Roxlhzmb-FuCq-wNUUvphOlxIzWzT3p0et1PkgSWhmax2QAzLRaS1ee"
+			  "XhjJYWOw\",\"q\":\"zfhOeQ-TN1hrAsyxtWTrNe45HxThb_He8xJm5cOiGa85gEZF"
+			  "6mmawWsZiXMmJ9UTMC0j8ZJ09Y3U8bUU2lnabQ\",\"dp\":\"mB2WRt_TYPThJqhoF"
+			  "QQ4xU5FrtvcFlVfrC9qwhIfHlF-rtRmfuWnW7eZ8GcdPjlsNjsTR_Yq6MUk2imbAOlI"
+			  "8w\",\"dq\":\"Xe9t0paA3I_tlgRG0-SnxRvVX1CFlClqNc9hsE4toqsgfVkPT95D3"
+			  "wx6RA6JC0eJDcK4jtbtkoPR5z5fuUmbbQ\",\"qi\":\"YAowniOLomk52oiRbA3o0B"
+			  "QwRKAPbXtRBYJbxsLL4XuISWcvQ6II54D6uziqyjKc4VifvngRC3mEmEyGaEudFA\"}",
+		  .pem = "-----BEGIN PUBLIC KEY-----\n"
+			 "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQC+/OdMI2k9dBb8c0PtTeAYTNKK\n"
+			 "7+SBGu/Z9QIPUerJyAuXPZtOig5CM8ufH7YjV3qTDg+NIIacvFVEyQUXsgrRKgnW\n"
+			 "k3m9htNfdHc2wPZadBC5uMuJAqWPtLXyf6PIvtPj6EMZEbi2oRr/kvACm2ig4Prj\n"
+			 "cl4klgXyxxV4o1i1HwIDAQAB\n"
+			 "-----END PUBLIC KEY-----\n" },
+		{.json_in = "{" \
+			"\"p\": \"3sx9h7zkPBGs0cnvEFLABeEZ8ew4Jdh1y2r-coJRmPy2rX"
+			"0fh4kw2trqYZirGUqOj4Gz6yf6-_nB3W4QHZamLdl1zADHuV-OM6Tk2"
+			"DTVctgbwasXnFjvIgOh6FZZyWXhgSnoLdwUTRjDyDzQqOZ0ttb8mnPD"
+			"ZmXFyM2GnAu4CSk\","
+			"\"kty\": \"RSA\","
+			"\"q\": \"lMrUzcLmjz_yUbFx7c4rdO0KYQ6GU7hZ5K2LjEOM4l3OLw"
+			"EBMxm_CeS5_qZhiOgbKklovlu6hGuxzn0asPax9EhpDt8W3PYZoQjYc"
+			"2SwtOuB7wudtZMFHX_L19Tv6Q3EN8fkqQFGoiiRDrPi4MePy-MNBbBD"
+			"3otbWIg65fmqbkk\","
+			"\"d\": \"O5jrumGNlc3BOfyTUxYGlZPvgYA-qII64dsDwXtTwbqmwi"
+			"63km_ij7yVZiMX8oSOkR5UVwK0VsdX4Zq6LPCjeg80Xjd-noYwQ9A5h"
+			"AW1YNKDN5IMYqIPXSF0rPpbwaGzLUPToZORblqKkrOfCuvkUB9RY7A1"
+			"fyYxad7b9I178R3RiT9pyfC_8axEBnkXjfo_HehBkGKK-8I9cetxzDA"
+			"8xEJekja1V5nnzWq7_fO2VtEu5L_W-JxAtPWT-Hh484OzZrOmZo93HW"
+			"vml5D7ezJMslTx90hHkxqf66c0x7gmmLsU8GmI5yBsZitz5lQrYR6jY"
+			"nfsm3Ye87VcfwMMUa1qgQ\","
+			"\"e\": \"AQAB\","
+			"\"use\": \"sig\","
+			"\"kid\": \"123\","
+			"\"qi\": \"JWvEuWge1CB6lrFsBHtco3pfC-xUOBtQArH7H3bGH5I_b"
+			"Ewxqvtnau3WH89DOXDoZsKBIuuoIl_rW9640pRpp9UOoLrE7jGqevDj"
+			"mcq2ZwKMIGp9XeAs2zMm08-sQmFp6NAfhjFhBhvH2ITqrLs49cHNvtL"
+			"g8WVpiDJRnHEgKSQ\","
+			"\"dp\": \"ICgdmiDOREk8y068_XskEfUqXHt-ox-56LE5pmdexZj7-"
+			"NBNY6-OaJgeKhXx5AWZy-aphDBSDlo---mt08dxlr6DPP2D1iKPkK6l"
+			"BPujLx836lz6XGuNoDgr_y-vZ90Xjh_xTeUs3O_NGjKE30vb3qPq85P"
+			"vyPC5ekEHw7ABUPk\","
+			"\"alg\": \"RS256\","
+			"\"dq\": \"RipUKefkA9967O1JtYPI2G3DvDs2OxqvQXhZWz6rnD_yM"
+			"BZAM5HLleXHk_9v9TjHPqy5eTMWhMWoZqB2Ssc66eCPslSfmnlvYpIi"
+			"SGBOODLq5ghLScnX2q5eORyQOg2k300jVlNktKl-pjlMHwXcmKAsjuc"
+			"tSi_bVqd_Zt3Scgk\","
+			"\"n\": \"gX6_IfGjjHZozSzXlGPTwoEE6v_zTyDGB_Xc1P6aAZUHFe"
+			"1gV8pD_6c6-i6HeWR79zbtL6QGH6OCQdnn_pkVh7zmxS4yMfsz6NmqL"
+			"S5NftG-Uw1tRhxMG-nypPRyPd6IO4ozeujAt25_htnfOdMlQp-uAJc5"
+			"Lu7pM_8qr-g9O-Q1ih-FBhGp8xbyEvDw4VRtr1OyZsHDPV9f35QXyny"
+			"PqO-oeCEqqDoWEnwSgbDRek93m3gnsYjvti_3VsaH1YtjfU6K-ZXhbC"
+			"xNxhhOo8Zr-ZxEVIs_Ck6dXttuCPA5enf0fREsw4fP_gY2RR5b6Lv7E"
+			"mdR2MjOB9Pg87RUYaQ6sQ\""
+			"}",
+		.json_out = "{\"kty\":\"RSA\",\"n\":\"gX6_IfGjjHZozSzXlGPTwoEE6v_zTyDGB_Xc1P6aA"
+			"ZUHFe1gV8pD_6c6-i6HeWR79zbtL6QGH6OCQdnn_pkVh7zmxS4yMfsz6NmqLS5NftG-Uw1"
+			"tRhxMG-nypPRyPd6IO4ozeujAt25_htnfOdMlQp-uAJc5Lu7pM_8qr-g9O-Q1ih-FBhGp8"
+			"xbyEvDw4VRtr1OyZsHDPV9f35QXynyPqO-oeCEqqDoWEnwSgbDRek93m3gnsYjvti_3Vsa"
+			"H1YtjfU6K-ZXhbCxNxhhOo8Zr-ZxEVIs_Ck6dXttuCPA5enf0fREsw4fP_gY2RR5b6Lv7E"
+			"mdR2MjOB9Pg87RUYaQ6sQ\","
+			"\"e\":\"AQAB\",\"use\":\"sig\",\"kid\":\"123\","
+			"\"d\":\"O5jrumGNlc3BOfyTUxYGlZPvgYA-qII64dsDwXtTwbqmwi63km_ij7yVZiMX8o"
+			"SOkR5UVwK0VsdX4Zq6LPCjeg80Xjd-noYwQ9A5hAW1YNKDN5IMYqIPXSF0rPpbwaGzLUPT"
+			"oZORblqKkrOfCuvkUB9RY7A1fyYxad7b9I178R3RiT9pyfC_8axEBnkXjfo_HehBkGKK-8"
+			"I9cetxzDA8xEJekja1V5nnzWq7_fO2VtEu5L_W-JxAtPWT-Hh484OzZrOmZo93HWvml5D7"
+			"ezJMslTx90hHkxqf66c0x7gmmLsU8GmI5yBsZitz5lQrYR6jYnfsm3Ye87VcfwMMUa1qgQ\","
+			"\"p\":\"3sx9h7zkPBGs0cnvEFLABeEZ8ew4Jdh1y2r-coJRmPy2rX0fh4kw2trqYZirGU"
+			"qOj4Gz6yf6-_nB3W4QHZamLdl1zADHuV-OM6Tk2DTVctgbwasXnFjvIgOh6FZZyWXhgSno"
+			"LdwUTRjDyDzQqOZ0ttb8mnPDZmXFyM2GnAu4CSk\",\"q\":\"lMrUzcLmjz_yUbFx7c4r"
+			"dO0KYQ6GU7hZ5K2LjEOM4l3OLwEBMxm_CeS5_qZhiOgbKklovlu6hGuxzn0asPax9EhpDt"
+			"8W3PYZoQjYc2SwtOuB7wudtZMFHX_L19Tv6Q3EN8fkqQFGoiiRDrPi4MePy-MNBbBD3otb"
+			"WIg65fmqbkk\",\"dp\":\"ICgdmiDOREk8y068_XskEfUqXHt-ox-56LE5pmdexZj7-NB"
+			"NY6-OaJgeKhXx5AWZy-aphDBSDlo---mt08dxlr6DPP2D1iKPkK6lBPujLx836lz6XGuNo"
+			"Dgr_y-vZ90Xjh_xTeUs3O_NGjKE30vb3qPq85PvyPC5ekEHw7ABUPk\",\"dq\":\"RipU"
+			"KefkA9967O1JtYPI2G3DvDs2OxqvQXhZWz6rnD_yMBZAM5HLleXHk_9v9TjHPqy5eTMWhM"
+			"WoZqB2Ssc66eCPslSfmnlvYpIiSGBOODLq5ghLScnX2q5eORyQOg2k300jVlNktKl-pjlM"
+			"HwXcmKAsjuctSi_bVqd_Zt3Scgk\",\"qi\":\"JWvEuWge1CB6lrFsBHtco3pfC-xUOBt"
+			"QArH7H3bGH5I_bEwxqvtnau3WH89DOXDoZsKBIuuoIl_rW9640pRpp9UOoLrE7jGqevDjm"
+			"cq2ZwKMIGp9XeAs2zMm08-sQmFp6NAfhjFhBhvH2ITqrLs49cHNvtLg8WVpiDJRnHEgKSQ\"}",
+		.pem = "-----BEGIN PUBLIC KEY-----\n" \
+			"MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAgX6/IfGjjHZozSzXlGPT\n" \
+			"woEE6v/zTyDGB/Xc1P6aAZUHFe1gV8pD/6c6+i6HeWR79zbtL6QGH6OCQdnn/pkV\n" \
+			"h7zmxS4yMfsz6NmqLS5NftG+Uw1tRhxMG+nypPRyPd6IO4ozeujAt25/htnfOdMl\n" \
+			"Qp+uAJc5Lu7pM/8qr+g9O+Q1ih+FBhGp8xbyEvDw4VRtr1OyZsHDPV9f35QXynyP\n" \
+			"qO+oeCEqqDoWEnwSgbDRek93m3gnsYjvti/3VsaH1YtjfU6K+ZXhbCxNxhhOo8Zr\n" \
+			"+ZxEVIs/Ck6dXttuCPA5enf0fREsw4fP/gY2RR5b6Lv7EmdR2MjOB9Pg87RUYaQ6\n" \
+			"sQIDAQAB\n" \
+			"-----END PUBLIC KEY-----\n", },
+#ifdef HAVE_X25519
+		{ .json_in = "{\"kty\":\"OKP\","
+			  "\"crv\":\"Ed25519\","
+			  "\"x\":\"xq1Sh-6NVxbYbfZFKMkMUnH10oNzTml2urMMm7vTOpQ\","
+			  "\"use\":\"sig\","
+			  "\"kid\":\"123\","
+			  "\"d\":\"8oIOduAeYeMtuM1Vd0Iu4Hd9ymFyTfOqpRtsFDWmlOU\"}",
+		.json_out = "{\"kty\":\"OKP\","
+			  "\"crv\":\"Ed25519\","
+			  "\"x\":\"xq1Sh-6NVxbYbfZFKMkMUnH10oNzTml2urMMm7vTOpQ\","
+			  "\"use\":\"sig\","
+			  "\"kid\":\"123\","
+			  "\"d\":\"8oIOduAeYeMtuM1Vd0Iu4Hd9ymFyTfOqpRtsFDWmlOU\"}",
+		  .pem = "-----BEGIN PUBLIC KEY-----\n"
+			 "MCowBQYDK2VwAyEAxq1Sh+6NVxbYbfZFKMkMUnH10oNzTml2urMMm7vTOpQ=\n"
+			 "-----END PUBLIC KEY-----\n" },
+#endif
+	};
+
+	test_begin("test_jwk_keys");
+
+	for (size_t i = 0; i < N_ELEMENTS(cases); i++)
+		test_jwk_key(cases[i].json_in, cases[i].json_out, cases[i].pem);
 
 	test_end();
 }
@@ -1317,6 +1780,203 @@ static void test_static_verify_ecdsa_x962(void)
 	test_end();
 }
 
+#ifdef HAVE_X25519
+static void test_sign_verify_ed25519(void)
+{
+	const char *error = NULL;
+	bool valid, ret;
+	struct dcrypt_keypair pair;
+	buffer_t *signature =
+		buffer_create_dynamic(pool_datastack_create(), 128);
+	const char *data = "signed data";
+
+	test_begin("sign and verify (ed25519)");
+
+	ret = dcrypt_keypair_generate(&pair, DCRYPT_KEY_EC, 0, "ED25519", &error);
+	if (!ret)
+		i_panic("%s", error);
+
+	test_assert(dcrypt_sign(pair.priv, "sha256", DCRYPT_SIGNATURE_FORMAT_DSS,
+		 data, strlen(data), signature, 0, &error));
+	/* verify signature */
+	test_assert(dcrypt_verify(pair.pub, "sha256", DCRYPT_SIGNATURE_FORMAT_DSS,
+		 data, strlen(data),
+		 signature->data, signature->used, &valid, 0, &error) && valid);
+
+	dcrypt_keypair_unref(&pair);
+
+	test_end();
+}
+
+static void test_static_verify_ed25519(void)
+{
+	const char *error = NULL;
+	bool valid, ret;
+	struct dcrypt_public_key *pub;
+	const char *data = "signed data";
+	const unsigned char sig[] = {
+		0xf6,0xc5,0xf9,0x6e,0x6c,0x42,0x6d,0xa8,0xbc,0x9f,0xc8,0xbe,
+		0x87,0x17,0x38,0x40,0xd9,0x5b,0x4b,0xee,0xba,0x64,0x1a,0xba,
+		0xb2,0xac,0x94,0x8c,0x25,0xd5,0x2b,0x1f,0x98,0x73,0x98,0x40,
+		0x85,0x33,0xfa,0xb9,0x40,0xd6,0x75,0x61,0x29,0xaa,0xcb,0xf7,
+		0x69,0xa4,0x93,0x21,0xa2,0x64,0x9b,0xc2,0xcd,0x62,0x95,0x42,
+		0xea,0x93,0x6f,0x07,
+	};
+	const char *key =
+"-----BEGIN PUBLIC KEY-----\n"
+"MCowBQYDK2VwAyEAPfeu6ItbVmVPUV/nYYHvV/aVheD7iVUWO9/POgcCyYM=\n"
+"-----END PUBLIC KEY-----";
+	test_begin("static verify (ed25519)");
+
+	ret = dcrypt_key_load_public(&pub, key, &error);
+	if (!ret)
+		i_panic("%s", error);
+
+	/* verify signature */
+	test_assert(dcrypt_verify(pub, "sha256", DCRYPT_SIGNATURE_FORMAT_DSS,
+		 data, strlen(data),
+		 sig, sizeof(sig), &valid, 0, &error) && valid);
+	dcrypt_key_unref_public(&pub);
+
+	test_end();
+}
+
+static void test_static_verify_ed448(void)
+{
+	const char *error = NULL;
+	bool valid, ret;
+	struct dcrypt_public_key *pub;
+	const char *data = "signed data";
+	const unsigned char sig[] = {
+		0x9d,0x90,0x9b,0xe9,0x40,0xf5,0xee,0x4e,0x42,0x34,0xa5,0x90,
+		0x85,0x0d,0x6a,0xea,0x60,0xae,0xd2,0x49,0x39,0x5f,0x61,0x64,
+		0x16,0x22,0x36,0xa4,0x14,0x8b,0x61,0x4e,0x4e,0xfa,0x74,0x45,
+		0xcb,0xf8,0x8b,0x15,0xc1,0x59,0x99,0xaa,0x26,0x20,0x45,0x32,
+		0x8a,0xa0,0xed,0x21,0xce,0x39,0xa4,0x06,0x00,0x75,0xb1,0x70,
+		0x6e,0xe6,0xb6,0x89,0x94,0x72,0xcb,0x3a,0xe8,0x1d,0xaf,0x18,
+		0x01,0xde,0x58,0xbe,0x1f,0x72,0x5b,0x0c,0xc4,0x98,0xfb,0xba,
+		0x51,0x26,0x89,0x01,0xc3,0xea,0xa7,0xe6,0xb2,0xf6,0xe5,0xee,
+		0xa2,0x5a,0x72,0x84,0xc4,0xfc,0x81,0x1f,0x48,0x45,0x9f,0xd1,
+		0x44,0x1f,0x77,0x5c,0x3b,0x00,
+	};
+	const char *key =
+"-----BEGIN PUBLIC KEY-----\n"
+"MEMwBQYDK2VxAzoAnWMyXj/1VTCDWIyx0IKbezYsUI0dl80fAkQ3IK+U5+SqR2gw\n"
+"zhHZ7ewPFgiEiP/KY3qKLWJHSDcA\n"
+"-----END PUBLIC KEY-----";
+	test_begin("static verify (ed448)");
+
+	ret = dcrypt_key_load_public(&pub, key, &error);
+	if (!ret)
+		i_panic("%s", error);
+
+	/* verify signature */
+	test_assert(dcrypt_verify(pub, "sha256", DCRYPT_SIGNATURE_FORMAT_DSS,
+		 data, strlen(data),
+		 sig, sizeof(sig), &valid, 0, &error) && valid);
+	dcrypt_key_unref_public(&pub);
+
+	test_end();
+}
+
+static void test_sign_verify_ed448(void)
+{
+	const char *error = NULL;
+	bool valid, ret;
+	struct dcrypt_keypair pair;
+	buffer_t *signature =
+		buffer_create_dynamic(pool_datastack_create(), 128);
+	const char *data = "signed data";
+
+	test_begin("sign and verify (ed448)");
+
+	ret = dcrypt_keypair_generate(&pair, DCRYPT_KEY_EC, 0, "ED448", &error);
+	if (!ret)
+		i_panic("%s", error);
+
+	test_assert(dcrypt_sign(pair.priv, "sha256", DCRYPT_SIGNATURE_FORMAT_DSS,
+		 data, strlen(data), signature, 0, &error));
+	/* verify signature */
+	test_assert(dcrypt_verify(pair.pub, "sha256", DCRYPT_SIGNATURE_FORMAT_DSS,
+		 data, strlen(data),
+		 signature->data, signature->used, &valid, 0, &error) && valid);
+
+	dcrypt_keypair_unref(&pair);
+
+	test_end();
+}
+
+static void test_xd_keypair(struct dcrypt_keypair *pair)
+{
+	const char *error = NULL;
+	bool ret;
+
+	/* perform ecdh */
+	buffer_t *R = t_buffer_create(64), *S = t_buffer_create(64);
+	buffer_t *S2 = t_buffer_create(64);
+	test_assert(dcrypt_ecdh_derive_secret_peer(pair->pub, R, S, &error));
+	test_assert(dcrypt_ecdh_derive_secret_local(pair->priv, R, S2, &error));
+	test_assert(S->used > 0);
+	test_assert(R->used > 0);
+	test_assert(buffer_cmp(S, S2));
+
+	/* try to store it as dovecot key */
+	string_t *pub = t_str_new(64);
+	string_t *priv = t_str_new(64);
+
+	ret = dcrypt_key_store_public(pair->pub, DCRYPT_FORMAT_DOVECOT, pub, &error);
+	test_assert(ret == TRUE);
+	ret = dcrypt_key_store_private(pair->priv, DCRYPT_FORMAT_DOVECOT, NULL, priv, NULL, NULL, &error);
+	test_assert(ret == TRUE);
+
+	struct dcrypt_keypair pair2;
+
+	ret = dcrypt_key_load_public(&pair2.pub, str_c(pub), &error);
+	test_assert(ret == TRUE);
+
+	ret = dcrypt_key_load_private(&pair2.priv, str_c(priv), NULL, NULL, &error);
+	test_assert(ret == TRUE);
+
+	struct dcrypt_public_key *pub2;
+	dcrypt_key_convert_private_to_public(pair2.priv, &pub2);
+
+	str_truncate(pub, 0);
+	ret = dcrypt_key_store_public(pub2, DCRYPT_FORMAT_DOVECOT, pub, &error);
+	test_assert(ret == TRUE);
+
+	dcrypt_key_unref_public(&pub2);
+	dcrypt_keypair_unref(pair);
+	dcrypt_keypair_unref(&pair2);
+}
+
+static void test_xd25519_keypair(void)
+{
+	test_begin("X25519 key exchange");
+	struct dcrypt_keypair pair;
+	const char *error = NULL;
+
+	if (!dcrypt_keypair_generate(&pair, DCRYPT_KEY_EC, 0, "X25519", &error))
+		i_panic("%s", error);
+
+	test_xd_keypair(&pair);
+
+	test_end();
+}
+
+static void test_xd448_keypair(void)
+{
+	test_begin("X448 key exchange");
+	struct dcrypt_keypair pair;
+	const char *error = NULL;
+
+	if (!dcrypt_keypair_generate(&pair, DCRYPT_KEY_EC, 0, "X448", &error))
+		i_panic("%s", error);
+
+	test_xd_keypair(&pair);
+
+	test_end();
+}
+#endif
 
 int main(void)
 {
@@ -1356,6 +2016,14 @@ int main(void)
 		test_static_verify_ecdsa,
 		test_static_verify_rsa,
 		test_static_verify_ecdsa_x962,
+#ifdef HAVE_X25519
+		test_sign_verify_ed25519,
+		test_sign_verify_ed448,
+		test_static_verify_ed25519,
+		test_static_verify_ed448,
+		test_xd25519_keypair,
+		test_xd448_keypair,
+#endif
 		NULL
 	};
 

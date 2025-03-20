@@ -7,6 +7,7 @@
 #include "ioloop.h"
 #include "str.h"
 #include "ioloop.h"
+#include "settings.h"
 #include "dict-private.h"
 
 struct dict_commit_callback_ctx {
@@ -27,6 +28,37 @@ struct dict_lookup_callback_ctx {
 	struct event *event;
 	dict_lookup_callback_t *callback;
 	void *context;
+};
+
+static bool dict_settings_check(void *_set, pool_t pool, const char **error_r);
+
+#undef DEF
+#define DEF(type, name) \
+	SETTING_DEFINE_STRUCT_##type(#name, name, struct dict_settings)
+static const struct setting_define dict_setting_defines[] = {
+	DEF(STR, dict_name),
+	DEF(STR, dict_driver),
+	{ .type = SET_FILTER_ARRAY, .key = "dict",
+	  .offset = offsetof(struct dict_settings, dicts),
+	  .filter_array_field_name = "dict_name", },
+
+	SETTING_DEFINE_LIST_END
+};
+static const struct dict_settings dict_default_settings = {
+	.dict_name = "",
+	.dict_driver = "",
+	.dicts = ARRAY_INIT,
+};
+const struct setting_parser_info dict_setting_parser_info = {
+	.name = "dict",
+
+	.defines = dict_setting_defines,
+	.defaults = &dict_default_settings,
+
+	.struct_size = sizeof(struct dict_settings),
+	.pool_offset1 = 1 + offsetof(struct dict_settings, pool),
+
+	.check_func = dict_settings_check,
 };
 
 static ARRAY(struct dict *) dict_drivers;
@@ -71,60 +103,109 @@ void dict_driver_register(struct dict *driver)
 
 void dict_driver_unregister(struct dict *driver)
 {
-	struct dict *const *dicts;
-	unsigned int idx = UINT_MAX;
+	unsigned int idx;
 
-	array_foreach(&dict_drivers, dicts) {
-		if (*dicts == driver) {
-			idx = array_foreach_idx(&dict_drivers, dicts);
-			break;
-		}
-	}
-	i_assert(idx != UINT_MAX);
+	if (!array_lsearch_ptr_idx(&dict_drivers, driver, &idx))
+		i_unreached();
 	array_delete(&dict_drivers, idx, 1);
 
 	if (array_count(&dict_drivers) == 0)
 		array_free(&dict_drivers);
 }
 
-int dict_init(const char *uri, const struct dict_settings *set,
-	      struct dict **dict_r, const char **error_r)
+static bool dict_settings_check(void *_set, pool_t pool ATTR_UNUSED,
+				const char **error_r ATTR_UNUSED)
 {
-	struct dict_settings set_dup = *set;
-	struct dict *dict;
-	const char *p, *name, *error;
+	struct dict_settings *set = _set;
 
-	p = strchr(uri, ':');
-	if (p == NULL) {
-		*error_r = t_strdup_printf("Dictionary URI is missing ':': %s",
-					   uri);
+	if (set->dict_driver[0] == '\0' && set->dict_name[0] != '\0') {
+		/* default an empty dict_driver to dict_name, so it's possible
+		   to configure simply: dict driver { .. }, but to still allow
+		   the same driver to be used multiple times if necessary. */
+		set->dict_driver = set->dict_name;
+	}
+	return TRUE;
+}
+
+int dict_init_auto(struct event *event, struct dict **dict_r,
+		   const char **error_r)
+{
+	struct dict_settings *dict_set;
+
+	i_assert(event != NULL);
+
+	if (settings_get(event, &dict_setting_parser_info, 0,
+			 &dict_set, error_r) < 0)
+		return -1;
+	if (array_is_empty(&dict_set->dicts)) {
+		*error_r = "dict { .. } named list filter is missing";
+		settings_free(dict_set);
+		return 0;
+	}
+	const char *dict_name_first =
+		t_strdup(array_idx_elem(&dict_set->dicts, 0));
+	if (array_count(&dict_set->dicts) > 1) {
+		/* There are currently no dicts that support child dicts. */
+		const char *dict_name_extra =
+			array_idx_elem(&dict_set->dicts, 1);
+		*error_r = t_strdup_printf(
+			"Extra dict %s { .. } named list filter - "
+			"the parent dict %s { .. } doesn't support a child dict",
+			dict_name_extra, dict_name_first);
+		settings_free(dict_set);
 		return -1;
 	}
 
-	name = t_strdup_until(uri, p);
-	dict = dict_driver_lookup(name);
-	if (dict == NULL) {
-		*error_r = t_strdup_printf("Unknown dict module: %s", name);
-		return -1;
-	}
-	struct event *event = event_create(set->event_parent);
-	event_add_category(event, &event_category_dict);
-	event_add_str(event, "driver", dict->name);
-	event_set_append_log_prefix(event, t_strdup_printf("dict(%s): ",
-				    dict->name));
-	set_dup.event_parent = event;
-	if (dict->v.init(dict, p+1, &set_dup, dict_r, &error) < 0) {
-		*error_r = t_strdup_printf("dict %s: %s", name, error);
+	int ret = dict_init_filter_auto(event, dict_name_first, dict_r, error_r);
+	settings_free(dict_set);
+	return ret;
+}
+
+int dict_init_filter_auto(struct event *event, const char *dict_name,
+			  struct dict **dict_r, const char **error_r)
+{
+	struct dict_settings *dict_set;
+	const struct dict *dict_driver;
+	const char *error;
+
+	/* Get settings for the first dict list filter */
+	event = event_create(event);
+	event_add_str(event, "dict", dict_name);
+	settings_event_add_list_filter_name(event, "dict", dict_name);
+	if (settings_get(event, &dict_setting_parser_info, 0,
+			 &dict_set, error_r) < 0) {
 		event_unref(&event);
+		return -1;
+	}
+
+	dict_driver = dict_driver_lookup(dict_set->dict_driver);
+	if (dict_driver == NULL) {
+		*error_r = t_strdup_printf("Unknown dict module: %s",
+					   dict_set->dict_driver);
+		event_unref(&event);
+		settings_free(dict_set);
+		return -1;
+	}
+
+	event_add_category(event, &event_category_dict);
+	event_add_str(event, "dict_driver", dict_driver->name);
+	event_set_append_log_prefix(event, t_strdup_printf("dict(%s): ",
+				    dict_driver->name));
+	if (dict_driver->v.init(dict_driver, event, dict_r, &error) < 0) {
+		*error_r = t_strdup_printf("dict %s: %s",
+					   dict_set->dict_driver, error);
+		event_unref(&event);
+		settings_free(dict_set);
 		return -1;
 	}
 	i_assert(*dict_r != NULL);
 	(*dict_r)->refcount++;
 	(*dict_r)->event = event;
-	e_debug(event_create_passthrough(event)->set_name("dict_created")->event(),
-		"dict created (uri=%s, base_dir=%s)", uri, set->base_dir);
-
-	return 0;
+	e_debug(event_create_passthrough(event)->
+		set_name("dict_created")->event(),
+		"dict created (driver=%s)", dict_set->dict_driver);
+	settings_free(dict_set);
+	return 1;
 }
 
 static void dict_ref(struct dict *dict)
@@ -187,7 +268,6 @@ void dict_wait(struct dict *dict)
 bool dict_have_async_operations(struct dict *dict)
 {
 	return dict->iter_count != 0 ||
-		dict->transaction_count != 0 ||
 		dict->commits != NULL;
 }
 
@@ -382,6 +462,8 @@ int dict_lookup_values(struct dict *dict, const struct dict_op_settings *set,
 	struct event *event = dict_event_create(dict, set);
 	int ret;
 	i_assert(dict_key_prefix_is_valid(key, set->username));
+
+	*error_r = NULL;
 
 	e_debug(event, "Looking up '%s'", key);
 	event_add_str(event, "key", key);
@@ -612,6 +694,11 @@ void dict_transaction_set_timestamp(struct dict_transaction_context *ctx,
 	if (ctx->dict->v.set_timestamp != NULL) T_BEGIN {
 		ctx->dict->v.set_timestamp(ctx, ts);
 	} T_END;
+}
+
+void dict_transaction_set_non_atomic(struct dict_transaction_context *ctx)
+{
+	ctx->non_atomic = TRUE;
 }
 
 struct dict_commit_sync_result {

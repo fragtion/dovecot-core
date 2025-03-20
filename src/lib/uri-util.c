@@ -789,6 +789,10 @@ uri_do_parse_authority(struct uri_parser *parser, struct uri_authority *auth,
 	switch (*parser->cur) {
 	case ':': case '/': case '?': case '#':
 		break;
+	case ';':
+		if (parser->semicolon_params)
+			break;
+		/* fall-through */
 	default:
 		if (parser->parse_prefix)
 			break;
@@ -808,6 +812,10 @@ uri_do_parse_authority(struct uri_parser *parser, struct uri_authority *auth,
 		switch (*parser->cur) {
 		case '/': case '?': case '#':
 			break;
+		case ';':
+			if (parser->semicolon_params)
+				break;
+			/* fall-through */
 		default:
 			if (parser->parse_prefix)
 				break;
@@ -1009,7 +1017,9 @@ int uri_parse_query(struct uri_parser *parser, const char **query_r)
 	   query         = *( pchar / "/" / "?" )
 	   pchar         = unreserved / pct-encoded / sub-delims / ":" / "@"
 	 */
-	if (parser->cur >= parser->end || *parser->cur != '?')
+	if (parser->cur >= parser->end ||
+	    (!parser->semicolon_params && *parser->cur != '?') ||
+	    (parser->semicolon_params && *parser->cur != ';'))
 		return 0;
 	parser->cur++;
 
@@ -1118,6 +1128,7 @@ int uri_parse_absolute_generic(struct uri_parser *parser,
 			       enum uri_parse_flags flags)
 {
 	int relative, aret, ret = 0;
+	bool allow_missing_slashslash = FALSE;
 
 	/* URI           = scheme ":" hier-part [ "?" query ] [ "#" fragment ]
 
@@ -1135,17 +1146,29 @@ int uri_parse_absolute_generic(struct uri_parser *parser,
 	 */
 
 	/* scheme ":" */
-	if ((flags & URI_PARSE_SCHEME_EXTERNAL) == 0 &&
-	    (ret = uri_parse_scheme(parser, NULL)) <= 0) {
-		if (ret == 0)
-			parser->error = "Missing scheme";
-		return -1;
+	if ((flags & URI_PARSE_SCHEME_EXTERNAL) == 0) {
+		const char *scheme;
+		if ((ret = uri_parse_scheme(parser, &scheme)) <= 0) {
+			if (ret == 0)
+				parser->error = "Missing scheme";
+			return -1;
+		}
+		if (strcmp(scheme, "aaa") == 0 ||
+		    (flags & URI_PARSE_SEMICOLON_PARAMS) != 0)
+			parser->semicolon_params = TRUE;
+		if (strcmp(scheme, "iax") == 0 ||
+		    (flags & URI_PARSE_ALLOW_MISSING_SLASHSLASH) != 0)
+			allow_missing_slashslash = TRUE;
 	}
 
 	/* "//" authority */
 	aret = uri_parse_slashslash_authority(parser, NULL);
 	if (aret < 0)
 		return -1;
+	else if (aret == 0 && allow_missing_slashslash) {
+		if ((aret = uri_parse_authority(parser, NULL)) < 0)
+			return -1;
+	}
 
 	/* path-absolute / path-rootless / path-empty */
 	if (aret == 0) {

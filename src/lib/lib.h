@@ -37,6 +37,10 @@
 #include "macros.h"
 #include "failures.h"
 
+typedef struct buffer buffer_t;
+typedef struct buffer string_t;
+
+#include "array-decl.h" /* ARRAY*()s may exist in any header */
 #include "malloc-overflow.h"
 #include "data-stack.h"
 #include "mempool.h"
@@ -52,7 +56,6 @@ struct ostream;
 
 typedef void lib_atexit_callback_t(void);
 
-#include "array-decl.h" /* ARRAY*()s may exist in any header */
 #include "bits.h"
 #include "hash-decl.h" /* HASH_TABLE*()s may exist in any header */
 #include "strfuncs.h"
@@ -120,12 +123,12 @@ uint32_t i_rand_limit(uint32_t upper_bound);
 
 static inline unsigned short i_rand_ushort(void)
 {
-        return i_rand_limit(USHRT_MAX + 1);
+	return i_rand_limit(USHRT_MAX + 1);
 }
 
 static inline unsigned char i_rand_uchar(void)
 {
-        return i_rand_limit(UCHAR_MAX + 1);
+	return i_rand_limit(UCHAR_MAX + 1);
 }
 
 /* Returns a random integer >= min_val, and <= max_val. */
@@ -151,4 +154,8 @@ static inline uint32_t time_to_uint32_trunc(time_t ts)
 		return UINT32_MAX;
 	return (uint32_t)(ts & 0xffffffff);
 }
+
+/* Check whether pathname is accessible. */
+int i_faccessat2(int dirfd, const char *pathname, int mode, int flags);
+
 #endif

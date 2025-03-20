@@ -298,6 +298,9 @@ struct smtp_server_callbacks {
 	void (*conn_proxy_data_updated)(void *conn_ctx,
 					const struct smtp_proxy_data *data);
 
+	/* TLS SNI Callback. */
+	int (*conn_tls_sni_callback)(void *conn_ctx, const char *name,
+				     const char **error_r);
 	/* Connection */
 	int (*conn_start_tls)(void *conn_ctx,
 			      struct istream **input, struct ostream **output);
@@ -339,7 +342,7 @@ struct smtp_server_settings {
 	   write raw protocol logs for debugging */
 	const char *rawlog_dir;
 
-	/* SSL settings; if NULL, master_service_ssl_init() is used instead */
+	/* SSL settings; if NULL, settings_get() is used automatically */
 	const struct ssl_iostream_settings *ssl;
 
 	/* The maximum time in milliseconds a client is allowed to be idle
@@ -476,6 +479,10 @@ void smtp_server_connection_close(struct smtp_server_connection **_conn,
 void smtp_server_connection_terminate(struct smtp_server_connection **_conn,
 				      const char *enh_code, const char *reason)
 				      ATTR_NULL(3);
+void smtp_server_connection_terminate_full(struct smtp_server_connection **_conn,
+					   const char *enh_code,
+					   const char *reply_reason,
+					   const char *log_reason);
 
 bool smtp_server_connection_data_check_state(struct smtp_server_cmd_ctx *cmd);
 void smtp_server_connection_data_chunk_init(struct smtp_server_cmd_ctx *cmd);
@@ -504,6 +511,8 @@ const char *
 smtp_server_connection_get_protocol_name(struct smtp_server_connection *conn);
 struct smtp_server_helo_data *
 smtp_server_connection_get_helo_data(struct smtp_server_connection *conn);
+const char *
+smtp_server_connection_get_server_name(struct smtp_server_connection *conn);
 
 void smtp_server_connection_get_proxy_data(struct smtp_server_connection *conn,
 					   struct smtp_proxy_data *proxy_data);
@@ -517,6 +526,8 @@ void smtp_server_connection_add_extra_capability(
 	struct smtp_server_connection *conn,
 	const struct smtp_capability_extra *cap);
 
+void smtp_server_connection_set_greeting(struct smtp_server_connection *conn,
+					 const char *greeting);
 void smtp_server_connection_register_mail_param(
 	struct smtp_server_connection *conn, const char *param);
 void smtp_server_connection_register_rcpt_param(
@@ -524,6 +535,7 @@ void smtp_server_connection_register_rcpt_param(
 
 bool smtp_server_connection_is_ssl_secured(struct smtp_server_connection *conn);
 bool smtp_server_connection_is_trusted(struct smtp_server_connection *conn);
+bool smtp_server_connection_is_started(struct smtp_server_connection *conn);
 
 /*
  * Command
@@ -795,6 +807,9 @@ void smtp_server_reply_ehlo_add_enhancedstatuscodes(
 	struct smtp_server_reply *reply);
 void smtp_server_reply_ehlo_add_pipelining(struct smtp_server_reply *reply);
 void smtp_server_reply_ehlo_add_size(struct smtp_server_reply *reply);
+#ifdef EXPERIMENTAL_MAIL_UTF8
+void smtp_server_reply_ehlo_add_smtputf8(struct smtp_server_reply *reply);
+#endif
 void smtp_server_reply_ehlo_add_starttls(struct smtp_server_reply *reply);
 void smtp_server_reply_ehlo_add_vrfy(struct smtp_server_reply *reply);
 void smtp_server_reply_ehlo_add_xclient(struct smtp_server_reply *reply);

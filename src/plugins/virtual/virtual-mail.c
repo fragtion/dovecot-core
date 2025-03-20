@@ -251,7 +251,11 @@ static int virtual_mail_precache(struct mail *mail)
 	if (backend_mail_get(vmail, &backend_mail) < 0)
 		return -1;
 	p = (struct mail_private *)backend_mail;
-	return p->v.precache(backend_mail);
+	if (p->v.precache(backend_mail) < 0) {
+		virtual_box_copy_error(mail->box, backend_mail->box);
+		return -1;
+	}
+	return 0;
 }
 
 static void
@@ -474,8 +478,8 @@ virtual_mail_get_stream(struct mail *mail, bool get_body,
 static int
 virtual_mail_get_binary_stream(struct mail *mail,
 			       const struct message_part *part,
-			       bool include_hdr, uoff_t *size_r,
-			       unsigned int *lines_r, bool *binary_r,
+			       bool include_hdr,
+			       struct mail_binary_properties *bprops_r,
 			       struct istream **stream_r)
 {
 	struct virtual_mail *vmail = virtual_mail_container_of(mail);
@@ -487,7 +491,7 @@ virtual_mail_get_binary_stream(struct mail *mail,
 	struct mail_private *p =
 		container_of(backend_mail, struct mail_private, mail);
 	if (p->v.get_binary_stream(backend_mail, part, include_hdr,
-				   size_r, lines_r, binary_r, stream_r) < 0) {
+				   bprops_r, stream_r) < 0) {
 		virtual_box_copy_error(mail->box, backend_mail->box);
 		return -1;
 	}

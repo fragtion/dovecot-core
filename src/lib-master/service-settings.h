@@ -22,9 +22,16 @@ enum service_type {
 	   warnings about temporarily reaching the limit. */
 	SERVICE_TYPE_WORKER,
 };
+
+struct config_service {
+	const struct service_settings *set;
+	const struct setting_keyvalue *defaults;
+};
+ARRAY_DEFINE_TYPE(config_service, struct config_service);
 /* </settings checks> */
 
 struct file_listener_settings {
+	pool_t pool;
 	const char *path;
 	const char *type;
 	unsigned int mode;
@@ -34,10 +41,12 @@ struct file_listener_settings {
 ARRAY_DEFINE_TYPE(file_listener_settings, struct file_listener_settings *);
 
 struct inet_listener_settings {
+	pool_t pool;
 	const char *name;
 	const char *type;
-	const char *address;
 	in_port_t port;
+	/* copied from master_settings: */
+	ARRAY_TYPE(const_string) listen;
 	bool ssl;
 	bool reuse_port;
 	bool haproxy;
@@ -45,6 +54,7 @@ struct inet_listener_settings {
 ARRAY_DEFINE_TYPE(inet_listener_settings, struct inet_listener_settings *);
 
 struct service_settings {
+	pool_t pool;
 	const char *name;
 	const char *protocol;
 	const char *type;
@@ -52,7 +62,7 @@ struct service_settings {
 	const char *user;
 	const char *group;
 	const char *privileged_group;
-	const char *extra_groups;
+	ARRAY_TYPE(const_string) extra_groups;
 	const char *chroot;
 
 	bool drop_priv_before_exec;
@@ -60,19 +70,22 @@ struct service_settings {
 	unsigned int process_min_avail;
 	unsigned int process_limit;
 	unsigned int client_limit;
-	unsigned int service_count;
-	unsigned int idle_kill;
+	unsigned int restart_request_count;
+	unsigned int idle_kill_interval;
 	uoff_t vsz_limit;
 
-	ARRAY_TYPE(file_listener_settings) unix_listeners;
-	ARRAY_TYPE(file_listener_settings) fifo_listeners;
-	ARRAY_TYPE(inet_listener_settings) inet_listeners;
+	ARRAY_TYPE(const_string) unix_listeners;
+	ARRAY_TYPE(const_string) fifo_listeners;
+	ARRAY_TYPE(const_string) inet_listeners;
 
 	/* internal to master: */
-	struct master_settings *master_set;
 	enum service_type parsed_type;
 	enum service_user_default user_default;
 	bool login_dump_core:1;
+
+	ARRAY_TYPE(file_listener_settings) parsed_unix_listeners;
+	ARRAY_TYPE(file_listener_settings) parsed_fifo_listeners;
+	ARRAY_TYPE(inet_listener_settings) parsed_inet_listeners;
 
 	/* -- flags that can be set internally -- */
 

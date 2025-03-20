@@ -6,7 +6,7 @@
 #include "ostream.h"
 #include "connection.h"
 #include "restrict-access.h"
-#include "settings-parser.h"
+#include "settings.h"
 #include "master-service.h"
 #include "master-service-settings.h"
 #include "mail-namespace.h"
@@ -35,16 +35,48 @@ struct quota_client {
 	bool warned_bad_state:1;
 };
 
+struct quota_status_result_settings {
+	pool_t pool;
+
+	const char *quota_status_success;
+	const char *quota_status_toolarge;
+	const char *quota_status_overquota;
+};
+
+#undef DEF
+#define DEF(type, name) \
+	SETTING_DEFINE_STRUCT_##type(#name, name, struct quota_status_result_settings)
+static const struct setting_define quota_status_result_setting_defines[] = {
+	DEF(STR, quota_status_success),
+	DEF(STR, quota_status_toolarge),
+	DEF(STR, quota_status_overquota),
+
+	SETTING_DEFINE_LIST_END
+};
+
+static const struct quota_status_result_settings quota_status_result_default_settings = {
+	.quota_status_success = "OK",
+	.quota_status_toolarge = "",
+	.quota_status_overquota = "554 5.2.2 %{error}",
+};
+
+const struct setting_parser_info quota_status_result_setting_parser_info = {
+	.name = "quota_status_result",
+	.plugin_dependency = "lib10_quota_plugin",
+	.defines = quota_status_result_setting_defines,
+	.defaults = &quota_status_result_default_settings,
+	.struct_size = sizeof(struct quota_status_result_settings),
+	.pool_offset1 = 1 + offsetof(struct quota_status_result_settings, pool),
+};
+
 static struct event_category event_category_quota_status = {
 	.name = "quota-status"
 };
 
-static struct quota_status_settings *quota_status_settings;
-static pool_t quota_status_pool;
+static const struct quota_status_settings *quota_status_settings;
 static enum quota_protocol protocol;
 static struct mail_storage_service_ctx *storage_service;
 static struct connection_list *clients;
-static char *nouser_reply;
 
 static void client_connected(struct master_service_connection *conn)
 {
@@ -88,7 +120,8 @@ quota_check(struct mail_user *user, uoff_t mail_size, const char **error_r)
 
 	ctx = quota_transaction_begin(box);
 	const char *internal_error;
-	ret = quota_test_alloc(ctx, I_MAX(1, mail_size), &internal_error);
+	ret = quota_test_alloc(ctx, I_MAX(1, mail_size), NULL, 0, NULL,
+			       &internal_error);
 	if (ret == QUOTA_ALLOC_RESULT_TEMPFAIL)
 		e_error(user->event, "quota check failed: %s", internal_error);
 	*error_r = quota_alloc_result_errstr(ret, ctx);
@@ -165,7 +198,7 @@ static void client_handle_request(struct quota_client *client)
 	restrict_access_allow_coredumps(TRUE);
 	if (ret == 0) {
 		e_debug(client->event, "User `%s' not found", input.username);
-		value = nouser_reply;
+		value = quota_status_settings->quota_status_nouser;
 	} else if (ret > 0) {
 		enum quota_alloc_result qret = quota_check(user, client->size,
 							   &error);
@@ -177,32 +210,48 @@ static void client_handle_request(struct quota_client *client)
 				"Quota check failed: %s", error);
 		}
 
-		switch (qret) {
-		case QUOTA_ALLOC_RESULT_OK: /* under quota */
-			value = mail_user_plugin_getenv(user,
-						"quota_status_success");
-			if (value == NULL)
-				value = "OK";
-			break;
-		case QUOTA_ALLOC_RESULT_OVER_MAXSIZE:
-		/* even over maximum quota */
-		case QUOTA_ALLOC_RESULT_OVER_QUOTA_LIMIT:
-			value = mail_user_plugin_getenv(user,
-						"quota_status_toolarge");
-			/* fall through */
-		case QUOTA_ALLOC_RESULT_OVER_QUOTA:
-			if (value == NULL)
-				value = mail_user_plugin_getenv(user,
-						"quota_status_overquota");
-			if (value == NULL)
-				value = t_strdup_printf("554 5.2.2 %s", error);
-			break;
-		case QUOTA_ALLOC_RESULT_TEMPFAIL:
-		case QUOTA_ALLOC_RESULT_BACKGROUND_CALC:
+		struct event *event = event_create(client->event);
+		const struct var_expand_table table[] = {
+			{ .key = "error", .value = error },
+			VAR_EXPAND_TABLE_END
+		};
+		struct var_expand_params params = {
+			.table = table,
+		};
+		const struct quota_status_result_settings *set;
+		const char *set_error;
+		event_set_ptr(event, SETTINGS_EVENT_VAR_EXPAND_PARAMS, &params);
+
+		if (settings_get(event, &quota_status_result_setting_parser_info,
+				 0, &set, &set_error) < 0) {
+			e_error(client->event, "%s", set_error);
+			error = "Temporary internal error";
 			ret = -1;
-			break;
+		} else {
+			switch (qret) {
+			case QUOTA_ALLOC_RESULT_OK: /* under quota */
+				value = set->quota_status_success;
+				break;
+			case QUOTA_ALLOC_RESULT_OVER_MAXSIZE:
+			/* even over maximum quota */
+			case QUOTA_ALLOC_RESULT_OVER_QUOTA_LIMIT:
+				value = set->quota_status_toolarge;
+				if (value[0] == '\0')
+					break;
+				/* fall through */
+			case QUOTA_ALLOC_RESULT_OVER_QUOTA:
+			case QUOTA_ALLOC_RESULT_OVER_QUOTA_MAILBOX_LIMIT:
+				value = set->quota_status_overquota;
+				break;
+			case QUOTA_ALLOC_RESULT_TEMPFAIL:
+			case QUOTA_ALLOC_RESULT_BACKGROUND_CALC:
+				ret = -1;
+				break;
+			}
+			value = t_strdup(value);
+			settings_free(set);
 		}
-		value = t_strdup(value); /* user's pool is being freed */
+		event_unref(&event);
 		mail_user_deinit(&user);
 	} else {
 		e_error(client->event,
@@ -279,23 +328,21 @@ static const struct connection_vfuncs client_vfuncs = {
 
 static void main_preinit(void)
 {
+	const char *error;
+
+	if (master_service_settings_read_simple(master_service, &error) < 0)
+		i_fatal("%s", error);
+
 	restrict_access_by_env(RESTRICT_ACCESS_FLAG_ALLOW_ROOT, NULL);
 	restrict_access_allow_coredumps(TRUE);
 }
 
 static void main_init(void)
 {
-	static const struct setting_parser_info *set_roots[] = {
-		&quota_status_setting_parser_info,
-		NULL
-	};
 	struct mail_storage_service_input input;
-	struct setting_parser_context *set_parser;
-	const struct mail_user_settings *user_set;
-	const char *value, *error;
 
 	clients = connection_list_init(&client_set, &client_vfuncs);
-	storage_service = mail_storage_service_init(master_service, set_roots,
+	storage_service = mail_storage_service_init(master_service,
 		MAIL_STORAGE_SERVICE_FLAG_ALLOW_ROOT |
 		MAIL_STORAGE_SERVICE_FLAG_USERDB_LOOKUP |
 		MAIL_STORAGE_SERVICE_FLAG_TEMP_PRIV_DROP |
@@ -306,25 +353,14 @@ static void main_init(void)
 	input.service = "quota-status";
 	input.username = "";
 
-	quota_status_pool = pool_alloconly_create("quota status settings", 512);
-	if (mail_storage_service_read_settings(storage_service, &input,
-					       &set_parser,
-					       &error) < 0)
-		i_fatal("%s", error);
-	user_set = settings_parser_get_root_set(set_parser,
-			&mail_user_setting_parser_info);
-	quota_status_settings = master_service_settings_get_root_set_dup(
-		master_service, &quota_status_setting_parser_info,
-		quota_status_pool);
-
-	value = mail_user_set_plugin_getenv(user_set, "quota_status_nouser");
-	nouser_reply = p_strdup(quota_status_pool,
-				value != NULL ? value : "REJECT Unknown user");
+	quota_status_settings = settings_get_or_fatal(
+		master_service_get_event(master_service),
+		&quota_status_setting_parser_info);
 }
 
 static void main_deinit(void)
 {
-	pool_unref(&quota_status_pool);
+	settings_free(quota_status_settings);
 	connection_list_deinit(&clients);
 	mail_storage_service_deinit(&storage_service);
 }

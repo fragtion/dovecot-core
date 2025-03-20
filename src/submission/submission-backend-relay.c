@@ -3,6 +3,7 @@
 #include "submission-common.h"
 #include "str.h"
 #include "str-sanitize.h"
+#include "settings.h"
 #include "mail-user.h"
 #include "iostream-ssl.h"
 #include "smtp-client.h"
@@ -49,8 +50,6 @@ backend_relay_handle_relay_reply(struct submission_backend_relay *rbackend,
 				 struct smtp_reply *reply_r) ATTR_NULL(2)
 {
 	struct submission_backend *backend = &rbackend->backend;
-	struct client *client = rbackend->backend.client;
-	struct mail_user *user = client->user;
 	const char *enh_code, *msg, *log_msg = NULL;
 	const char *const *reply_lines;
 	bool result = TRUE;
@@ -138,7 +137,7 @@ backend_relay_handle_relay_reply(struct submission_backend_relay *rbackend,
 			if (smtp_reply_is_remote(reply)) {
 				e_error(backend->event, "%s: %s",
 					log_msg, smtp_reply_log(reply));
-			} else if (user->mail_debug) {
+			} else {
 				e_debug(backend->event, "%s: %s",
 					log_msg, smtp_reply_log(reply));
 			}
@@ -1079,7 +1078,6 @@ submission_backend_relay_create(
 {
 	struct submission_backend_relay *rbackend;
 	struct mail_user *user = client->user;
-	struct ssl_iostream_settings ssl_set;
 	struct smtp_client_settings smtp_set;
 	pool_t pool;
 
@@ -1090,18 +1088,12 @@ submission_backend_relay_create(
 
 	event_set_append_log_prefix(rbackend->backend.event, "relay: ");
 
-	mail_user_init_ssl_client_settings(user, &ssl_set);
-	if (set->ssl_verify)
-		ssl_set.verbose_invalid_cert = TRUE;
-	else
-		ssl_set.allow_invalid_cert = TRUE;
-
 	/* make relay connection */
 	i_zero(&smtp_set);
 	smtp_set.my_hostname = set->my_hostname;
 	smtp_set.extra_capabilities = set->extra_capabilities;
-	smtp_set.ssl = &ssl_set;
-	smtp_set.debug = user->mail_debug;
+	smtp_set.ssl_allow_invalid_cert = !set->ssl_verify;
+	smtp_set.debug = event_want_debug(rbackend->backend.event);
 	smtp_set.event_parent = rbackend->backend.event;
 
 	if (set->rawlog_dir != NULL) {

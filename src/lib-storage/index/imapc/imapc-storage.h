@@ -6,12 +6,8 @@
 #include "imapc-client.h"
 
 #define IMAPC_STORAGE_NAME "imapc"
-/* storage_name separator */
-#define IMAPC_LIST_STORAGE_NAME_ESCAPE_CHAR '%'
 /* fs_name separator */
-#define IMAPC_LIST_FS_NAME_ESCAPE_CHAR '%'
-/* vname separator */
-#define IMAPC_LIST_VNAME_ESCAPE_CHAR '~'
+#define IMAPC_LIST_FS_NAME_ESCAPE_CHAR "%"
 
 struct imap_arg;
 struct imapc_untagged_reply;
@@ -59,6 +55,7 @@ struct imapc_storage_client {
 	struct imapc_mailbox_list *_list;
 
 	struct imapc_client *client;
+	const struct imapc_settings *set;
 
 	ARRAY(struct imapc_storage_event_callback) untagged_callbacks;
 
@@ -72,15 +69,24 @@ struct imapc_storage_client {
 	bool destroying:1;
 };
 
+struct imapc_storage_attribute_context {
+	pool_t pool;
+	const char *const *keys;
+	const char *value;
+	const char *error;
+	bool iterating:1;
+};
+
 struct imapc_storage {
 	struct mail_storage storage;
-	const struct imapc_settings *set;
+	const struct imapc_settings *set; /* points to client->set */
 
 	struct ioloop *root_ioloop;
 	struct imapc_storage_client *client;
 
 	struct imapc_mailbox *cur_status_box;
 	struct mailbox_status *cur_status;
+	struct imapc_storage_attribute_context *cur_attribute_context;
 	unsigned int reopen_count;
 
 	ARRAY(struct imapc_namespace) remote_namespaces;
@@ -198,9 +204,7 @@ struct imapc_simple_context {
 #define IMAPC_STORAGE(s)	container_of(s, struct imapc_storage, storage)
 #define IMAPC_MAILBOX(s)	container_of(s, struct imapc_mailbox, box)
 
-int imapc_storage_client_create(struct mail_namespace *ns,
-				const struct imapc_settings *imapc_set,
-				const struct mail_storage_settings *mail_set,
+int imapc_storage_client_create(struct mailbox_list *list,
 				struct imapc_storage_client **client_r,
 				const char **error_r);
 void imapc_storage_client_unref(struct imapc_storage_client **client);

@@ -309,7 +309,7 @@ maildir_fill_readdir_entry(struct maildir_list_iterate_context *ctx,
 		(void)imap_utf8_to_utf7(str_c(destvname), dest);
 
 		if (rename(src, str_c(dest)) < 0 && errno != ENOENT)
-			e_error(ctx->ctx.list->ns->user->event,
+			e_error(ctx->ctx.list->event,
 				"rename(%s, %s) failed: %m", src, str_c(dest));
 		/* just skip this in this iteration, we'll see it on the
 		   next list */
@@ -379,7 +379,7 @@ maildir_fill_readdir(struct maildir_list_iterate_context *ctx,
 
 	dirp = opendir(ctx->dir);
 	if (dirp == NULL) {
-		if (errno == EACCES) {
+		if (ENOACCESS(errno)) {
 			mailbox_list_set_critical(list, "%s",
 				mail_error_eacces_msg("opendir", ctx->dir));
 		} else if (errno != ENOENT) {
@@ -443,10 +443,10 @@ maildir_list_iter_init(struct mailbox_list *_list, const char *const *patterns,
 	ctx->prefix_char = strcmp(_list->name, MAILBOX_LIST_NAME_IMAPDIR) == 0 ?
 		'\0' : list->sep;
 
-	if (_list->set.iter_from_index_dir)
-		ctx->dir = _list->set.index_dir;
+	if (_list->mail_set->mailbox_list_iter_from_index_dir)
+		ctx->dir = _list->mail_set->mail_index_path;
 	else
-		ctx->dir = _list->set.root_dir;
+		ctx->dir = _list->mail_set->mail_path;
 
 	if ((flags & MAILBOX_LIST_ITER_SELECT_SUBSCRIBED) != 0) {
 		/* Listing only subscribed mailboxes.

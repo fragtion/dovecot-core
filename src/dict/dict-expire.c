@@ -7,6 +7,7 @@
 #include "process-title.h"
 #include "env-util.h"
 #include "module-dir.h"
+#include "settings.h"
 #include "master-service.h"
 #include "master-service-settings.h"
 #include "sql-api.h"
@@ -35,7 +36,7 @@ static void dict_expire_run(void)
 	for (i = count; i > 0; i--) {
 		struct expire_dict *dict = &dicts[i-1];
 
-		if (dict_settings->verbose_proctitle)
+		if (server_settings->verbose_proctitle)
 			process_title_set(t_strdup_printf("[running dict %s]", dict->name));
 		ret = dict_expire_scan(dict->dict, &error);
 		if (ret < 0)
@@ -45,7 +46,7 @@ static void dict_expire_run(void)
 			array_delete(&expire_dicts, i-1, 1);
 		}
 	}
-	if (dict_settings->verbose_proctitle)
+	if (server_settings->verbose_proctitle)
 		process_title_set("[idling]");
 }
 
@@ -62,38 +63,33 @@ static void client_connected(struct master_service_connection *conn ATTR_UNUSED)
 	dict_expire_run();
 }
 
-static void dict_expire_init(void)
+static void dict_expire_init(struct event *event)
 {
-	struct dict_settings dict_set = {
-		.base_dir = dict_settings->base_dir,
-	};
-	struct dict *dict;
-	const char *const *strlist, *error;
-	unsigned int i, count;
-
 	i_array_init(&expire_dicts, 16);
-	strlist = array_get(&dict_settings->dicts, &count);
-	for (i = 0; i < count; i += 2) {
-		const char *name = strlist[i];
-		const char *uri = strlist[i+1];
 
-		if (dict_init(uri, &dict_set, &dict, &error) < 0) {
+	if (!array_is_created(&dict_settings->dicts))
+		return;
+
+	struct dict *dict;
+	const char *dict_name, *error;
+	array_foreach_elem(&dict_settings->dicts, dict_name) {
+		if (dict_init_filter_auto(event, dict_name, &dict, &error) < 0) {
 			i_error("Failed to initialize dictionary '%s': %s - skipping",
-				name, error);
+				dict_name, error);
 		} else {
 			struct expire_dict *expire_dict =
 				array_append_space(&expire_dicts);
-			expire_dict->name = name;
+			expire_dict->name = dict_name;
 			expire_dict->dict = dict;
 		}
 	}
+
 }
 
 static void main_preinit(void)
 {
 	/* Load built-in SQL drivers (if any) */
 	sql_drivers_init();
-	sql_drivers_register_all();
 #ifdef HAVE_CDB
 	dict_driver_register(&dict_driver_cdb);
 #endif
@@ -105,9 +101,14 @@ static void main_preinit(void)
 static void main_init(void)
 {
 	struct module_dir_load_settings mod_set;
+	struct event *event = master_service_get_event(master_service);
 
-	dict_settings = master_service_settings_get_root_set(master_service,
-				&dict_setting_parser_info);
+	event_add_category(event, &dict_server_event_category);
+	settings_event_add_filter_name(event, "dict_server");
+	server_settings =
+		settings_get_or_fatal(event, &dict_server_setting_parser_info);
+	dict_settings =
+		settings_get_or_fatal(event, &dict_setting_parser_info);
 
 	i_zero(&mod_set);
 	mod_set.abi_version = DOVECOT_ABI_VERSION;
@@ -120,7 +121,7 @@ static void main_init(void)
 	   which we'll need to register. */
 	dict_drivers_register_all();
 
-	dict_expire_init();
+	dict_expire_init(event);
 	to_expire = timeout_add(DICT_EXPIRE_RUN_INTERVAL_MSECS,
 				dict_expire_timeout, NULL);
 }
@@ -138,15 +139,13 @@ static void main_deinit(void)
 
 	sql_drivers_deinit();
 	timeout_remove(&to_expire);
+	settings_free(server_settings);
+	settings_free(dict_settings);
 }
 
 int main(int argc, char *argv[])
 {
 	const enum master_service_flags service_flags = 0;
-	const struct setting_parser_info *set_roots[] = {
-		&dict_setting_parser_info,
-		NULL
-	};
 	const char *error;
 
 	master_service = master_service_init("dict-expire", service_flags,
@@ -154,13 +153,8 @@ int main(int argc, char *argv[])
 	if (master_getopt(master_service) > 0)
 		return FATAL_DEFAULT;
 
-	const struct master_service_settings_input set_input = {
-		.roots = set_roots,
-	};
-	struct master_service_settings_output output;
-	if (master_service_settings_read(master_service, &set_input,
-					 &output, &error) < 0)
-		i_fatal("Error reading configuration: %s", error);
+	if (master_service_settings_read_simple(master_service, &error) < 0)
+		i_fatal("%s", error);
 
 	master_service_init_log_with_pid(master_service);
 	main_preinit();

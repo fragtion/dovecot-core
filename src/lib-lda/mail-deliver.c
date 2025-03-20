@@ -147,7 +147,7 @@ const struct var_expand_table *
 mail_deliver_ctx_get_log_var_expand_table(struct mail_deliver_context *ctx,
 					  const char *message)
 {
-	unsigned int delivery_time_msecs;
+	long long delivery_time_msecs;
 
 	/* If a mail was saved/copied, the fields are already filled and the
 	   following call is ignored. Otherwise, only the source mail exists. */
@@ -163,19 +163,19 @@ mail_deliver_ctx_get_log_var_expand_table(struct mail_deliver_context *ctx,
 						 &ctx->delivery_time_started);
 
 	const struct var_expand_table stack_tab[] = {
-		{ '$', message, NULL },
-		{ 'm', ctx->fields.message_id != NULL ?
-		       ctx->fields.message_id : "unspecified", "msgid" },
-		{ 's', ctx->fields.subject, "subject" },
-		{ 'f', ctx->fields.from, "from" },
-		{ 'e', ctx->fields.from_envelope, "from_envelope" },
-		{ 'p', dec2str(ctx->fields.psize), "size" },
-		{ 'w', dec2str(ctx->fields.vsize), "vsize" },
-		{ '\0', dec2str(delivery_time_msecs), "delivery_time" },
-		{ '\0', dec2str(ctx->session_time_msecs), "session_time" },
-		{ '\0', smtp_address_encode(ctx->rcpt_params.orcpt.addr), "to_envelope" },
-		{ '\0', ctx->fields.storage_id, "storage_id" },
-		{ '\0', NULL, NULL }
+		{ .key = "message", .value = message },
+		{ .key = "msgid", .value = ctx->fields.message_id != NULL ?
+		       ctx->fields.message_id : "unspecified" },
+		{ .key = "subject", .value = ctx->fields.subject },
+		{ .key = "from", .value = ctx->fields.from },
+		{ .key = "from_envelope", .value = ctx->fields.from_envelope },
+		{ .key = "size", .value = dec2str(ctx->fields.psize) },
+		{ .key = "vsize", .value = dec2str(ctx->fields.vsize) },
+		{ .key = "delivery_time", .value = dec2str(delivery_time_msecs) },
+		{ .key = "session_time", .value = dec2str(ctx->session_time_msecs) },
+		{ .key = "to_envelope", .value = smtp_address_encode(ctx->rcpt_params.orcpt.addr) },
+		{ .key = "storage_id", .value = ctx->fields.storage_id },
+		VAR_EXPAND_TABLE_END
 	};
 	return p_memdup(unsafe_data_stack_pool, stack_tab, sizeof(stack_tab));
 }
@@ -184,7 +184,6 @@ void mail_deliver_log(struct mail_deliver_context *ctx, const char *fmt, ...)
 {
 	va_list args;
 	string_t *str;
-	const struct var_expand_table *tab;
 	const char *msg, *error;
 
 	if (*ctx->set->deliver_log_format == '\0')
@@ -194,8 +193,12 @@ void mail_deliver_log(struct mail_deliver_context *ctx, const char *fmt, ...)
 	msg = t_strdup_vprintf(fmt, args);
 
 	str = t_str_new(256);
-	tab = mail_deliver_ctx_get_log_var_expand_table(ctx, msg);
-	if (var_expand(str, ctx->set->deliver_log_format, tab, &error) <= 0) {
+	const struct var_expand_params params = {
+		.table = mail_deliver_ctx_get_log_var_expand_table(ctx, msg),
+		.event = ctx->event,
+	};
+	if (var_expand(str, ctx->set->deliver_log_format,
+			   &params, &error) < 0) {
 		e_error(ctx->event,
 			"Failed to expand deliver_log_format=%s: %s",
 			ctx->set->deliver_log_format, error);
@@ -506,13 +509,11 @@ const char *mail_deliver_get_new_message_id(struct mail_deliver_context *ctx)
 {
 	static int count = 0;
 	struct mail_user *user = ctx->rcpt_user;
-	const struct mail_storage_settings *mail_set =
-		mail_user_set_get_storage_set(user);
 
 	return t_strdup_printf("<dovecot-%s-%s-%d@%s>",
 			       dec2str(ioloop_timeval.tv_sec),
 			       dec2str(ioloop_timeval.tv_usec),
-			       count++, mail_set->hostname);
+			       count++, user->set->hostname);
 }
 
 static bool mail_deliver_is_tempfailed(struct mail_deliver_context *ctx,
@@ -541,17 +542,24 @@ mail_do_deliver(struct mail_deliver_context *ctx,
 	else {
 		ctx->dup_db = mail_duplicate_db_init(ctx->rcpt_user,
 						     DUPLICATE_DB_NAME);
-		if (deliver_mail(ctx, storage_r) <= 0) {
-			/* if message was saved, don't bounce it even though
-			   the script failed later. */
-			ret = ctx->saved_mail ? 0 : -1;
-		} else {
+		ret = deliver_mail(ctx, storage_r);
+		mail_duplicate_db_deinit(&ctx->dup_db);
+		if (ret > 0) {
 			/* success. message may or may not have been saved. */
 			ret = 0;
+		} else if (ctx->saved_mail) {
+			/* if message was saved, don't bounce it even though
+			   the script failed later. */
+			ret = 0;
+		} else if (ret == 0) {
+			/* message wasn't delivered yet. */
+			ret = -1;
+		} else if (ret < 0) {
+			/* delivery failed. */
+			if (mail_deliver_is_tempfailed(ctx, *storage_r))
+				return -1;
+			ret = -1;
 		}
-		mail_duplicate_db_deinit(&ctx->dup_db);
-		if (ret < 0 && mail_deliver_is_tempfailed(ctx, *storage_r))
-			return -1;
 	}
 
 	if (ret < 0 && !ctx->tried_default_save) {
@@ -586,8 +594,7 @@ int mail_deliver(struct mail_deliver_context *ctx,
 	mail_deliver_fields_update(&ctx->fields, ctx->pool, ctx->src_mail);
 	mail_deliver_update_event(ctx);
 
-	muser->want_storage_id =
-		var_has_key(ctx->set->deliver_log_format, '\0', "storage_id");
+	muser->want_storage_id = ctx->set->parsed_want_storage_id;
 
 	muser->deliver_ctx = ctx;
 

@@ -11,25 +11,27 @@ enum submission_client_workarounds {
 /* </settings checks> */
 
 struct submission_settings {
+	pool_t pool;
 	bool verbose_proctitle;
 	const char *rawlog_dir;
 
 	const char *hostname;
 
 	const char *login_greeting;
-	const char *login_trusted_networks;
+	ARRAY_TYPE(const_string) login_trusted_networks;
 
 	const char *recipient_delimiter;
 
 	/* submission: */
 	uoff_t submission_max_mail_size;
 	unsigned int submission_max_recipients;
-	const char *submission_client_workarounds;
+	ARRAY_TYPE(const_string) submission_client_workarounds;
 	const char *submission_logout_format;
 	bool submission_add_received_header;
+	bool mail_utf8_extensions;
 
 	/* submission backend: */
-	const char *submission_backend_capabilities;
+	ARRAY_TYPE(const_string) submission_backend_capabilities;
 
 	/* submission relay: */
 	const char *submission_relay_host;

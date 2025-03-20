@@ -7,14 +7,15 @@
 #include "ostream-private.h"
 #include "istream-multiplex.h"
 #include "ostream-multiplex.h"
+#include "iostream-multiplex-private.h"
 #include "ostream.h"
 #include <unistd.h>
 
 #include "hex-binary.h"
 
-static void test_ostream_multiplex_simple(void)
+static void test_ostream_multiplex_packet_simple(void)
 {
-	test_begin("ostream multiplex (simple)");
+	test_begin("ostream multiplex packet (simple)");
 
 	const unsigned char expected[] = {
 		'\x00','\x00','\x00','\x00','\x05','\x68','\x65',
@@ -24,7 +25,8 @@ static void test_ostream_multiplex_simple(void)
 
 	buffer_t *result = t_str_new(64);
 	struct ostream *os = test_ostream_create(result);
-	struct ostream *os2 = o_stream_create_multiplex(os, SIZE_MAX);
+	struct ostream *os2 = o_stream_create_multiplex(os, SIZE_MAX,
+		OSTREAM_MULTIPLEX_FORMAT_PACKET);
 	struct ostream *os3 = o_stream_multiplex_add_channel(os2, 1);
 
 	test_assert(o_stream_send_str(os2, "hello") == 5);
@@ -109,9 +111,9 @@ static void test_ostream_multiplex_stream_write(struct ostream *channel ATTR_UNU
 	}
 }
 
-static void test_ostream_multiplex_stream(void)
+static void test_ostream_multiplex_packet_stream(void)
 {
-	test_begin("ostream multiplex (stream)");
+	test_begin("ostream multiplex packet (stream)");
 
 	struct ioloop *ioloop = io_loop_create();
 	io_loop_set_current(ioloop);
@@ -123,7 +125,8 @@ static void test_ostream_multiplex_stream(void)
 	struct ostream *os = o_stream_create_fd(fds[1], SIZE_MAX);
 	struct istream *is = i_stream_create_fd(fds[0], SIZE_MAX);
 
-	chan0 = o_stream_create_multiplex(os, SIZE_MAX);
+	chan0 = o_stream_create_multiplex(os, SIZE_MAX,
+					  OSTREAM_MULTIPLEX_FORMAT_PACKET);
 	chan1 = o_stream_multiplex_add_channel(chan0, 1);
 
 	struct io *io0 =
@@ -152,12 +155,13 @@ static void test_ostream_multiplex_stream(void)
 	test_end();
 }
 
-static void test_ostream_multiplex_cork(void)
+static void test_ostream_multiplex_packet_cork(void)
 {
-	test_begin("ostream multiplex (corking)");
+	test_begin("ostream multiplex packet (corking)");
 	buffer_t *output = t_buffer_create(128);
 	struct ostream *os = test_ostream_create(output);
-	struct ostream *chan0 = o_stream_create_multiplex(os, SIZE_MAX);
+	struct ostream *chan0 = o_stream_create_multiplex(os, SIZE_MAX,
+		OSTREAM_MULTIPLEX_FORMAT_PACKET);
 
 	const struct const_iovec iov[] = {
 		{ "hello", 5 },
@@ -212,11 +216,11 @@ static void test_hang_input(struct test_hang_context *ctx)
 		io_loop_stop(current_ioloop);
 }
 
-static void test_ostream_multiplex_hang(void)
+static void test_ostream_multiplex_packet_hang(void)
 {
 	int fd[2];
 
-	test_begin("ostream multiplex hang");
+	test_begin("ostream multiplex packet (hang)");
 	if (pipe(fd) < 0)
 		i_fatal("pipe() failed: %m");
 	fd_set_nonblock(fd[0], TRUE);
@@ -225,9 +229,10 @@ static void test_ostream_multiplex_hang(void)
 	struct ioloop *ioloop = io_loop_create();
 	struct ostream *file_output = o_stream_create_fd(fd[1], 1024);
 	o_stream_set_no_error_handling(file_output, TRUE);
-	struct ostream *channel = o_stream_create_multiplex(file_output, 4096);
+	struct ostream *channel = o_stream_create_multiplex(file_output, 4096,
+		OSTREAM_MULTIPLEX_FORMAT_PACKET);
 	struct ostream *channel2 = o_stream_multiplex_add_channel(channel, 1);
-	char buf[256];
+	char buf[257];
 
 	/* send multiplex output until the buffer is full */
 	ssize_t ret, ret2;
@@ -246,11 +251,10 @@ static void test_ostream_multiplex_hang(void)
 	test_assert(o_stream_finish(channel2) == 0);
 	o_stream_uncork(channel);
 	o_stream_uncork(channel2);
-	/* We expect the first channel to have data buffered */
-	test_assert(o_stream_get_buffer_used_size(channel) >=
+	/* The previous writes must leave some data buffered into channel 0.
+	   Otherwise the test isn't fully testing what it's supposed to be. */
+	test_assert(o_stream_get_buffer_used_size(channel) >
 		    o_stream_get_buffer_used_size(file_output));
-	test_assert(o_stream_get_buffer_used_size(channel) -
-		    o_stream_get_buffer_used_size(file_output) > 0);
 
 	/* read everything that was already sent */
 	struct istream *file_input = i_stream_create_fd(fd[0], 1024);
@@ -340,11 +344,11 @@ static void test_flush_input(struct test_flush_context *ctx)
 		io_loop_stop(current_ioloop);
 }
 
-static void test_ostream_multiplex_flush_callback(void)
+static void test_ostream_multiplex_packet_flush_callback(void)
 {
 	int fd[2];
 
-	test_begin("ostream multiplex flush callback");
+	test_begin("ostream multiplex packet (flush callback)");
 	if (pipe(fd) < 0)
 		i_fatal("pipe() failed: %m");
 	fd_set_nonblock(fd[0], TRUE);
@@ -353,7 +357,8 @@ static void test_ostream_multiplex_flush_callback(void)
 	struct ioloop *ioloop = io_loop_create();
 	struct ostream *file_output = o_stream_create_fd(fd[1], 1024);
 	o_stream_set_no_error_handling(file_output, TRUE);
-	struct ostream *channel = o_stream_create_multiplex(file_output, 4096);
+	struct ostream *channel = o_stream_create_multiplex(file_output, 4096,
+		OSTREAM_MULTIPLEX_FORMAT_PACKET);
 	struct ostream *channel2 = o_stream_multiplex_add_channel(channel, 1);
 
 	struct istream *file_input = i_stream_create_fd(fd[0], 1024);
@@ -395,11 +400,107 @@ static void test_ostream_multiplex_flush_callback(void)
 	test_end();
 }
 
+static bool buf_expect(buffer_t *buf, const void *data, size_t size)
+{
+	if (buf->used < size || memcmp(buf->data, data, size) != 0)
+		return FALSE;
+	buffer_delete(buf, 0, size);
+	return TRUE;
+}
+
+static void test_ostream_multiplex_stream(void)
+{
+	static unsigned char multiplex_header[] = "\xFF\xFF\xFF\xFF\xFF\x00\x02";
+	char c;
+
+	test_begin("ostream multiplex stream");
+	buffer_t *buf = buffer_create_dynamic(default_pool, 1024);
+	struct ostream *output_buf = o_stream_create_buffer(buf);
+	struct ostream *output =
+		o_stream_create_multiplex(output_buf, SIZE_MAX,
+					  OSTREAM_MULTIPLEX_FORMAT_STREAM);
+	test_assert(buf->used == 0);
+
+	o_stream_nsend(output, "x", 1);
+	/* starts with header */
+	buf_expect(buf, multiplex_header, sizeof(multiplex_header)-1);
+	buf_expect(buf, IOSTREAM_MULTIPLEX_CHANNEL_SWITCH_PREFIX,
+		   IOSTREAM_MULTIPLEX_CHANNEL_SWITCH_PREFIX_LEN);
+	/* initial channel switch to 0 */
+	c = MULTIPLEX_ISTREAM_SWITCH_TYPE_CHANNEL_ID;
+	buf_expect(buf, &c, 1);
+	c = 0;
+	buf_expect(buf, &c, 1);
+	/* the actual data we sent */
+	c = 'x';
+	buf_expect(buf, &c, 1);
+	test_assert(buf->used == 0);
+
+	/* same channel, so continues with sent data */
+	o_stream_nsend(output, "y", 1);
+	c = 'y';
+	buf_expect(buf, &c, 1);
+	test_assert(buf->used == 0);
+
+	/* no need to escape the header if sent again */
+	o_stream_nsend(output, multiplex_header, sizeof(multiplex_header)-1);
+	buf_expect(buf, multiplex_header, sizeof(multiplex_header)-1);
+	test_assert(buf->used == 0);
+
+	/* channel switch is escaped */
+	o_stream_nsend(output, IOSTREAM_MULTIPLEX_CHANNEL_SWITCH_PREFIX,
+		       IOSTREAM_MULTIPLEX_CHANNEL_SWITCH_PREFIX_LEN);
+	buf_expect(buf, "\x03\xFE\x01\xFE", 4);
+	test_assert(buf->used == 0);
+
+	/* channel switch's first character is escaped */
+	o_stream_nsend(output, IOSTREAM_MULTIPLEX_CHANNEL_SWITCH_PREFIX, 1);
+	buf_expect(buf, "\x03\xFE\x01", 3);
+	test_assert(buf->used == 0);
+
+	/* channel switch's first character followed by non-second character
+	   is not escaped */
+	char data[2] = { IOSTREAM_MULTIPLEX_CHANNEL_SWITCH_PREFIX[0], 'x' };
+	o_stream_nsend(output, data, 2);
+	buf_expect(buf, data, 2);
+	test_assert(buf->used == 0);
+
+	/* 2nd channel */
+	struct ostream *output2 =
+		o_stream_multiplex_add_channel(output, 3);
+	o_stream_nsend(output2, "z", 1);
+	buf_expect(buf, "\x03\xFE\x00\x03z", 5);
+	test_assert(buf->used == 0);
+
+	o_stream_nsend(output2, "abc", 3);
+	buf_expect(buf, "abc", 3);
+	test_assert(buf->used == 0);
+
+	/* back to 1st channel */
+	o_stream_nsend(output, "def", 3);
+	buf_expect(buf, "\x03\xFE\000\000def", 7);
+	test_assert(buf->used == 0);
+
+	o_stream_nsend(output, "g", 1);
+	buf_expect(buf, "g", 1);
+	test_assert(buf->used == 0);
+
+	test_assert(o_stream_flush(output) == 1);
+
+	(void)o_stream_finish(output2);
+	o_stream_unref(&output2);
+	o_stream_unref(&output);
+	o_stream_unref(&output_buf);
+	buffer_free(&buf);
+	test_end();
+}
+
 void test_ostream_multiplex(void)
 {
-	test_ostream_multiplex_simple();
+	test_ostream_multiplex_packet_simple();
+	test_ostream_multiplex_packet_stream();
+	test_ostream_multiplex_packet_cork();
+	test_ostream_multiplex_packet_hang();
+	test_ostream_multiplex_packet_flush_callback();
 	test_ostream_multiplex_stream();
-	test_ostream_multiplex_cork();
-	test_ostream_multiplex_hang();
-	test_ostream_multiplex_flush_callback();
 }

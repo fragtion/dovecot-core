@@ -2,6 +2,7 @@
 #define IMAP_CLIENT_H
 
 #include "net.h"
+#include "imap-stats.h"
 
 struct imap_client_state {
 	/* required: */
@@ -22,11 +23,14 @@ struct imap_client_state {
 	const unsigned char *state;
 	size_t state_size;
 
+	struct imap_logout_stats logout_stats;
+
 	guid_128_t anvil_conn_guid;
 	unsigned int imap_idle_notify_interval;
 	bool idle_cmd;
 	bool have_notify_fd;
 	bool anvil_sent;
+	bool multiplex_ostream;
 };
 
 struct imap_client *

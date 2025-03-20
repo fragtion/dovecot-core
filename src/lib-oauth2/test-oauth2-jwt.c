@@ -9,11 +9,12 @@
 #include "base64.h"
 #include "randgen.h"
 #include "array.h"
-#include "json-parser.h"
 #include "iso8601-date.h"
+#include "json-generator.h"
+#include "settings.h"
 #include "oauth2.h"
 #include "oauth2-private.h"
-#include "dcrypt.h"
+#include "dcrypt-private.h"
 #include "dict.h"
 #include "dict-private.h"
 #include "test-common.h"
@@ -737,6 +738,78 @@ static void test_jwt_kid_escape(void)
 	test_end();
 }
 
+static void test_jwt_nested_fields(void)
+{
+	test_begin("JWT nested fields");
+
+	buffer_t *tokenbuf = t_str_new(128);
+	const char *error ATTR_UNUSED;
+	bool is_jwt;
+	time_t now = time(NULL);
+	time_t exp = now+500;
+	time_t iat = now-500;
+	time_t nbf = now-250;
+
+	base64url_encode_str("{\"alg\":\"HS256\",\"typ\":\"JWT\"}", tokenbuf);
+	str_append_c(tokenbuf, '.');
+	base64url_encode_str(t_strdup_printf("{\"sub\":\"testuser\","
+					     "\"nbf\":%"PRIdTIME_T","
+					     "\"aud\":[\"dacity\",\"iron\"],"
+					     "\"user\":{"
+					        "\"name\":\"test\","
+					        "\"features\":[\"one\",\"two\",\"tap\\tdance\"],"
+					        "\"enabled\":true,"
+					        "\"locations\":{\"shared\":true,\"private\":false}"
+					     "},"
+					     "\"borders_\":{\"_left\":\"left\","
+					        "\"right_\":{\"_ok_\":\"right\"},"
+					        "\"_both_\":\"both\","
+					        "\"middle_one\":\"middle\","
+					        "\"middle_inner\":{\"middle_two\":\"middle_in\"}"
+					     "},"
+					     "\"exp\":%"PRIdTIME_T","
+					     "\"iat\":%"PRIdTIME_T"}",
+					     nbf, exp, iat),
+			     tokenbuf);
+	sign_jwt_token_hs256(tokenbuf, hs_sign_key);
+	struct oauth2_request req;
+
+	test_assert(parse_jwt_token(&req, str_c(tokenbuf), &is_jwt, &error) == 0);
+	test_assert(is_jwt == TRUE);
+
+	const struct oauth2_field test_fields[] = {
+		{ .name = "sub", .value = "testuser" },
+		{ .name = "nbf", .value = dec2str(nbf) },
+		{ .name = "exp", .value = dec2str(exp) },
+		{ .name = "iat", .value = dec2str(iat) },
+		{ .name = "aud", .value = "dacity\tiron" },
+		{ .name = "user_name", .value = "test" },
+		{ .name = "user_enabled", .value = "true" },
+		{ .name = "borders___left", .value = "left" },
+		{ .name = "borders___both_", .value = "both" },
+		{ .name = "borders__middle_one", .value = "middle" },
+		{ .name = "user_features", .value = "one\ttwo\ttap\1tdance" },
+		{ .name = "user_locations_shared", .value = "true" },
+		{ .name = "user_locations_private", .value = "false" },
+		{ .name = "borders__right___ok_", .value = "right" },
+		{ .name = "borders__middle_inner_middle_two", .value = "middle_in" },
+		{ .name = NULL, .value = NULL }
+	};
+
+
+	/* lets see them fields */
+	const struct oauth2_field *field;
+	unsigned int i = 0;
+	array_foreach(&req.fields, field) {
+		i_assert(i < N_ELEMENTS(test_fields));
+		test_assert_strcmp_idx(field->name, test_fields[i].name, i);
+		test_assert_strcmp_idx(field->value, test_fields[i].value, i);
+		i++;
+	}
+	test_assert_ucmp(i, ==, N_ELEMENTS(test_fields) - 1);
+	test_end();
+}
+
 static void test_jwt_rs_token(void)
 {
 	const char *error;
@@ -861,16 +934,19 @@ static void test_do_init(void)
 {
 	const char *error;
 	struct dcrypt_settings dcrypt_set = {
-		.module_dir = "../lib-dcrypt/.libs",
 	};
-	struct dict_settings dict_set = {
-		.base_dir = ".",
-	};
+	struct settings_simple set;
+	settings_simple_init(&set, (const char *const []) {
+		"dict", "file",
+		"dict/file/path", ".keys",
+		NULL,
+	});
 
 	i_unlink_if_exists(".keys");
 	dict_driver_register(&dict_driver_file);
-	if (dict_init("file:.keys", &dict_set, &keys_dict, &error) < 0)
-		i_fatal("dict_init(file:.keys): %s", error);
+	if (dict_init_auto(set.event, &keys_dict, &error) <= 0)
+		i_fatal("dict_init_auto(): %s", error);
+	dcrypt_openssl_init(NULL);
 	if (!dcrypt_initialize(NULL, &dcrypt_set, &error)) {
 		i_error("No functional dcrypt backend found - "
 			"skipping some tests: %s", error);
@@ -886,6 +962,7 @@ static void test_do_init(void)
 					    hs_sign_key->data,
 					    hs_sign_key->used);
 	save_key("HS256", str_c(b64_key));
+	settings_simple_deinit(&set);
 }
 
 static void test_do_deinit(void)
@@ -896,6 +973,7 @@ static void test_do_deinit(void)
 	i_unlink(".keys");
 	buffer_free(&hs_sign_key);
 	dcrypt_deinitialize();
+	dcrypt_openssl_deinit();
 }
 
 int main(void)
@@ -910,6 +988,7 @@ int main(void)
 		test_jwt_dates,
 		test_jwt_key_files,
 		test_jwt_kid_escape,
+		test_jwt_nested_fields,
 		test_jwt_rs_token,
 		test_jwt_ps_token,
 		test_jwt_ec_token,

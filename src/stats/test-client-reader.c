@@ -128,7 +128,12 @@ static const char *const settings_blob_2[] = {
 	"metric=test",
 	"metric/test/metric_name=test",
 	"metric/test/filter=event=test",
-	"metric/test/group_by=test_name",
+	"metric/test/metric_group_by=test_name",
+	"metric/test/metric_group_by/test_name/metric_group_by_field=test_name",
+	"metric/test/metric_group_by/test_name/metric_group_by_method=foo",
+	"metric/test/metric_group_by/test_name/metric_group_by_method/foo/method=linear",
+	"metric/test/metric_group_by/test_name/metric_group_by_method/foo/metric_group_by_method_linear_max=100",
+	"metric/test/metric_group_by/test_name/metric_group_by_method/foo/metric_group_by_method_linear_step=10",
 	NULL
 };
 
@@ -221,7 +226,7 @@ int main(void) {
 	struct master_service local_master_service = {
 		.stopping = TRUE,
 		.total_available_count = 100,
-		.service_count_left = 100,
+		.restart_request_count_left = 100,
 	};
 	void (*const test_functions[])(void) = {
 		test_client_reader,

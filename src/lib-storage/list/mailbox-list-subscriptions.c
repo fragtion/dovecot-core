@@ -124,14 +124,16 @@ int mailbox_list_subscriptions_refresh(struct mailbox_list *src_list,
 		dest_list->subscriptions = mailbox_tree_init(sep);
 	}
 
-	type = src_list->set.control_dir != NULL ?
+	type = src_list->mail_set->mail_control_path[0] != '\0' ?
 		MAILBOX_LIST_PATH_TYPE_CONTROL : MAILBOX_LIST_PATH_TYPE_DIR;
 	if (!mailbox_list_get_root_path(src_list, type, &path) ||
-	    src_list->set.subscription_fname == NULL) {
+	    src_list->mail_set->mailbox_subscriptions_filename[0] == '\0') {
 		/* no subscriptions (e.g. pop3c) */
 		return 0;
 	}
-	path = t_strconcat(path, "/", src_list->set.subscription_fname, NULL);
+	path = t_strconcat(path, "/",
+			   src_list->mail_set->mailbox_subscriptions_filename,
+			   NULL);
 	if (stat(path, &st) < 0) {
 		if (errno == ENOENT) {
 			/* no subscriptions */
@@ -161,7 +163,7 @@ int mailbox_list_subscriptions_refresh(struct mailbox_list *src_list,
 								 src_list, name);
 		} T_END;
 		if (ret < 0) {
-			e_warning(dest_list->ns->user->event,
+			e_warning(dest_list->event,
 				  "Subscriptions file %s: "
 				  "Removing invalid entry: %s",
 				  path, name);

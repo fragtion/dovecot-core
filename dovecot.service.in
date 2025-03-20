@@ -11,7 +11,7 @@
 Description=Dovecot IMAP/POP3 email server
 Documentation=man:dovecot(1)
 Documentation=https://doc.dovecot.org/
-After=local-fs.target network-online.target remote-fs.target
+After=local-fs.target network-online.target remote-fs.target time-sync.target
 
 [Service]
 Type=@systemdservicetype@
@@ -23,6 +23,7 @@ NonBlocking=yes
 ProtectSystem=full
 ProtectHome=no
 PrivateDevices=true
+OOMPolicy=continue
 
 # You can add environment variables with e.g.:
 #Environment='CORE_OUTOFMEM=1'

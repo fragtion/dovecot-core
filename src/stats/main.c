@@ -3,8 +3,10 @@
 #include "stats-common.h"
 #include "restrict-access.h"
 #include "ioloop.h"
+#include "settings.h"
 #include "master-service.h"
 #include "master-service-settings.h"
+#include "ssl-settings.h"
 #include "stats-settings.h"
 #include "stats-event-category.h"
 #include "stats-metrics.h"
@@ -44,15 +46,20 @@ static void main_preinit(void)
 
 static void main_init(void)
 {
-	stats_settings = master_service_settings_get_root_set(master_service,
-				&stats_setting_parser_info);
+	const char *error;
+
+	stats_settings =
+		settings_get_or_fatal(master_service_get_event(master_service),
+				      &stats_setting_parser_info);
 
 	stats_startup_time = ioloop_time;
-	stats_metrics = stats_metrics_init(stats_settings);
+	if (stats_metrics_init(master_service_get_event(master_service),
+			       stats_settings, &stats_metrics, &error) < 0)
+		i_fatal("%s", error);
 	stats_event_categories_init();
 	client_readers_init();
 	client_writers_init();
-	client_http_init(stats_settings);
+	client_http_init(master_service_get_event(master_service));
 	stats_services_init();
 }
 
@@ -64,14 +71,11 @@ static void main_deinit(void)
 	client_http_deinit();
 	stats_event_categories_deinit();
 	stats_metrics_deinit(&stats_metrics);
+	settings_free(stats_settings);
 }
 
 int main(int argc, char *argv[])
 {
-	const struct setting_parser_info *set_roots[] = {
-		&stats_setting_parser_info,
-		NULL
-	};
 	const enum master_service_flags service_flags =
 		MASTER_SERVICE_FLAG_NO_SSL_INIT |
 		MASTER_SERVICE_FLAG_DONT_SEND_STATS |
@@ -83,9 +87,9 @@ int main(int argc, char *argv[])
 					     &argc, &argv, "");
 	if (master_getopt(master_service) > 0)
 		return FATAL_DEFAULT;
-	if (master_service_settings_read_simple(master_service, set_roots,
-						&error) < 0)
-		i_fatal("Error reading configuration: %s", error);
+
+	if (master_service_settings_read_simple(master_service, &error) < 0)
+		i_fatal("%s", error);
 	master_service_init_log(master_service);
 	master_service_set_die_callback(master_service, stats_die);
 

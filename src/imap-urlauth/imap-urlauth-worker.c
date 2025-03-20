@@ -13,13 +13,13 @@
 #include "strescape.h"
 #include "llist.h"
 #include "hostpid.h"
-#include "var-expand.h"
 #include "process-title.h"
 #include "randgen.h"
 #include "restrict-access.h"
-#include "settings-parser.h"
+#include "settings.h"
 #include "connection.h"
 #include "master-service.h"
+#include "master-service-settings.h"
 #include "master-interface.h"
 #include "mail-storage.h"
 #include "mail-storage-service.h"
@@ -238,6 +238,7 @@ static void client_destroy(struct client *client)
 	connection_deinit(&client->conn_ctrl);
 	connection_deinit(&client->conn);
 	event_unref(&client->event);
+	settings_free(client->set);
 	i_free(client);
 
 	imap_urlauth_worker_refresh_proctitle();
@@ -539,6 +540,7 @@ client_handle_user_command(struct client *client, const char *cmd,
 	/* lookup user */
 	i_zero(&input);
 	input.service = "imap-urlauth-worker";
+	input.protocol = "imap";
 	input.username = args[0];
 	input.event_parent = client->event;
 
@@ -557,13 +559,18 @@ client_handle_user_command(struct client *client, const char *cmd,
 		return 1;
 	}
 
-	event_set_forced_debug(client->event, mail_user->mail_debug);
+	if (settings_get(mail_user->event,
+			 &imap_urlauth_worker_setting_parser_info, 0,
+			 &set, &error) < 0) {
+		e_error(client->event, "user %s: %s", input.username, error);
+		client_abort(client, "Session aborted: Failed to get settings");
+		return 0;
+	}
+
+	event_set_forced_debug(client->event, event_want_debug(mail_user->event));
 
 	/* drop privileges */
 	restrict_access_allow_coredumps(TRUE);
-
-	set = settings_parser_get_root_set(mail_user->set_parser,
-			&imap_urlauth_worker_setting_parser_info);
 
 	if (set->verbose_proctitle) {
 		verbose_proctitle = TRUE;
@@ -970,16 +977,12 @@ static void client_connected(struct master_service_connection *conn)
 
 int main(int argc, char *argv[])
 {
-	static const struct setting_parser_info *set_roots[] = {
-		&imap_urlauth_worker_setting_parser_info,
-		NULL
-	};
 	enum master_service_flags service_flags = 0;
 	enum mail_storage_service_flags storage_service_flags =
 		MAIL_STORAGE_SERVICE_FLAG_USERDB_LOOKUP |
 		MAIL_STORAGE_SERVICE_FLAG_NO_LOG_INIT;
 	ARRAY_TYPE (const_string) access_apps;
-	const char *access_user = NULL;
+	const char *access_user = NULL, *error;
 	int c;
 
 	if (IS_STANDALONE()) {
@@ -1015,9 +1018,12 @@ int main(int argc, char *argv[])
 	master_service_init_log_with_pid(master_service);
 	master_service_set_die_callback(master_service, imap_urlauth_worker_die);
 
+	if (master_service_settings_read_simple(master_service, &error) < 0)
+		i_fatal("%s", error);
+
 	storage_service =
 		mail_storage_service_init(master_service,
-					  set_roots, storage_service_flags);
+					  storage_service_flags);
 	master_service_init_finish(master_service);
 
 	/* fake that we're running, so we know if client was destroyed

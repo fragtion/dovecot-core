@@ -5,6 +5,8 @@
 
 #ifdef USERDB_SQL
 
+#include "settings.h"
+#include "settings-parser.h"
 #include "auth-cache.h"
 #include "db-sql.h"
 
@@ -13,7 +15,7 @@
 struct sql_userdb_module {
 	struct userdb_module module;
 
-	struct db_sql_connection *conn;
+	struct sql_db *db;
 };
 
 struct userdb_sql_request {
@@ -24,17 +26,47 @@ struct userdb_sql_request {
 struct sql_userdb_iterate_context {
 	struct userdb_iterate_context ctx;
 	struct sql_result *result;
+	bool query_sent:1;
 	bool freed:1;
 	bool call_iter:1;
+};
+
+struct userdb_sql_settings {
+	pool_t pool;
+	const char *query;
+	const char *iterate_query;
+};
+#undef DEF
+#define DEF(type, name) \
+	SETTING_DEFINE_STRUCT_##type("userdb_sql_"#name, name, struct userdb_sql_settings)
+static const struct setting_define userdb_sql_setting_defines[] = {
+	DEF(STR, query),
+	DEF(STR, iterate_query),
+
+	SETTING_DEFINE_LIST_END
+};
+static const struct userdb_sql_settings userdb_sql_default_settings = {
+	.query = "",
+	.iterate_query = "",
+};
+const struct setting_parser_info userdb_sql_setting_parser_info = {
+	.name = "userdb_sql",
+
+	.defines = userdb_sql_setting_defines,
+	.defaults = &userdb_sql_default_settings,
+
+	.struct_size = sizeof(struct userdb_sql_settings),
+	.pool_offset1 = 1 + offsetof(struct userdb_sql_settings, pool),
 };
 
 static void userdb_sql_iterate_next(struct userdb_iterate_context *_ctx);
 static int userdb_sql_iterate_deinit(struct userdb_iterate_context *_ctx);
 
-static void
+static int
 sql_query_get_result(struct sql_result *result,
 		     struct auth_request *auth_request)
 {
+	struct auth_fields *fields = auth_fields_init(auth_request->pool);
 	const char *name, *value;
 	unsigned int i, fields_count;
 
@@ -43,43 +75,35 @@ sql_query_get_result(struct sql_result *result,
 		name = sql_result_get_field_name(result, i);
 		value = sql_result_get_field_value(result, i);
 
-		if (*name != '\0' && value != NULL) {
+		if (*name == '\0' || value == NULL)
+			continue;
+
+		auth_fields_add(fields, name, value, 0);
+		if (auth_request->userdb->set->fields_import_all) {
 			auth_request_set_userdb_field(auth_request,
 						      name, value);
 		}
 	}
+	return auth_request_set_userdb_fields(auth_request, fields);
 }
 
 static void sql_query_callback(struct sql_result *sql_result,
 			       struct userdb_sql_request *sql_request)
 {
 	struct auth_request *auth_request = sql_request->auth_request;
-	struct userdb_module *_module = auth_request->userdb->userdb;
-	struct sql_userdb_module *module =
-		(struct sql_userdb_module *)_module;
 	enum userdb_result result = USERDB_RESULT_INTERNAL_FAILURE;
 	int ret;
 
 	ret = sql_result_next_row(sql_result);
 	if (ret >= 0)
-		db_sql_success(module->conn);
+		db_sql_success();
 	if (ret < 0) {
-		if (!module->conn->default_user_query) {
-			e_error(authdb_event(auth_request),
-				"User query failed: %s",
-				sql_result_get_error(sql_result));
-		} else {
-			e_error(authdb_event(auth_request),
-				"User query failed: %s "
-				"(using built-in default user_query: %s)",
-				sql_result_get_error(sql_result),
-				module->conn->set.user_query);
-		}
+		e_error(authdb_event(auth_request), "User query failed: %s",
+			sql_result_get_error(sql_result));
 	} else if (ret == 0) {
 		result = USERDB_RESULT_USER_UNKNOWN;
-		auth_request_log_unknown_user(auth_request, AUTH_SUBSYS_DB);
-	} else {
-		sql_query_get_result(sql_result, auth_request);
+		auth_request_db_log_unknown_user(auth_request);
+	} else if (sql_query_get_result(sql_result, auth_request) == 0) {
 		result = USERDB_RESULT_OK;
 	}
 
@@ -88,14 +112,10 @@ static void sql_query_callback(struct sql_result *sql_result,
 	i_free(sql_request);
 }
 
-static const char *
-userdb_sql_escape(const char *str, const struct auth_request *auth_request)
+static const char *userdb_sql_escape(const char *str, void *context)
 {
-	struct userdb_module *_module = auth_request->userdb->userdb;
-	struct sql_userdb_module *module =
-		(struct sql_userdb_module *)_module;
-
-	return sql_escape_string(module->conn->db, str);
+	struct sql_db *db = context;
+	return sql_escape_string(db, str);
 }
 
 static void userdb_sql_lookup(struct auth_request *auth_request,
@@ -103,16 +123,19 @@ static void userdb_sql_lookup(struct auth_request *auth_request,
 {
 	struct userdb_module *_module = auth_request->userdb->userdb;
 	struct sql_userdb_module *module =
-		(struct sql_userdb_module *)_module;
+		container_of(_module, struct sql_userdb_module, module);
 	struct userdb_sql_request *sql_request;
-	const char *query, *error;
+	const struct userdb_sql_settings *set;
+	const char *error;
 
-	if (t_auth_request_var_expand(module->conn->set.user_query,
-				      auth_request, userdb_sql_escape,
-				      &query, &error) <= 0) {
-		e_error(authdb_event(auth_request),
-			"Failed to expand user_query=%s: %s",
-			module->conn->set.user_query, error);
+	struct settings_get_params params = {
+		.escape_func = userdb_sql_escape,
+		.escape_context = module->db,
+	};
+	if (settings_get_params(authdb_event(auth_request),
+				&userdb_sql_setting_parser_info, &params,
+				&set, &error) < 0) {
+		e_error(authdb_event(auth_request), "%s", error);
 		callback(USERDB_RESULT_INTERNAL_FAILURE, auth_request);
 		return;
 	}
@@ -122,10 +145,10 @@ static void userdb_sql_lookup(struct auth_request *auth_request,
 	sql_request->callback = callback;
 	sql_request->auth_request = auth_request;
 
-	e_debug(authdb_event(auth_request), "%s", query);
+	e_debug(authdb_event(auth_request), "%s", set->query);
 
-	sql_query(module->conn->db, query,
-		  sql_query_callback, sql_request);
+	sql_query(module->db, set->query, sql_query_callback, sql_request);
+	settings_free(set);
 }
 
 static void sql_iter_query_callback(struct sql_result *sql_result,
@@ -146,17 +169,10 @@ userdb_sql_iterate_init(struct auth_request *auth_request,
 {
 	struct userdb_module *_module = auth_request->userdb->userdb;
 	struct sql_userdb_module *module =
-		(struct sql_userdb_module *)_module;
+		container_of(_module, struct sql_userdb_module, module);
 	struct sql_userdb_iterate_context *ctx;
-	const char *query, *error;
-
-	if (t_auth_request_var_expand(module->conn->set.iterate_query,
-				      auth_request, userdb_sql_escape,
-				      &query, &error) <= 0) {
-		e_error(authdb_event(auth_request),
-			"Failed to expand iterate_query=%s: %s",
-			module->conn->set.iterate_query, error);
-	}
+	const struct userdb_sql_settings *set;
+	const char *error;
 
 	ctx = i_new(struct sql_userdb_iterate_context, 1);
 	ctx->ctx.auth_request = auth_request;
@@ -164,9 +180,24 @@ userdb_sql_iterate_init(struct auth_request *auth_request,
 	ctx->ctx.context = context;
 	auth_request_ref(auth_request);
 
-	sql_query(module->conn->db, query,
-		  sql_iter_query_callback, ctx);
-	e_debug(authdb_event(auth_request), "%s", query);
+	if (settings_get(authdb_event(auth_request),
+			 &userdb_sql_setting_parser_info, 0,
+			 &set, &error) < 0) {
+		e_error(authdb_event(auth_request), "%s", error);
+		ctx->ctx.failed = TRUE;
+		return &ctx->ctx;
+	}
+
+	if (*set->iterate_query == '\0') {
+		e_error(authdb_event(auth_request), "User iteration failed: "
+			"userdb_sql_iterate_query is empty");
+		ctx->ctx.failed = TRUE;
+	} else {
+		ctx->query_sent = TRUE;
+		sql_query(module->db, set->iterate_query, sql_iter_query_callback, ctx);
+		e_debug(authdb_event(auth_request), "%s", set->iterate_query);
+	}
+	settings_free(set);
 	return &ctx->ctx;
 }
 
@@ -203,12 +234,14 @@ static int userdb_sql_iterate_get_user(struct sql_userdb_iterate_context *ctx,
 static void userdb_sql_iterate_next(struct userdb_iterate_context *_ctx)
 {
 	struct sql_userdb_iterate_context *ctx =
-		(struct sql_userdb_iterate_context *)_ctx;
-	struct userdb_module *_module = _ctx->auth_request->userdb->userdb;
-	struct sql_userdb_module *module = (struct sql_userdb_module *)_module;
+		container_of(_ctx, struct sql_userdb_iterate_context, ctx);
 	const char *user;
 	int ret;
 
+	if (_ctx->failed) {
+		_ctx->callback(NULL, _ctx->context);
+		return;
+	}
 	if (ctx->result == NULL) {
 		/* query not finished yet */
 		ctx->call_iter = TRUE;
@@ -217,7 +250,7 @@ static void userdb_sql_iterate_next(struct userdb_iterate_context *_ctx)
 
 	ret = sql_result_next_row(ctx->result);
 	if (ret >= 0)
-		db_sql_success(module->conn);
+		db_sql_success();
 	if (ret > 0) {
 		if (userdb_sql_iterate_get_user(ctx, &user) < 0)
 			e_error(authdb_event(_ctx->auth_request),
@@ -231,17 +264,9 @@ static void userdb_sql_iterate_next(struct userdb_iterate_context *_ctx)
 		}
 		_ctx->failed = TRUE;
 	} else if (ret < 0) {
-		if (!module->conn->default_iterate_query) {
-			e_error(authdb_event(_ctx->auth_request),
-				"sql: Iterate query failed: %s",
-				sql_result_get_error(ctx->result));
-		} else {
-			e_error(authdb_event(_ctx->auth_request),
-				"sql: Iterate query failed: %s "
-				"(using built-in default iterate_query: %s)",
-				sql_result_get_error(ctx->result),
-				module->conn->set.iterate_query);
-		}
+		e_error(authdb_event(_ctx->auth_request),
+			"sql: Iterate query failed: %s",
+			sql_result_get_error(ctx->result));
 		_ctx->failed = TRUE;
 	}
 	_ctx->callback(NULL, _ctx->context);
@@ -250,11 +275,11 @@ static void userdb_sql_iterate_next(struct userdb_iterate_context *_ctx)
 static int userdb_sql_iterate_deinit(struct userdb_iterate_context *_ctx)
 {
 	struct sql_userdb_iterate_context *ctx =
-		(struct sql_userdb_iterate_context *)_ctx;
+		container_of(_ctx, struct sql_userdb_iterate_context, ctx);
 	int ret = _ctx->failed ? -1 : 0;
 
 	auth_request_unref(&_ctx->auth_request);
-	if (ctx->result == NULL) {
+	if (ctx->query_sent && ctx->result == NULL) {
 		/* sql query hasn't finished yet */
 		ctx->freed = TRUE;
 	} else {
@@ -265,52 +290,80 @@ static int userdb_sql_iterate_deinit(struct userdb_iterate_context *_ctx)
 	return ret;
 }
 
-static struct userdb_module *
-userdb_sql_preinit(pool_t pool, const char *args)
+static int
+userdb_sql_preinit(pool_t pool, struct event *event,
+		   struct userdb_module **module_r, const char **error_r)
 {
 	struct sql_userdb_module *module;
+	const struct userdb_sql_settings *set;
+	const struct auth_userdb_post_settings *post_set;
+
+	if (settings_get(event, &userdb_sql_setting_parser_info,
+			 SETTINGS_GET_FLAG_NO_CHECK |
+			 SETTINGS_GET_FLAG_NO_EXPAND,
+			 &set, error_r) < 0)
+		return -1;
+	if (settings_get(event, &auth_userdb_post_setting_parser_info,
+			 SETTINGS_GET_FLAG_NO_CHECK |
+			 SETTINGS_GET_FLAG_NO_EXPAND,
+			 &post_set, error_r) < 0) {
+		settings_free(set);
+		return -1;
+	}
 
 	module = p_new(pool, struct sql_userdb_module, 1);
-	module->conn = db_sql_init(args, TRUE);
+	if (sql_init_auto(event, &module->db, error_r) <= 0) {
+		settings_free(set);
+		settings_free(post_set);
+		return -1;
+	}
 
 	module->module.default_cache_key =
-		auth_cache_parse_key(pool, module->conn->set.user_query);
-	return &module->module;
+		auth_cache_parse_key_and_fields(pool, set->query,
+						&post_set->fields, "sql");
+	settings_free(set);
+	settings_free(post_set);
+	*module_r = &module->module;
+	return 0;
 }
 
 static void userdb_sql_init(struct userdb_module *_module)
 {
 	struct sql_userdb_module *module =
-		(struct sql_userdb_module *)_module;
+		container_of(_module, struct sql_userdb_module, module);
 	enum sql_db_flags flags;
 
-	flags = sql_get_flags(module->conn->db);
-	_module->blocking = (flags & SQL_DB_FLAG_BLOCKING) != 0;
+	flags = sql_get_flags(module->db);
+	if (!_module->blocking)
+		_module->blocking = (flags & SQL_DB_FLAG_BLOCKING) != 0;
 
 	if (!_module->blocking || worker)
-		db_sql_connect(module->conn);
+		db_sql_connect(module->db);
 }
 
 static void userdb_sql_deinit(struct userdb_module *_module)
 {
 	struct sql_userdb_module *module =
-		(struct sql_userdb_module *)_module;
+		container_of(_module, struct sql_userdb_module, module);
 
-	db_sql_unref(&module->conn);
+	/* Abort any pending requests, even if the database is still
+	   kept referenced. */
+	sql_disconnect(module->db);
+	sql_unref(&module->db);
 }
 
 struct userdb_module_interface userdb_sql = {
-	"sql",
+	.name = "sql",
 
-	userdb_sql_preinit,
-	userdb_sql_init,
-	userdb_sql_deinit,
+	.preinit = userdb_sql_preinit,
+	.init = userdb_sql_init,
+	.deinit = userdb_sql_deinit,
 
-	userdb_sql_lookup,
+	.lookup = userdb_sql_lookup,
 
-	userdb_sql_iterate_init,
-	userdb_sql_iterate_next,
-	userdb_sql_iterate_deinit
+	.iterate_init = userdb_sql_iterate_init,
+	.iterate_next = userdb_sql_iterate_next,
+	.iterate_deinit = userdb_sql_iterate_deinit
 };
 #else
 struct userdb_module_interface userdb_sql = {

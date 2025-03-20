@@ -13,6 +13,7 @@ struct fs;
 struct mail_namespace;
 struct mail_storage;
 struct mailbox_list;
+struct mail_storage_settings;
 
 enum mailbox_list_properties {
 	/* maildir_name must always be empty */
@@ -43,7 +44,8 @@ enum mailbox_list_flags {
 	MAILBOX_LIST_FLAG_SECONDARY		= 0x02,
 	/* There are no mail files, only index and/or control files. */
 	MAILBOX_LIST_FLAG_NO_MAIL_FILES		= 0x04,
-	/* LAYOUT=index: Don't delete any files in delete_mailbox(). */
+	/* mailbox_list_layout=index: Don't delete any files in
+	   delete_mailbox(). */
 	MAILBOX_LIST_FLAG_NO_DELETES		= 0x08
 };
 
@@ -111,81 +113,6 @@ enum mailbox_list_get_storage_flags {
 	MAILBOX_LIST_GET_STORAGE_FLAG_SAVEONLY = BIT(0),
 };
 
-struct mailbox_list_settings {
-	const char *layout; /* FIXME: shouldn't be here */
-	const char *root_dir;
-	const char *index_dir;
-	const char *index_pvt_dir;
-	const char *index_cache_dir;
-	const char *control_dir;
-	const char *alt_dir; /* FIXME: dbox-specific.. */
-	/* Backend-local directory where volatile data, such as lock files,
-	   can be temporarily created. This setting allows specifying a
-	   separate directory for them to reduce disk I/O on the real storage.
-	   The volatile_dir can point to an in-memory filesystem. */
-	const char *volatile_dir;
-
-	const char *inbox_path;
-	const char *subscription_fname;
-	const char *list_index_fname;
-	/* Mailbox list index directory. NULL defaults to index directory.
-	   The path may be relative to the index directory. */
-	const char *list_index_dir;
-	/* If non-empty, it means that mails exist in a maildir_name
-	   subdirectory. eg. if you have a directory containing directories:
-
-	   mail/
-	   mail/foo/
-	   mail/foo/Maildir
-
-	   If mailbox_name is empty, you have mailboxes "mail", "mail/foo" and
-	   "mail/foo/Maildir".
-
-	   If mailbox_name is "Maildir", you have a non-selectable mailbox
-	   "mail" and a selectable mailbox "mail/foo". */
-	const char *maildir_name;
-	/* if set, store mailboxes under root_dir/mailbox_dir_name/.
-	   this setting contains either "" or "dir/". */
-	const char *mailbox_dir_name;
-
-	/* Used for escaping the mailbox name in storage (storage_name). If the
-	   UTF-8 vname has characters that can't reversibly (or safely) be
-	   converted to storage_name and back, encode the problematic parts
-	   using <storage_name_escape_char><hex>. The storage_name_escape_char
-	   itself also has to be encoded the same way. For example
-	   { vname="A/B.C%D", storage_name_escape_char='%', namespace_sep='/',
-	   storage_sep='.' } -> storage_name="A.B%2eC%25D". */
-	char storage_name_escape_char;
-	/* Used for escaping the user/client-visible UTF-8 vname. If the
-	   storage_name can't be converted reversibly to the vname and back,
-	   encode the problematic parts using <vname_escape_char><hex>. The
-	   vname_escape_char itself also has to be encoded the same way. For
-	   example { storage_name="A/B.C%D", vname_escape_char='%',
-	   namespace_sep='/', storage_sep='.' } -> vname="A%2fB/C%25D".
-
-	   Note that it's possible for escape_char and broken_char to be the
-	   same character. They're just used for different directions in
-	   conversion. */
-	char vname_escape_char;
-	/* Use UTF-8 mailbox names on filesystem instead of mUTF-7 */
-	bool utf8:1;
-	/* Don't check/create the alt-dir symlink. */
-	bool alt_dir_nocheck:1;
-	/* Use maildir_name also for index/control directories. This should
-	   have been the default since the beginning, but for backwards
-	   compatibility it had to be made an option. */
-	bool index_control_use_maildir_name:1;
-	/* Perform mailbox iteration using the index directory instead of the
-	   mail root directory. This can be helpful if the indexes are on a
-	   faster storage. This could perhaps be made the default at some point,
-	   but for now since it's less tested it's optional. */
-	bool iter_from_index_dir:1;
-	/* Control creation and listing of \NoSelect mailboxes. */
-	bool keep_noselect:1;
-	/* Do not validate names as fs names (allows weird names) */
-	bool no_fs_validation:1;
-};
-
 struct mailbox_permissions {
 	/* The actual uid/gid of the mailbox */
 	uid_t file_uid;
@@ -211,21 +138,20 @@ void mailbox_list_unregister(const struct mailbox_list *list);
 const struct mailbox_list *
 mailbox_list_find_class(const char *driver);
 
-/* Returns 0 if ok, -1 if driver was unknown. */
-int mailbox_list_create(const char *driver, struct mail_namespace *ns,
-			const struct mailbox_list_settings *set,
+int mailbox_list_create(struct event *event, struct mail_namespace *ns,
+			const struct mail_storage_settings *mail_set,
 			enum mailbox_list_flags flags,
 			struct mailbox_list **list_r, const char **error_r);
 void mailbox_list_destroy(struct mailbox_list **list);
 
 const char *
 mailbox_list_get_driver_name(const struct mailbox_list *list) ATTR_PURE;
-const struct mailbox_list_settings *
-mailbox_list_get_settings(const struct mailbox_list *list) ATTR_PURE;
 enum mailbox_list_flags
 mailbox_list_get_flags(const struct mailbox_list *list) ATTR_PURE;
 struct mail_namespace *
 mailbox_list_get_namespace(const struct mailbox_list *list) ATTR_PURE;
+struct event *
+mailbox_list_get_event(const struct mailbox_list *list) ATTR_PURE;
 struct mail_user *
 mailbox_list_get_user(const struct mailbox_list *list) ATTR_PURE;
 /* Get a mail_storage for the given mailbox_list/vname combination. This might
@@ -238,6 +164,8 @@ int mailbox_list_get_storage(struct mailbox_list **list, const char **vname,
 void mailbox_list_get_default_storage(struct mailbox_list *list,
 				      struct mail_storage **storage);
 char mailbox_list_get_hierarchy_sep(struct mailbox_list *list);
+const struct mail_storage_settings *
+mailbox_list_get_mail_set(const struct mailbox_list *list);
 
 /* Returns the mode and GID that should be used when creating new files and
    directories to the specified mailbox. (gid_t)-1 is returned if it's not
@@ -296,6 +224,9 @@ struct mailbox_log *mailbox_list_get_changelog(struct mailbox_list *list);
    current time is used */
 void mailbox_list_set_changelog_timestamp(struct mailbox_list *list,
 					  time_t stamp);
+/* Get the number of mailboxes in the list, ignoring any ACLs. Auto-created
+   mailboxes that haven't been yet created are not counted. */
+int mailbox_list_get_count(struct mailbox_list *list, unsigned int *count_r);
 
 /* Returns a prefix that temporary files should use without conflicting
    with the namespace. */
@@ -332,12 +263,11 @@ mailbox_list_get_last_internal_error(struct mailbox_list *list,
 void mailbox_list_last_error_push(struct mailbox_list *list);
 void mailbox_list_last_error_pop(struct mailbox_list *list);
 
-/* Create a fs based on the settings in the given mailbox_list. If event_parent
-   is NULL, use user->event as the parent. */
+/* Create a fs based on the settings in the given mailbox_list. Returns 1 if
+   ok, 0 if fs_driver is empty (error_r is set), -1 on internal error. */
 int mailbox_list_init_fs(struct mailbox_list *list, struct event *event_parent,
-			 const char *driver,
-			 const char *args, const char *root_dir,
-			 struct fs **fs_r, const char **error_r);
+			 const char *root_dir, struct fs **fs_r,
+			 const char **error_r);
 /* Return mailbox_list that was used to create the fs via
    mailbox_list_init_fs(). */
 struct mailbox_list *mailbox_list_fs_get_list(struct fs *fs);

@@ -39,7 +39,7 @@ struct module;
 
 /* Client logged out without having successfully authenticated. */
 #define CLIENT_UNAUTHENTICATED_LOGOUT_MSG \
-	"Aborted login by logging out"
+	"Logged out"
 
 #define CLIENT_TRANSPORT_TLS "TLS"
 #define CLIENT_TRANSPORT_INSECURE "insecure"
@@ -77,6 +77,7 @@ enum client_auth_result {
 	CLIENT_AUTH_RESULT_AUTHFAILED_REASON,
 	CLIENT_AUTH_RESULT_AUTHZFAILED,
 	CLIENT_AUTH_RESULT_TEMPFAIL,
+	CLIENT_AUTH_RESULT_LIMIT_REACHED,
 	CLIENT_AUTH_RESULT_PASS_EXPIRED,
 	CLIENT_AUTH_RESULT_SSL_REQUIRED,
 	CLIENT_AUTH_RESULT_INVALID_BASE64,
@@ -107,16 +108,22 @@ struct client_auth_reply {
 	unsigned int proxy_refresh_secs;
 	unsigned int proxy_host_immediate_failure_after_secs;
 
+	/* final SASL success reply (challenge) sent by server
+	   (only used when login_binary->sasl_support_final_reply == TRUE) */
+	const char *final_reply;
+
 	/* all the key=value fields returned by passdb */
 	const char *const *all_fields;
 
 	bool nologin:1;
+	bool proxy_no_multiplex:1;
 };
 
 struct client_vfuncs {
 	struct client *(*alloc)(pool_t pool);
-	void (*create)(struct client *client, void **other_sets);
+	int (*create)(struct client *client);
 	void (*destroy)(struct client *client);
+	int (*reload_config)(struct client *client, const char **error_r);
 	void (*notify_auth_ready)(struct client *client);
 	void (*notify_disconnect)(struct client *client,
 				  enum client_disconnect_reason reason,
@@ -126,18 +133,29 @@ struct client_vfuncs {
 	void (*notify_starttls)(struct client *client,
 				bool success, const char *text);
 	void (*starttls)(struct client *client);
+
+	/* Called just before client iostreams are changed (e.g. STARTTLS).
+	   iostream_change_post() is guaranteed to be called. */
+	void (*iostream_change_pre)(struct client *client);
+	/* Called just after client iostreams may have changed. Nothing may
+	   have happened in case of unexpected errors. */
+	void (*iostream_change_post)(struct client *client);
+
 	void (*input)(struct client *client);
 	bool (*sasl_filter_mech)(struct client *client,
 				 struct auth_mech_desc *mech);
 	bool (*sasl_check_login)(struct client *client);
 	void (*auth_send_challenge)(struct client *client, const char *data);
-	void (*auth_parse_response)(struct client *client);
+	bool (*auth_parse_response)(struct client *client);
 	void (*auth_result)(struct client *client,
 			    enum client_auth_result result,
 			    const struct client_auth_reply *reply,
 			    const char *text);
 	void (*proxy_reset)(struct client *client);
 	int (*proxy_parse_line)(struct client *client, const char *line);
+	int (*proxy_side_channel_input)(struct client *client,
+					const char *const *args,
+					const char **error_r);
 	void (*proxy_failed)(struct client *client,
 			     enum login_proxy_failure_type type,
 			     const char *reason, bool reconnecting);
@@ -171,8 +189,8 @@ struct client {
 	in_port_t real_local_port, real_remote_port;
 	struct ssl_iostream *ssl_iostream;
 	const struct login_settings *set;
-	const struct master_service_ssl_settings *ssl_set;
-	const struct master_service_ssl_server_settings *ssl_server_set;
+	const struct ssl_settings *ssl_set;
+	const struct ssl_server_settings *ssl_server_set;
 	const char *session_id, *listener_name, *postlogin_socket_path;
 	const char *local_name;
 	const char *client_cert_common_name;
@@ -183,9 +201,15 @@ struct client {
 	int fd;
 	struct istream *input;
 	struct ostream *output;
+	/* If non-NULL, this is the multiplex ostream. It is usually the same
+	   as the output pointer, but some plugins may make them different.
+	   This isn't holding a reference, so it must not be unreferenced. */
+	struct ostream *multiplex_output;
+	struct ostream *multiplex_orig_output;
 	struct io *io;
 	struct iostream_proxy *iostream_fd_proxy;
 	struct timeout *to_auth_waiting;
+	struct timeout *to_notify_auth_ready;
 	struct timeout *to_disconnect;
 
 	unsigned char *master_data_prefix;
@@ -205,12 +229,13 @@ struct client {
 	struct auth_client_request *reauth_request;
 	string_t *auth_response;
 	struct timeval auth_first_started, auth_finished;
-	enum sasl_server_reply delayed_final_reply;
-	const char *const *final_args;
 	const char *const *auth_passdb_args;
+	const char *auth_success_data;
 	struct anvil_query *anvil_query;
 	struct anvil_request *anvil_request;
 
+	char *auth_conn_cookie;
+	unsigned int auth_server_pid;
 	unsigned int master_auth_id;
 	/* Tag that can be used with login_client_request_abort() to abort
 	   sending client fd to mail process. authenticating is always TRUE
@@ -221,6 +246,7 @@ struct client {
 	unsigned int bad_counter;
 	unsigned int auth_attempts, auth_successes;
 	enum client_auth_fail_code last_auth_fail;
+	enum login_proxy_failure_type proxy_last_failure;
 	pid_t mail_pid;
 
 	/* Module-specific contexts. */
@@ -274,13 +300,17 @@ struct client {
 	/* Client asked for SASL authentication to be aborted by sending
 	   "*" line. */
 	bool auth_aborted_by_client:1;
+	/* Too many connections from user/ip */
+	bool auth_login_limit_reached:1;
 	bool auth_initializing:1;
 	bool auth_process_comm_fail:1;
 	bool auth_anonymous:1;
 	bool auth_nologin_referral:1;
-	bool proxy_auth_failed:1;
+	bool proxy_failed:1;
 	bool proxy_noauth:1;
 	bool proxy_nopipelining:1;
+	/* Disable multiplex iostream to next nop */
+	bool proxy_no_multiplex;
 	bool proxy_not_trusted:1;
 	bool proxy_redirect_reauth:1;
 	bool notified_auth_ready:1;
@@ -288,7 +318,9 @@ struct client {
 	bool fd_proxying:1;
 	bool shutting_down:1;
 	bool resource_constraint:1;
-	bool final_response:1;
+	/* Defer calling auth ready callback until TLS handshake has been
+	   finished. */
+	bool defer_auth_ready:1;
 	/* ... */
 };
 
@@ -309,15 +341,10 @@ void login_client_hooks_add(struct module *module,
 			    const struct login_client_hooks *hooks);
 void login_client_hooks_remove(const struct login_client_hooks *hooks);
 
-struct client *
-client_alloc(int fd, pool_t pool,
-	     const struct master_service_connection *conn,
-	     const struct login_settings *set,
-	     const struct master_service_ssl_settings *ssl_set,
-	     const struct master_service_ssl_server_settings *ssl_server_set);
-void client_init(struct client *client, void **other_sets);
-void client_disconnect(struct client *client, const char *reason,
-		       bool add_disconnected_prefix);
+int client_alloc(int fd, const struct master_service_connection *conn,
+		 struct client **client_r);
+int client_init(struct client *client);
+void client_disconnect(struct client *client, const char *reason);
 void client_destroy(struct client *client, const char *reason);
 void client_destroy_iostream_error(struct client *client);
 /* Destroy the client after a successful login. Either the client fd was
@@ -329,6 +356,9 @@ bool client_unref(struct client **client) ATTR_NOWARN_UNUSED_RESULT;
 
 int client_init_ssl(struct client *client);
 void client_cmd_starttls(struct client *client);
+
+void client_multiplex_output_start(struct client *client);
+void client_multiplex_output_stop(struct client *client);
 
 int client_get_plaintext_fd(struct client *client, int *fd_r, bool *close_fd_r);
 
@@ -379,7 +409,7 @@ void client_common_proxy_failed(struct client *client,
 
 void client_set_auth_waiting(struct client *client);
 void client_auth_send_challenge(struct client *client, const char *data);
-void client_auth_parse_response(struct client *client);
+bool client_auth_parse_response(struct client *client);
 int client_auth_begin(struct client *client, const char *mech_name,
 		      const char *init_resp);
 int client_auth_begin_private(struct client *client, const char *mech_name,
@@ -388,6 +418,8 @@ int client_auth_begin_implicit(struct client *client, const char *mech_name,
 			       const char *init_resp);
 bool client_check_plaintext_auth(struct client *client, bool pass_sent);
 int client_auth_read_line(struct client *client);
+int client_sni_callback(const char *name, const char **error_r,
+			void *context);
 
 void client_proxy_finish_destroy_client(struct client *client);
 void client_proxy_log_failure(struct client *client, const char *line);

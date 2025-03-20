@@ -249,6 +249,12 @@ http_server_request_get_response(struct http_server_request *req)
 	return req->response;
 }
 
+struct http_server *
+http_server_request_get_server(struct http_server_request *req)
+{
+	return req->server;
+}
+
 int http_server_request_get_auth(struct http_server_request *req,
 				 struct http_auth_credentials *credentials)
 {
@@ -338,7 +344,7 @@ void http_server_request_received(struct http_server_request *req)
 		"(%u requests pending; %u maximum)",
 		http_server_request_label(req),
 		req->conn->request_queue_count,
-		req->conn->server->set.max_pipelined_requests);
+		req->conn->server->set->max_pipelined_requests);
 }
 
 void http_server_request_callback(struct http_server_request *req)

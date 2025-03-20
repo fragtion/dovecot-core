@@ -6,8 +6,10 @@
 #include "mail-storage-settings.h"
 #include "process-stat.h"
 
+#define SETTINGS_EVENT_MAIL_USER "mail_user"
+
 struct module;
-struct fs_settings;
+struct fs_parameters;
 struct ssl_iostream_settings;
 struct master_service_anvil_session;
 struct mail_user;
@@ -21,6 +23,7 @@ struct mail_user_vfuncs {
 struct mail_user_connection_data {
 	struct ip_addr *local_ip, *remote_ip;
 	in_port_t local_port, remote_port;
+	const char *local_name;
 
 	bool end_client_tls_secured:1;
 };
@@ -43,24 +46,23 @@ struct mail_user {
 	uid_t uid;
 	gid_t gid;
 	const char *service;
+	const char *protocol;
 	const char *session_id;
 	struct mail_user_connection_data conn;
 	const char *auth_mech, *auth_token, *auth_user;
+	const char *master_user;
 	const char *const *userdb_fields;
 	const char *const *_alt_usernames;
 	/* Timestamp when this session was initially created. Most importantly
 	   this stays the same after IMAP client is hibernated and restored. */
 	time_t session_create_time;
 
-	const struct var_expand_table *var_expand_table;
+	const struct var_expand_params *var_expand_params;
 	/* If non-NULL, fail the user initialization with this error.
 	   This could be set by plugins that need to fail the initialization. */
 	const char *error;
 
-	struct setting_parser_context *unexpanded_set_parser;
-	struct setting_parser_context *set_parser;
-	const struct mail_user_settings *unexpanded_set;
-	struct mail_user_settings *set;
+	const struct mail_user_settings *set;
 	struct mail_namespace *namespaces;
 	struct mail_storage *storages;
 	struct dict_op_settings *dict_op_set;
@@ -90,12 +92,6 @@ struct mail_user {
 	/* The initial namespaces have been created and
 	   hook_mail_namespaces_created() has been called. */
 	bool namespaces_created:1;
-	/* SET_STR_VARS in user's all settings have been expanded.
-	   This happens near the beginning of the user initialization,
-	   so this is rarely needed to be checked. */
-	bool settings_expanded:1;
-	/* Shortcut to mail_storage_settings.mail_debug */
-	bool mail_debug:1;
 	/* If INBOX can't be opened, log an error, but only once. */
 	bool inbox_open_error_logged:1;
 	/* Fuzzy search works for this user (FTS enabled) */
@@ -124,14 +120,10 @@ union mail_user_module_context {
 };
 extern struct mail_user_module_register mail_user_module_register;
 extern struct auth_master_connection *mail_user_auth_master_conn;
-extern const struct var_expand_func_table *mail_user_var_expand_func_table;
+extern const struct var_expand_provider *mail_user_var_expand_providers;
 
 struct mail_user *
-mail_user_alloc(struct mail_storage_service_user *service_user,
-		struct setting_parser_context *unexpanded_set_parser);
-struct mail_user *
-mail_user_alloc_nodup_set(struct mail_storage_service_user *service_user,
-			  struct setting_parser_context *set_parser);
+mail_user_alloc(struct mail_storage_service_user *service_user);
 /* Returns -1 if settings were invalid. */
 int mail_user_init(struct mail_user *user, const char **error_r);
 
@@ -151,13 +143,8 @@ struct mail_user *mail_user_find(struct mail_user *user, const char *name);
 void mail_user_set_vars(struct mail_user *user, const char *service,
 			const struct mail_user_connection_data *conn);
 /* Return %variable expansion table for the user. */
-const struct var_expand_table *
-mail_user_var_expand_table(struct mail_user *user);
-/* Expand %variables for the user. The settings values may be allocated from
-   user->pool. Returns the same as settings_var_expand_with_funcs(). */
-int mail_user_var_expand(struct mail_user *user,
-			 const struct setting_parser_info *info, void *set,
-			 const char **error_r);
+const struct var_expand_params *
+mail_user_var_expand_params(struct mail_user *user);
 
 /* Specify the user's home directory. This should be called also with home=NULL
    when it's known that the user doesn't have a home directory to avoid the
@@ -182,13 +169,6 @@ int mail_user_lock_file_create(struct mail_user *user, const char *lock_fname,
 
 /* Returns TRUE if plugin is loaded for the user. */
 bool mail_user_is_plugin_loaded(struct mail_user *user, struct module *module);
-/* If name exists in plugin_envs, return its value. */
-const char *mail_user_plugin_getenv(struct mail_user *user, const char *name);
-bool mail_user_plugin_getenv_bool(struct mail_user *user, const char *name);
-const char *mail_user_set_plugin_getenv(const struct mail_user_settings *set,
-					const char *name);
-bool mail_user_set_plugin_getenv_bool(const struct mail_user_settings *set,
-				      const char *name);
 
 /* Add more namespaces to user's namespaces. The ->next pointers may be
    changed, so the namespaces pointer will be updated to user->namespaces. */
@@ -216,14 +196,9 @@ mail_user_get_storage_class(struct mail_user *user, const char *name);
 /* Import any event_ fields from userdb fields to mail user event. */
 void mail_user_add_event_fields(struct mail_user *user);
 
-/* Initialize SSL client settings from mail_user settings. */
-void mail_user_init_ssl_client_settings(struct mail_user *user,
-	struct ssl_iostream_settings *ssl_set_r);
-
-/* Initialize fs_settings from mail_user settings. */
-void mail_user_init_fs_settings(struct mail_user *user,
-				struct fs_settings *fs_set,
-				struct ssl_iostream_settings *ssl_set_r);
+/* Initialize fs_parameters from mail_user settings. */
+void mail_user_init_fs_parameters(struct mail_user *user,
+				struct fs_parameters *fs_set);
 
 /* Try to mkdir() user's home directory. Ideally this should be called only
    after the caller tries to create a file to the home directory, but it fails

@@ -9,6 +9,7 @@
 #include "str.h"
 #include "strescape.h"
 #include "str-sanitize.h"
+#include "strnum.h"
 #include "time-util.h"
 #include "process-title.h"
 #include "master-service.h"
@@ -56,7 +57,9 @@ static void imap_master_client_destroy(struct connection *conn)
 
 static int
 imap_master_client_parse_input(const char *const *args, pool_t pool,
+			       enum client_create_flags *create_flags,
 			       struct mail_storage_service_input *input_r,
+			       struct imap_logout_stats *stats_r,
 			       struct imap_master_input *master_input_r,
 			       const char **error_r)
 {
@@ -64,6 +67,7 @@ imap_master_client_parse_input(const char *const *args, pool_t pool,
 	unsigned int peer_dev_major = 0, peer_dev_minor = 0;
 
 	i_zero(input_r);
+	i_zero(stats_r);
 	i_zero(master_input_r);
 	master_input_r->client_input = buffer_create_dynamic(pool, 64);
 	master_input_r->client_output = buffer_create_dynamic(pool, 16);
@@ -144,6 +148,8 @@ imap_master_client_parse_input(const char *const *args, pool_t pool,
 					"Invalid hibernation_started value: %s", value);
 				return -1;
 			}
+		} else if (strcmp(key, "multiplex_ostream") == 0) {
+			*create_flags |= CLIENT_CREATE_FLAG_MULTIPLEX_OUTPUT;
 		} else if (strcmp(key, "userdb_fields") == 0) {
 			input_r->userdb_fields =
 				t_strsplit_tabescaped(value);
@@ -174,6 +180,72 @@ imap_master_client_parse_input(const char *const *args, pool_t pool,
 			master_input_r->state_import_bad_idle_done = TRUE;
 		} else if (strcmp(key, "idle-continue") == 0) {
 			master_input_r->state_import_idle_continue = TRUE;
+		} else if (strcmp(key, "fetch_hdr_count") == 0) {
+			if (str_to_uint(value, &stats_r->fetch_hdr_count) < 0) {
+				*error_r = t_strdup_printf(
+					"Invalid fetch_hdr_count value: %s", value);
+				return -1;
+			}
+		} else if (strcmp(key, "fetch_hdr_bytes") == 0) {
+			if (str_to_uint64(value, &stats_r->fetch_hdr_bytes) < 0) {
+				*error_r = t_strdup_printf(
+					"Invalid fetch_hdr_bytes value: %s", value);
+				return -1;
+			}
+		} else if (strcmp(key, "fetch_body_count") == 0) {
+			if (str_to_uint(value, &stats_r->fetch_body_count) < 0) {
+				*error_r = t_strdup_printf(
+					"Invalid fetch_body_count value: %s", value);
+				return -1;
+			}
+		} else if (strcmp(key, "fetch_body_bytes") == 0) {
+			if (str_to_uint64(value, &stats_r->fetch_body_bytes) < 0) {
+				*error_r = t_strdup_printf(
+					"Invalid fetch_body_bytes value: %s", value);
+				return -1;
+			}
+		} else if (strcmp(key, "deleted_count") == 0) {
+			if (str_to_uint(value, &stats_r->deleted_count) < 0) {
+				*error_r = t_strdup_printf(
+					"Invalid deleted_count value: %s", value);
+				return -1;
+			}
+		} else if (strcmp(key, "expunged_count") == 0) {
+			if (str_to_uint(value, &stats_r->expunged_count) < 0) {
+				*error_r = t_strdup_printf(
+					"Invalid expunged_count value: %s", value);
+				return -1;
+			}
+		} else if (strcmp(key, "trashed_count") == 0) {
+			if (str_to_uint(value, &stats_r->trashed_count) < 0) {
+				*error_r = t_strdup_printf(
+					"Invalid trashed_count value: %s", value);
+				return -1;
+			}
+		} else if (strcmp(key, "autoexpunged_count") == 0) {
+			if (str_to_uint(value, &stats_r->autoexpunged_count) < 0) {
+				*error_r = t_strdup_printf(
+					"Invalid autoexpunged_count value: %s", value);
+				return -1;
+			}
+		} else if (strcmp(key, "append_count") == 0) {
+			if (str_to_uint(value, &stats_r->append_count) < 0) {
+				*error_r = t_strdup_printf(
+					"Invalid append_count value: %s", value);
+				return -1;
+			}
+		} else if (strcmp(key, "input_bytes_extra") == 0) {
+			if (str_to_uoff(value, &stats_r->input_bytes_extra) < 0) {
+				*error_r = t_strdup_printf(
+					"Invalid input_bytes_extra value: %s", value);
+				return -1;
+			}
+		} else if (strcmp(key, "output_bytes_extra") == 0) {
+			if (str_to_uoff(value, &stats_r->output_bytes_extra) < 0) {
+				*error_r = t_strdup_printf(
+					"Invalid output_bytes_extra value: %s", value);
+				return -1;
+			}
 		}
 	}
 	if (peer_dev_major != 0 || peer_dev_minor != 0) {
@@ -217,13 +289,15 @@ imap_master_client_input_args(struct connection *conn, const char *const *args,
 {
 	struct imap_master_client *client = (struct imap_master_client *)conn;
 	struct client *imap_client;
+	enum client_create_flags create_flags = CLIENT_CREATE_FLAG_UNHIBERNATED;
 	struct mail_storage_service_input input;
+	struct imap_logout_stats stats;
 	struct imap_master_input master_input;
 	const char *error = NULL, *reason;
 	int ret;
 
-	if (imap_master_client_parse_input(args, pool, &input, &master_input,
-					   &error) < 0) {
+	if (imap_master_client_parse_input(args, pool, &create_flags,
+					   &input, &stats, &master_input, &error) < 0) {
 		e_error(conn->event, "imap-master: Failed to parse client input: %s", error);
 		o_stream_nsend_str(conn->output, t_strdup_printf(
 			"-Failed to parse client input: %s\n", error));
@@ -241,8 +315,8 @@ imap_master_client_input_args(struct connection *conn, const char *const *args,
 
 	/* NOTE: before client_create_from_input() on failures we need to close
 	   fd_client, but afterward it gets closed by client_destroy() */
-	ret = client_create_from_input(&input, fd_client, fd_client,
-				       TRUE, &imap_client, &error);
+	ret = client_create_from_input(&input, &stats, fd_client, fd_client,
+				       create_flags, &imap_client, &error);
 	if (ret < 0) {
 		e_error(conn->event,
 			"imap-master(%s): Failed to create client: %s",

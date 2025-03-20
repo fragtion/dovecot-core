@@ -13,6 +13,7 @@
 #include "connection.h"
 #include "iostream-rawlog.h"
 #include "iostream-ssl.h"
+#include "settings.h"
 #include "master-service.h"
 #include "master-service-ssl.h"
 
@@ -20,6 +21,7 @@
 #include "smtp-reply-parser.h"
 #include "smtp-command-parser.h"
 #include "smtp-server-private.h"
+#include "ssl-settings.h"
 
 const char *const smtp_server_state_names[] = {
 	"GREETING",
@@ -134,11 +136,13 @@ void smtp_server_connection_input_unlock(struct smtp_server_connection *conn)
 }
 
 #undef smtp_server_connection_input_capture
-void smtp_server_connection_input_capture(struct smtp_server_connection *conn,
+void smtp_server_connection_input_capture(
+	struct smtp_server_connection *conn,
 	smtp_server_input_callback_t *callback, void *context)
 {
 	i_assert(!conn->input_broken && !conn->disconnected);
 	connection_input_halt(&conn->conn);
+	i_stream_set_input_pending(conn->conn.input, TRUE);
 	conn->conn.io = io_add_istream(conn->conn.input, *callback, context);
 }
 
@@ -277,6 +281,8 @@ static void smtp_server_connection_ready(struct smtp_server_connection *conn)
 	conn->raw_input = conn->conn.input;
 	conn->raw_output = conn->conn.output;
 
+	conn->connect_succeeded = TRUE;
+
 	smtp_server_connection_update_rawlog(conn);
 
 	conn->smtp_parser = smtp_command_parser_init(conn->conn.input,
@@ -313,7 +319,8 @@ static void smtp_server_connection_destroy(struct connection *_conn)
 
 static bool
 smtp_server_connection_handle_command(struct smtp_server_connection *conn,
-	const char *cmd_name, const char *cmd_params)
+				      const char *cmd_name,
+				      const char *cmd_params)
 {
 	struct smtp_server_connection *tmp_conn = conn;
 	struct smtp_server_command *cmd;
@@ -342,40 +349,60 @@ smtp_server_connection_handle_command(struct smtp_server_connection *conn,
 }
 
 static int
-smtp_server_connection_init_ssl_ctx(struct smtp_server_connection *conn,
-				    const char **error_r)
+smtp_server_connection_sni_callback(const char *name, const char **error_r,
+				    void *context)
 {
-	struct smtp_server *server = conn->server;
-	const char *error;
+	struct smtp_server_connection *conn = context;
+	struct ssl_iostream_context *ssl_ctx;
+	const struct ssl_settings *ssl_set;
+	const struct ssl_server_settings *ssl_server_set;
 
-	if (conn->ssl_ctx != NULL || conn->set.ssl == NULL)
-		return 0;
-	if (conn->set.ssl == server->set.ssl) {
-		if (smtp_server_init_ssl_ctx(server, error_r) < 0)
-			return -1;
-		conn->ssl_ctx = server->ssl_ctx;
-		ssl_iostream_context_ref(conn->ssl_ctx);
-		return 0;
-	}
-
-	if (ssl_iostream_server_context_cache_get(conn->set.ssl, &conn->ssl_ctx,
-						  &error) < 0) {
-		*error_r = t_strdup_printf(
-			"Couldn't initialize SSL context: %s", error);
+	event_add_str(conn->event, "local_name", name);
+	i_free(conn->local_name);
+	conn->local_name = i_strdup(name);
+	if (ssl_server_settings_get(conn->event, &ssl_set, &ssl_server_set,
+				    error_r) < 0)
+		return -1;
+	if (conn->local_name != NULL && *conn->local_name != '\0')
+		conn->set.hostname = conn->local_name;
+	if (conn->callbacks->conn_tls_sni_callback != NULL &&
+	    conn->callbacks->conn_tls_sni_callback(conn->context, name,
+						   error_r) < 0) {
+		settings_free(ssl_set);
+		settings_free(ssl_server_set);
 		return -1;
 	}
+
+	ssl_server_settings_to_iostream_set(ssl_set, ssl_server_set,
+					    &conn->set.ssl);
+
+	int ret;
+	if ((ret = ssl_iostream_server_context_cache_get(conn->set.ssl, &ssl_ctx,
+							 error_r)) < 0) {
+		settings_free(ssl_set);
+		settings_free(ssl_server_set);
+		return -1;
+	}
+	settings_free(ssl_set);
+	settings_free(ssl_server_set);
+	if (ret == 1) {
+		const char *application_protocol = smtp_protocol_name(conn->set.protocol);
+		const char *const names[] = {
+			application_protocol,
+			NULL
+		};
+		ssl_iostream_context_set_application_protocols(ssl_ctx, names);
+	}
+	ssl_iostream_change_context(conn->ssl_iostream, ssl_ctx);
+	ssl_iostream_context_unref(&ssl_ctx);
 	return 0;
 }
 
 int smtp_server_connection_ssl_init(struct smtp_server_connection *conn)
 {
+	struct ssl_iostream_context *ssl_ctx;
 	const char *error;
 	int ret;
-
-	if (smtp_server_connection_init_ssl_ctx(conn, &error) < 0) {
-		e_error(conn->event, "Couldn't initialize SSL: %s", error);
-		return -1;
-	}
 
 	e_debug(conn->event, "Starting SSL handshake");
 
@@ -390,15 +417,21 @@ int smtp_server_connection_ssl_init(struct smtp_server_connection *conn)
 	}
 
 	smtp_server_connection_input_halt(conn);
-	if (conn->ssl_ctx == NULL) {
-		ret = master_service_ssl_init(
-			master_service, &conn->conn.input, &conn->conn.output,
-			&conn->ssl_iostream, &error);
-	} else {
-		ret = io_stream_create_ssl_server(
-			conn->ssl_ctx, conn->set.ssl, conn->event,
+	if (conn->set.ssl == NULL) {
+		const struct ssl_iostream_server_autocreate_parameters parameters = {
+			.event_parent = conn->event,
+		};
+		ret = io_stream_autocreate_ssl_server(&parameters,
 			&conn->conn.input, &conn->conn.output,
 			&conn->ssl_iostream, &error);
+	} else if (ssl_iostream_server_context_cache_get(conn->set.ssl,
+							 &ssl_ctx, &error) < 0)
+		ret = -1;
+	else {
+		ret = io_stream_create_ssl_server(ssl_ctx, conn->event,
+			&conn->conn.input, &conn->conn.output,
+			&conn->ssl_iostream, &error);
+		ssl_iostream_context_unref(&ssl_ctx);
 	}
 	if (ret < 0) {
 		e_error(conn->event,
@@ -406,15 +439,25 @@ int smtp_server_connection_ssl_init(struct smtp_server_connection *conn)
 			conn->conn.name, error);
 		return -1;
 	}
+	ssl_iostream_set_sni_callback(
+		conn->ssl_iostream, smtp_server_connection_sni_callback, conn);
 	smtp_server_connection_input_resume(conn);
+
+	if (ssl_iostream_handshake(conn->ssl_iostream) < 0) {
+		e_error(conn->event, "SSL handshake failed: %s",
+			ssl_iostream_get_last_error(conn->ssl_iostream));
+		return -1;
+	}
 
 	conn->ssl_secured = TRUE;
 	conn->set.capabilities &= ENUM_NEGATE(SMTP_CAPABILITY_STARTTLS);
 
-	if (conn->ssl_start)
-		smtp_server_connection_ready(conn);
-	else
+	if (conn->connect_succeeded)
 		smtp_server_connection_streams_changed(conn);
+	else if (conn->ssl_start &&
+		 ssl_iostream_is_handshaked(conn->ssl_iostream))
+		smtp_server_connection_ready(conn);
+
 	return 0;
 }
 
@@ -564,6 +607,7 @@ static void smtp_server_connection_input(struct connection *_conn)
 {
 	struct smtp_server_connection *conn =
 		(struct smtp_server_connection *)_conn;
+	int ret;
 
 	i_assert(!conn->input_broken);
 
@@ -578,13 +622,50 @@ static void smtp_server_connection_input(struct connection *_conn)
 				"SSL Initialization failed");
 			return;
 		}
+	}
+	i_assert(!conn->halted);
+
+	/* If connection is established over secure line, wait for TLS
+	   handshake to finish. */
+	if (conn->ssl_iostream != NULL &&
+	    !ssl_iostream_is_handshaked(conn->ssl_iostream)) {
+		/* Finish SSL negotiating by reading from input stream. */
+		while ((ret = i_stream_read(conn->conn.input)) > 0 ||
+		       ret == -2) {
+			if (ssl_iostream_is_handshaked(conn->ssl_iostream))
+				break;
+		}
+		if (ret == -1) {
+			int stream_errno = conn->conn.input->stream_errno;
+
+			/* Failed somehow. */
+			i_assert(ret != -2);
+			const char *error = t_strdup_printf(
+				"SSL handshaking with %s failed: "
+				"read(%s) failed: %s",
+				_conn->name,
+				i_stream_get_name(conn->conn.input),
+				(stream_errno != 0 ?
+				 i_stream_get_error(conn->conn.input) : "EOF"));
+			e_error(conn->event, "%s", error);
+			smtp_server_connection_close(&conn, error);
+			return;
+		}
+		if (!ssl_iostream_is_handshaked(conn->ssl_iostream)) {
+			/* Not finished. */
+			i_assert(ret == 0);
+			return;
+		}
 		if (conn->halted) {
 			smtp_server_connection_input_lock(conn);
 			return;
 		}
 	}
-	i_assert(!conn->halted);
 
+	if (!conn->connect_succeeded &&
+	    (conn->ssl_iostream == NULL ||
+	     ssl_iostream_is_handshaked(conn->ssl_iostream)))
+		smtp_server_connection_ready(conn);
 
 	if (!smtp_server_connection_check_pipeline(conn)) {
 		smtp_server_connection_input_halt(conn);
@@ -793,7 +874,7 @@ smtp_server_connection_alloc(struct smtp_server *server,
 	struct smtp_server_connection *conn;
 	pool_t pool;
 
-	pool = pool_alloconly_create("smtp server", 1024);
+	pool = pool_alloconly_create("smtp server", 2048);
 	conn = p_new(pool, struct smtp_server_connection, 1);
 	conn->pool = pool;
 	conn->refcount = 1;
@@ -808,8 +889,10 @@ smtp_server_connection_alloc(struct smtp_server *server,
 		if (set->rawlog_dir != NULL && *set->rawlog_dir != '\0')
 			conn->set.rawlog_dir = p_strdup(pool, set->rawlog_dir);
 
-		if (set->ssl != NULL)
-			conn->set.ssl = ssl_iostream_settings_dup(pool, set->ssl);
+		if (set->ssl != NULL) {
+			conn->set.ssl = set->ssl;
+			pool_ref(conn->set.ssl->pool);
+		}
 
 		if (set->hostname != NULL && *set->hostname != '\0')
 			conn->set.hostname = p_strdup(pool, set->hostname);
@@ -942,6 +1025,17 @@ smtp_server_connection_alloc(struct smtp_server *server,
 	return conn;
 }
 
+static void smtp_server_connection_created(struct smtp_server_connection *conn)
+{
+	conn->raw_input = conn->conn.input;
+	conn->raw_output = conn->conn.output;
+
+	/* Halt input until started */
+	smtp_server_connection_halt(conn);
+
+	e_debug(conn->event, "Connection created");
+}
+
 struct smtp_server_connection *
 smtp_server_connection_create(
 	struct smtp_server *server, int fd_in, int fd_out,
@@ -966,10 +1060,7 @@ smtp_server_connection_create(
 	if (ssl_start)
 		conn->set.capabilities &= ENUM_NEGATE(SMTP_CAPABILITY_STARTTLS);
 
-	/* Halt input until started */
-	smtp_server_connection_halt(conn);
-
-	e_debug(conn->event, "Connection created");
+	smtp_server_connection_created(conn);
 
 	return conn;
 }
@@ -1006,10 +1097,7 @@ smtp_server_connection_create_from_streams(
 	smtp_server_connection_update_event(conn);
 	event_unref(&conn_event);
 
-	/* Halt input until started */
-	smtp_server_connection_halt(conn);
-
-	e_debug(conn->event, "Connection created");
+	smtp_server_connection_created(conn);
 
 	return conn;
 }
@@ -1086,8 +1174,7 @@ smtp_server_connection_disconnect(struct smtp_server_connection *conn,
 	if (conn->smtp_parser != NULL)
 		smtp_command_parser_deinit(&conn->smtp_parser);
 	ssl_iostream_destroy(&conn->ssl_iostream);
-	if (conn->ssl_ctx != NULL)
-		ssl_iostream_context_unref(&conn->ssl_ctx);
+	settings_free(conn->set.ssl);
 
 	if (conn->callbacks != NULL &&
 	    conn->callbacks->conn_disconnect != NULL) {
@@ -1120,16 +1207,17 @@ bool smtp_server_connection_unref(struct smtp_server_connection **_conn)
 
 	e_debug(conn->event, "Connection destroy");
 
+	connection_deinit(&conn->conn);
+
 	if (conn->callbacks != NULL && conn->callbacks->conn_free != NULL)
 		conn->callbacks->conn_free(conn->context);
-
-	connection_deinit(&conn->conn);
 
 	i_free(conn->proxy_helo);
 	i_free(conn->helo_domain);
 	i_free(conn->username);
 	i_free(conn->session_id);
 	i_free(conn->client_transport);
+	i_free(conn->local_name);
 	event_unref(&conn->next_trans_event);
 	pool_unref(&conn->pool);
 	return FALSE;
@@ -1240,8 +1328,7 @@ void smtp_server_connection_start_pending(struct smtp_server_connection *conn)
 	i_assert(!conn->started);
 	conn->started = TRUE;
 
-	conn->raw_input = conn->conn.input;
-	conn->raw_output = conn->conn.output;
+	e_debug(conn->event, "Connection started");
 
 	if (!conn->ssl_start)
 		smtp_server_connection_ready(conn);
@@ -1284,8 +1371,12 @@ void smtp_server_connection_halt(struct smtp_server_connection *conn)
 {
 	conn->halted = TRUE;
 	smtp_server_connection_timeout_stop(conn);
-	if (!conn->started || !conn->ssl_start || conn->ssl_iostream != NULL)
-		smtp_server_connection_input_lock(conn);
+	if (conn->ssl_start &&
+	    (conn->ssl_iostream == NULL ||
+	     !ssl_iostream_is_handshaked(conn->ssl_iostream)))
+		return;
+
+	smtp_server_connection_input_lock(conn);
 }
 
 void smtp_server_connection_resume(struct smtp_server_connection *conn)
@@ -1313,6 +1404,13 @@ void smtp_server_connection_close(struct smtp_server_connection **_conn,
 void smtp_server_connection_terminate(struct smtp_server_connection **_conn,
 				      const char *enh_code, const char *reason)
 {
+	smtp_server_connection_terminate_full(_conn, enh_code, reason, reason);
+}
+
+void smtp_server_connection_terminate_full(
+	struct smtp_server_connection **_conn, const char *enh_code,
+	const char *reply_reason, const char *log_reason)
+{
 	struct smtp_server_connection *conn = *_conn;
 	const char **reason_lines;
 
@@ -1325,14 +1423,14 @@ void smtp_server_connection_terminate(struct smtp_server_connection **_conn,
 
 	T_BEGIN {
 		/* Add hostname prefix */
-		reason_lines = t_strsplit_spaces(reason, "\r\n");
+		reason_lines = t_strsplit_spaces(reply_reason, "\r\n");
 		reason_lines[0] = t_strconcat(conn->set.hostname, " ",
 					      reason_lines[0], NULL);
 
 		smtp_server_connection_reply_lines(conn, 421, enh_code,
 						   reason_lines);
 
-		smtp_server_connection_close(&conn, reason);
+		smtp_server_connection_close(&conn, log_reason);
 	} T_END;
 }
 
@@ -1391,8 +1489,8 @@ void smtp_server_connection_reset_state(struct smtp_server_connection *conn)
 
 	/* RFC 3030, Section 2:
 	   The RSET command, when issued after the first BDAT and before the
-	   BDAT LAST, clears all segments sent during that transaction and resets
-	   the session.
+	   BDAT LAST, clears all segments sent during that transaction and
+	   resets the session.
 	 */
 	i_stream_destroy(&conn->state.data_input);
 	i_stream_destroy(&conn->state.data_chain_input);
@@ -1418,6 +1516,12 @@ void smtp_server_connection_set_capabilities(
 	conn->set.capabilities = capabilities;
 }
 
+void smtp_server_connection_set_greeting(struct smtp_server_connection *conn,
+					 const char *greeting)
+{
+	conn->set.login_greeting = p_strdup(conn->pool, greeting);
+}
+
 void smtp_server_connection_add_extra_capability(
 	struct smtp_server_connection *conn,
 	const struct smtp_capability_extra *cap)
@@ -1431,7 +1535,7 @@ void smtp_server_connection_add_extra_capability(
 	i_assert(smtp_ehlo_keyword_is_valid(cap->name));
 	i_assert(smtp_ehlo_params_are_valid(cap->params));
 
-	/* Cannot override standard capabiltiies */
+	/* Cannot override standard capabilities */
 	i_assert(smtp_capability_find_by_name(cap->name)
 		 == SMTP_CAPABILITY_NONE);
 
@@ -1476,6 +1580,11 @@ bool smtp_server_connection_is_trusted(struct smtp_server_connection *conn)
 	if (conn->callbacks == NULL || conn->callbacks->conn_is_trusted == NULL)
 		return FALSE;
 	return conn->callbacks->conn_is_trusted(conn->context);
+}
+
+bool smtp_server_connection_is_started(struct smtp_server_connection *conn)
+{
+	return conn->started;
 }
 
 enum smtp_protocol
@@ -1536,6 +1645,7 @@ void smtp_server_connection_get_proxy_data(struct smtp_server_connection *conn,
 	proxy_data->login = conn->username;
 	proxy_data->session = conn->session_id;
 	proxy_data->client_transport = conn->client_transport;
+	proxy_data->local_name = conn->local_name;
 
 	if (conn->proxy_proto != SMTP_PROXY_PROTOCOL_UNKNOWN)
 		proxy_data->proto = conn->proxy_proto;
@@ -1585,7 +1695,10 @@ void smtp_server_connection_set_proxy_data(
 		i_free(conn->client_transport);
 		conn->client_transport = i_strdup(proxy_data->client_transport);
 	}
-
+	if (proxy_data->local_name != NULL) {
+		i_free(conn->local_name);
+		conn->local_name = i_strdup(proxy_data->local_name);
+	}
 	if (proxy_data->ttl_plus_1 > 0)
 		conn->proxy_ttl_plus_1 = proxy_data->ttl_plus_1;
 	if (conn->proxy_timeout_secs > 0)
@@ -1657,4 +1770,12 @@ smtp_server_connection_reason_begin(struct smtp_server_connection *conn,
 	const char *reason_code =
 		event_reason_code(conn->set.reason_code_module, name);
 	return event_reason_begin(reason_code);
+}
+
+const char *
+smtp_server_connection_get_server_name(struct smtp_server_connection *conn)
+{
+	if (conn->ssl_iostream == NULL)
+		return NULL;
+	return ssl_iostream_get_server_name(conn->ssl_iostream);
 }

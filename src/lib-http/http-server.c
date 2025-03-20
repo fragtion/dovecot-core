@@ -12,6 +12,7 @@
 #include "dns-lookup.h"
 #include "iostream-rawlog.h"
 #include "iostream-ssl.h"
+#include "settings.h"
 #include "http-url.h"
 
 #include "http-server-private.h"
@@ -24,40 +25,48 @@ static struct event_category event_category_http_server = {
  * Server
  */
 
-struct http_server *http_server_init(const struct http_server_settings *set)
+int http_server_init_auto(struct event *event_parent,
+                          struct http_server **server_r, const char **error_r)
+{
+       const struct http_server_settings *set;
+       if (settings_get(event_parent, &http_server_setting_parser_info,
+                        0, &set, error_r) < 0)
+               return -1;
+       *server_r = http_server_init(set, event_parent);
+       settings_free(set);
+       return 0;
+}
+
+void http_server_settings_init(pool_t pool, struct http_server_settings *set_r)
+{
+	i_zero(set_r);
+	set_r->pool = pool;
+	set_r->base_dir = PKG_RUNDIR;
+	set_r->default_host = "";
+	set_r->max_pipelined_requests = 1;
+	set_r->request_max_payload_size = HTTP_SERVER_DEFAULT_MAX_PAYLOAD_SIZE;
+}
+
+struct http_server *http_server_init(const struct http_server_settings *set,
+				     struct event *event_parent)
 {
 	struct http_server *server;
 	pool_t pool;
-	size_t pool_size;
 
-	pool_size = (set->ssl != NULL) ? 10240 : 1024; /* ca/cert/key will be >8K */
-	pool = pool_alloconly_create("http server", pool_size);
+	pool = pool_alloconly_create("http server", 1024);
 	server = p_new(pool, struct http_server, 1);
 	server->pool = pool;
 
-	if (set->default_host != NULL && *set->default_host != '\0')
-		server->set.default_host = p_strdup(pool, set->default_host);
-	if (set->rawlog_dir != NULL && *set->rawlog_dir != '\0')
-		server->set.rawlog_dir = p_strdup(pool, set->rawlog_dir);
-	if (set->ssl != NULL) {
-		server->set.ssl =
-			ssl_iostream_settings_dup(server->pool, set->ssl);
-	}
-	server->set.max_client_idle_time_msecs = set->max_client_idle_time_msecs;
-	server->set.max_pipelined_requests =
-		(set->max_pipelined_requests > 0 ? set->max_pipelined_requests : 1);
-	server->set.request_limits = set->request_limits;
-	server->set.socket_send_buffer_size = set->socket_send_buffer_size;
-	server->set.socket_recv_buffer_size = set->socket_recv_buffer_size;
-	server->set.debug = set->debug;
+	server->set = set;
+	pool_ref(set->pool);
 
-	server->event = event_create(set->event);
+	server->event = event_create(event_parent);
 	event_add_category(server->event, &event_category_http_server);
-	event_set_forced_debug(server->event, set->debug);
 	event_set_append_log_prefix(server->event, "http-server: ");
 
 	server->conn_list = http_server_connection_list_init();
 
+	settings_free(server->ssl_set);
 	p_array_init(&server->resources, pool, 4);
 	p_array_init(&server->locations, pool, 4);
 
@@ -77,9 +86,8 @@ void http_server_deinit(struct http_server **_server)
 		http_server_resource_free(&res);
 	i_assert(array_count(&server->locations) == 0);
 
-	if (server->ssl_ctx != NULL)
-		ssl_iostream_context_unref(&server->ssl_ctx);
 	event_unref(&server->event);
+	settings_free(server->set);
 	pool_unref(&server->pool);
 }
 
@@ -101,32 +109,25 @@ void http_server_switch_ioloop(struct http_server *server)
 
 void http_server_shut_down(struct http_server *server)
 {
-	struct connection *_conn, *_next;
+	struct connection *_conn;
 
 	server->shutting_down = TRUE;
 
-	for (_conn = server->conn_list->connections;
-		_conn != NULL; _conn = _next) {
+	_conn = server->conn_list->connections;
+	while (_conn != NULL) {
 		struct http_server_connection *conn =
 			(struct http_server_connection *)_conn;
+		struct connection *_next = _conn->next;
 
-		_next = _conn->next;
 		(void)http_server_connection_shut_down(conn);
+		_conn = _next;
 	}
 }
 
-int http_server_init_ssl_ctx(struct http_server *server, const char **error_r)
+void http_server_set_ssl_settings(struct http_server *server,
+				  const struct ssl_iostream_settings *ssl)
 {
-	const char *error;
-
-	if (server->set.ssl == NULL || server->ssl_ctx != NULL)
-		return 0;
-
-	if (ssl_iostream_server_context_cache_get(server->set.ssl,
-		&server->ssl_ctx, &error) < 0) {
-		*error_r = t_strdup_printf("Couldn't initialize SSL context: %s",
-					   error);
-		return -1;
-	}
-	return 0;
+	settings_free(server->ssl_set);
+	server->ssl_set = ssl;
+	pool_ref(server->ssl_set->pool);
 }

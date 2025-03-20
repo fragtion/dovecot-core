@@ -8,9 +8,10 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-sasl \
 	-I$(top_srcdir)/src/lib-auth-client \
 	-I$(top_srcdir)/src/lib-ssl-iostream \
-	-I$(top_srcdir)/src/lib-dns \
+	-I$(top_srcdir)/src/lib-dns-client \
 	-I$(top_srcdir)/src/lib-program-client \
 	-I$(top_srcdir)/src/lib-mail \
+	-I$(top_srcdir)/src/lib-var-expand \
 	-DTEST_BIN_DIR=\"$(abs_srcdir)/test-bin\"
 
 smtp_server_cmds = \
@@ -103,6 +104,7 @@ EXTRA_DIST = \
 test_libs = \
 	$(noinst_LTLIBRARIES) \
 	../lib-program-client/libprogram_client.la \
+	../lib-dns-client/libdns-client.la  \
 	../lib-dns/libdns.la \
 	../lib-mail/libmail.la \
 	../lib-charset/libcharset.la \
@@ -110,9 +112,12 @@ test_libs = \
 	../lib-auth-client/libauth-client.la \
 	../lib-ssl-iostream/libssl_iostream.la \
 	../lib-settings/libsettings.la \
+	../lib-dns/libdns.la \
 	../lib-sasl/libsasl.la \
 	../lib-auth/libauth.la \
 	../lib-otp/libotp.la \
+	../lib-json/libjson.la \
+	../lib-var-expand/libvar_expand.la \
 	../lib-test/libtest.la \
 	../lib/liblib.la \
 	$(MODULE_LIBS)
@@ -120,6 +125,7 @@ test_libs = \
 test_deps = \
 	$(noinst_LTLIBRARIES) \
 	../lib-program-client/libprogram_client.la \
+	../lib-dns-client/libdns-client.la  \
 	../lib-dns/libdns.la \
 	../lib-mail/libmail.la \
 	../lib-charset/libcharset.la \
@@ -127,8 +133,11 @@ test_deps = \
 	../lib-auth-client/libauth-client.la \
 	../lib-ssl-iostream/libssl_iostream.la \
 	../lib-settings/libsettings.la \
+	../lib-dns/libdns.la \
 	../lib-sasl/libsasl.la \
 	../lib-auth/libauth.la \
+	../lib-json/libjson.la \
+	../lib-var-expand/libvar_expand.la \
 	../lib-test/libtest.la \
 	../lib/liblib.la
 
@@ -175,7 +184,7 @@ test_smtp_client_errors_DEPENDENCIES = $(test_deps)
 
 test_smtp_server_errors_SOURCES = test-smtp-server-errors.c
 test_smtp_server_errors_LDFLAGS = -export-dynamic
-test_smtp_server_errors_LDADD = $(test_libs)
+test_smtp_server_errors_LDADD = $(test_libs) $(test_libs_ssl)
 test_smtp_server_errors_DEPENDENCIES = $(test_deps)
 
 nodist_EXTRA_fuzz_smtp_server_SOURCES = force-cxx-linking.cxx

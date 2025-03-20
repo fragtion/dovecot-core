@@ -9,7 +9,6 @@
 #include "mail-index-private.h"
 #include "mail-transaction-log-private.h"
 
-#include <stddef.h>
 #include <stdio.h>
 #include <sys/stat.h>
 
@@ -186,35 +185,6 @@ int mail_transaction_log_move_to_memory(struct mail_transaction_log *log)
 	}
 }
 
-void mail_transaction_log_indexid_changed(struct mail_transaction_log *log)
-{
-	struct mail_transaction_log_file *file;
-
-	mail_transaction_logs_clean(log);
-
-	for (file = log->files; file != NULL; file = file->next) {
-		if (file->hdr.indexid != log->index->indexid) {
-			mail_transaction_log_file_set_corrupted(file,
-				"indexid changed: %u -> %u",
-				file->hdr.indexid, log->index->indexid);
-		}
-	}
-
-	if (log->head != NULL &&
-	    log->head->hdr.indexid != log->index->indexid) {
-		struct mail_transaction_log_file *old_head = log->head;
-
-		(void)mail_transaction_log_create(log, FALSE);
-		if (--old_head->refcount == 0) {
-			if (old_head == log->head) {
-				/* failed to create a new log */
-				log->head = NULL;
-			}
-			mail_transaction_log_file_free(&old_head);
-		}
-	}
-}
-
 void mail_transaction_logs_clean(struct mail_transaction_log *log)
 {
 	struct mail_transaction_log_file *file, *next;
@@ -342,11 +312,10 @@ int mail_transaction_log_rotate(struct mail_transaction_log *log, bool reset)
 	return 0;
 }
 
-static int
-mail_transaction_log_refresh(struct mail_transaction_log *log, bool nfs_flush,
-			     const char **reason_r)
+int mail_transaction_log_has_changed(struct mail_transaction_log *log,
+				     bool nfs_flush,
+				     const char **reason_r)
 {
-        struct mail_transaction_log_file *file;
 	struct stat st;
 
 	i_assert(log->head != NULL);
@@ -386,6 +355,18 @@ mail_transaction_log_refresh(struct mail_transaction_log *log, bool nfs_flush,
 		*reason_r = "Log inode is unchanged";
 		return 0;
 	}
+	return 1;
+}
+
+static int
+mail_transaction_log_refresh(struct mail_transaction_log *log, bool nfs_flush,
+			     const char **reason_r)
+{
+        struct mail_transaction_log_file *file;
+
+	int ret = mail_transaction_log_has_changed(log, nfs_flush, reason_r);
+	if (ret <= 0)
+		return ret;
 
 	file = mail_transaction_log_file_alloc(log, log->filepath);
 	if (mail_transaction_log_file_open(file, reason_r) <= 0) {

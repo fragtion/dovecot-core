@@ -21,11 +21,17 @@ struct ssl_iostream_context {
 	SSL_CTX *ssl_ctx;
 
 	pool_t pool;
-	struct ssl_iostream_settings set;
+
+	const struct ssl_alpn_protocol {
+		const unsigned char *proto;
+		size_t proto_len;
+	} *protos;
 
 	int username_nid;
 
 	bool client_ctx:1;
+	bool verify_remote_cert:1;
+	bool allow_invalid_cert:1;
 };
 
 struct ssl_iostream {
@@ -50,21 +56,22 @@ struct ssl_iostream {
 	char *ja3_str;
 	int plain_stream_errno;
 
-	/* copied settings */
-	bool verbose_invalid_cert, allow_invalid_cert;
-	int username_nid;
-
 	ssl_iostream_handshake_callback_t *handshake_callback;
 	void *handshake_context;
 
 	ssl_iostream_sni_callback_t *sni_callback;
 	void *sni_context;
 
+	bool do_shutdown:1;
+	bool allow_invalid_cert:1;
 	bool handshaked:1;
 	bool handshake_failed:1;
 	bool cert_received:1;
 	bool cert_broken:1;
 	bool want_read:1;
+	/* last_error is a "fallback error", which is used only if another
+	   error won't show up. */
+	bool last_error_is_fallback:1;
 	bool ostream_flush_waiting_input:1;
 	bool closed:1;
 	bool destroyed:1;
@@ -84,13 +91,14 @@ int openssl_iostream_context_init_client(const struct ssl_iostream_settings *set
 int openssl_iostream_context_init_server(const struct ssl_iostream_settings *set,
 					 struct ssl_iostream_context **ctx_r,
 					 const char **error_r);
+
+void openssl_iostream_context_set_application_protocols(struct ssl_iostream_context *ssl_ctx,
+							const char *const *names);
+
 void openssl_iostream_context_ref(struct ssl_iostream_context *ctx);
 void openssl_iostream_context_unref(struct ssl_iostream_context *ctx);
 void openssl_iostream_global_deinit(void);
 
-int openssl_iostream_load_key(const struct ssl_iostream_cert *set,
-			      const char *set_name,
-			      EVP_PKEY **pkey_r, const char **error_r);
 bool openssl_cert_match_name(SSL *ssl, const char *verify_name,
 			     const char **reason_r);
 #define OPENSSL_ALL_PROTOCOL_OPTIONS \
@@ -121,7 +129,7 @@ void openssl_iostream_set_error(struct ssl_iostream *ssl_io, const char *str);
 const char *openssl_iostream_error(void);
 const char *openssl_iostream_key_load_error(void);
 const char *
-openssl_iostream_use_certificate_error(const char *cert, const char *set_name);
+openssl_iostream_use_certificate_error(const char *cert);
 void openssl_iostream_clear_errors(void);
 
 void ssl_iostream_openssl_init(void);

@@ -1,33 +1,16 @@
 /* Copyright (c) 2018 Dovecot authors, see the included COPYING file */
 
-#include "test-lib.h"
 #include "lib.h"
-#include "time-util.h"
 #include "lib-event-private.h"
 #include "str.h"
-#include "sleep.h"
 #include "ioloop.h"
-#include "connection.h"
-#include "ostream.h"
-#include "istream.h"
 #include "stats-client.h"
 #include "test-common.h"
-#include <fcntl.h>
-#include <unistd.h>
-#include <signal.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <sys/wait.h>
 
 #define TST_BEGIN(test_name)				\
 	test_begin(test_name);				\
 	ioloop_timeval.tv_sec = 0;			\
 	ioloop_timeval.tv_usec = 0;
-
-#define BASE_DIR "."
-#define SOCK_PATH ".test-temp-stats-event-sock"
-
-#define SOCK_FULL BASE_DIR "/" SOCK_PATH
 
 static struct event_category test_cats[5] = {
 	{.name = "test1"},
@@ -57,169 +40,7 @@ static struct event_field test_fields[5] = {
 	 .value = {.intmax = 50}},
 };
 
-static void stats_conn_accept(void *context ATTR_UNUSED);
-static void stats_conn_destroy(struct connection *_conn);
-static void stats_conn_input(struct connection *_conn);
-
-static bool compare_test_stats_to(const char *format, ...) ATTR_FORMAT(1, 2);
-
-static struct connection_settings stats_conn_set = {
-	.input_max_size = SIZE_MAX,
-	.output_max_size = SIZE_MAX,
-	.client = FALSE
-};
-
-static const struct connection_vfuncs stats_conn_vfuncs = {
-	.destroy = stats_conn_destroy,
-	.input = stats_conn_input
-};
-
-struct server_connection {
-	struct connection conn;
-
-	pool_t pool;
-	bool handshake_sent:1;
-};
-
-static int stats_sock_fd;
-static struct connection_list *stats_conn_list;
-static struct ioloop *ioloop;
-
-static pid_t stats_pid;
-
-static int run_tests(void);
-static void signal_process(const char *signal_file);
-static void wait_for_signal(const char *signal_file);
-static void kill_stats_child(void);
-
-static const char *stats_ready = ".test-temp-stats-event-stats-ready";
-static const char *test_done = ".test-temp-stats-event-test-done";
-static const char *exit_stats = ".test-temp-stats-event-exit-stats";
-static const char *stats_data_file = ".test-temp-stats-event-test_stats";
-
-static void kill_stats_child(void)
-{
-	i_assert(stats_pid != 0);
-	(void)kill(stats_pid, SIGKILL);
-	(void)waitpid(stats_pid, NULL, 0);
-}
-
-static void stats_proc(void)
-{
-	struct io *io_listen;
-	/* Make sure socket file not existing */
-	i_unlink_if_exists(SOCK_FULL);
-	stats_sock_fd = net_listen_unix(SOCK_FULL, 128);
-	if (stats_sock_fd == -1)
-		i_fatal("listen(%s) failed: %m", SOCK_FULL);
-	ioloop = io_loop_create();
-	io_listen = io_add(stats_sock_fd, IO_READ, stats_conn_accept, NULL);
-	stats_conn_list = connection_list_init(&stats_conn_set,
-					       &stats_conn_vfuncs);
-	signal_process(stats_ready);
-	io_loop_run(ioloop);
-	io_remove(&io_listen);
-	connection_list_deinit(&stats_conn_list);
-	io_loop_destroy(&ioloop);
-	i_close_fd(&stats_sock_fd);
-	i_unlink(SOCK_FULL);
-}
-
-static void stats_conn_accept(void *context ATTR_UNUSED)
-{
-	int fd;
-	struct server_connection *conn;
-	pool_t pool;
-	fd = net_accept(stats_sock_fd, NULL, NULL);
-	if (stats_sock_fd == -1)
-		return;
-	if (stats_sock_fd == -2)
-		i_fatal("test stats: accept() failed: %m");
-	net_set_nonblock(fd, TRUE);
-	pool = pool_alloconly_create("stats connection", 512);
-	conn = p_new(pool, struct server_connection, 1);
-	conn->pool = pool;
-	connection_init_server(stats_conn_list,
-			       &conn->conn,
-			       "stats connection", fd, fd);
-}
-
-static void stats_conn_destroy(struct connection *_conn)
-{
-	struct server_connection *conn =
-		(struct server_connection *)_conn;
-	connection_deinit(&conn->conn);
-	pool_unref(&conn->pool);
-}
-
-static void stats_conn_input(struct connection *_conn)
-{
-	int fd;
-	struct ostream *stats_data_out;
-	struct server_connection *conn = (struct server_connection *)_conn;
-	const char *handshake = "VERSION\tstats-server\t4\t0\n"
-		"FILTER\tcategory=test1 OR category=test2 OR category=test3 OR "
-		"category=test4 OR category=test5\n";
-	const char *line = NULL;
-	if (!conn->handshake_sent) {
-		conn->handshake_sent = TRUE;
-		o_stream_nsend_str(conn->conn.output, handshake);
-	}
-	while (access(exit_stats, F_OK) < 0) {
-		/* Test process haven't signal yet about end of the tests */
-		while (access(test_done, F_OK) < 0 ||
-		       ((line=i_stream_read_next_line(conn->conn.input)) != NULL)) {
-			if (line != NULL) {
-				if (str_begins_with(line, "VERSION"))
-					continue;
-
-				if ((fd=open(stats_data_file, O_WRONLY | O_CREAT | O_APPEND, 0600)) < 0) {
-					i_fatal("failed create stats data file %m");
-				}
-
-				stats_data_out = o_stream_create_fd_autoclose(&fd, SIZE_MAX);
-				o_stream_nsend_str(stats_data_out, line);
-				o_stream_nsend_str(stats_data_out, "\n");
-
-				o_stream_set_no_error_handling(stats_data_out, TRUE);
-				o_stream_unref(&stats_data_out);
-			}
-			i_sleep_msecs(100);
-		}
-		i_unlink(test_done);
-		signal_process(stats_ready);
-	}
-	i_unlink(exit_stats);
-	i_unlink_if_exists(test_done);
-	io_loop_stop(ioloop);
-}
-
-static void wait_for_signal(const char *signal_file)
-{
-	struct timeval start, now;
-	i_gettimeofday(&start);
-	while (access(signal_file, F_OK) < 0) {
-		i_sleep_msecs(10);
-		i_gettimeofday(&now);
-		if (timeval_diff_usecs(&now, &start) > 10000000) {
-			kill_stats_child();
-			i_fatal("wait_for_signal has timed out");
-		}
-	}
-	i_unlink(signal_file);
-}
-
-static void signal_process(const char *signal_file)
-{
-	int fd;
-	if ((fd = open(signal_file, O_CREAT, 0666)) < 0) {
-		if (stats_pid != 0) {
-			kill_stats_child();
-		}
-		i_fatal("Failed to create signal file %s", signal_file);
-	}
-	i_close_fd(&fd);
-}
+static string_t *stats_buf;
 
 static bool compare_test_stats_data_line(const char *reference, const char *actual)
 {
@@ -255,33 +76,18 @@ static bool compare_test_stats_data_lines(const char *actual, const char *refere
 	return *lines_ref == *lines_act;
 }
 
-static bool compare_test_stats_to(const char *format, ...)
+static bool ATTR_FORMAT(1, 2)
+compare_test_stats_to(const char *format, ...)
 {
 	bool res;
 	string_t *reference = t_str_new(1024);
-	struct istream *input;
 	va_list args;
 	va_start (args, format);
 	str_vprintfa (reference, format, args);
 	va_end (args);
-	/* signal stats process to receive and record stats data */
-	signal_process(test_done);
-	/* Wait stats data to be recorded by stats process */
-	wait_for_signal(stats_ready);
 
-	input = i_stream_create_file(stats_data_file, SIZE_MAX);
-	while (i_stream_read(input) > 0) ;
-	if (input->stream_errno != 0) {
-		i_fatal("stats data file read failed: %s",
-			i_stream_get_error(input));
-		res = FALSE;
-	} else {
-		size_t size;
-		const unsigned char *data = i_stream_get_data(input, &size);
-		res = compare_test_stats_data_lines(t_strdup_until(data, data+size), str_c(reference));
-	}
-	i_stream_unref(&input);
-	i_unlink(stats_data_file);
+	res = compare_test_stats_data_lines(str_c(stats_buf), str_c(reference));
+	str_truncate(stats_buf, 0);
 	return res;
 }
 
@@ -305,7 +111,6 @@ static void register_all_categories(void)
 		e_info(ev, "message");
 		event_unref(&ev);
 	}
-	signal_process(test_done);
 }
 
 static void test_no_merging1(void)
@@ -316,6 +121,7 @@ static void test_no_merging1(void)
 	struct event *single_ev = event_create(NULL);
 	event_add_category(single_ev, &test_cats[0]);
 	event_add_str(single_ev, test_fields[0].key, test_fields[0].value.str);
+	event_set_name(single_ev, "evname");
 	e_info(single_ev, "info message");
 	l = __LINE__ - 1;
 	event_unref(&single_ev);
@@ -323,7 +129,7 @@ static void test_no_merging1(void)
 		compare_test_stats_to(
 			"EVENT	0	0	1	0	0"
 			"	s"__FILE__"	%d"
-			"	l0	0	ctest1	Skey1	str1\n", l));
+			"	l0	0	nevname	ctest1	Skey1	str1\n", l));
 	test_end();
 }
 
@@ -339,6 +145,7 @@ static void test_no_merging2(void)
 	id = parent_ev->id;
 	struct event *child_ev = event_create(parent_ev);
 	event_add_category(child_ev, &test_cats[1]);
+	event_set_name(child_ev, "evname");
 	e_info(child_ev, "info message");
 	l = __LINE__ - 1;
 	event_unref(&parent_ev);
@@ -347,8 +154,8 @@ static void test_no_merging2(void)
 		compare_test_stats_to(
 			"EVENT	0	%"PRIu64"	1	0	0"
 			"	s"__FILE__"	%d"
-			"	l0	0	ctest2\n"
-			"END	9\n", id, l));
+			"	l0	0	nevname	ctest2\n"
+			"END	8\n", id, l));
 	test_end();
 }
 
@@ -366,6 +173,7 @@ static void test_no_merging3(void)
 	ioloop_timeval.tv_sec++;
 	struct event *child_ev = event_create(parent_ev);
 	event_add_category(child_ev, &test_cats[1]);
+	event_set_name(child_ev, "evname");
 	e_info(child_ev, "info message");
 	l = __LINE__ - 1;
 	event_unref(&parent_ev);
@@ -376,7 +184,7 @@ static void test_no_merging3(void)
 			"	s"__FILE__"	%d	ctest1\n"
 			"EVENT	0	%"PRIu64"	1	1	0"
 			"	s"__FILE__"	%d"
-			"	l1	0	ctest2\n"
+			"	l1	0	nevname	ctest2\n"
 			"END\t%"PRIu64"\n", idp, lp, idp, l, idp));
 	test_end();
 }
@@ -396,6 +204,7 @@ static void test_merge_events1(void)
 	event_add_timeval(merge_ev2,test_fields[2].key,
 			  &test_fields[2].value.timeval);
 	event_add_int(merge_ev2,test_fields[1].key, test_fields[1].value.intmax);
+	event_set_name(merge_ev2, "evname");
 	e_info(merge_ev2, "info message");
 	l = __LINE__ - 1;
 	event_unref(&merge_ev1);
@@ -404,7 +213,7 @@ static void test_merge_events1(void)
 		compare_test_stats_to(
 			"EVENT	0	0	1	0	0"
 			"	s"__FILE__"	%d	l0	0"
-			"	ctest3	ctest2	ctest1	Tkey3"
+			"	nevname	ctest3	ctest2	ctest1	Tkey3"
 			"	10	0	Ikey2	20"
 			"	Skey1	str1\n", l));
 	test_end();
@@ -429,6 +238,7 @@ static void test_merge_events2(void)
 	event_add_timeval(merge_ev2,test_fields[2].key,
 			  &test_fields[2].value.timeval);
 	event_add_int(merge_ev2,test_fields[1].key, test_fields[1].value.intmax);
+	event_set_name(merge_ev2, "evname");
 	e_info(merge_ev2, "info message");
 	l = __LINE__ - 1;
 	id = parent_ev->id;
@@ -439,10 +249,10 @@ static void test_merge_events2(void)
 		compare_test_stats_to(
 			"EVENT	0	%"PRIu64"	1	0	0"
 			"	s"__FILE__"	%d	l0	0"
-			"	ctest3	ctest2	ctest1	Tkey3"
+			"	nevname	ctest3	ctest2	ctest1	Tkey3"
 			"	10	0	Ikey2	20"
 			"	Skey1	str1\n"
-			"END	16\n", id, l));
+			"END	15\n", id, l));
 	test_end();
 }
 
@@ -462,6 +272,7 @@ static void test_skip_parents(void)
 	ioloop_timeval.tv_sec++;
 	struct event *child_ev = event_create(empty_parent2);
 	event_add_category(child_ev, &test_cats[1]);
+	event_set_name(child_ev, "evname");
 	e_info(child_ev, "info message");
 	l = __LINE__ - 1;
 	event_unref(&parent_to_log);
@@ -473,7 +284,7 @@ static void test_skip_parents(void)
 			"BEGIN	%"PRIu64"	0	1	0	0"
 			"	s"__FILE__"	%d	ctest1\n"
 			"EVENT	0	%"PRIu64"	1	3	0	"
-			"s"__FILE__"	%d	l3	0"
+			"s"__FILE__"	%d	l3	0	nevname"
 			"	ctest2\nEND\t%"PRIu64"\n", id, lp, id, l, id));
 	test_end();
 }
@@ -503,6 +314,7 @@ static void test_merge_events_skip_parents(void)
 	event_add_timeval(child2_ev,test_fields[2].key,
 			  &test_fields[2].value.timeval);
 	event_add_str(child2_ev,test_fields[3].key, test_fields[3].value.str);
+	event_set_name(child2_ev, "evname");
 	e_info(child2_ev, "info message");
 	l = __LINE__ - 1;
 	event_unref(&parent_to_log);
@@ -515,7 +327,7 @@ static void test_merge_events_skip_parents(void)
 			"BEGIN	%"PRIu64"	0	1	0	0"
 			"	s"__FILE__"	%d	ctest1\n"
 			"EVENT	0	%"PRIu64"	1	3	0	"
-			"s"__FILE__"	%d	l3	0	"
+			"s"__FILE__"	%d	l3	0	nevname	"
 			"ctest4	ctest5	Tkey3	10	0	Skey4"
 			"	str4\nEND\t%"PRIu64"\n", id, lp, id, l, id));
 	test_end();
@@ -564,12 +376,14 @@ static void test_parent_update_post_send(void)
 	event_add_int(c, "c", 3);
 
 	/* force 'a' event to be sent */
+	event_set_name(b, "evname");
 	e_info(b, "field 'a' should be 1");
 	line_log1 = __LINE__ - 1;
 
 	event_add_int(a, "a", 1000); /* update parent */
 
 	/* log child, which should re-sent parent */
+	event_set_name(c, "evname");
 	e_info(c, "field 'a' should be 1000");
 	line_log2 = __LINE__ - 1;
 
@@ -588,7 +402,7 @@ static void test_parent_update_post_send(void)
 			"	Ia	1\n"
 			"EVENT	0	%"PRIu64"	1	1	0"
 			"	s"__FILE__"	%d"
-			"	l1	0	ctest2" "	Ib	2\n"
+			"	l1	0	nevname	ctest2" "	Ib	2\n"
 			/* second e_info() */
 			"UPDATE	%"PRIu64"	0	0	0"
 			"	s"__FILE__"	%d	ctest1"
@@ -598,7 +412,7 @@ static void test_parent_update_post_send(void)
 			"	l0	0	ctest2	Ib	2\n"
 			"EVENT	0	%"PRIu64"	1	1	0"
 			"	s"__FILE__"	%d"
-			"	l1	0	ctest3"
+			"	l1	0	nevname	ctest3"
 			"	Ic	3\n"
 			"END\t%"PRIu64"\n"
 			"END\t%"PRIu64"\n",
@@ -627,12 +441,15 @@ static void test_large_event_id(void)
 	b = make_event(a, &test_cats[1], NULL, NULL);
 
 	ioloop_timeval.tv_sec++;
+	event_set_name(a, "evname");
 	e_info(a, "emit");
 	line_log1 = __LINE__-1;
 	ioloop_timeval.tv_sec++;
+	event_set_name(b, "evname");
 	e_info(b, "emit");
 	line_log2 = __LINE__-1;
 	event_add_int(a, "test1", 1);
+	event_set_name(b, "evname");
 	e_info(b, "emit");
 	line_log3 = __LINE__-1;
 
@@ -644,19 +461,19 @@ static void test_large_event_id(void)
 			/* first e_info() */
 			"EVENT	0	%"PRIu64"	1	1	0"
 			"	s"__FILE__"	%d"
-			"	l1	0	ctest1\n"
+			"	l1	0	nevname	ctest1\n"
 			"BEGIN	%"PRIu64"	0	1	0	0"
 			"	s"__FILE__"	%d"
 			"	l0	0	ctest1\n"
 			"EVENT	0	%"PRIu64"	1	1	0"
 			"	s"__FILE__"	%d"
-			"	l1	0	ctest2\n"
+			"	l1	0	nevname	ctest2\n"
 			"UPDATE	%"PRIu64"	0	1	0"
 			"	s"__FILE__"	%d"
 			"	l1	0	ctest1	Itest1	1\n"
 			"EVENT	0	%"PRIu64"	1	1	0"
 			"	s"__FILE__"	%d"
-			"	l1	0	ctest2\n"
+			"	l1	0	nevname	ctest2\n"
 			"END	%"PRIu64"\n",
 			(uint64_t)0, line_log1,
 			id, line,
@@ -688,6 +505,7 @@ static void test_global_event(void)
 	struct timeval tv;
 	event_get_create_time(merge_ev1, &tv);
 
+	event_set_name(merge_ev2, "evname");
 	e_info(merge_ev2, "info message");
 	int log_line = __LINE__ - 1;
 
@@ -702,7 +520,7 @@ static void test_global_event(void)
 			"\ts"__FILE__"\t%d"
 			"\tSglobal\tvalue\n"
 			"EVENT\t%"PRIu64"\t0\t1\t0\t0"
-			"\ts"__FILE__"\t%d\tl0\t0"
+			"\ts"__FILE__"\t%d\tl0\t0\tnevname"
 			"\tctest1\tIkey2\t20\tSkey1\tstr1\n"
 			"END\t%"PRIu64"\n",
 			global_event_id, global_event_line,
@@ -727,49 +545,17 @@ static int run_tests(void)
 		test_global_event,
 		NULL
 	};
-	struct ioloop *ioloop = io_loop_create();
-	struct stats_client *stats_client = stats_client_init(SOCK_FULL, FALSE);
+	stats_buf = str_new(default_pool, 512);
+	struct stats_client *stats_client =
+		stats_client_init_unittest(stats_buf,
+			"category=test1 OR category=test2 OR category=test3 OR "
+			"category=test4 OR category=test5");
 	register_all_categories();
-	wait_for_signal(stats_ready);
-	/* Remove stats data file containing register categories related stuff */
-	i_unlink(stats_data_file);
+	str_truncate(stats_buf, 0);
+
 	ret = test_run(tests);
 	stats_client_deinit(&stats_client);
-	signal_process(exit_stats);
-	signal_process(test_done);
-	(void)waitpid(stats_pid, NULL, 0);
-	io_loop_destroy(&ioloop);
-	return ret;
-}
-
-static void cleanup_test_stats(void)
-{
-	i_unlink_if_exists(SOCK_FULL);
-	i_unlink_if_exists(stats_data_file);
-	i_unlink_if_exists(test_done);
-	i_unlink_if_exists(exit_stats);
-	i_unlink_if_exists(stats_ready);
-}
-
-static int launch_test_stats(void)
-{
-	int ret;
-
-	/* Make sure files are not existing */
-	cleanup_test_stats();
-
-	if ((stats_pid = fork()) == (pid_t)-1)
-		i_fatal("fork() failed: %m");
-	if (stats_pid == 0) {
-		stats_proc();
-		return 0;
-	}
-	wait_for_signal(stats_ready);
-	ret = run_tests();
-
-	/* Make sure we don't leave anything behind */
-	cleanup_test_stats();
-
+	str_free(&stats_buf);
 	return ret;
 }
 
@@ -778,7 +564,7 @@ int main(void)
 	int ret;
 	i_set_info_handler(test_fail_callback);
 	lib_init();
-	ret = launch_test_stats();
+	ret = run_tests();
 	lib_deinit();
 	return ret;
 }

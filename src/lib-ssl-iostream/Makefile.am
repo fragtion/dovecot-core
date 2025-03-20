@@ -5,6 +5,8 @@ NOPLUGIN_LDFLAGS =
 AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib \
 	-I$(top_srcdir)/src/lib-test \
+	-I$(top_srcdir)/src/lib-settings \
+	-I$(top_srcdir)/src/lib-var-expand \
 	-DMODULE_DIR=\""$(moduledir)"\" \
 	$(SSL_CFLAGS)
 
@@ -23,7 +25,8 @@ libssl_iostream_openssl_la_SOURCES = \
 libssl_iostream_la_SOURCES = \
 	iostream-ssl.c \
 	iostream-ssl-context-cache.c \
-	iostream-ssl-test.c
+	iostream-ssl-test.c \
+	ssl-settings.c
 
 noinst_HEADERS = \
 	dovecot-openssl-common.h
@@ -32,7 +35,8 @@ headers = \
 	iostream-openssl.h \
 	iostream-ssl.h \
 	iostream-ssl-private.h \
-	iostream-ssl-test.h
+	iostream-ssl-test.h \
+	ssl-settings.h
 
 pkginc_libdir=$(pkgincludedir)
 pkginc_lib_HEADERS = $(headers)
@@ -40,6 +44,9 @@ pkginc_lib_HEADERS = $(headers)
 test_libs = \
 	$(module_LTLIBRARIES) \
 	$(noinst_LTLIBRARIES) \
+	../lib-settings/libsettings.la \
+	../lib-dns/libdns.la \
+	../lib-var-expand/libvar_expand.la \
 	../lib-test/libtest.la \
 	../lib/liblib.la
 

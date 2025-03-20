@@ -65,25 +65,31 @@ static void log_prefix_add(const struct failure_context *ctx, string_t *str);
 static int i_failure_send_option_forced(const char *key, const char *value);
 static int internal_send_split(string_t *full_str, size_t prefix_len);
 
-static string_t * ATTR_FORMAT(3, 0) default_format(const struct failure_context *ctx,
-						   size_t *prefix_len_r ATTR_UNUSED,
-						   const char *format,
-						   va_list args)
+static bool log_fd_can_close(int fd)
 {
-	string_t *str = t_str_new(256);
-	log_timestamp_add(ctx, str);
-	log_prefix_add(ctx, str);
-
-	/* make sure there's no %n in there and fix %m */
-	str_vprintfa(str, printf_format_fix(format), args);
-	return str;
+	return fd != STDOUT_FILENO && fd != STDERR_FILENO;
 }
 
-static int default_write(enum log_type type, string_t *data, size_t prefix_len ATTR_UNUSED)
+static const char *log_prefix_sanitize(const char *str)
 {
-	int fd;
+	/* we really only care about LFs, which can break everything. */
+	return t_str_replace(str, '\n', ' ');
+}
 
-	switch (type) {
+static int ATTR_FORMAT(2, 0)
+default_write(const struct failure_context *ctx,
+	      const char *format, va_list args)
+{
+	string_t *data = t_str_new(256);
+	log_timestamp_add(ctx, data);
+	log_prefix_add(ctx, data);
+	size_t prefix_len = str_len(data);
+
+	/* make sure there's no %n in there and fix %m */
+	str_vprintfa(data, printf_format_fix(format), args);
+
+	int fd;
+	switch (ctx->type) {
 	case LOG_TYPE_DEBUG:
 		fd = log_debug_fd;
 		break;
@@ -94,6 +100,16 @@ static int default_write(enum log_type type, string_t *data, size_t prefix_len A
 		fd = log_fd;
 		break;
 	}
+
+	const char *p;
+	while ((p = strchr(str_c(data), '\n')) != NULL) {
+		size_t line_len = p - str_c(data) + 1;
+		if (log_fd_write(fd, str_data(data), line_len) < 0)
+			return -1;
+		/* delete the written line, not including the log prefix */
+		str_delete(data, prefix_len, line_len - prefix_len);
+	}
+
 	str_append_c(data, '\n');
 	return log_fd_write(fd, str_data(data), str_len(data));
 }
@@ -115,35 +131,24 @@ static void default_on_handler_failure(const struct failure_context *ctx)
 	}
 }
 
-static void default_post_handler(const struct failure_context *ctx)
+static int ATTR_FORMAT(2, 0)
+syslog_write(const struct failure_context *ctx,
+	     const char *format, va_list args)
 {
-	if (ctx->type == LOG_TYPE_ERROR && coredump_on_error)
-		abort();
-}
-
-static string_t * ATTR_FORMAT(3, 0) syslog_format(const struct failure_context *ctx,
-						  size_t *prefix_len_r ATTR_UNUSED,
-						  const char *format,
-						  va_list args)
-{
-	string_t *str = t_str_new(128);
+	string_t *data = t_str_new(128);
 	if (ctx->type == LOG_TYPE_INFO) {
 		if (ctx->log_prefix != NULL)
-			str_append(str, ctx->log_prefix);
+			str_append(data, log_prefix_sanitize(ctx->log_prefix));
 		else if (log_prefix != NULL)
-			str_append(str, log_prefix);
+			str_append(data, log_prefix);
 	} else {
-		log_prefix_add(ctx, str);
+		log_prefix_add(ctx, data);
 	}
-	str_vprintfa(str, format, args);
-	return str;
-}
+	size_t prefix_len = str_len(data);
+	str_vprintfa(data, format, args);
 
-static int syslog_write(enum log_type type, string_t *data, size_t prefix_len ATTR_UNUSED)
-{
 	int level = LOG_ERR;
-
-	switch (type) {
+	switch (ctx->type) {
 	case LOG_TYPE_DEBUG:
 		level = LOG_DEBUG;
 		break;
@@ -164,6 +169,16 @@ static int syslog_write(enum log_type type, string_t *data, size_t prefix_len AT
 	case LOG_TYPE_OPTION:
 		i_unreached();
 	}
+	char *p;
+	while ((p = strchr(str_c_modifiable(data) + prefix_len, '\n')) != NULL) {
+		size_t line_len = p - str_c_modifiable(data) + 1;
+		*p = '\0';
+		syslog(level, "%s", str_c(data));
+		/* delete the written line, not including the log prefix */
+		i_assert(line_len > prefix_len);
+		str_delete(data, prefix_len, line_len - prefix_len);
+	}
+
 	syslog(level, "%s", str_c(data));
 	return 0;
 }
@@ -173,16 +188,11 @@ static void syslog_on_handler_failure(const struct failure_context *ctx ATTR_UNU
 	failure_exit(FATAL_LOGERROR);
 }
 
-static void syslog_post_handler(const struct failure_context *ctx ATTR_UNUSED)
+static int ATTR_FORMAT(2, 0)
+internal_write(const struct failure_context *ctx,
+	       const char *format, va_list args)
 {
-}
-
-static string_t * ATTR_FORMAT(3, 0) internal_format(const struct failure_context *ctx,
-						    size_t *prefix_len_r,
-						    const char *format,
-						    va_list args)
-{
-	string_t *str;
+	string_t *data;
 	unsigned char log_type = ctx->type + 1;
 
 	if (ctx->log_prefix != NULL) {
@@ -194,26 +204,23 @@ static string_t * ATTR_FORMAT(3, 0) internal_format(const struct failure_context
 			/* Failed to write log prefix. The log message writing
 			   would likely fail as well, but don't even try since
 			   the log prefix would be wrong. */
-			return NULL;
+			return -1;
 		}
 		log_prefix_sent = TRUE;
 	}
 
-	str = t_str_new(128);
-	str_printfa(str, "\001%c%s ", log_type, my_pid);
+	data = t_str_new(128);
+	str_printfa(data, "\001%c%s ", log_type, my_pid);
 	if ((log_type & LOG_TYPE_FLAG_PREFIX_LEN) != 0)
-		str_printfa(str, "%u ", ctx->log_prefix_type_pos);
+		str_printfa(data, "%u ", ctx->log_prefix_type_pos);
 	if (ctx->log_prefix != NULL)
-		str_append(str, ctx->log_prefix);
-	*prefix_len_r = str_len(str);
+		str_append(data, log_prefix_sanitize(ctx->log_prefix));
+	size_t prefix_len = str_len(data);
 
-	str_vprintfa(str, format, args);
-	return str;
-}
+	str_vprintfa(data, format, args);
 
-static int internal_write(enum log_type type ATTR_UNUSED, string_t *data, size_t prefix_len)
-{
-	if (str_len(data)+1 <= PIPE_BUF) {
+	if (str_len(data)+1 <= PIPE_BUF && strchr(str_c(data), '\n') == NULL) {
+		/* fast path: Log line is short enough and has no LFs */
 		str_append_c(data, '\n');
 		return log_fd_write(STDERR_FILENO,
 				    str_data(data), str_len(data));
@@ -226,29 +233,19 @@ static void internal_on_handler_failure(const struct failure_context *ctx ATTR_U
 	failure_exit(FATAL_LOGERROR);
 }
 
-static void internal_post_handler(const struct failure_context *ctx ATTR_UNUSED)
-{
-}
-
 static struct failure_handler_vfuncs default_handler_vfuncs = {
 	.write = &default_write,
-	.format = &default_format,
 	.on_handler_failure = &default_on_handler_failure,
-	.post_handler = &default_post_handler
 };
 
 static struct failure_handler_vfuncs syslog_handler_vfuncs = {
 	.write = &syslog_write,
-	.format = &syslog_format,
 	.on_handler_failure = &syslog_on_handler_failure,
-	.post_handler = &syslog_post_handler
 };
 
 static struct failure_handler_vfuncs internal_handler_vfuncs = {
 	.write = &internal_write,
-	.format = &internal_format,
 	.on_handler_failure = &internal_on_handler_failure,
-	.post_handler = &internal_post_handler
 };
 
 struct failure_handler_config failure_handler = { .fatal_err_reset = FATAL_LOGWRITE,
@@ -259,7 +256,6 @@ static int common_handler(const struct failure_context *ctx,
 {
 	static int recursed = 0;
 	int ret;
-	size_t prefix_len = 0;
 
 	if (recursed >= 2) {
 		/* we're being called from some signal handler or we ran
@@ -269,9 +265,7 @@ static int common_handler(const struct failure_context *ctx,
 	recursed++;
 
 	T_BEGIN {
-		string_t *str = failure_handler.v->format(ctx, &prefix_len, format, args);
-		ret = str == NULL ? -1 :
-			failure_handler.v->write(ctx->type, str, prefix_len);
+		ret = failure_handler.v->write(ctx, format, args);
 	} T_END;
 
 	if (ret < 0 && failure_ignore_errors)
@@ -286,7 +280,8 @@ static void error_handler_real(const struct failure_context *ctx,
 {
 	if (common_handler(ctx, format, args) < 0)
 		failure_handler.v->on_handler_failure(ctx);
-	failure_handler.v->post_handler(ctx);
+	if (ctx->type == LOG_TYPE_ERROR && coredump_on_error)
+		abort();
 }
 
 static void ATTR_FORMAT(2, 0)
@@ -346,13 +341,14 @@ static void log_prefix_add(const struct failure_context *ctx, string_t *str)
 			str_append(str, log_prefix);
 		str_append(str, failure_log_type_prefixes[ctx->type]);
 	} else if (ctx->log_prefix_type_pos == 0) {
-		str_append(str, ctx->log_prefix);
+		str_append(str, log_prefix_sanitize(ctx->log_prefix));
 		str_append(str, failure_log_type_prefixes[ctx->type]);
 	} else {
-		i_assert(ctx->log_prefix_type_pos <= strlen(ctx->log_prefix));
-		str_append_data(str, ctx->log_prefix, ctx->log_prefix_type_pos);
+		const char *prefix = log_prefix_sanitize(ctx->log_prefix);
+		i_assert(ctx->log_prefix_type_pos <= strlen(prefix));
+		str_append_data(str, prefix, ctx->log_prefix_type_pos);
 		str_append(str, failure_log_type_prefixes[ctx->type]);
-		str_append(str, ctx->log_prefix + ctx->log_prefix_type_pos);
+		str_append(str, prefix + ctx->log_prefix_type_pos);
 	}
 }
 
@@ -673,7 +669,7 @@ static void open_log_file(int *fd, const char *path)
 {
 	const char *str;
 
-	if (*fd != STDERR_FILENO) {
+	if (log_fd_can_close(*fd)) {
 		if (close(*fd) < 0) {
 			str = t_strdup_printf("close(%d) failed: %m\n", *fd);
 			(void)write_full(STDERR_FILENO, str, strlen(str));
@@ -682,6 +678,8 @@ static void open_log_file(int *fd, const char *path)
 
 	if (path == NULL || strcmp(path, "/dev/stderr") == 0)
 		*fd = STDERR_FILENO;
+	else if (strcmp(path, "/dev/stdout") == 0)
+		*fd = STDOUT_FILENO;
 	else {
 		*fd = open(path, O_CREAT | O_APPEND | O_WRONLY, 0600);
 		if (*fd == -1) {
@@ -702,12 +700,12 @@ void i_set_failure_file(const char *path, const char *prefix)
 {
 	i_set_failure_prefix("%s", prefix);
 
-	if (log_info_fd != STDERR_FILENO && log_info_fd != log_fd) {
+	if (log_fd_can_close(log_info_fd) && log_info_fd != log_fd) {
 		if (close(log_info_fd) < 0)
 			i_error("close(%d) failed: %m", log_info_fd);
 	}
 
-	if (log_debug_fd != STDERR_FILENO && log_debug_fd != log_info_fd &&
+	if (log_fd_can_close(log_debug_fd) && log_debug_fd != log_info_fd &&
 	    log_debug_fd != log_fd) {
 		if (close(log_debug_fd) < 0)
 			i_error("close(%d) failed: %m", log_debug_fd);
@@ -747,7 +745,10 @@ void i_set_failure_prefix(const char *prefix_fmt, ...)
 
 	va_start(args, prefix_fmt);
 	i_free(log_prefix);
-	log_prefix = i_strdup_vprintf(prefix_fmt, args);
+	T_BEGIN {
+		log_prefix = i_strdup(log_prefix_sanitize(
+			t_strdup_vprintf(prefix_fmt, args)));
+	} T_END;
 	va_end(args);
 
 	log_prefix_sent = FALSE;
@@ -794,12 +795,22 @@ static int internal_send_split(string_t *full_str, size_t prefix_len)
 
 	while (pos < str_len(full_str)) {
 		str_truncate(str, prefix_len);
-		str_append_max(str, str_c(full_str) + pos, max_text_len);
-		str_append_c(str, '\n');
+		const char *text = str_c(full_str) + pos;
+		const char *lf = strchr(text, '\n');
+		size_t line_len;
+		if (lf == NULL || (size_t)(lf - text) > max_text_len) {
+			str_append_max(str, text, max_text_len);
+			str_append_c(str, '\n');
+			line_len = max_text_len;
+		} else {
+			/* write up to and including the LF */
+			line_len = lf - text + 1;
+			str_append_data(str, text, line_len);
+		}
 		if (log_fd_write(STDERR_FILENO,
 				 str_data(str), str_len(str)) < 0)
 			return -1;
-		pos += max_text_len;
+		pos += line_len;
 	}
 	return 0;
 }
@@ -931,6 +942,13 @@ void i_set_debug_file(const char *path)
 	debug_handler = default_error_handler;
 }
 
+bool i_failure_have_stdout_logs(void)
+{
+	return log_fd == STDOUT_FILENO ||
+		log_info_fd == STDOUT_FILENO ||
+		log_debug_fd == STDOUT_FILENO;
+}
+
 void i_set_failure_timestamp_format(const char *fmt)
 {
 	const char *p;
@@ -970,17 +988,17 @@ void failures_deinit(void)
 	if (log_info_fd == log_fd)
 		log_info_fd = STDERR_FILENO;
 
-	if (log_fd != STDERR_FILENO) {
+	if (log_fd_can_close(log_fd)) {
 		i_close_fd(&log_fd);
 		log_fd = STDERR_FILENO;
 	}
 
-	if (log_info_fd != STDERR_FILENO) {
+	if (log_fd_can_close(log_info_fd)) {
 		i_close_fd(&log_info_fd);
 		log_info_fd = STDERR_FILENO;
 	}
 
-	if (log_debug_fd != STDERR_FILENO) {
+	if (log_fd_can_close(log_debug_fd)) {
 		i_close_fd(&log_debug_fd);
 		log_debug_fd = STDERR_FILENO;
 	}

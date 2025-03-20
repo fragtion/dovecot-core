@@ -65,7 +65,7 @@ struct service {
 	   idle_start == 0. */
 	struct service_process *busy_processes;
 	/* linked list of processes belonging to this service, which have
-	   ldle_start != 0. */
+	   idle_start != 0. */
 	struct service_process *idle_processes_head, *idle_processes_tail;
 
 	/* number of processes currently created for this service */
@@ -75,7 +75,7 @@ struct service {
 	/* number of processes currently idling (idle_start != 0) */
 	unsigned int process_idling;
 	/* Lowest number of processes that have been idling at the same time.
-	   This is reset to process_idling every idle_kill seconds. */
+	   This is reset to process_idling every idle_kill_interval seconds. */
 	unsigned int process_idling_lowwater_since_kills;
 	/* max number of processes allowed */
 	unsigned int process_limit;
@@ -85,7 +85,7 @@ struct service {
 	/* Maximum number of client connections a process can handle. */
 	unsigned int client_limit;
 	/* Kill idling processes after this many seconds. */
-	unsigned int idle_kill;
+	unsigned int idle_kill_interval;
 	/* set->vsz_limit or set->master_set->default_client_limit */
 	uoff_t vsz_limit;
 
@@ -145,14 +145,12 @@ struct service {
 
 struct service_list {
 	pool_t pool;
-	pool_t set_pool;
 	int refcount;
 	struct timeout *to_kill;
 	unsigned int fork_counter;
 	struct event *event;
 
 	const struct master_settings *set;
-	const struct master_service_settings *service_set;
 
 	struct service *config;
 	struct service *log;
@@ -162,7 +160,7 @@ struct service_list {
 	struct io *io_master;
 	int master_fd;
 
-	/* nonblocking log fds usd by master */
+	/* nonblocking log fds used by master */
 	int master_log_fd[2];
 	struct service_process_notify *log_byes;
 

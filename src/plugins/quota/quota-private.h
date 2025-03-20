@@ -4,6 +4,7 @@
 #include "mail-storage-private.h"
 #include "mail-namespace.h"
 #include "quota.h"
+#include "quota-settings.h"
 
 /* Modules should use do "my_id = quota_module_id++" and
    use quota_module_contexts[id] for their own purposes. */
@@ -11,60 +12,32 @@ extern unsigned int quota_module_id;
 
 struct quota {
 	struct mail_user *user;
-	struct quota_settings *set;
 	struct event *event;
 
-	ARRAY(struct quota_root *) roots;
-	ARRAY(struct mail_namespace *) namespaces;
-	struct mail_namespace *unwanted_ns;
-};
+	/* Global quota roots. These are filled when initializing the user.
+	   These quota roots will be used only for private namespaces. */
+	ARRAY(struct quota_root *) global_private_roots;
+	/* All seen quota roots, which may be specific to only some namespaces.
+	   Quota roots are added lazily when a new quota_name is seen for a
+	   namespace. It's assumed that the relevant quota backend settings
+	   don't change for the same quota_name. */
+	ARRAY(struct quota_root *) all_roots;
 
-struct quota_settings {
-	pool_t pool;
-
-	ARRAY(struct quota_root_settings *) root_sets;
-	struct event *event;
 	enum quota_alloc_result (*test_alloc)(
 		struct quota_transaction_context *ctx, uoff_t size,
-		const char **error_r);
+		struct mailbox *expunged_box, uoff_t expunged_size,
+		const struct quota_overrun **overruns_r, const char **error_r);
 
-	uoff_t max_mail_size;
-	const char *quota_exceeded_msg;
-	bool debug:1;
-	bool initialized:1;
 	bool vsizes:1;
-};
-
-struct quota_rule {
-	const char *mailbox_mask;
-
-	int64_t bytes_limit, count_limit;
-	/* relative to default_rule */
-	int bytes_percent, count_percent;
-
-	/* Don't include this mailbox in quota */
-	bool ignore:1;
-};
-
-struct quota_warning_rule {
-	struct quota_rule rule;
-	const char *command;
-	bool reverse:1;
 };
 
 struct quota_backend_vfuncs {
 	struct quota_root *(*alloc)(void);
-	int (*init)(struct quota_root *root, const char *args,
-		    const char **error_r);
+	int (*init)(struct quota_root *root, const char **error_r);
 	void (*deinit)(struct quota_root *root);
 
-	bool (*parse_rule)(struct quota_root_settings *root_set,
-			   struct quota_rule *rule,
-			   const char *str, const char **error_r);
-	int (*init_limits)(struct quota_root *root, const char **error_r);
-
 	/* called once for each namespace */
-	void (*namespace_added)(struct quota *quota,
+	void (*namespace_added)(struct quota_root *root,
 				struct mail_namespace *ns);
 
 	const char *const *(*get_resources)(struct quota_root *root);
@@ -91,72 +64,60 @@ struct quota_backend {
 	struct quota_backend_vfuncs v;
 };
 
-struct quota_root_settings {
-	/* Unique quota root name. */
-	const char *name;
-	/* Name in settings, e.g. "quota", "quota2", .. */
-	const char *set_name;
-
-	struct quota_settings *set;
-	const char *args;
-
-	const struct quota_backend *backend;
-	struct quota_rule default_rule;
-	ARRAY(struct quota_rule) rules;
-	ARRAY(struct quota_warning_rule) warning_rules;
-	const char *limit_set;
-
-	/* If user is under quota before saving a mail, allow the last mail to
-	   bring the user over quota by this many bytes. */
-	uint64_t last_mail_max_extra_bytes;
-	struct quota_rule grace_rule;
-
-	/* Limits in default_rule override backend's quota limits */
-	bool force_default_rule:1;
-	/* TRUE if any of the warning_rules have reverse==TRUE */
-	bool have_reverse_warnings:1;
-};
-
 struct quota_root {
 	pool_t pool;
 
-	struct quota_root_settings *set;
+	const char *set_filter_name;
+	const struct quota_root_settings *set;
+
 	struct quota *quota;
 	struct quota_backend backend;
-	struct dict *limit_set_dict;
 
-	/* this quota root applies only to this namespace. it may also be
-	   a public namespace without an owner. */
-	struct mail_namespace *ns;
-	/* this is set in quota init(), because namespaces aren't known yet.
-	   when accessing shared users the ns_prefix may be non-NULL but
-	   ns=NULL, so when checking if quota root applies only to a specific
-	   namespace use the ns_prefix!=NULL check. */
-	const char *ns_prefix;
+	/* All namespaces using this quota root */
+	ARRAY(struct mail_namespace *) namespaces;
 
-	/* initially the same as set->default_rule.*_limit, but some backends
-	   may change these by reading the limits elsewhere (e.g. Maildir++,
-	   FS quota) */
+	/* initially the same as set->quota_storage_size and
+	   set->quota_message_count, but some backends may change these by
+	   reading the limits elsewhere (e.g. imapc, FS quota) */
 	int64_t bytes_limit, count_limit;
 
 	/* Module-specific contexts. See quota_module_id. */
 	ARRAY(void) quota_module_contexts;
 
-	/* don't enforce quota when saving */
-	bool no_enforcing:1;
 	/* quota is automatically updated. update() should be called but the
 	   bytes won't be changed. count is still changed, because it's cheap
 	   to do and it's internally used to figure out whether there have
 	   been some changes and that quota_warnings should be checked. */
 	bool auto_updating:1;
-	/* If user has unlimited quota, disable quota tracking */
-	bool disable_unlimited_tracking:1;
 	/* Set while quota is being recalculated to avoid recursion. */
 	bool recounting:1;
-	/* Quota root is hidden (to e.g. IMAP GETQUOTAROOT) */
-	bool hidden:1;
-	/* Did we already check quota_over_flag correctness? */
-	bool quota_over_flag_checked:1;
+	/* Did we already check quota_over_status correctness? */
+	bool quota_over_status_checked:1;
+	/* Are there any quota warnings with threshold=under? */
+	bool have_under_warnings:1;
+};
+
+struct quota_transaction_root_context {
+	/* how many bytes/mails can be saved until limit is reached.
+	   (set once, not updated by bytes_used/count_used).
+
+	   if last_mail_max_extra_bytes>0, the bytes_ceil is initially
+	   increased by that much, while bytes_ceil2 contains the real ceiling.
+	   after the first allocation is done, bytes_ceil is set to
+	   bytes_ceil2. */
+	uint64_t bytes_ceil, bytes_ceil2, count_ceil;
+	/* How many bytes/mails we are over quota. Like *_ceil, these are set
+	   only once and not updated by bytes_used/count_used. (Either *_ceil
+	   or *_over is always zero.) */
+	uint64_t bytes_over, count_over;
+
+	/* Quota resource usage reduction performed in separate transactions.
+	   Hence, these changes are already committed and must not be counted
+	   a second time in this transaction. These values are used in the
+	   limit calculations though, since the limits were recorded at the
+	   start of the transaction and these reductions were performed some
+	   time later. */
+	uint64_t bytes_expunged, count_expunged;
 };
 
 struct quota_transaction_context {
@@ -165,11 +126,25 @@ struct quota_transaction_context {
 	struct quota *quota;
 	struct mailbox *box;
 
+	const struct quota_settings *set;
+
+	struct quota_transaction_root_context *roots;
+
+	/* Quota resource usage changes relative to the start of the
+	   transaction. */
 	int64_t bytes_used, count_used;
+	/* Quota resource usage reduction performed in separate transactions.
+	   Hence, these changes are already committed and must not be counted
+	   a second time in this transaction. These values are used in the
+	   limit calculations though, since the limits were recorded at the
+	   start of the transaction and these reductions were performed some
+	   time later. */
+	uint64_t bytes_expunged, count_expunged;
+
 	/* how many bytes/mails can be saved until limit is reached.
 	   (set once, not updated by bytes_used/count_used).
 
-	   if last_mail_max_extra_bytes>0, the bytes_ceil is initially
+	   if quota_storage_grace>0, the bytes_ceil is initially
 	   increased by that much, while bytes_ceil2 contains the real ceiling.
 	   after the first allocation is done, bytes_ceil is set to
 	   bytes_ceil2. */
@@ -191,38 +166,44 @@ struct quota_transaction_context {
 	bool no_quota_updates:1;
 };
 
-/* Register storage to all user's quota roots. */
-void quota_add_user_namespace(struct quota *quota, struct mail_namespace *ns);
+void quota_add_user_namespace(struct quota *quota, const char *root_name,
+			      struct mail_namespace *ns);
 void quota_remove_user_namespace(struct mail_namespace *ns);
 
-int quota_root_default_init(struct quota_root *root, const char *args,
-			    const char **error_r);
 struct quota *quota_get_mail_user_quota(struct mail_user *user);
 
-bool quota_root_is_namespace_visible(struct quota_root *root,
-				     struct mail_namespace *ns);
-struct quota_rule *
-quota_root_rule_find(struct quota_root_settings *root_set, const char *name);
+bool quota_root_is_visible(struct quota_root *root, struct mailbox *box);
 
-void quota_root_recalculate_relative_rules(struct quota_root_settings *root_set,
-					   int64_t bytes_limit,
-					   int64_t count_limit);
 /* Returns 1 if values were returned successfully, 0 if we're recursing into
    the same function, -1 if error. */
 int quota_count(struct quota_root *root, uint64_t *bytes_r, uint64_t *count_r,
 		enum quota_get_result *error_result_r, const char **error_r);
 
-int quota_root_parse_grace(struct quota_root_settings *root_set,
-			   const char *value, const char **error_r);
-bool quota_warning_match(const struct quota_warning_rule *w,
+bool quota_warning_match(const struct quota_root_settings *w,
 			 uint64_t bytes_before, uint64_t bytes_current,
 			 uint64_t count_before, uint64_t count_current,
 			 const char **reason_r);
+
+int quota_get_mail_size(struct quota_transaction_context *ctx,
+			struct mail *mail, uoff_t *size_r);
+void quota_used_apply_expunged(int64_t *used, uint64_t expunged);
 bool quota_transaction_is_over(struct quota_transaction_context *ctx, uoff_t size);
+bool quota_root_is_over(struct quota_transaction_context *ctx,
+			struct quota_transaction_root_context *root,
+			uoff_t count_alloc, uoff_t bytes_alloc,
+			uoff_t count_expunged, uoff_t bytes_expunged,
+			uoff_t *count_overrun_r, uoff_t *bytes_overrun_r);
+
+void quota_transaction_root_expunged(
+	struct quota_transaction_root_context *rctx,
+	uint64_t count_expunged, uint64_t bytes_expunged);
+void quota_transaction_update_expunged(struct quota_transaction_context *ctx);
+
 int quota_transaction_set_limits(struct quota_transaction_context *ctx,
 				 enum quota_get_result *error_result_r,
 				 const char **error_r);
 
+const struct quota_backend *quota_backend_find(const char *name);
 void quota_backend_register(const struct quota_backend *backend);
 void quota_backend_unregister(const struct quota_backend *backend);
 

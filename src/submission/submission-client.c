@@ -10,10 +10,8 @@
 #include "istream.h"
 #include "ostream.h"
 #include "hostpid.h"
-#include "var-expand.h"
-#include "settings-parser.h"
+#include "settings.h"
 #include "master-service.h"
-#include "master-service-settings.h"
 #include "mail-namespace.h"
 #include "mail-storage.h"
 #include "mail-storage-service.h"
@@ -69,11 +67,13 @@ static void client_parse_backend_capabilities(struct client *client)
 	const char *const *str;
 
 	client->backend_capabilities = SMTP_CAPABILITY_NONE;
-	if (set->submission_backend_capabilities == NULL)
+	if (array_is_empty(&set->submission_backend_capabilities))
 		return;
 
-	str = t_strsplit_spaces(set->submission_backend_capabilities, " ,");
+	str = settings_boollist_get(&set->submission_backend_capabilities);
 	for (; *str != NULL; str++) {
+		if (strcmp(*str, "none") == 0)
+			continue;
 		enum smtp_capability cap = smtp_capability_find_by_name(*str);
 
 		if (cap == SMTP_CAPABILITY_NONE) {
@@ -104,6 +104,10 @@ void client_apply_backend_capabilities(struct client *client)
 	caps |= SMTP_CAPABILITY_AUTH | SMTP_CAPABILITY_PIPELINING |
 		SMTP_CAPABILITY_SIZE | SMTP_CAPABILITY_ENHANCEDSTATUSCODES |
 		SMTP_CAPABILITY_CHUNKING | SMTP_CAPABILITY_BURL;
+#ifdef EXPERIMENTAL_MAIL_UTF8
+	if (client->set->mail_utf8_extensions)
+		caps |= SMTP_CAPABILITY_SMTPUTF8;
+#endif
 	caps &= SUBMISSION_SUPPORTED_SMTP_CAPABILITIES;
 	smtp_server_connection_set_capabilities(client->conn, caps);
 }
@@ -181,11 +185,10 @@ client_create(int fd_in, int fd_out, struct event *event,
 	      const struct submission_settings *set, const char *helo,
 	      const struct smtp_proxy_data *proxy_data,
 	      const unsigned char *pdata, unsigned int pdata_len,
-	      bool no_greeting)
+	      bool no_greeting, bool have_mailbox_attribute_dict)
 {
 	enum submission_client_workarounds workarounds =
 		set->parsed_workarounds;
-	const struct mail_storage_settings *mail_set;
 	struct smtp_server_settings smtp_set;
 	struct smtp_server_connection *conn;
 	struct client *client;
@@ -216,7 +219,7 @@ client_create(int fd_in, int fd_out, struct event *event,
 	smtp_set.max_message_size = set->submission_max_mail_size;
 	smtp_set.rawlog_dir = set->rawlog_dir;
 	smtp_set.no_greeting = no_greeting;
-	smtp_set.debug = user->mail_debug;
+	smtp_set.debug = event_want_debug(client->event);
 	smtp_set.event_parent = event;
 
 	if ((workarounds & SUBMISSION_WORKAROUND_WHITESPACE_BEFORE_PATH) != 0) {
@@ -242,9 +245,7 @@ client_create(int fd_in, int fd_out, struct event *event,
 
 	client_create_backend_default(client, set);
 
-	mail_set = mail_user_set_get_storage_set(user);
-	if (*set->imap_urlauth_host != '\0' &&
-	    *mail_set->mail_attribute_dict != '\0') {
+	if (*set->imap_urlauth_host != '\0' && have_mailbox_attribute_dict) {
 		/* Enable BURL capability only when urlauth dict is
 		   configured correctly */
 		client_init_urlauth(client);
@@ -289,15 +290,16 @@ static void client_state_reset(struct client *client)
 }
 
 void client_destroy(struct client **_client, const char *prefix,
-		    const char *reason)
+		    const char *reply_reason, const char *log_reason)
 {
 	struct client *client = *_client;
 	struct smtp_server_connection *conn = client->conn;
 
 	*_client = NULL;
 
-	smtp_server_connection_terminate(
-		&conn, (prefix == NULL ? "4.0.0" : prefix), reason);
+	smtp_server_connection_terminate_full(
+		&conn, (prefix == NULL ? "4.0.0" : prefix),
+		reply_reason, log_reason);
 }
 
 static void
@@ -331,6 +333,7 @@ client_default_destroy(struct client *client)
 
 	client_state_reset(client);
 
+	settings_free(client->set);
 	event_unref(&client->event);
 	pool_unref(&client->pool);
 
@@ -399,31 +402,40 @@ static const char *client_stats(struct client *client)
 	const char *trans_id =
 		smtp_server_connection_get_transaction_id(client->conn);
 	const struct var_expand_table logout_tab[] = {
-		{ 'i', dec2str(stats->input), "input" },
-		{ 'o', dec2str(stats->output), "output" },
-		{ '\0', dec2str(stats->command_count), "command_count" },
-		{ '\0', dec2str(stats->reply_count), "reply_count" },
-		{ '\0', trans_id, "transaction_id" },
-		{ '\0', NULL, NULL }
+		{ .key = "input", .value = dec2str(stats->input) },
+		{ .key = "output", .value = dec2str(stats->output) },
+		{ .key = "command_count", .value = dec2str(stats->command_count) },
+		{ .key = "reply_count", .value = dec2str(stats->reply_count) },
+		{ .key = "transaction_id", .value = trans_id },
+		VAR_EXPAND_TABLE_END
 	};
-	const struct var_expand_table *user_tab =
-		mail_user_var_expand_table(client->user);
-	const struct var_expand_table *tab =
-		t_var_expand_merge_tables(logout_tab, user_tab);
+
+	const struct var_expand_params *user_params =
+		mail_user_var_expand_params(client->user);
+	const struct var_expand_params params = {
+		.tables_arr = (const struct var_expand_table*[]) {
+			user_params->table,
+			logout_tab,
+			NULL
+		},
+		.providers = user_params->providers,
+		.context =  user_params->context,
+		.event = client->event,
+	};
+
 	string_t *str;
 	const char *error;
 
+	event_add_int(client->event, "net_in_bytes", stats->input);
+	event_add_int(client->event, "net_out_bytes", stats->output);
+
 	str = t_str_new(128);
-	if (var_expand_with_funcs(str, client->set->submission_logout_format,
-				  tab, mail_user_var_expand_func_table,
-				  client->user, &error) <= 0) {
+	if (var_expand(str, client->set->submission_logout_format,
+			   &params, &error) < 0) {
 		e_error(client->event,
 			"Failed to expand submission_logout_format=%s: %s",
 			client->set->submission_logout_format, error);
 	}
-
-	event_add_int(client->event, "net_in_bytes", stats->input);
-	event_add_int(client->event, "net_out_bytes", stats->output);
 
 	return str_c(str);
 }
@@ -487,7 +499,7 @@ void client_add_extra_capability(struct client *client, const char *capability,
 {
 	struct client_extra_capability cap;
 
-	/* Don't add capabilties handled by lib-smtp here */
+	/* Don't add capabilities handled by lib-smtp here */
 	i_assert(smtp_capability_find_by_name(capability)
 		 == SMTP_CAPABILITY_NONE);
 
@@ -505,16 +517,19 @@ void client_add_extra_capability(struct client *client, const char *capability,
 	array_push_back(&client->extra_capabilities, &cap);
 }
 
-void client_kick(struct client *client)
+void client_kick(struct client *client, bool shutdown)
 {
 	mail_storage_service_io_activate_user(client->user->service_user);
-	client_destroy(&client, "4.3.2", MASTER_SERVICE_SHUTTING_DOWN_MSG);
+	client_destroy(&client, "4.3.2", MASTER_SERVICE_SHUTTING_DOWN_MSG,
+		       shutdown ? MASTER_SERVICE_SHUTTING_DOWN_MSG :
+		       MASTER_SERVICE_USER_KICKED_MSG);
 }
 
 void clients_destroy_all(void)
 {
+	bool shutdown = !master_service_is_user_kicked(master_service);
 	while (submission_clients != NULL)
-		client_kick(submission_clients);
+		client_kick(submission_clients, shutdown);
 }
 
 static const struct smtp_server_callbacks smtp_callbacks = {

@@ -81,6 +81,8 @@ struct connection_settings {
 	   be created. */
 	size_t input_max_size;
 	size_t output_max_size;
+	/* Stop accepting input if output size reaches this. */
+	size_t output_throttle_size;
 	enum connection_behavior input_full_behavior;
 
 	/* Set to TRUE if this is a client */
@@ -120,32 +122,56 @@ struct connection {
 	   composed from the connection properties; e.g., "ip:port". */
 	const char *name;
 
+	/* Label for the connection, formed from base_name,
+	 * property_label, id and file descriptors. */
 	char *label;
+	/* Property part of the label (pid, uid, etc.) */
 	char *property_label;
+	/* Connection ID. Incremented each time connection is formed. */
 	unsigned int id;
 
+	/* Connection file descriptors. */
 	int fd_in, fd_out;
+	/* Associated ioloop. */
 	struct ioloop *ioloop;
+	/* Input handler (removed when connection is halted). */
 	struct io *io;
+	/* IO streams. */
 	struct istream *input;
 	struct ostream *output;
 
+	/* How long to wait until disconnecting with no input.
+	   0 = unlimited. connection_init*() copies it from
+	   connection_list. */
 	unsigned int input_idle_timeout_secs;
 	struct timeout *to;
+	/* Last input timestamps. */
 	time_t last_input;
 	struct timeval last_input_tv;
+
+	/* Client has started to connect. This is client-only
+	   value. */
 	struct timeval connect_started;
+	/* Timestamp when client has finished handshake successfully. */
+	struct timeval handshake_finished;
+	/* Client has finished connecting. This is recorded for
+	   both server and client. */
 	struct timeval connect_finished;
 
-	/* set to parent event before calling init */
+	/* Set to parent event before calling init. */
 	struct event *event_parent;
 	struct event *event;
 
-	/* connection properties */
+	/* Local and remote IP for TCP connections. */
 	struct ip_addr local_ip, remote_ip;
+	/* Remote port for TCP connections. */
 	in_port_t remote_port;
+	/* Remote pid, UNIX socket only. */
 	pid_t remote_pid;
+	/* Remote user id, UNIX socket only. */
 	uid_t remote_uid;
+	/* Remote group id, UNIX socket only. */
+	gid_t remote_gid;
 
 	/* received minor version */
 	unsigned int minor_version;
@@ -153,13 +179,24 @@ struct connection {
 	/* handlers */
 	struct connection_vfuncs v;
 
+	/* original ostream flush callback */
+	void *flush_callback;
+	void *flush_context;
+
+	/* Errno for connect() failure. */
 	int connect_failed_errno;
+	/* Reason for disconnection */
 	enum connection_disconnect_reason disconnect_reason;
 
+	/* We have received a version from remote end. */
 	bool version_received:1;
-	bool handshake_received:1;
+	/* Set if this is a unix socket. */
 	bool unix_socket:1;
+	/* Unix peer credentials have been attempted to look up. */
 	bool unix_peer_checked:1;
+	/* Unix peer credentials were successfully looked up. */
+	bool have_unix_credentials:1;
+	/* Connection is disconnected. */
 	bool disconnected:1;
 };
 
@@ -236,6 +273,14 @@ void connection_update_counters(struct connection *conn);
 /* This needs to be called if the input/output streams are changed */
 void connection_streams_changed(struct connection *conn);
 
+/* This function must be called if handshaking is handled without
+   connection API. This is automatically called once handshake
+   vfunctions return success and will call the handshake_ready() vfunction. */
+void connection_set_handshake_ready(struct connection *conn);
+
+/* Returns TRUE if handshake has been done */
+bool connection_handshake_received(struct connection *conn);
+
 /* Returns -1 = disconnected, 0 = nothing new, 1 = something new.
    If input_full_behavior is ALLOW, may return also -2 = buffer full. */
 int connection_input_read(struct connection *conn);
@@ -274,5 +319,11 @@ int connection_input_line_default(struct connection *conn, const char *line);
 /* Change handlers, calls connection_input_halt and connection_input_resume */
 void connection_set_handlers(struct connection *conn, const struct connection_vfuncs *vfuncs);
 void connection_set_default_handlers(struct connection *conn);
+
+/* Checks if the given name is a valid DNS servername as per RFC1123 section 1.2,
+   RFC8591 section 4.2.1 and for practicality, the '_' character.
+   IP address like values are also accepted.
+*/
+bool connection_is_valid_dns_name(const char *name);
 
 #endif

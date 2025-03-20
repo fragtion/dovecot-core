@@ -2,27 +2,8 @@
 
 #include "lib.h"
 #include "module-dir.h"
+#include "settings.h"
 #include "iostream-ssl-private.h"
-
-#define OFFSET(name) offsetof(struct ssl_iostream_settings, name)
-static const size_t ssl_iostream_settings_string_offsets[] = {
-	OFFSET(min_protocol),
-	OFFSET(cipher_list),
-	OFFSET(ciphersuites),
-	OFFSET(curve_list),
-	OFFSET(ca),
-	OFFSET(ca_file),
-	OFFSET(ca_dir),
-	OFFSET(cert.cert),
-	OFFSET(cert.key),
-	OFFSET(cert.key_password),
-	OFFSET(alt_cert.cert),
-	OFFSET(alt_cert.key),
-	OFFSET(alt_cert.key_password),
-	OFFSET(dh),
-	OFFSET(cert_username_field),
-	OFFSET(crypto_device),
-};
 
 static bool ssl_module_loaded = FALSE;
 static struct module *ssl_module = NULL;
@@ -42,22 +23,21 @@ void iostream_ssl_module_init(const struct iostream_ssl_vfuncs *vfuncs)
 
 int ssl_module_load(const char **error_r)
 {
-	const char *plugin_name = "ssl_iostream_openssl";
+	const char *plugin_names[] = { "ssl_iostream_openssl", NULL };
 	struct module_dir_load_settings mod_set;
 
 	i_zero(&mod_set);
 	mod_set.abi_version = DOVECOT_ABI_VERSION;
 	mod_set.setting_name = "<built-in lib-ssl-iostream lookup>";
 	mod_set.require_init_funcs = TRUE;
-	ssl_module = module_dir_load(MODULE_DIR, plugin_name, &mod_set);
-	if (module_dir_try_load_missing(&ssl_module, MODULE_DIR, plugin_name,
+	if (module_dir_try_load_missing(&ssl_module, MODULE_DIR, plugin_names,
 					&mod_set, error_r) < 0)
 		return -1;
 	module_dir_init(ssl_module);
 	if (!ssl_module_loaded) {
 		*error_r = t_strdup_printf(
 			"%s didn't call iostream_ssl_module_init() - SSL not initialized",
-			plugin_name);
+			plugin_names[0]);
 		module_dir_unload(&ssl_module);
 		return -1;
 	}
@@ -97,13 +77,19 @@ int ssl_iostream_context_init_server(const struct ssl_iostream_settings *set,
 				     struct ssl_iostream_context **ctx_r,
 				     const char **error_r)
 {
+	struct ssl_iostream_settings set_copy = *set;
+
+	/* Allow client to provide an invalid certificate. The caller is
+	   expected to check and handle it however it wants. */
+	set_copy.allow_invalid_cert = TRUE;
+
 	if (!ssl_module_loaded) {
 		if (ssl_module_load(error_r) < 0)
 			return -1;
 	}
-	if (io_stream_ssl_global_init(set, error_r) < 0)
+	if (io_stream_ssl_global_init(&set_copy, error_r) < 0)
 		return -1;
-	return ssl_vfuncs->context_init_server(set, ctx_r, error_r);
+	return ssl_vfuncs->context_init_server(&set_copy, ctx_r, error_r);
 }
 
 void ssl_iostream_context_ref(struct ssl_iostream_context *ctx)
@@ -122,27 +108,103 @@ void ssl_iostream_context_unref(struct ssl_iostream_context **_ctx)
 }
 
 int io_stream_create_ssl_client(struct ssl_iostream_context *ctx, const char *host,
-				const struct ssl_iostream_settings *set,
 				struct event *event_parent,
+				enum ssl_iostream_flags flags,
 				struct istream **input, struct ostream **output,
 				struct ssl_iostream **iostream_r,
 				const char **error_r)
 {
-	struct ssl_iostream_settings set_copy = *set;
-	set_copy.verify_remote_cert = TRUE;
-	return ssl_vfuncs->create(ctx, event_parent, host, &set_copy, TRUE,
+	return ssl_vfuncs->create(ctx, event_parent, host, TRUE, flags,
 				  input, output, iostream_r, error_r);
 }
 
 int io_stream_create_ssl_server(struct ssl_iostream_context *ctx,
-				const struct ssl_iostream_settings *set,
 				struct event *event_parent,
 				struct istream **input, struct ostream **output,
 				struct ssl_iostream **iostream_r,
 				const char **error_r)
 {
-	return ssl_vfuncs->create(ctx, event_parent, NULL, set, TRUE,
+	return ssl_vfuncs->create(ctx, event_parent, NULL, TRUE, 0,
 				  input, output, iostream_r, error_r);
+}
+
+int io_stream_autocreate_ssl_client(
+	const struct ssl_iostream_client_autocreate_parameters *parameters,
+	struct istream **input, struct ostream **output,
+	struct ssl_iostream **iostream_r,
+	const char **error_r)
+{
+	const struct ssl_settings *ssl_set;
+	const struct ssl_iostream_settings *set;
+	struct ssl_iostream_context *ctx;
+	int ret;
+
+	i_assert(parameters->event_parent != NULL);
+	if (ssl_client_settings_get(parameters->event_parent,
+				    &ssl_set, error_r) < 0)
+		return -1;
+	ssl_client_settings_to_iostream_set(ssl_set, &set);
+	if ((parameters->flags & SSL_IOSTREAM_FLAG_DISABLE_CA_FILES) != 0) {
+		pool_t pool = pool_alloconly_create("ssl iostream settings copy",
+						    sizeof(*set));
+		struct ssl_iostream_settings *set_copy =
+			p_memdup(pool, set, sizeof(*set));
+		set_copy->pool = pool;
+		pool_add_external_ref(pool, set->pool);
+		set_copy->ca_dir = NULL;
+		settings_free(set);
+		set = set_copy;
+	}
+	settings_free(ssl_set);
+
+	ret = ssl_iostream_client_context_cache_get(set, &ctx, error_r);
+	settings_free(set);
+	if (ret < 0)
+		return -1;
+	if (ret > 0 && parameters->application_protocols != NULL) {
+		ssl_iostream_context_set_application_protocols(ctx,
+				parameters->application_protocols);
+	}
+	ret = io_stream_create_ssl_client(ctx, parameters->host,
+					  parameters->event_parent,
+					  parameters->flags, input,
+					  output, iostream_r, error_r);
+	ssl_iostream_context_unref(&ctx);
+	return ret;
+}
+
+int io_stream_autocreate_ssl_server(
+	const struct ssl_iostream_server_autocreate_parameters *parameters,
+	struct istream **input, struct ostream **output,
+	struct ssl_iostream **iostream_r,
+	const char **error_r)
+{
+	const struct ssl_settings *ssl_set;
+	const struct ssl_server_settings *ssl_server_set;
+	const struct ssl_iostream_settings *set;
+	struct ssl_iostream_context *ctx;
+	int ret;
+
+	i_assert(parameters->event_parent != NULL);
+	if (ssl_server_settings_get(parameters->event_parent, &ssl_set,
+				    &ssl_server_set, error_r) < 0)
+		return -1;
+	ssl_server_settings_to_iostream_set(ssl_set, ssl_server_set, &set);
+	settings_free(ssl_set);
+	settings_free(ssl_server_set);
+
+	ret = ssl_iostream_server_context_cache_get(set, &ctx, error_r);
+	settings_free(set);
+	if (ret < 0)
+		return -1;
+	if (ret > 0 && parameters->application_protocols != NULL) {
+		ssl_iostream_context_set_application_protocols(ctx,
+				parameters->application_protocols);
+	}
+	ret = io_stream_create_ssl_server(ctx, parameters->event_parent, input,
+					  output, iostream_r, error_r);
+	ssl_iostream_context_unref(&ctx);
+	return ret;
 }
 
 void ssl_iostream_unref(struct ssl_iostream **_ssl_io)
@@ -245,9 +307,14 @@ int ssl_iostream_check_cert_validity(struct ssl_iostream *ssl_io,
 	return 0;
 }
 
-const char *ssl_iostream_get_peer_name(struct ssl_iostream *ssl_io)
+bool ssl_iostream_get_allow_invalid_cert(struct ssl_iostream *ssl_io)
 {
-	return ssl_vfuncs->get_peer_name(ssl_io);
+	return ssl_vfuncs->get_allow_invalid_cert(ssl_io);
+}
+
+const char *ssl_iostream_get_peer_username(struct ssl_iostream *ssl_io)
+{
+	return ssl_vfuncs->get_peer_username(ssl_io);
 }
 
 const char *ssl_iostream_get_server_name(struct ssl_iostream *ssl_io)
@@ -270,61 +337,55 @@ const char *ssl_iostream_get_last_error(struct ssl_iostream *ssl_io)
 	return ssl_vfuncs->get_last_error(ssl_io);
 }
 
-struct ssl_iostream_settings *ssl_iostream_settings_dup(pool_t pool,
-			const struct ssl_iostream_settings *old_set)
+static bool quick_strcmp(const char *str1, const char *str2)
 {
-	struct ssl_iostream_settings *new_set;
-
-	new_set = p_new(pool, struct ssl_iostream_settings, 1);
-	ssl_iostream_settings_init_from(pool, new_set, old_set);
-	return new_set;
-}
-
-void ssl_iostream_settings_init_from(pool_t pool,
-				     struct ssl_iostream_settings *dest,
-				     const struct ssl_iostream_settings *src)
-{
-	unsigned int i;
-
-	*dest = *src;
-	for (i = 0; i < N_ELEMENTS(ssl_iostream_settings_string_offsets); i++) {
-		const size_t offset = ssl_iostream_settings_string_offsets[i];
-		const char *const *src_str = CONST_PTR_OFFSET(src, offset);
-		const char **dest_str = PTR_OFFSET(dest, offset);
-		*dest_str = p_strdup(pool, *src_str);
-	}
+	/* fast path: settings can point to the same strings */
+	if (str1 == str2)
+		return TRUE;
+	return null_strcmp(str1, str2) == 0;
 }
 
 bool ssl_iostream_settings_equals(const struct ssl_iostream_settings *set1,
 				  const struct ssl_iostream_settings *set2)
 {
-	struct ssl_iostream_settings set1_nonstr, set2_nonstr;
-	unsigned int i;
+	if (set1 == set2)
+		return TRUE;
 
-	set1_nonstr = *set1;
-	set2_nonstr = *set2;
-	for (i = 0; i < N_ELEMENTS(ssl_iostream_settings_string_offsets); i++) {
-		const size_t offset = ssl_iostream_settings_string_offsets[i];
-		const char **str1 = PTR_OFFSET(&set1_nonstr, offset);
-		const char **str2 = PTR_OFFSET(&set2_nonstr, offset);
+	if (!quick_strcmp(set1->cert.cert.content, set2->cert.cert.content) ||
+	    !quick_strcmp(set1->cert.key.content, set2->cert.key.content) ||
+	    !quick_strcmp(set1->cert.key_password, set2->cert.key_password))
+		return FALSE;
 
-		if (null_strcmp(*str1, *str2) != 0)
-			return FALSE;
+	if (!quick_strcmp(set1->alt_cert.cert.content,
+			  set2->alt_cert.cert.content) ||
+	    !quick_strcmp(set1->alt_cert.key.content,
+			  set2->alt_cert.key.content) ||
+	    !quick_strcmp(set1->alt_cert.key_password,
+			  set2->alt_cert.key_password))
+		return FALSE;
 
-		/* clear away the string pointer from the settings struct */
-		*str1 = NULL;
-		*str2 = NULL;
-	}
-	/* The set*_nonstr no longer have any pointers, so we can compare them
-	   directly. */
-	return memcmp(&set1_nonstr, &set2_nonstr, sizeof(set1_nonstr)) == 0;
-}
+	if (!quick_strcmp(set1->ca.content, set2->ca.content) ||
+	    !quick_strcmp(set1->ca_dir, set2->ca_dir))
+		return FALSE;
 
-void ssl_iostream_settings_drop_stream_only(struct ssl_iostream_settings *set)
-{
-	set->verbose = FALSE;
-	set->verbose_invalid_cert = FALSE;
-	set->allow_invalid_cert = FALSE;
+	if (!quick_strcmp(set1->min_protocol, set2->min_protocol) ||
+	    !quick_strcmp(set1->cipher_list, set2->cipher_list) ||
+	    !quick_strcmp(set1->ciphersuites, set2->ciphersuites) ||
+	    !quick_strcmp(set1->curve_list, set2->curve_list) ||
+	    !quick_strcmp(set1->dh.content, set2->dh.content) ||
+	    !quick_strcmp(set1->cert_username_field,
+			  set2->cert_username_field) ||
+	    !quick_strcmp(set1->crypto_device, set2->crypto_device))
+		return FALSE;
+
+	if (set1->skip_crl_check != set2->skip_crl_check ||
+	    set1->verify_remote_cert != set2->verify_remote_cert ||
+	    set1->allow_invalid_cert != set2->allow_invalid_cert ||
+	    set1->prefer_server_ciphers != set2->prefer_server_ciphers ||
+	    set1->compression != set2->compression ||
+	    set1->tickets != set2->tickets)
+		return FALSE;
+	return TRUE;
 }
 
 const char *ssl_iostream_get_cipher(struct ssl_iostream *ssl_io,
@@ -343,7 +404,43 @@ const char *ssl_iostream_get_protocol_name(struct ssl_iostream *ssl_io)
 	return ssl_vfuncs->get_protocol_name(ssl_io);
 }
 
+enum ssl_iostream_protocol_version
+ssl_iostream_get_protocol_version(struct ssl_iostream *ssl_io)
+{
+	return ssl_vfuncs->get_protocol_version(ssl_io);
+}
+
 const char *ssl_iostream_get_ja3(struct ssl_iostream *ssl_io)
 {
 	return ssl_vfuncs->get_ja3(ssl_io);
+}
+
+const char *ssl_iostream_get_application_protocol(struct ssl_iostream *ssl_io)
+{
+	return ssl_vfuncs->get_application_protocol(ssl_io);
+}
+
+void ssl_iostream_context_set_application_protocols(struct ssl_iostream_context *ssl_ctx,
+						    const char *const *names)
+{
+	ssl_vfuncs->set_application_protocols(ssl_ctx, names);
+}
+
+int ssl_iostream_get_channel_binding(struct ssl_iostream *ssl_io,
+				     const char *type, const buffer_t **data_r,
+				     const char **error_r)
+{
+	*data_r = NULL;
+	*error_r = NULL;
+
+	if (ssl_io == NULL) {
+		*error_r = "Channel binding not available for insecure channel";
+		return -1;
+	}
+	if (ssl_vfuncs->get_channel_binding == NULL) {
+		*error_r = "Channel binding not supported";
+		return -1;
+	}
+
+	return ssl_vfuncs->get_channel_binding(ssl_io, type, data_r, error_r);
 }

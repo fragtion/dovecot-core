@@ -1,4 +1,3 @@
-noinst_LTLIBRARIES = libauth.la
 auth_moduledir = $(moduledir)/auth
 
 # automake seems to force making this unconditional..
@@ -40,8 +39,10 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-auth \
 	-I$(top_srcdir)/src/lib-auth-client \
 	-I$(top_srcdir)/src/lib-test \
+	-I$(top_srcdir)/src/lib-json \
+	-I$(top_srcdir)/src/lib-ldap \
 	-I$(top_srcdir)/src/lib-dict \
-	-I$(top_srcdir)/src/lib-dns \
+	-I$(top_srcdir)/src/lib-dns-client \
 	-I$(top_srcdir)/src/lib-http \
 	-I$(top_srcdir)/src/lib-sql \
 	-I$(top_srcdir)/src/lib-settings \
@@ -52,6 +53,7 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-ssl-iostream \
 	-I$(top_srcdir)/src/lib-lua \
 	-I$(top_srcdir)/src/lib-dcrypt \
+	-I$(top_srcdir)/src/lib-var-expand \
 	-DAUTH_MODULE_DIR=\""$(auth_moduledir)"\" \
 	-DPKG_LIBEXECDIR=\""$(pkglibexecdir)"\" \
 	-DPKG_RUNDIR=\""$(rundir)"\" \
@@ -62,20 +64,19 @@ AM_CPPFLAGS = \
 auth_LDFLAGS = -export-dynamic
 
 auth_libs = \
-	libauth.la \
+	../lib-auth/libauth-crypt.la \
 	$(AUTH_LUA_LIBS) \
 	$(LIBDOVECOT_SQL)
 
 auth_CPPFLAGS = $(AM_CPPFLAGS) $(BINARY_CFLAGS)
 auth_LDADD = $(auth_libs) $(LIBDOVECOT) $(AUTH_LIBS) $(BINARY_LDFLAGS) $(AUTH_LUA_LDADD)
 auth_DEPENDENCIES = $(auth_libs) $(LIBDOVECOT_DEPS)
-auth_SOURCES = main.c
+auth_SOURCES = main.c $(auth_common_sources)
 
-ldap_sources = db-ldap.c passdb-ldap.c userdb-ldap.c
+ldap_sources = db-ldap.c db-ldap-settings.c passdb-ldap.c userdb-ldap.c
 lua_sources = db-lua.c passdb-lua.c userdb-lua.c
 
-libauth_la_DEPENDENCIES = $(LIBDOVECOT_DEPS)
-libauth_la_SOURCES = \
+auth_common_sources = \
 	auth.c \
 	auth-cache.c \
 	auth-client-connection.c \
@@ -93,8 +94,6 @@ libauth_la_SOURCES = \
 	auth-token.c \
 	auth-worker-connection.c \
 	auth-worker-server.c \
-	db-dict.c \
-	db-dict-cache-key.c \
 	db-oauth2.c \
 	db-sql.c \
 	db-passwd-file.c \
@@ -116,23 +115,19 @@ libauth_la_SOURCES = \
 	passdb-blocking.c \
 	passdb-bsdauth.c \
 	passdb-cache.c \
-	passdb-dict.c \
 	passdb-oauth2.c \
 	passdb-passwd.c \
 	passdb-passwd-file.c \
 	passdb-pam.c \
 	passdb-sql.c \
 	passdb-static.c \
-	passdb-template.c \
 	userdb.c \
 	userdb-blocking.c \
-	userdb-dict.c \
 	userdb-passwd.c \
 	userdb-passwd-file.c \
 	userdb-prefetch.c \
 	userdb-static.c \
 	userdb-sql.c \
-	userdb-template.c \
 	$(ldap_sources) \
 	$(lua_sources)
 
@@ -157,8 +152,8 @@ headers = \
 	auth-token.h \
 	auth-worker-connection.h \
 	auth-worker-server.h \
-	db-dict.h \
 	db-ldap.h \
+	db-ldap-settings.h \
 	db-sql.h \
 	db-passwd-file.h \
 	db-oauth2.h \
@@ -166,10 +161,8 @@ headers = \
 	passdb.h \
 	passdb-blocking.h \
 	passdb-cache.h \
-	passdb-template.h \
 	userdb.h \
-	userdb-blocking.h \
-	userdb-template.h
+	userdb-blocking.h
 
 if GSSAPI_PLUGIN
 libmech_gssapi_la_LDFLAGS = -module -avoid-version
@@ -179,20 +172,22 @@ libmech_gssapi_la_SOURCES = mech-gssapi.c
 endif
 
 if LDAP_PLUGIN
-libauthdb_ldap_la_LDFLAGS = -module -avoid-version
-libauthdb_ldap_la_LIBADD = $(LDAP_LIBS)
+libauthdb_ldap_la_LDFLAGS = -module -avoid-version -shared
+libauthdb_ldap_la_LIBADD = $(LIBDOVECOT_LDAP) $(LDAP_LIBS)
 libauthdb_ldap_la_CPPFLAGS = $(AM_CPPFLAGS) -DPLUGIN_BUILD
 libauthdb_ldap_la_SOURCES = $(ldap_sources)
+else
+auth_libs += $(LIBDOVECOT_LDAP)
 endif
 
 if AUTH_LUA_PLUGIN
-libauthdb_lua_la_LDFLAGS = -module -avoid-version
+libauthdb_lua_la_LDFLAGS = -module -avoid-version -shared
 libauthdb_lua_la_LIBADD = $(LIBDOVECOT_LUA)
 libauthdb_lua_la_CPPFLAGS = $(AM_CPPFLAGS) -DPLUGIN_BUILD
 libauthdb_lua_la_SOURCES = $(lua_sources)
 endif
 
-libauthdb_imap_la_LDFLAGS = -module -avoid-version
+libauthdb_imap_la_LDFLAGS = -module -avoid-version -shared
 libauthdb_imap_la_LIBADD = \
 	../lib-imap-client/libimap_client.la \
 	$(LIBDOVECOT)
@@ -207,41 +202,61 @@ pkginc_lib_HEADERS = $(headers)
 
 test_programs = \
 	test-auth-cache \
+	test-auth-client \
+	test-auth-master \
 	test-auth \
 	test-mech
 
 noinst_PROGRAMS = $(test_programs)
 
-noinst_HEADERS = test-auth.h db-lua.h
-
-test_libs = \
-	../lib-dovecot/libdovecot.la
+noinst_HEADERS = test-auth.h db-lua.h test-auth-master.h
 
 test_auth_cache_SOURCES = auth-cache.c test-auth-cache.c
-test_auth_cache_LDADD = $(test_libs)
-test_auth_cache_DEPENDENCIES = $(pkglibexec_PROGRAMS) $(test_libs)
+test_auth_cache_LDADD = $(LIBDOVECOT)
+test_auth_cache_DEPENDENCIES = $(pkglibexec_PROGRAMS) $(LIBDOVECOT_DEPS)
 # this is needed to force auth-cache.c recompilation
 test_auth_cache_CPPFLAGS = $(AM_CPPFLAGS)
 
 test_auth_SOURCES = \
+	$(auth_common_sources) \
 	test-auth-request-var-expand.c \
 	test-auth-request-fields.c \
 	test-username-filter.c \
-	test-db-dict.c \
-	test-db-ldap.c \
 	test-lua.c \
 	test-mock.c \
 	test-main.c
 
-test_auth_LDADD = $(test_libs) $(auth_libs) $(AUTH_LIBS) $(LUA_LIBS)
-test_auth_DEPENDENCIES = $(pkglibexec_PROGRAMS) $(test_libs)
+test_auth_LDADD = $(LIBDOVECOT) $(auth_libs) $(AUTH_LIBS) $(LUA_LIBS)
+test_auth_DEPENDENCIES = $(pkglibexec_PROGRAMS) $(LIBDOVECOT_DEPS)
 
 test_mech_SOURCES = \
+	$(auth_common_sources) \
+	test-auth.c \
 	test-mock.c \
 	test-mech.c
 
-test_mech_LDADD = $(test_libs) $(auth_libs) $(AUTH_LIBS) $(LUA_LIBS)
-test_mech_DEPENDENCIES = $(pkglibexec_PROGRAMS) $(test_libs)
+test_mech_LDADD = $(LIBDOVECOT) $(auth_libs) $(AUTH_LIBS) $(LUA_LIBS)
+test_mech_DEPENDENCIES = $(pkglibexec_PROGRAMS) $(LIBDOVECOT_DEPS)
+
+test_auth_client_SOURCES = \
+	$(auth_common_sources) \
+	test-auth.c \
+	test-mock.c \
+	test-auth-client.c
+
+test_auth_client_LDADD = $(LIBDOVECOT) $(auth_libs) $(AUTH_LIBS) $(LUA_LIBS)
+test_auth_client_DEPENDENCIES = $(pkglibexec_PROGRAMS) $(LIBDOVECOT_DEPS)
+
+test_auth_master_SOURCES = \
+	$(auth_common_sources) \
+	test-auth.c \
+	test-mock.c \
+	test-auth-master.c \
+	test-auth-master-server.c
+
+test_auth_master_LDADD = $(LIBDOVECOT) $(auth_libs) $(AUTH_LIBS) $(LUA_LIBS)
+test_auth_master_DEPENDENCIES = $(pkglibexec_PROGRAMS) $(LIBDOVECOT_DEPS)
+
 
 check-local:
 	for bin in $(test_programs); do \

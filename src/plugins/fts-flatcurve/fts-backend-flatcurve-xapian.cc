@@ -3,12 +3,15 @@
 
 extern "C" {
 #include "lib.h"
+#include "array.h"
 #include "file-create-locked.h"
 #include "hash.h"
+#include "hex-binary.h"
 #include "message-header-parser.h"
 #include "path-util.h"
 #include "mail-storage-private.h"
 #include "mail-search.h"
+#include "md5.h"
 #include "sleep.h"
 #include "str.h"
 #include "unichar.h"
@@ -16,8 +19,8 @@ extern "C" {
 #include "fts-backend-flatcurve.h"
 #include "fts-backend-flatcurve-xapian.h"
 #include <dirent.h>
-#include <stdio.h>
 };
+#include <cstdio>
 
 #pragma GCC diagnostic push
 #  ifdef __clang__ // for building xapian's libs from gcc built debian package
@@ -70,7 +73,7 @@ extern "C" {
 #define FLATCURVE_XAPIAN_DB_CURRENT_PREFIX "current."
 
 /* These are temporary data types that may appear in the fts directory. They
- * are not intended to perservere between sessions. */
+ * are not intended to persist between sessions. */
 #define FLATCURVE_XAPIAN_DB_OPTIMIZE "optimize"
 
 /* Xapian "recommendations" are that you begin your local prefix identifier
@@ -78,7 +81,7 @@ extern "C" {
  * "convention". However, this recommendation is for maintaining
  * compatability with the search front-end (Omega) that they provide. We don't
  * care about compatability, so save storage space by using single letter
- * prefixes. Bodytext is stored without prefixes, as it is expected to be the
+ * prefixes. Body text is stored without prefixes, as it is expected to be the
  * single largest storage pool. */
 
 /* Caution: the code below expects these prefix to be 1-char long */
@@ -159,9 +162,18 @@ struct flatcurve_xapian {
 	bool deinit:1;
 };
 
-struct flatcurve_fts_query_xapian {
+struct flatcurve_fts_query_xapian_maybe {
 	Xapian::Query *query;
 };
+
+ struct flatcurve_fts_query_xapian {
+	Xapian::Query *query;
+	ARRAY(struct flatcurve_fts_query_xapian_maybe) maybe_queries;
+
+	bool and_search:1;
+	bool maybe:1;
+	bool start:1;
+ };
 
 struct flatcurve_xapian_db_iter {
 	struct flatcurve_fts_backend *backend;
@@ -200,6 +212,9 @@ struct fts_flatcurve_xapian_query_iter {
 	Xapian::Database *db;
 	Xapian::Enquire *enquire;
 	Xapian::MSetIterator mset_iter;
+	Xapian::MSet m;
+	bool init:1;
+	bool main_query:1;
 };
 
 static int
@@ -234,6 +249,7 @@ void fts_flatcurve_xapian_deinit(struct flatcurve_fts_backend *backend)
 	struct flatcurve_xapian *x = backend->xapian;
 	const char *error;
 
+	i_assert(x != NULL);
 	x->deinit = TRUE;
 	if (hash_table_is_created(x->optimize)) {
 		struct hash_iterate_context *iter =
@@ -494,8 +510,8 @@ static bool
 fts_flatcurve_xapian_need_optimize(struct flatcurve_fts_backend *backend)
 {
 	if (backend->fuser == NULL) return FALSE;
-	if (backend->fuser->set.optimize_limit == 0) return FALSE;
-	return backend->xapian->shards >= backend->fuser->set.optimize_limit;
+	if (backend->fuser->set->optimize_limit == 0) return FALSE;
+	return backend->xapian->shards >= backend->fuser->set->optimize_limit;
 }
 
 static void
@@ -577,19 +593,31 @@ fts_flatcurve_xapian_db_add(struct flatcurve_fts_backend *backend,
 static int fts_flatcurve_xapian_lock(struct flatcurve_fts_backend *backend,
 				     const char **error_r)
 {
+	struct file_create_settings set;
 	struct flatcurve_xapian *x = backend->xapian;
 
-	if (x->lock_path == NULL)
-		x->lock_path = p_strdup_printf(
-			x->pool, "%s" FLATCURVE_XAPIAN_LOCK_FNAME,
-			str_c(backend->db_path));
-
-	struct file_create_settings set;
 	i_zero(&set);
 	set.lock_timeout_secs = FLATCURVE_XAPIAN_LOCK_TIMEOUT_SECS;
 	set.lock_settings.close_on_free = TRUE;
 	set.lock_settings.unlink_on_free = TRUE;
 	set.lock_settings.lock_method = backend->parsed_lock_method;
+
+	if (x->lock_path == NULL) {
+		if (backend->volatile_dir != NULL && str_len(backend->volatile_dir) > 0) {
+			unsigned char db_path_hash[MD5_RESULTLEN];
+			md5_get_digest(str_c(backend->db_path), str_len(backend->db_path),
+				db_path_hash);
+			x->lock_path = p_strdup_printf(
+				x->pool, "%s/" FLATCURVE_XAPIAN_LOCK_FNAME ".%s",
+				str_c(backend->volatile_dir),
+				binary_to_hex(db_path_hash, sizeof(db_path_hash)));
+			set.mkdir_mode = 0700;
+		} else {
+			x->lock_path = p_strdup_printf(
+				x->pool, "%s" FLATCURVE_XAPIAN_LOCK_FNAME,
+				str_c(backend->db_path));
+		}
+	}
 
 	bool created;
 	return file_create_locked(x->lock_path, &set, &x->lock, &created, error_r);
@@ -600,7 +628,7 @@ static void fts_flatcurve_xapian_unlock(struct flatcurve_fts_backend *backend)
 	file_lock_free(&backend->xapian->lock);
 }
 
-/* Returns: 0 if read DB is null, 1 if database has been addeds, -1 on error */
+/* Returns: 0 if read DB is null, 1 if database has been added, -1 on error */
 static int
 fts_flatcurve_xapian_db_read_add(struct flatcurve_fts_backend *backend,
 				 struct flatcurve_xapian_db *xdb,
@@ -1265,17 +1293,17 @@ fts_flatcurve_xapian_check_commit_limit(struct flatcurve_fts_backend *backend,
 	++xdb->changes;
 
 	if (xdb->type == FLATCURVE_XAPIAN_DB_TYPE_CURRENT &&
-	    fuser->set.rotate_count > 0 &&
-	    xdb->dbw->get_doccount() >= fuser->set.rotate_count) {
+	    fuser->set->rotate_count > 0 &&
+	    xdb->dbw->get_doccount() >= fuser->set->rotate_count) {
 		return fts_flatcurve_xapian_close_db(
 			backend, xdb, FLATCURVE_XAPIAN_DB_CLOSE_ROTATE, error_r);
 	}
 
-	if (fuser->set.commit_limit > 0 &&
-	    x->doc_updates >= fuser->set.commit_limit) {
+	if (fuser->set->commit_limit > 0 &&
+	    x->doc_updates >= fuser->set->commit_limit) {
 		e_debug(backend->event,
 			"Committing DB as update limit was reached; limit=%d",
-			fuser->set.commit_limit);
+			fuser->set->commit_limit);
 		return fts_flatcurve_xapian_close_dbs(
 			backend, FLATCURVE_XAPIAN_DB_CLOSE_WDB_COMMIT, error_r);
 	}
@@ -1353,7 +1381,7 @@ fts_flatcurve_xapian_close_db(struct flatcurve_fts_backend *backend,
 				       FLATCURVE_XAPIAN_DB_CLOSE_MBOX)) {
 			int ret = 0;
 			try {
-				/* even if xapian documetation states that close
+				/* even if xapian documentation states that close
 				auto-commits, GlassWritableDatabase::close() can
 				fail to actually close the db if commit fails.
 				We explicitly commit before invoking close to
@@ -1387,11 +1415,10 @@ fts_flatcurve_xapian_close_db(struct flatcurve_fts_backend *backend,
 	if (commit) {
 		struct timeval now;
 		i_gettimeofday(&now);
-		unsigned int elapsed =
-			(unsigned int) timeval_diff_msecs(&now, &start);
+		long long elapsed = timeval_diff_msecs(&now, &start);
 		if (xdb->changes > 0)
 			e_debug(backend->event, "Committed %u changes to DB "
-				"(RW, %s) in %u.%03u secs", xdb->changes,
+				"(RW, %s) in %lld.%03lld secs", xdb->changes,
 				xdb->dbpath->fname, elapsed / 1000, elapsed % 1000);
 
 		xdb->changes = 0;
@@ -1399,8 +1426,8 @@ fts_flatcurve_xapian_close_db(struct flatcurve_fts_backend *backend,
 
 		if (xdb->type == FLATCURVE_XAPIAN_DB_TYPE_CURRENT) {
 			if (HAS_ALL_BITS(opts, FLATCURVE_XAPIAN_DB_CLOSE_ROTATE) ||
-				(backend->fuser->set.rotate_time > 0 &&
-				 elapsed > backend->fuser->set.rotate_time))
+				(backend->fuser->set->rotate_time > 0 &&
+				 elapsed > backend->fuser->set->rotate_time))
 				rotate = TRUE;
 		}
 	}
@@ -1412,9 +1439,15 @@ fts_flatcurve_xapian_close_db(struct flatcurve_fts_backend *backend,
 			e_error(backend->event, "%s", error);
 		else {
 			const char *fname = p_strdup(x->pool, xdb->dbpath->fname);
-			enum flatcurve_xapian_db_close flags =
+			/* When rotating, we need to open RW for Xapian to
+			 * create the new shard, but immediately close the
+			 * RW handle since there is no imminent write, and
+			 * failure to do so may cause locking issues with
+			 * other processes. */
+			const auto flags =
 				(enum flatcurve_xapian_db_close)
-				(opts & FLATCURVE_XAPIAN_DB_CLOSE_MBOX);
+				((opts & FLATCURVE_XAPIAN_DB_CLOSE_MBOX) |
+					 FLATCURVE_XAPIAN_DB_CLOSE_WDB);
 			if (fts_flatcurve_xapian_create_current(
 				backend, flags, &error) < 0)
 				e_error(backend->event, "Error rotating DB (%s)",
@@ -1561,8 +1594,10 @@ int fts_flatcurve_xapian_uid_exists(struct flatcurve_fts_backend *backend,
 			(FLATCURVE_XAPIAN_DB_NOCREATE_CURRENT |
 			 FLATCURVE_XAPIAN_DB_IGNORE_EMPTY);
 
-	if (fts_flatcurve_xapian_read_db(backend, opts, NULL, error_r) <= 0)
-		return -1;
+	int ret = fts_flatcurve_xapian_read_db(backend, opts, NULL, error_r);
+	if (ret <= 0)
+		return ret;
+
 	return fts_flatcurve_xapian_uid_exists_db(backend, uid, NULL, error_r);
 }
 
@@ -1659,7 +1694,6 @@ fts_flatcurve_xapian_index_header(struct flatcurve_fts_backend_update_context *c
 		if (ctx->indexed_hdr)
 			hdr_name = str_ucase(hdr_name);
 
-
 		string_t *all_term = t_str_new(size);
 		string_t *hdr_term = t_str_new(size + strlen(hdr_name));
 		str_append(hdr_term, FLATCURVE_XAPIAN_HEADER_PREFIX);
@@ -1669,7 +1703,7 @@ fts_flatcurve_xapian_index_header(struct flatcurve_fts_backend_update_context *c
 		const unsigned char *end = data + size;
 		for(; end > data; data += uni_utf8_char_bytes((unsigned char) *data)) {
 			size_t len = end - data;
-			if (len < fuser->set.min_term_size)
+			if (len < fuser->set->min_term_size)
 				break;
 
 			/* Capital ASCII letters at the beginning of a Xapian
@@ -1691,7 +1725,7 @@ fts_flatcurve_xapian_index_header(struct flatcurve_fts_backend_update_context *c
 				x->doc->add_term(str_c(hdr_term));
 			}
 
-			if (!fuser->set.substring_search)
+			if (!fuser->set->substring_search)
 				break;
 		}
 	} T_END;
@@ -1720,7 +1754,7 @@ fts_flatcurve_xapian_index_body(struct flatcurve_fts_backend_update_context *ctx
 		const char *end = data + str_len(term);
 		for(; end > data; data += uni_utf8_char_bytes((unsigned char) *data)) {
 			size_t len = end - data;
-			if (len < fuser->set.min_term_size)
+			if (len < fuser->set->min_term_size)
 				break;
 
 			/* Capital ASCII letters at the beginning of a Xapian term are
@@ -1730,7 +1764,7 @@ fts_flatcurve_xapian_index_body(struct flatcurve_fts_backend_update_context *ctx
 			*data = i_tolower(*data);
 			x->doc->add_term(data);
 
-			if (!fuser->set.substring_search)
+			if (!fuser->set->substring_search)
 				break;
 		}
 	} T_END;
@@ -1875,8 +1909,8 @@ fts_flatcurve_xapian_optimize_box_do(struct flatcurve_fts_backend *backend,
 
 	int ret = 0;
 	while (fts_flatcurve_xapian_db_iter_next(iter)) {
-		if (iter->type != FLATCURVE_XAPIAN_DB_TYPE_OPTIMIZE &&
-		    iter->type != FLATCURVE_XAPIAN_DB_TYPE_LOCK) {
+		if (iter->type == FLATCURVE_XAPIAN_DB_TYPE_INDEX ||
+		    iter->type == FLATCURVE_XAPIAN_DB_TYPE_CURRENT) {
 			if (fts_flatcurve_xapian_delete(
 				backend, iter->path, error_r) < 0) {
 				ret = -1;
@@ -1902,8 +1936,8 @@ fts_flatcurve_xapian_optimize_box_do(struct flatcurve_fts_backend *backend,
 
 	struct timeval now;
 	i_gettimeofday(&now);
-	unsigned int elapsed = (unsigned int) timeval_diff_msecs(&now, &start);
-	e_debug(backend->event, "Optimized DB in %u.%03u secs",
+	long long elapsed = timeval_diff_msecs(&now, &start);
+	e_debug(backend->event, "Optimized DB in %lld.%03lld secs",
 				elapsed / 1000, elapsed % 1000);
 
 	return 0;
@@ -1957,12 +1991,14 @@ fts_flatcurve_build_query_arg_term(struct flatcurve_fts_query *query,
 				   const char *term)
 {
 	const char *hdr;
+	bool maybe_or = FALSE;
+	struct flatcurve_fts_query_xapian_maybe *mquery;
 	Xapian::Query::op op = Xapian::Query::OP_INVALID;
 	Xapian::Query *oldq, q;
 	struct flatcurve_fts_query_xapian *x = query->xapian;
 
-	if (x->query != NULL) {
-		if ((query->flags & FTS_LOOKUP_FLAG_AND_ARGS) != 0) {
+	if (x->start) {
+		if (x->and_search) {
 			op = Xapian::Query::OP_AND;
 			str_append(query->qtext, " AND ");
 		} else {
@@ -1970,6 +2006,7 @@ fts_flatcurve_build_query_arg_term(struct flatcurve_fts_query *query,
 			str_append(query->qtext, " OR ");
 		}
 	}
+	x->start = TRUE;
 
 	if (arg->match_not)
 		str_append(query->qtext, "NOT ");
@@ -2021,7 +2058,10 @@ fts_flatcurve_build_query_arg_term(struct flatcurve_fts_query *query,
 				 * appears in the general pool of header
 				 * terms for the message, not to a specific
 				 * header, so this is only a maybe match. */
-				query->maybe = TRUE;
+				if (x->and_search)
+					x->maybe = TRUE;
+				else
+					maybe_or = TRUE;
 			}
 		} else {
 			hdr = t_str_lcase(arg->hdr_field_name);
@@ -2039,9 +2079,17 @@ fts_flatcurve_build_query_arg_term(struct flatcurve_fts_query *query,
 		q = Xapian::Query(Xapian::Query::OP_AND_NOT,
 				  Xapian::Query::MatchAll, q);
 
-	if (x->query == NULL)
+	if (maybe_or) {
+		/* Maybe searches are not added to the "master search" query if this
+		 * is an OR search; they will be run independently. Matches will be
+		 * placed in the maybe results array. */
+		if (!array_is_created(&x->maybe_queries))
+			p_array_init(&x->maybe_queries, query->pool, 4);
+		mquery = array_append_space(&x->maybe_queries);
+		mquery->query = new Xapian::Query(std_move(q));
+	} else if (x->query == NULL) {
 		x->query = new Xapian::Query(std_move(q));
-	else {
+	} else {
 		oldq = x->query;
 		x->query = new Xapian::Query(op, *(x->query), q);
 		delete(oldq);
@@ -2118,6 +2166,7 @@ void fts_flatcurve_xapian_build_query(struct flatcurve_fts_query *query)
 	struct mail_search_arg *args;
 
 	query->xapian = p_new(query->pool, struct flatcurve_fts_query_xapian, 1);
+	query->xapian->and_search = ((query->flags & FTS_LOOKUP_FLAG_AND_ARGS) != 0);
 	for (args = query->args; args != NULL ; args = args->next)
 		fts_flatcurve_build_query_arg(query, args);
 }
@@ -2127,6 +2176,8 @@ fts_flatcurve_xapian_query_iter_init(struct flatcurve_fts_query *query)
 {
 	struct fts_flatcurve_xapian_query_iter *iter;
 	iter = new fts_flatcurve_xapian_query_iter();
+	iter->init = FALSE;
+	iter->main_query = TRUE;
 	iter->query = query;
 	iter->result = p_new(query->pool,
 			     struct fts_flatcurve_xapian_query_result, 1);
@@ -2143,26 +2194,53 @@ fts_flatcurve_xapian_query_iter_next(struct fts_flatcurve_xapian_query_iter *ite
 	if (iter->error != NULL)
 		return FALSE;
 
-	Xapian::MSet m;
-	if (iter->enquire == NULL) {
-		if (iter->query->xapian->query == NULL)
+	if (!iter->init) {
+		iter->init = TRUE;
+
+		Xapian::Query *q = NULL, maybe;
+		if (iter->main_query) {
+			if (iter->query->xapian->query == NULL)
+				iter->main_query = FALSE;
+			else
+				q = iter->query->xapian->query;
+		}
+
+		/* Maybe queries. */
+		if (!iter->main_query &&
+		    array_not_empty(&iter->query->xapian->maybe_queries)) {
+			const struct flatcurve_fts_query_xapian_maybe *mquery;
+			maybe = Xapian::Query();
+			array_foreach(&iter->query->xapian->maybe_queries, mquery)
+				maybe = Xapian::Query(Xapian::Query::OP_OR, maybe,
+						      *mquery->query);
+			/* Add main query to merge Xapian scores correctly. */
+			if (iter->query->xapian->query != NULL)
+				maybe = Xapian::Query(Xapian::Query::OP_AND_MAYBE, maybe,
+						      *iter->query->xapian->query);
+			q = &maybe;
+		}
+
+		if (q == NULL)
 			return FALSE;
 
-		const char *error;
-		int ret = fts_flatcurve_xapian_read_db(
-			iter->query->backend, opts, &iter->db, &error);
-		if (ret < 0)
-			iter->error = i_strdup(error);
-		if (ret <= 0)
-			return FALSE;
+		if (iter->db == NULL) {
+			const char *error;
+			int ret = fts_flatcurve_xapian_read_db(
+				iter->query->backend, opts, &iter->db, &error);
+			if (ret < 0)
+				iter->error = i_strdup(error);
+			if (ret <= 0)
+				return FALSE;
+		}
 
-		iter->enquire = new Xapian::Enquire(*iter->db);
-		iter->enquire->set_docid_order(
-				Xapian::Enquire::DONT_CARE);
-		iter->enquire->set_query(*iter->query->xapian->query);
+		if (iter->enquire == NULL) {
+			iter->enquire = new Xapian::Enquire(*iter->db);
+			iter->enquire->set_docid_order(Xapian::Enquire::DONT_CARE);
+		}
+		iter->enquire->set_query(*q);
 
 		try {
-			m = iter->enquire->get_mset(0, iter->db->get_doccount());
+			iter->m = iter->enquire->get_mset(0, iter->db->get_doccount());
 		} catch (Xapian::DatabaseModifiedError &e) {
 			/* Per documentation, this is only thrown if more than
 			 * one change has been made to the database. To
@@ -2176,12 +2254,17 @@ fts_flatcurve_xapian_query_iter_next(struct fts_flatcurve_xapian_query_iter *ite
 			i_unreached();
 		}
 
-		iter->mset_iter = m.begin();
+		iter->mset_iter = iter->m.begin();
 	}
 
-	if (iter->mset_iter == m.end())
-		return FALSE;
+	if (iter->mset_iter == iter->m.end()) {
+		if (!iter->main_query)
+			return FALSE;
+		iter->init = iter->main_query = FALSE;
+		return fts_flatcurve_xapian_query_iter_next(iter, result_r);
+	}
 
+	iter->result->maybe = !iter->main_query;
 	iter->result->score = iter->mset_iter.get_weight();
 	/* MSet docid can be an "interleaved" docid generated by
 	 * Xapian::Database when handling multiple DBs at once. Instead, we
@@ -2227,10 +2310,18 @@ int fts_flatcurve_xapian_run_query(struct flatcurve_fts_query *query,
 
 	iter = fts_flatcurve_xapian_query_iter_init(query);
 	while (fts_flatcurve_xapian_query_iter_next(iter, &result)) {
-		seq_range_array_add(&r->uids, result->uid);
-		score = array_append_space(&r->scores);
-		score->score = (float)result->score;
-		score->uid = result->uid;
+		bool add_score = TRUE;
+		if (result->maybe || query->xapian->maybe) {
+			add_score = !seq_range_exists(&r->uids, result->uid) &&
+				    !seq_range_exists(&r->maybe_uids, result->uid);
+			seq_range_array_add(&r->maybe_uids, result->uid);
+		} else
+			seq_range_array_add(&r->uids, result->uid);
+		if (add_score) {
+			score = array_append_space(&r->scores);
+			score->score = (float)result->score;
+			score->uid = result->uid;
+		}
 	}
 	return fts_flatcurve_xapian_query_iter_deinit(&iter, error_r);
 }
@@ -2238,6 +2329,14 @@ int fts_flatcurve_xapian_run_query(struct flatcurve_fts_query *query,
 void fts_flatcurve_xapian_destroy_query(struct flatcurve_fts_query *query)
 {
 	delete(query->xapian->query);
+
+	if (array_is_created(&query->xapian->maybe_queries)) {
+		struct flatcurve_fts_query_xapian_maybe *mquery;
+		array_foreach_modifiable(&query->xapian->maybe_queries, mquery) {
+			delete(mquery->query);
+		}
+		array_free(&query->xapian->maybe_queries);
+	}
 }
 
 const char *fts_flatcurve_xapian_library_version()

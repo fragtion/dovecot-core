@@ -25,27 +25,55 @@ struct dict_sql_map {
 	const char *value_field;
 	const char *value_type;
 	const char *expire_field;
-	bool value_hexblob;
 
 	/* SQL field names, one for each $ variable in the pattern */
 	ARRAY(struct dict_sql_field) pattern_fields;
 
 	/* generated: */
 	unsigned int values_count;
-	const char *const *value_fields;
 	const enum dict_sql_type *value_types;
 };
 
-struct dict_sql_settings {
-	const char *connect;
+struct dict_map_key_field_settings {
+	pool_t pool;
 
-	unsigned int max_pattern_fields_count;
+	const char *name;
+	const char *type;
+	const char *value;
+};
+
+struct dict_map_value_field_settings {
+	pool_t pool;
+
+	const char *name;
+	const char *type;
+};
+
+struct dict_map_settings {
+	pool_t pool;
+
+	const char *pattern;
+	const char *sql_table;
+	const char *username_field;
+	const char *expire_field;
+	ARRAY_TYPE(const_string) fields;
+	ARRAY_TYPE(const_string) values;
+
+	ARRAY_TYPE(const_string) maps;
+};
+
+struct dict_sql_map_settings {
+	pool_t pool;
 	ARRAY(struct dict_sql_map) maps;
 };
 
-struct dict_sql_settings *
-dict_sql_settings_read(const char *path, const char **error_r);
+extern const char *dict_sql_type_names[];
+extern const struct setting_parser_info dict_map_key_field_setting_parser_info;
+extern const struct setting_parser_info dict_map_value_field_setting_parser_info;
+extern const struct setting_parser_info dict_map_setting_parser_info;
 
-void dict_sql_settings_deinit(void);
+int dict_sql_settings_get(struct event *event,
+			  struct dict_sql_map_settings **set_r,
+			  const char **error_r);
 
 #endif

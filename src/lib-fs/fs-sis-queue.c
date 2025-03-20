@@ -4,7 +4,13 @@
 #include "str.h"
 #include "istream.h"
 #include "ostream.h"
+#include "settings.h"
 #include "fs-sis-common.h"
+
+struct fs_sis_queue_settings {
+	pool_t pool;
+	const char *fs_sis_queue_path;
+};
 
 struct sis_queue_fs {
 	struct fs fs;
@@ -19,6 +25,28 @@ struct sis_queue_fs_file {
 #define SISQUEUE_FS(ptr)	container_of((ptr), struct sis_queue_fs, fs)
 #define SISQUEUE_FILE(ptr)	container_of((ptr), struct sis_queue_fs_file, file)
 
+#undef DEF
+#define DEF(type, name) \
+	SETTING_DEFINE_STRUCT_##type(#name, name, struct fs_sis_queue_settings)
+static const struct setting_define fs_sis_queue_setting_defines[] = {
+	DEF(STR, fs_sis_queue_path),
+
+	SETTING_DEFINE_LIST_END
+};
+static const struct fs_sis_queue_settings fs_sis_queue_default_settings = {
+	.fs_sis_queue_path = "",
+};
+
+const struct setting_parser_info fs_sis_queue_setting_parser_info = {
+	.name = "fs_sis_queue",
+
+	.defines = fs_sis_queue_setting_defines,
+	.defaults = &fs_sis_queue_default_settings,
+
+	.struct_size = sizeof(struct fs_sis_queue_settings),
+	.pool_offset1 = 1 + offsetof(struct fs_sis_queue_settings, pool),
+};
+
 static struct fs *fs_sis_queue_alloc(void)
 {
 	struct sis_queue_fs *fs;
@@ -29,31 +57,19 @@ static struct fs *fs_sis_queue_alloc(void)
 }
 
 static int
-fs_sis_queue_init(struct fs *_fs, const char *args,
-		  const struct fs_settings *set, const char **error_r)
+fs_sis_queue_init(struct fs *_fs, const struct fs_parameters *params,
+		  const char **error_r)
 {
 	struct sis_queue_fs *fs = SISQUEUE_FS(_fs);
-	const char *p, *parent_name, *parent_args;
+	const struct fs_sis_queue_settings *set;
 
-	/* <queue_dir>:<parent fs>[:<args>] */
-
-	p = strchr(args, ':');
-	if (p == NULL || p[1] == '\0') {
-		*error_r = "Parent filesystem not given as parameter";
+	if (settings_get(_fs->event, &fs_sis_queue_setting_parser_info, 0,
+			 &set, error_r) < 0)
 		return -1;
-	}
+	fs->queue_dir = i_strdup(set->fs_sis_queue_path);
+	settings_free(set);
 
-	fs->queue_dir = i_strdup_until(args, p);
-	parent_name = p + 1;
-
-	parent_args = strchr(parent_name, ':');
-	if (parent_args == NULL)
-		parent_args = "";
-	else
-		parent_name = t_strdup_until(parent_name, parent_args++);
-	if (fs_init(parent_name, parent_args, set, &_fs->parent, error_r) < 0)
-		return -1;
-	return 0;
+	return fs_init_parent(_fs, params, error_r);
 }
 
 static void fs_sis_queue_free(struct fs *_fs)

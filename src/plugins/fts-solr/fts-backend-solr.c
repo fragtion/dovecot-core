@@ -29,8 +29,13 @@
 
 #define SOLR_QUERY_MAX_MAILBOX_COUNT 10
 
+struct event_category event_category_fts_solr = {
+	.name = "fts-solr",
+	.parent = &event_category_fts
+};
 struct solr_fts_backend {
 	struct fts_backend backend;
+	struct event *event;
 	struct solr_connection *solr_conn;
 };
 
@@ -180,21 +185,18 @@ static int
 fts_backend_solr_init(struct fts_backend *_backend, const char **error_r)
 {
 	struct solr_fts_backend *backend = (struct solr_fts_backend *)_backend;
-	struct fts_solr_user *fuser = FTS_SOLR_USER_CONTEXT(_backend->ns->user);
-	struct ssl_iostream_settings ssl_set;
+	struct fts_solr_user *fuser;
 
-	if (fuser == NULL) {
-		*error_r = "Invalid fts_solr setting";
+	backend->event = event_create(_backend->event);
+	event_add_category(backend->event, &event_category_fts_solr);
+
+	if (fts_solr_mail_user_get(_backend->ns->user, backend->event,
+				   &fuser, error_r) < 0) {
+		event_unref(&backend->event);
 		return -1;
 	}
-	if (fuser->set.use_libfts) {
-		/* change our flags so we get proper input */
-		_backend->flags &= ENUM_NEGATE(FTS_BACKEND_FLAG_FUZZY_SEARCH);
-		_backend->flags |= FTS_BACKEND_FLAG_TOKENIZED_INPUT;
-	}
 
-	mail_user_init_ssl_client_settings(_backend->ns->user, &ssl_set);
-	return solr_connection_init(&fuser->set, &ssl_set, _backend->event,
+	return solr_connection_init(fuser->set, backend->event,
 				    &backend->solr_conn, error_r);
 }
 
@@ -202,7 +204,9 @@ static void fts_backend_solr_deinit(struct fts_backend *_backend)
 {
 	struct solr_fts_backend *backend = (struct solr_fts_backend *)_backend;
 
-	solr_connection_deinit(&backend->solr_conn);
+	if (backend->solr_conn != NULL)
+		solr_connection_deinit(&backend->solr_conn);
+	event_unref(&backend->event);
 	i_free(backend);
 }
 
@@ -389,7 +393,7 @@ static int fts_backend_solr_commit(struct solr_fts_backend_update_context *ctx)
 	struct fts_solr_user *fuser =
 		FTS_SOLR_USER_CONTEXT_REQUIRE(ctx->ctx.backend->ns->user);
 
-	if (!fuser->set.soft_commit)
+	if (!fuser->set->soft_commit)
 		return 0;
 
 	const char *str = t_strdup_printf(
@@ -506,7 +510,7 @@ fts_backend_solr_uid_changed(struct solr_fts_backend_update_context *ctx,
 	struct fts_solr_user *fuser =
 		FTS_SOLR_USER_CONTEXT_REQUIRE(ctx->ctx.backend->ns->user);
 
-	if (ctx->mails_since_flush >= fuser->set.batch_size) {
+	if (ctx->mails_since_flush >= fuser->set->batch_size) {
 		if (fts_backed_solr_build_flush(ctx) < 0)
 			ctx->ctx.failed = TRUE;
 	}
@@ -846,13 +850,11 @@ fts_backend_solr_lookup(struct fts_backend *_backend, struct mailbox *box,
 
 	str = t_str_new(256);
 	str_printfa(str, "wt=xml&fl=uid,score&rows=%u&sort=uid+asc&q=%%7b!lucene+q.op%%3dAND%%7d",
-		    status.uidnext);
+		    I_MIN(status.uidnext, SOLR_MAX_MULTI_ROWS));
 	prefix_len = str_len(str);
 
 	if (solr_add_definite_query_args(str, args, and_args)) {
-		ARRAY_TYPE(seq_range) *uids_arr =
-			(flags & FTS_LOOKUP_FLAG_NO_AUTO_FUZZY) == 0 ?
-			&result->definite_uids : &result->maybe_uids;
+		ARRAY_TYPE(seq_range) *uids_arr = &result->definite_uids;
 		if (solr_search(_backend, str, box_guid,
 				uids_arr, &result->scores) < 0)
 			return -1;
@@ -869,10 +871,9 @@ fts_backend_solr_lookup(struct fts_backend *_backend, struct mailbox *box,
 
 static int
 solr_search_multi(struct fts_backend *_backend, string_t *str,
-		  struct mailbox *const boxes[], enum fts_lookup_flags flags,
-		  struct fts_multi_result *result)
+		  struct mailbox *const boxes[], struct fts_multi_result *result)
 {
-	struct event *event = _backend->ns->user->event;
+	struct event *event = _backend->ns->list->event;
 	struct solr_fts_backend *backend = (struct solr_fts_backend *)_backend;
 	struct solr_result **solr_results;
 	struct fts_result *fts_result;
@@ -933,10 +934,7 @@ solr_search_multi(struct fts_backend *_backend, string_t *str,
 		}
 		fts_result = array_append_space(&fts_results);
 		fts_result->box = box;
-		if ((flags & FTS_LOOKUP_FLAG_NO_AUTO_FUZZY) == 0)
-			fts_result->definite_uids = solr_results[i]->uids;
-		else
-			fts_result->maybe_uids = solr_results[i]->uids;
+		fts_result->definite_uids = solr_results[i]->uids;
 		fts_result->scores = solr_results[i]->scores;
 		fts_result->scores_sorted = TRUE;
 	}
@@ -961,7 +959,7 @@ fts_backend_solr_lookup_multi(struct fts_backend *backend,
 		    SOLR_MAX_MULTI_ROWS);
 
 	if (solr_add_definite_query_args(str, args, and_args)) {
-		if (solr_search_multi(backend, str, boxes, flags, result) < 0)
+		if (solr_search_multi(backend, str, boxes, result) < 0)
 			return -1;
 	}
 	/* FIXME: maybe_uids could be handled also with some more work.. */

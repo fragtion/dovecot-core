@@ -14,6 +14,7 @@
 #include "master-service.h"
 #include "auth-request.h"
 #include "auth-worker-server.h"
+#include "db-oauth2.h"
 
 
 #define AUTH_WORKER_WARN_DISCONNECTED_LONG_CMD_SECS 30
@@ -23,8 +24,8 @@
 #define WORKER_STATE_IDLE "idling"
 #define WORKER_STATE_STOP "waiting for shutdown"
 
-static unsigned int auth_worker_max_service_count = 0;
-static unsigned int auth_worker_service_count = 0;
+static unsigned int auth_worker_max_restart_request_count = 0;
+static unsigned int auth_worker_restart_request_count = 0;
 
 struct auth_worker_server {
 	struct connection conn;
@@ -32,6 +33,7 @@ struct auth_worker_server {
 
 	struct auth *auth;
 	struct event *event;
+	struct db_oauth2 *oauth2;
 	time_t cmd_start;
 
 	bool error_sent:1;
@@ -58,9 +60,9 @@ static int auth_worker_output(struct auth_worker_server *server);
 static void auth_worker_server_destroy(struct connection *conn);
 static void auth_worker_server_unref(struct auth_worker_server **_client);
 
-void auth_worker_set_max_service_count(unsigned int count)
+void auth_worker_set_max_restart_request_count(unsigned int count)
 {
-	auth_worker_max_service_count = count;
+	auth_worker_max_restart_request_count = count;
 }
 
 static struct auth_worker_server *auth_worker_get_client(void)
@@ -151,8 +153,9 @@ bool auth_worker_auth_request_new(struct auth_worker_command *cmd, unsigned int 
 		}
 	}
 	if (auth_request->fields.user == NULL ||
-	    auth_request->fields.service == NULL) {
+	    auth_request->fields.protocol == NULL) {
 		auth_request_unref(&auth_request);
+		e_debug(cmd->event, "Invalid auth request: Missing user or service");
 		return FALSE;
 	}
 
@@ -230,7 +233,7 @@ static void verify_plain_callback(enum passdb_result result,
 	}
 	if (result != PASSDB_RESULT_INTERNAL_FAILURE) {
 		str_append_c(str, '\t');
-		if (request->user_changed_by_lookup)
+		if (request->user_returned_by_lookup)
 			str_append_tabescaped(str, request->fields.user);
 		str_append_c(str, '\t');
 		if (request->passdb_password != NULL)
@@ -347,8 +350,8 @@ auth_worker_handle_passw(struct auth_worker_command *cmd,
 
 	request->passdb = passdb;
 
-	ret = auth_request_password_verify(request, password,
-					   crypted, scheme, "cache");
+	ret = auth_request_password_verify(request, request->event, password,
+					   crypted, scheme);
 	str = t_str_new(128);
 	str_printfa(str, "%u\t", request->id);
 
@@ -390,7 +393,7 @@ lookup_credentials_callback(enum passdb_result result,
 			str_append(str, "NEXT\t");
 		else
 			str_append(str, "OK\t");
-		if (request->user_changed_by_lookup)
+		if (request->user_returned_by_lookup)
 			str_append_tabescaped(str, request->fields.user);
 		str_append_c(str, '\t');
 		if (request->wanted_credentials_scheme[0] != '\0') {
@@ -527,7 +530,7 @@ lookup_user_callback(enum userdb_result result,
 		break;
 	case USERDB_RESULT_OK:
 		str_append(str, "OK\t");
-		if (auth_request->user_changed_by_lookup)
+		if (auth_request->user_returned_by_lookup)
 			str_append_tabescaped(str, auth_request->fields.user);
 		/* export only the fields changed by this lookup */
 		auth_fields_append(auth_request->fields.userdb_reply, str,
@@ -589,9 +592,10 @@ auth_worker_handle_user(struct auth_worker_command *cmd,
 		return FALSE;
 	}
 
-	if (auth_request->fields.userdb_reply == NULL)
-		auth_request_init_userdb_reply(auth_request, TRUE);
 	auth_request_userdb_lookup_begin(auth_request);
+	if (auth_request->fields.userdb_reply == NULL)
+		auth_request_init_userdb_reply(auth_request);
+
 	auth_request->userdb->userdb->iface->
 		lookup(auth_request, lookup_user_callback);
 	return TRUE;
@@ -744,8 +748,8 @@ static bool auth_worker_verify_db_hash(const char *passdb_hash, const char *user
 	unsigned char passdb_md5[MD5_RESULTLEN];
 	unsigned char userdb_md5[MD5_RESULTLEN];
 
-	passdbs_generate_md5(passdb_md5);
-	userdbs_generate_md5(userdb_md5);
+	auth_passdbs_generate_md5(passdb_md5);
+	auth_userdbs_generate_md5(userdb_md5);
 
 	binary_to_hex_append(str, passdb_md5, sizeof(passdb_md5));
 	if (strcmp(str_c(str), passdb_hash) != 0)
@@ -754,6 +758,91 @@ static bool auth_worker_verify_db_hash(const char *passdb_hash, const char *user
 	binary_to_hex_append(str, userdb_md5, sizeof(userdb_md5));
 	return strcmp(str_c(str), userdb_hash) == 0;
 };
+
+static void auth_worker_handle_token_continue(struct db_oauth2_request *db_request,
+					      enum passdb_result result,
+					      const char *error,
+					      struct auth_request *auth_request)
+{
+	struct auth_worker_command *cmd = auth_request->context;
+	struct auth_worker_server *server = cmd->server;
+
+	/* send result */
+	string_t *str = t_str_new(128);
+	str_printfa(str, "%u\t", auth_request->id);
+
+	if (result != PASSDB_RESULT_OK && result != PASSDB_RESULT_NEXT)
+		str_printfa(str, "FAIL\t%d\t%s", result, error);
+	else {
+		str_printfa(str, "OK\t%d\t%s\t", result, db_request->username);
+		auth_request_set_field(auth_request, "token", db_request->token, "PLAIN");
+		reply_append_extra_fields(str, auth_request);
+	}
+	str_append_c(str, '\n');
+	auth_worker_send_reply(server, auth_request, str);
+	connection_input_resume(&cmd->server->conn);
+	auth_request_unref(&auth_request);
+	pool_unref(&db_request->pool);
+	if (error != NULL)
+		error = t_strconcat("oauth2 failed: ", error, NULL);
+	if (result == PASSDB_RESULT_INTERNAL_FAILURE)
+		e_error(auth_request->mech_event, "%s", error);
+	else if (result != PASSDB_RESULT_OK)
+		e_info(auth_request->mech_event, "%s", error);
+	auth_worker_request_finished(cmd, error);
+}
+
+static bool
+auth_worker_handler_oauth2_token(struct auth_worker_command *cmd, unsigned int id,
+				 const char *const *args, const char **error_r)
+{
+	const char *error;
+	const char *token = *args;
+	pool_t pool = pool_alloconly_create(MEMPOOL_GROWING"oauth2 request", 256);
+	struct db_oauth2_request *db_req =
+		p_new(pool, struct db_oauth2_request, 1);
+	db_req->pool = pool;
+
+	if (!auth_worker_auth_request_new(cmd, id, args + 1, &db_req->auth_request)) {
+		*error_r = "BUG: Auth server sent us invalid TOKEN request";
+		pool_unref(&pool);
+		return FALSE;
+	}
+
+	if (cmd->server->oauth2 == NULL) {
+		if (db_oauth2_init(cmd->event, FALSE, &cmd->server->oauth2, &error) < 0) {
+			e_error(cmd->event, "%s", error);
+			auth_worker_handle_token_continue(db_req,
+					PASSDB_RESULT_INTERNAL_FAILURE, error,
+					db_req->auth_request);
+			return TRUE;
+		}
+	}
+
+	connection_input_halt(&cmd->server->conn);
+	db_oauth2_lookup(cmd->server->oauth2, db_req, token, db_req->auth_request,
+			 auth_worker_handle_token_continue, db_req->auth_request);
+	return TRUE;
+}
+
+static bool
+auth_worker_handle_token(struct auth_worker_command *cmd, unsigned int id,
+			 const char *const *args, const char **error_r)
+{
+	if (args[0] == NULL) {
+		*error_r = "Invalid TOKEN request";
+		return FALSE;
+	}
+
+	if (strcmp(args[0], "OAUTH2") == 0)
+		return auth_worker_handler_oauth2_token(cmd, id, args + 1, error_r);
+	else {
+		*error_r =
+			t_strdup_printf("Invalid TOKEN request: Unsupported token type '%s'",
+					args[0]);
+	}
+	return FALSE;
+}
 
 static int auth_worker_server_handshake_args(struct connection *conn, const char *const *args)
 {
@@ -810,10 +899,10 @@ auth_worker_server_input_args(struct connection *conn, const char *const *args)
 	server->refcount++;
 	e_debug(cmd->event, "Handling %s request", args[1]);
 
-	/* Check if we have reached service_count */
-	if (auth_worker_max_service_count > 0) {
-		auth_worker_service_count++;
-		if (auth_worker_service_count >= auth_worker_max_service_count)
+	/* Check if we have reached restart_request_count */
+	if (auth_worker_max_restart_request_count > 0) {
+		auth_worker_restart_request_count++;
+		if (auth_worker_restart_request_count >= auth_worker_max_restart_request_count)
 			worker_restart_request = TRUE;
 	}
 
@@ -830,6 +919,8 @@ auth_worker_server_input_args(struct connection *conn, const char *const *args)
 		ret = auth_worker_handle_user(cmd, id, args + 2, &error);
 	else if (strcmp(args[1], "LIST") == 0)
 		ret = auth_worker_handle_list(cmd, id, args + 2, &error);
+	else if (strcmp(args[1], "TOKEN") == 0)
+		ret = auth_worker_handle_token(cmd, id, args + 2, &error);
 	else {
 		error = t_strdup_printf("BUG: Auth-worker received unknown command: %s",
 			args[1]);
@@ -928,7 +1019,8 @@ auth_worker_server_create(struct auth *auth,
 	server->refcount = 1;
 	server->auth = auth;
 	server->conn.event_parent = auth_event;
-	server->conn.input_idle_timeout_secs = master_service_get_idle_kill_secs(master_service);
+	server->conn.input_idle_timeout_secs =
+		master_service_get_idle_kill_interval_secs(master_service);
 	connection_init_server(clients, &server->conn, master_conn->name,
 			       master_conn->fd, master_conn->fd);
 	auth_worker_server_send_handshake(&server->conn);

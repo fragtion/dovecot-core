@@ -3,8 +3,11 @@ noinst_LTLIBRARIES = libprogram_client.la
 AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib \
 	-I$(top_srcdir)/src/lib-test \
-	-I$(top_srcdir)/src/lib-dns \
-	-I$(top_srcdir)/src/lib-mail
+	-I$(top_srcdir)/src/lib-dns-client \
+	-I$(top_srcdir)/src/lib-mail \
+	-I$(top_srcdir)/src/lib-settings \
+	-I$(top_srcdir)/src/lib-var-expand \
+	-DPKG_RUNDIR=\""$(rundir)"\"
 
 libprogram_client_la_SOURCES = \
 	program-client.c \
@@ -29,10 +32,14 @@ noinst_PROGRAMS = $(test_programs)
 
 test_libs = \
 	libprogram_client.la \
+	../lib-dns-client/libdns-client.la  \
 	../lib-dns/libdns.la  \
 	../lib-test/libtest.la \
 	../lib-mail/libmail.la \
+	../lib-settings/libsettings.la  \
+	../lib-dns/libdns.la \
 	../lib-charset/libcharset.la \
+	../lib-var-expand/libvar_expand.la \
 	../lib/liblib.la \
 	$(MODULE_LIBS)
 

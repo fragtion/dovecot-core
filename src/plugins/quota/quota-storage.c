@@ -3,6 +3,7 @@
 #include "lib.h"
 #include "array.h"
 #include "istream.h"
+#include "settings.h"
 #include "mail-search-build.h"
 #include "mail-storage-private.h"
 #include "mailbox-list-private.h"
@@ -60,6 +61,7 @@ static void quota_set_storage_error(struct quota_transaction_context *qt,
 		mail_storage_set_error(storage, MAIL_ERROR_LIMIT, errstr);
 		break;
 	case QUOTA_ALLOC_RESULT_OVER_QUOTA_LIMIT:
+	case QUOTA_ALLOC_RESULT_OVER_QUOTA_MAILBOX_LIMIT:
 	case QUOTA_ALLOC_RESULT_OVER_QUOTA:
 		mail_storage_set_error(storage, MAIL_ERROR_NOQUOTA, errstr);
 		break;
@@ -91,7 +93,7 @@ static void quota_mail_expunge(struct mail *_mail)
 	   the mail at the same time. In here we'll just save the message's
 	   physical size and do the quota freeing later when the message was
 	   known to be expunged. */
-	if (quser->quota->set->vsizes)
+	if (quser->quota->vsizes)
 		ret = mail_get_virtual_size(_mail, &size);
 	else
 		ret = mail_get_physical_size(_mail, &size);
@@ -116,6 +118,39 @@ static void quota_mail_expunge(struct mail *_mail)
 }
 
 static int
+quota_create_box(struct mailbox *box, const struct mailbox_update *update,
+		 bool directory)
+{
+	struct quota_mailbox *qbox = QUOTA_CONTEXT_REQUIRE(box);
+	const struct quota_settings *set;
+	unsigned int mailbox_count;
+	const char *error;
+
+	if (settings_get(box->event, &quota_setting_parser_info, 0,
+			 &set, &error) < 0) {
+		mailbox_set_critical(box, "%s", error);
+		return -1;
+	}
+	unsigned int quota_mailbox_count = set->quota_mailbox_count;
+	settings_free(set);
+
+	if (quota_mailbox_count == SET_UINT_UNLIMITED) {
+		/* no mailbox count limit */
+	} else if (mailbox_is_autocreated(box)) {
+		/* Always allow autocreated mailbox to be created.
+		   There shouldn't be many of them */
+	} else if (mailbox_list_get_count(box->list, &mailbox_count) < 0) {
+		mail_storage_copy_list_error(box->storage, box->list);
+		return -1;
+	} else if (mailbox_count >= quota_mailbox_count) {
+		mail_storage_set_error(box->storage, MAIL_ERROR_LIMIT,
+				       "Maximum number of mailboxes reached");
+		return -1;
+	}
+	return qbox->module_ctx.super.create_box(box, update, directory);
+}
+
+static int
 quota_get_status(struct mailbox *box, enum mailbox_status_items items,
 		 struct mailbox_status *status_r)
 {
@@ -126,7 +161,8 @@ quota_get_status(struct mailbox *box, enum mailbox_status_items items,
 	if ((items & STATUS_CHECK_OVER_QUOTA) != 0) {
 		qt = quota_transaction_begin(box);
 		const char *error;
-		enum quota_alloc_result qret = quota_test_alloc(qt, 0, &error);
+		enum quota_alloc_result qret =
+			quota_test_alloc(qt, 0, NULL, 0, NULL, &error);
 		if (qret != QUOTA_ALLOC_RESULT_OK) {
 			quota_set_storage_error(qt, box, qret, error);
 			ret = -1;
@@ -210,56 +246,18 @@ void quota_mail_allocated(struct mail *_mail)
 	MODULE_CONTEXT_SET_SELF(mail, quota_mail_module, qmail);
 }
 
-static bool
-quota_move_requires_check(struct mailbox *dest_box, struct mailbox *src_box)
-{
-	struct mail_namespace *src_ns = src_box->list->ns;
-	struct mail_namespace *dest_ns = dest_box->list->ns;
-	struct quota_user *quser = QUOTA_USER_CONTEXT_REQUIRE(src_ns->user);
-	struct quota_root *const *rootp;
-
-	array_foreach(&quser->quota->roots, rootp) {
-		bool have_src_quota, have_dest_quota;
-
-		have_src_quota = quota_root_is_namespace_visible(*rootp, src_ns);
-		have_dest_quota = quota_root_is_namespace_visible(*rootp, dest_ns);
-		if (have_src_quota == have_dest_quota) {
-			/* Both/neither have this quota */
-		} else if (have_dest_quota) {
-			/* Destination mailbox has a quota that doesn't exist
-			   in source. We'll need to check if it's being
-			   exceeded. */
-			return TRUE;
-		} else {
-			/* Source mailbox has a quota root that doesn't exist
-			   in destination. We're not increasing the source
-			   quota, so ignore it. */
-		}
-	}
-	return FALSE;
-}
-
-static int quota_check(struct mail_save_context *ctx, struct mailbox *src_box)
+static int quota_check(struct mail_save_context *ctx)
 {
 	struct mailbox_transaction_context *t = ctx->transaction;
 	struct quota_transaction_context *qt = QUOTA_CONTEXT_REQUIRE(t);
 	enum quota_alloc_result ret;
 
-	i_assert(!ctx->moving || src_box != NULL);
-
-	if (ctx->moving &&
-	     !quota_move_requires_check(ctx->transaction->box, src_box)) {
-		/* the mail is being moved. the quota won't increase (after
-		   the following expunge), so allow this even if user is
-		   currently over quota */
-		quota_alloc(qt, ctx->dest_mail);
+	if (qt->failed)
 		return 0;
-	} else if (qt->failed) {
-		return 0;
-	}
 
 	const char *error;
-	ret = quota_try_alloc(qt, ctx->dest_mail, &error);
+	ret = quota_try_alloc(qt, ctx->dest_mail, ctx->expunged_mail,
+			      NULL, &error);
 	switch (ret) {
 	case QUOTA_ALLOC_RESULT_OK:
 		return 0;
@@ -314,7 +312,7 @@ quota_copy(struct mail_save_context *ctx, struct mail *mail)
 		   quota */
 		return 0;
 	}
-	return quota_check(ctx, mail->box);
+	return quota_check(ctx);
 }
 
 static int
@@ -328,6 +326,9 @@ quota_save_begin(struct mail_save_context *ctx, struct istream *input)
 
 	if (!ctx->moving && i_stream_get_size(input, TRUE, &size) > 0 &&
 	    !qt->failed) {
+		struct mailbox *expunged_box = NULL;
+		uoff_t expunged_size = 0;
+
 		/* Input size is known, check for quota immediately. This
 		   check isn't perfect, especially because input stream's
 		   linefeeds may contain CR+LFs while physical message would
@@ -338,7 +339,29 @@ quota_save_begin(struct mail_save_context *ctx, struct istream *input)
 		   benefit of giving "out of quota" error before sending the
 		   full mail. */
 
-		enum quota_alloc_result qret = quota_test_alloc(qt, size, &error);
+		if (ctx->expunged_mail != NULL) {
+			struct mail *expmail = ctx->expunged_mail;
+			if (quota_get_mail_size(qt, expmail,
+						&expunged_size) < 0) {
+				enum mail_error err;
+				error = mailbox_get_last_internal_error(
+					expmail->box, &err);
+
+				if (err != MAIL_ERROR_EXPUNGED) {
+					e_error(qt->quota->event,
+						"Failed to get size for expunged mail"
+						"(box=%s, uid=%u): %s",
+						expmail->box->vname,
+						expmail->uid, error);
+				}
+			} else {
+				expunged_box = expmail->box;
+			}
+		}
+
+		enum quota_alloc_result qret =
+			quota_test_alloc(qt, size, expunged_box, expunged_size,
+					 NULL, &error);
 		switch (qret) {
 		case QUOTA_ALLOC_RESULT_OK:
 			/* Great, there is space. */
@@ -384,13 +407,11 @@ quota_save_begin(struct mail_save_context *ctx, struct istream *input)
 static int quota_save_finish(struct mail_save_context *ctx)
 {
 	struct quota_mailbox *qbox = QUOTA_CONTEXT_REQUIRE(ctx->transaction->box);
-	struct mailbox *src_box;
 
 	if (qbox->module_ctx.super.save_finish(ctx) < 0)
 		return -1;
 
-	src_box = ctx->copy_src_mail == NULL ? NULL : ctx->copy_src_mail->box;
-	return quota_check(ctx, src_box);
+	return quota_check(ctx);
 }
 
 static void quota_mailbox_sync_cleanup(struct quota_mailbox *qbox)
@@ -483,7 +504,7 @@ static void quota_mailbox_sync_notify(struct mailbox *box, uint32_t uid,
 		/* FIXME: it's not ideal that we do the vsize update here, but
 		   this is the easiest place for it for now.. maybe the mail
 		   size checking code could be moved to lib-storage */
-		if (ibox->vsize_update != NULL && quser->quota->set->vsizes)
+		if (ibox->vsize_update != NULL && quser->quota->vsizes)
 			index_mailbox_vsize_hdr_expunge(ibox->vsize_update, uid, *sizep);
 		return;
 	}
@@ -505,7 +526,7 @@ static void quota_mailbox_sync_notify(struct mailbox *box, uint32_t uid,
 	}
 	if (!mail_set_uid(qbox->expunge_qt->tmp_mail, uid))
 		;
-	else if (!quser->quota->set->vsizes) {
+	else if (!quser->quota->vsizes) {
 		if (mail_get_physical_size(qbox->expunge_qt->tmp_mail, &size) == 0) {
 			quota_free_bytes(qbox->expunge_qt, size);
 			return;
@@ -540,7 +561,7 @@ static void quota_roots_flush(struct quota *quota)
 	struct quota_root *const *roots;
 	unsigned int i, count;
 
-	roots = array_get(&quota->roots, &count);
+	roots = array_get(&quota->all_roots, &count);
 	for (i = 0; i < count; i++) {
 		if (roots[i]->backend.v.flush != NULL)
 			roots[i]->backend.v.flush(roots[i]);
@@ -595,6 +616,7 @@ void quota_mailbox_allocated(struct mailbox *box)
 	qbox->module_ctx.super = *v;
 	box->vlast = &qbox->module_ctx.super;
 
+	v->create_box = quota_create_box;
 	v->get_status = quota_get_status;
 	v->transaction_begin = quota_mailbox_transaction_begin;
 	v->transaction_commit = quota_mailbox_transaction_commit;
@@ -628,153 +650,103 @@ struct quota *quota_get_mail_user_quota(struct mail_user *user)
 static void quota_user_deinit(struct mail_user *user)
 {
 	struct quota_user *quser = QUOTA_USER_CONTEXT_REQUIRE(user);
-	struct quota_settings *quota_set = quser->quota->set;
 
 	quota_deinit(&quser->quota);
 	quser->module_ctx.super.deinit(user);
-
-	quota_settings_deinit(&quota_set);
 }
 
 void quota_mail_user_created(struct mail_user *user)
 {
 	struct mail_user_vfuncs *v = user->vlast;
 	struct quota_user *quser;
-	struct quota_settings *set;
 	struct quota *quota;
 	const char *error;
-	int ret;
 
-	if ((ret = quota_user_read_settings(user, &set, &error)) > 0) {
-		if (quota_init(set, user, &quota, &error) < 0) {
-			quota_settings_deinit(&set);
-			ret = -1;
-		}
-	}
-
-	if (ret < 0) {
+	if (quota_init(user, &quota, &error) < 0) {
 		user->error = p_strdup_printf(user->pool,
 			"Failed to initialize quota: %s", error);
 		return;
 	}
-	if (ret > 0) {
-		quser = p_new(user->pool, struct quota_user, 1);
-		quser->module_ctx.super = *v;
-		user->vlast = &quser->module_ctx.super;
-		v->deinit = quota_user_deinit;
-		quser->quota = quota;
+	quser = p_new(user->pool, struct quota_user, 1);
+	quser->module_ctx.super = *v;
+	user->vlast = &quser->module_ctx.super;
+	v->deinit = quota_user_deinit;
+	quser->quota = quota;
 
-		MODULE_CONTEXT_SET(user, quota_user_module, quser);
-	} else {
-		e_debug(user->event, "quota: No quota setting - plugin disabled");
-	}
+	MODULE_CONTEXT_SET(user, quota_user_module, quser);
 }
 
-static struct quota_root *
-quota_find_root_for_ns(struct quota *quota, struct mail_namespace *ns)
+static bool
+quota_has_global_private_root(struct quota *quota, const char *root_name)
 {
-	struct quota_root *const *roots;
-	unsigned int i, count;
-
-	roots = array_get(&quota->roots, &count);
-	for (i = 0; i < count; i++) {
-		if (roots[i]->ns_prefix != NULL &&
-		    strcmp(roots[i]->ns_prefix, ns->prefix) == 0)
-			return roots[i];
+	struct quota_root *root;
+	array_foreach_elem(&quota->global_private_roots, root) {
+		if (strcmp(root->set->quota_name, root_name) == 0)
+			return TRUE;
 	}
-	return NULL;
+	return FALSE;
 }
 
 void quota_mailbox_list_created(struct mailbox_list *list)
 {
 	struct quota_mailbox_list *qlist;
 	struct quota *quota = NULL;
-	struct quota_root *root;
 	struct mail_user *quota_user;
-	bool add;
+	const struct quota_settings *set;
+	const char *root_name, *error;
 
-	/* see if we have a quota explicitly defined for this namespace */
-	quota = quota_get_mail_user_quota(list->ns->user);
+	quota_user = list->ns->owner != NULL ?
+		list->ns->owner : list->ns->user;
+	quota = quota_get_mail_user_quota(quota_user);
 	if (quota == NULL)
 		return;
-	root = quota_find_root_for_ns(quota, list->ns);
-	if (root != NULL) {
-		/* explicit quota root */
-		root->ns = list->ns;
-		quota_user = list->ns->user;
-	} else {
-		quota_user = list->ns->owner != NULL ?
-			list->ns->owner : list->ns->user;
-	}
 
 	if ((list->ns->flags & NAMESPACE_FLAG_NOQUOTA) != 0)
-		add = FALSE;
-	else if (list->ns->owner == NULL) {
-		/* public namespace - add quota only if namespace is
-		   explicitly defined for it */
-		add = root != NULL;
-	} else {
-		/* for shared namespaces add only if the owner has quota
-		   enabled */
-		add = QUOTA_USER_CONTEXT(quota_user) != NULL;
+		return;
+
+	if (settings_get(list->event, &quota_setting_parser_info, 0,
+			 &set, &error) < 0) {
+		e_error(list->event, "%s", error);
+		return;
 	}
 
-	if (add) {
-		struct mailbox_list_vfuncs *v = list->vlast;
+	struct mailbox_list_vfuncs *v = list->vlast;
 
-		qlist = p_new(list->pool, struct quota_mailbox_list, 1);
-		qlist->module_ctx.super = *v;
-		list->vlast = &qlist->module_ctx.super;
-		v->deinit = quota_mailbox_list_deinit;
-		MODULE_CONTEXT_SET(list, quota_mailbox_list_module, qlist);
+	qlist = p_new(list->pool, struct quota_mailbox_list, 1);
+	qlist->module_ctx.super = *v;
+	list->vlast = &qlist->module_ctx.super;
+	v->deinit = quota_mailbox_list_deinit;
+	MODULE_CONTEXT_SET(list, quota_mailbox_list_module, qlist);
 
-		quota = quota_get_mail_user_quota(quota_user);
-		i_assert(quota != NULL);
-		quota_add_user_namespace(quota, list->ns);
-	}
-}
-
-static void quota_root_set_namespace(struct quota_root *root,
-				     struct mail_namespace *namespaces)
-{
-	const struct quota_rule *rule;
-	const char *name;
-	struct mail_namespace *ns;
-	/* silence errors for autocreated (shared) users */
-	bool silent_errors = namespaces->user->autocreated;
-
-	if (root->ns_prefix != NULL && root->ns == NULL) {
-		root->ns = mail_namespace_find_prefix(namespaces,
-						      root->ns_prefix);
-		if (root->ns == NULL && !silent_errors) {
-			e_error(root->quota->event,
-				"Unknown namespace: %s",
-				root->ns_prefix);
-		}
+	if (!array_is_created(&set->quota_roots)) {
+		/* even without quota roots, the quota plugin still enforces
+		   e.g. quota_mail_size, so the quota_mailbox_list must be
+		   set. */
+		settings_free(set);
+		return;
 	}
 
-	array_foreach(&root->set->rules, rule) {
-		name = rule->mailbox_mask;
-		ns = mail_namespace_find(namespaces, name);
-		if ((ns->flags & NAMESPACE_FLAG_UNUSABLE) != 0 &&
-		    !silent_errors)
-			e_error(root->quota->event,
-				"Unknown namespace: %s", name);
+	quota = quota_get_mail_user_quota(quota_user);
+	i_assert(quota != NULL);
+	array_foreach_elem(&set->quota_roots, root_name) {
+		/* All visible quota roots are used for private namespaces.
+		   For shared/public namespaces use only quota roots explicitly
+		   defined inside the namespace { .. } This means the quota root
+		   name is not in the global_private_roots array. */
+		if (list->ns->type == MAIL_NAMESPACE_TYPE_PRIVATE ||
+		    !quota_has_global_private_root(quota, root_name))
+			quota_add_user_namespace(quota, root_name, list->ns);
 	}
+	settings_free(set);
 }
 
 void quota_mail_namespaces_created(struct mail_namespace *namespaces)
 {
 	struct quota *quota;
-	struct quota_root *const *roots;
-	unsigned int i, count;
 
 	quota = quota_get_mail_user_quota(namespaces->user);
 	if (quota == NULL)
 		return;
-	roots = array_get(&quota->roots, &count);
-	for (i = 0; i < count; i++)
-		quota_root_set_namespace(roots[i], namespaces);
 
-	quota_over_flag_check_startup(quota);
+	quota_over_status_check_startup(quota);
 }

@@ -17,6 +17,11 @@ enum event_filter_code {
 	EVENT_FILTER_CODE_FIELD		= 'f',
 };
 
+enum cmp_flags {
+	CMP_FLAG_WILDCARD = BIT(1),
+	CMP_FLAG_CASE_SENSITIVE = BIT(2),
+};
+
 /* map <log type> to <event filter log type & name> */
 static const struct log_type_map {
 	enum event_filter_log_type log_type;
@@ -58,6 +63,11 @@ struct event_filter *event_filter_create(void)
 	return event_filter_create_real(pool_alloconly_create("event filter", 2048), FALSE);
 }
 
+struct event_filter *event_filter_create_with_pool(pool_t pool)
+{
+	return event_filter_create_real(pool, FALSE);
+}
+
 struct event_filter *event_filter_create_fragment(pool_t pool)
 {
 	return event_filter_create_real(pool, TRUE);
@@ -87,6 +97,28 @@ void event_filter_unref(struct event_filter **_filter)
 		/* fragments' pools are freed by the consumer */
 		pool_unref(&filter->pool);
 	}
+}
+
+static const char *
+wanted_field_value_str(const struct event_field *wanted_field)
+{
+	switch (wanted_field->value_type) {
+	case EVENT_FIELD_VALUE_TYPE_STR:
+		return wanted_field->value.str;
+	case EVENT_FIELD_VALUE_TYPE_INTMAX:
+		return t_strdup_printf("%jd", wanted_field->value.intmax);
+	case EVENT_FIELD_VALUE_TYPE_IP: {
+		const char *str = net_ip2addr(&wanted_field->value.ip);
+		if (wanted_field->value.ip_bits ==
+		    IPADDR_BITS(&wanted_field->value.ip))
+			return str;
+		return t_strdup_printf("%s/%u", str, wanted_field->value.ip_bits);
+	}
+	case EVENT_FIELD_VALUE_TYPE_TIMEVAL:
+	case EVENT_FIELD_VALUE_TYPE_STRLIST:
+		break;
+	}
+	i_unreached();
 }
 
 /*
@@ -154,7 +186,7 @@ static bool filter_node_requires_event_name(struct event_filter_node *node)
 
 static int
 event_filter_parse_real(const char *str, struct event_filter *filter,
-			const char **error_r)
+			bool case_sensitive, const char **error_r)
 {
 	struct event_filter_query_internal *int_query;
 	struct event_filter_parser_state state;
@@ -165,6 +197,7 @@ event_filter_parse_real(const char *str, struct event_filter *filter,
 	state.len = strlen(str);
 	state.pos = 0;
 	state.pool = filter->pool;
+	state.case_sensitive = case_sensitive;
 
 	event_filter_parser_lex_init(&state.scanner);
 	event_filter_parser_set_extra(&state, state.scanner);
@@ -204,9 +237,109 @@ int event_filter_parse(const char *str, struct event_filter *filter,
 {
 	int ret;
 	T_BEGIN {
-		ret = event_filter_parse_real(str, filter, error_r);
+		ret = event_filter_parse_real(str, filter, FALSE, error_r);
 	} T_END_PASS_STR_IF(ret < 0, error_r);
 	return ret;
+}
+
+int event_filter_parse_case_sensitive(const char *str,
+				      struct event_filter *filter,
+				      const char **error_r)
+{
+	int ret;
+	T_BEGIN {
+		ret = event_filter_parse_real(str, filter, TRUE, error_r);
+	} T_END_PASS_STR_IF(ret < 0, error_r);
+	return ret;
+}
+
+static const char *
+event_filter_node_find_field_exact(struct event_filter_node *node,
+				   const char *key, bool op_not, bool *op_not_r)
+{
+	const char *value;
+
+	switch (node->op) {
+	case EVENT_FILTER_OP_CMP_EQ:
+		if (node->type == EVENT_FILTER_NODE_TYPE_EVENT_FIELD_EXACT &&
+		    strcmp(node->field.key, key) == 0 &&
+		    node->field.value_type == EVENT_FIELD_VALUE_TYPE_STR) {
+			*op_not_r = op_not;
+			return node->field.value.str;
+		}
+		break;
+	case EVENT_FILTER_OP_AND:
+	case EVENT_FILTER_OP_OR:
+		value = event_filter_node_find_field_exact(node->children[0],
+							   key, op_not, op_not_r);
+		if (value != NULL)
+			return value;
+		value = event_filter_node_find_field_exact(node->children[1],
+							   key, op_not, op_not_r);
+		if (value != NULL)
+			return value;
+		break;
+	case EVENT_FILTER_OP_NOT:
+		return event_filter_node_find_field_exact(node->children[0],
+							  key, !op_not, op_not_r);
+	default:
+		break;
+	}
+	return NULL;
+}
+
+const char *event_filter_find_field_exact(struct event_filter *filter,
+					  const char *key, bool *op_not_r)
+{
+	const struct event_filter_query_internal *query;
+	const char *value;
+
+	array_foreach(&filter->queries, query) {
+		value = event_filter_node_find_field_exact(query->expr, key, FALSE, op_not_r);
+		if (value != NULL)
+			return value;
+	}
+	return NULL;
+}
+
+static bool
+event_filter_node_has_field_prefix(struct event_filter_node *node,
+				   const char *key, const char *prefix)
+{
+	switch (node->op) {
+	case EVENT_FILTER_OP_CMP_EQ:
+		if (node->type == EVENT_FILTER_NODE_TYPE_EVENT_FIELD_EXACT &&
+		    strcmp(node->field.key, key) == 0 &&
+		    node->field.value_type == EVENT_FIELD_VALUE_TYPE_STR &&
+		    str_begins_with(node->field.value.str, prefix))
+			return TRUE;
+		break;
+	case EVENT_FILTER_OP_AND:
+	case EVENT_FILTER_OP_OR:
+		if (event_filter_node_has_field_prefix(
+				node->children[0], key, prefix) ||
+		    event_filter_node_has_field_prefix(
+				node->children[1], key, prefix))
+			return TRUE;
+		break;
+	case EVENT_FILTER_OP_NOT:
+		return FALSE;
+	default:
+		break;
+	}
+	return FALSE;
+}
+
+bool event_filter_has_field_prefix(struct event_filter *filter,
+				   const char *key, const char *prefix)
+{
+	const struct event_filter_query_internal *query;
+
+	array_foreach(&filter->queries, query) {
+		if (event_filter_node_has_field_prefix(query->expr, key, prefix))
+			return TRUE;
+	}
+	return FALSE;
 }
 
 bool event_filter_category_to_log_type(const char *name,
@@ -246,23 +379,53 @@ clone_expr(pool_t pool, struct event_filter_node *old)
 	new = p_new(pool, struct event_filter_node, 1);
 	new->type = old->type;
 	new->op = old->op;
-	new->children[0] = clone_expr(pool, old->children[0]);
-	new->children[1] = clone_expr(pool, old->children[1]);
-	new->str = p_strdup(pool, old->str);
-	new->intmax = old->intmax;
-	new->category.log_type = old->category.log_type;
-	new->category.name = p_strdup(pool, old->category.name);
-	new->category.ptr = old->category.ptr;
-	new->field.key = p_strdup(pool, old->field.key);
-	new->field.value_type = old->field.value_type;
-	new->field.value.str = p_strdup(pool, old->field.value.str);
-	new->field.value.intmax = old->field.value.intmax;
-	new->field.value.timeval = old->field.value.timeval;
+	switch (old->type) {
+	case EVENT_FILTER_NODE_TYPE_LOGIC:
+		new->children[0] = clone_expr(pool, old->children[0]);
+		new->children[1] = clone_expr(pool, old->children[1]);
+		break;
+	case EVENT_FILTER_NODE_TYPE_EVENT_CATEGORY:
+		new->category.log_type = old->category.log_type;
+		new->category.name = p_strdup(pool, old->category.name);
+		new->category.ptr = old->category.ptr;
+		break;
+	default:
+		new->field.key = p_strdup(pool, old->field.key);
+		new->field.value_type = old->field.value_type;
+
+		switch (old->field.value_type) {
+		case EVENT_FIELD_VALUE_TYPE_STR:
+			new->field.value.str = p_strdup(pool, old->field.value.str);
+			break;
+		case EVENT_FIELD_VALUE_TYPE_INTMAX:
+			new->field.value.intmax = old->field.value.intmax;
+			break;
+		case EVENT_FIELD_VALUE_TYPE_TIMEVAL:
+			new->field.value.timeval = old->field.value.timeval;
+			break;
+		case EVENT_FIELD_VALUE_TYPE_IP:
+			new->field.value.ip = old->field.value.ip;
+			new->field.value.ip_bits = old->field.value.ip_bits;
+			break;
+		case EVENT_FIELD_VALUE_TYPE_STRLIST:
+			if (array_is_created(&old->field.value.strlist)) {
+				const char *str;
+				p_array_init(&new->field.value.strlist, pool,
+					     array_count(&old->field.value.strlist));
+				array_foreach_elem(&old->field.value.strlist, str) {
+					str = p_strdup(pool, str);
+					array_push_back(&new->field.value.strlist, &str);
+				}
+			}
+			break;
+		}
+	}
 	new->ambiguous_unit = old->ambiguous_unit;
 	new->warned_ambiguous_unit = old->warned_ambiguous_unit;
 	new->warned_type_mismatch = old->warned_type_mismatch;
 	new->warned_string_inequality = old->warned_string_inequality;
 	new->warned_timeval_not_implemented = old->warned_timeval_not_implemented;
+	new->case_sensitive = old->case_sensitive;
 
 	return new;
 }
@@ -270,9 +433,22 @@ clone_expr(pool_t pool, struct event_filter_node *old)
 static void
 event_filter_merge_with_context_internal(struct event_filter *dest,
 					 const struct event_filter *src,
+					 enum event_filter_merge_op op,
 					 void *new_context, bool with_context)
 {
 	const struct event_filter_query_internal *int_query;
+	enum event_filter_node_op node_op;
+
+	switch (op) {
+	case EVENT_FILTER_MERGE_OP_OR:
+		node_op = EVENT_FILTER_OP_OR;
+		break;
+	case EVENT_FILTER_MERGE_OP_AND:
+		node_op = EVENT_FILTER_OP_AND;
+		break;
+	default:
+		i_unreached();
+	}
 
 	array_foreach(&src->queries, int_query) T_BEGIN {
 		void *context = with_context ? new_context : int_query->context;
@@ -281,8 +457,9 @@ event_filter_merge_with_context_internal(struct event_filter *dest,
 		new = event_filter_get_or_alloc_internal_query(dest, context);
 
 		add_node(dest->pool, &new->expr,
-			 clone_expr(dest->pool, int_query->expr),
-			 EVENT_FILTER_OP_OR);
+			 clone_expr(dest->pool, int_query->expr), node_op);
+		dest->named_queries_only = dest->named_queries_only &&
+			filter_node_requires_event_name(int_query->expr);
 	} T_END;
 }
 
@@ -303,16 +480,18 @@ bool event_filter_remove_queries_with_context(struct event_filter *filter,
 }
 
 void event_filter_merge(struct event_filter *dest,
-			const struct event_filter *src)
+			const struct event_filter *src,
+			enum event_filter_merge_op op)
 {
-	event_filter_merge_with_context_internal(dest, src, NULL, FALSE);
+	event_filter_merge_with_context_internal(dest, src, op, NULL, FALSE);
 }
 
 void event_filter_merge_with_context(struct event_filter *dest,
 				     const struct event_filter *src,
+				     enum event_filter_merge_op op,
 				     void *new_context)
 {
-	event_filter_merge_with_context_internal(dest, src, new_context, TRUE);
+	event_filter_merge_with_context_internal(dest, src, op, new_context, TRUE);
 }
 
 static void
@@ -386,7 +565,7 @@ event_filter_export_query_expr(const struct event_filter_query_internal *query,
 		str_append(dest, "event");
 		str_append(dest, event_filter_export_query_expr_op(node->op));
 		str_append_c(dest, '"');
-		event_filter_append_escaped(dest, node->str,
+		event_filter_append_escaped(dest, node->field.value.str,
 			node->type == EVENT_FILTER_NODE_TYPE_EVENT_NAME_WILDCARD);
 		str_append_c(dest, '"');
 		break;
@@ -394,9 +573,7 @@ event_filter_export_query_expr(const struct event_filter_query_internal *query,
 		str_append(dest, "source_location");
 		str_append(dest, event_filter_export_query_expr_op(node->op));
 		str_append_c(dest, '"');
-		event_filter_append_escaped(dest, node->str, FALSE);
-		if (node->intmax != 0)
-			str_printfa(dest, ":%ju", node->intmax);
+		event_filter_append_escaped(dest, node->field.value.str, FALSE);
 		str_append_c(dest, '"');
 		break;
 	case EVENT_FILTER_NODE_TYPE_EVENT_CATEGORY:
@@ -417,7 +594,8 @@ event_filter_export_query_expr(const struct event_filter_query_internal *query,
 		str_append_c(dest, '"');
 		str_append(dest, event_filter_export_query_expr_op(node->op));
 		str_append_c(dest, '"');
-		event_filter_append_escaped(dest, node->field.value.str,
+		event_filter_append_escaped(dest,
+			wanted_field_value_str(&node->field),
 			node->type != EVENT_FILTER_NODE_TYPE_EVENT_FIELD_EXACT);
 		str_append_c(dest, '"');
 		break;
@@ -514,46 +692,67 @@ event_has_category(struct event *event, struct event_filter_node *node,
 }
 
 static bool
-event_match_strlist_recursive(struct event *event,
-			      const struct event_field *wanted_field,
-			      bool use_strcmp, bool *seen)
+cmp_str(const char *value, const char *wanted_value, enum cmp_flags flags)
 {
-	const char *wanted_value = wanted_field->value.str;
+	if ((flags & CMP_FLAG_WILDCARD) != 0) {
+		if ((flags & CMP_FLAG_CASE_SENSITIVE) != 0)
+			return wildcard_match_escaped(value, wanted_value);
+		else
+			return wildcard_match_escaped_icase(value, wanted_value);
+	} else {
+		if ((flags & CMP_FLAG_CASE_SENSITIVE) != 0)
+			return strcmp(value, wanted_value) == 0;
+		else
+			return strcasecmp(value, wanted_value) == 0;
+	}
+}
+
+static bool
+cmp_value(const char *value, const struct event_field *wanted_field,
+	  enum cmp_flags flags)
+{
+	return cmp_str(value, wanted_field_value_str(wanted_field), flags);
+}
+
+static bool
+event_match_strlist_recursive(struct event *event,
+			      const char *wanted_key, const char *wanted_value,
+			      enum cmp_flags cmp_flags, bool *seen)
+{
 	const struct event_field *field;
 	const char *value;
-	bool match;
 
 	if (event == NULL)
 		return FALSE;
 
-	field = event_find_field_nonrecursive(event, wanted_field->key);
+	field = event_find_field_nonrecursive(event, wanted_key);
 	if (field != NULL) {
 		i_assert(field->value_type == EVENT_FIELD_VALUE_TYPE_STRLIST);
 		array_foreach_elem(&field->value.strlist, value) {
 			*seen = TRUE;
-			match = use_strcmp ? strcasecmp(value, wanted_value) == 0 :
-				wildcard_match_escaped_icase(value, wanted_value);
-			if (match)
+			if (cmp_str(value, wanted_value, cmp_flags))
 				return TRUE;
 		}
 	}
-	return event_match_strlist_recursive(event->parent, wanted_field,
-					     use_strcmp, seen);
+	return event_match_strlist_recursive(event->parent, wanted_key,
+					     wanted_value, cmp_flags, seen);
 }
 
 static bool
 event_match_strlist(struct event *event, const struct event_field *wanted_field,
-		    bool use_strcmp)
+		    enum cmp_flags cmp_flags)
 {
+	const char *wanted_value = wanted_field_value_str(wanted_field);
 	bool seen = FALSE;
 
-	if (event_match_strlist_recursive(event, wanted_field,
-					  use_strcmp, &seen))
+	if (event_match_strlist_recursive(event, wanted_field->key, wanted_value,
+					  cmp_flags, &seen))
 		return TRUE;
 	if (event_match_strlist_recursive(event_get_global(),
-					  wanted_field, use_strcmp, &seen))
+					  wanted_field->key, wanted_value,
+					  cmp_flags, &seen))
 		return TRUE;
-	if (wanted_field->value.str[0] == '\0' && !seen) {
+	if (wanted_value[0] == '\0' && !seen) {
 		/* strlist="" matches nonexistent strlist */
 		return TRUE;
 	}
@@ -585,12 +784,13 @@ event_filter_handle_numeric_operation(enum event_filter_node_op op,
 }
 
 static bool
-event_match_field(struct event *event, struct event_filter_node *node,
-		  bool use_strcmp, const char *source_filename,
-		  unsigned int source_linenum)
+event_match_field(struct event_filter *filter, struct event *event,
+		  struct event_filter_node *node, bool use_strcmp,
+		  const char *source_filename, unsigned int source_linenum)
 {
 	const struct event_field *field;
 	struct event_field duration;
+	bool ret;
 
 	const struct event_field *wanted_field = &node->field;
 	if (strcmp(wanted_field->key, "duration") == 0) {
@@ -607,8 +807,14 @@ event_match_field(struct event *event, struct event_filter_node *node,
 	}
 	if (field == NULL) {
 		/* field="" matches nonexistent field */
-		return wanted_field->value.str[0] == '\0';
+		return wanted_field->value_type == EVENT_FIELD_VALUE_TYPE_STR &&
+			wanted_field->value.str[0] == '\0';
 	}
+	enum cmp_flags cmp_flags = 0;
+	if (!use_strcmp)
+		cmp_flags |= CMP_FLAG_WILDCARD;
+	if (node->case_sensitive)
+		cmp_flags |= CMP_FLAG_CASE_SENSITIVE;
 
 	switch (field->value_type) {
 	case EVENT_FIELD_VALUE_TYPE_STR:
@@ -631,12 +837,19 @@ event_match_field(struct event *event, struct event_filter_node *node,
 		}
 		if (field->value.str[0] == '\0') {
 			/* field was removed, but it matches field="" filter */
-			return wanted_field->value.str[0] == '\0';
+			return wanted_field->value_type == EVENT_FIELD_VALUE_TYPE_STR &&
+				wanted_field->value.str[0] == '\0';
 		}
-		if (use_strcmp)
-			return strcasecmp(field->value.str, wanted_field->value.str) == 0;
-		else
-			return wildcard_match_escaped_icase(field->value.str, wanted_field->value.str);
+		T_BEGIN {
+			if (filter->cmp_key != NULL &&
+			    strcmp(wanted_field->key, filter->cmp_key) == 0) {
+				ret = filter->cmp_key_func(field->value.str,
+					wanted_field_value_str(wanted_field));
+			} else {
+				ret = cmp_value(field->value.str, wanted_field, cmp_flags);
+			}
+		} T_END;
+		return ret;
 	case EVENT_FIELD_VALUE_TYPE_INTMAX:
 		if (node->ambiguous_unit) {
 			if (!node->warned_ambiguous_unit) {
@@ -649,7 +862,7 @@ event_match_field(struct event *event, struct event_filter_node *node,
 					  "interval or size respectively. "
 					  "(event=%s, source=%s:%u)",
 					  wanted_field->key,
-					  wanted_field->value.str,
+					  wanted_field_value_str(wanted_field),
 					  name != NULL ? name : "",
 					  source_filename, source_linenum);
 				node->warned_ambiguous_unit = TRUE;
@@ -659,7 +872,7 @@ event_match_field(struct event *event, struct event_filter_node *node,
 			/* compare against an integer */
 			return event_filter_handle_numeric_operation(
 				node->op, field->value.intmax, wanted_field->value.intmax);
-		} else if (use_strcmp ||
+		} else if ((cmp_flags & CMP_FLAG_WILDCARD) == 0 ||
 			   (node->type != EVENT_FILTER_NODE_TYPE_EVENT_FIELD_NUMERIC_WILDCARD)) {
 			if (!node->warned_type_mismatch) {
 				const char *name = event->sending_name;
@@ -668,7 +881,7 @@ event_match_field(struct event *event, struct event_filter_node *node,
 					  "'%s' against non-integer value '%s'. "
 					  "(event=%s, source=%s:%u)",
 					  wanted_field->key,
-					  wanted_field->value.str,
+					  wanted_field_value_str(wanted_field),
 					  name != NULL ? name : "",
 					  source_filename, source_linenum);
 				node->warned_type_mismatch = TRUE;
@@ -686,7 +899,7 @@ event_match_field(struct event *event, struct event_filter_node *node,
 					  "please use '='. (event=%s, "
 					  "source=%s:%u)",
 					  wanted_field->key,
-					  wanted_field->value.str,
+					  wanted_field_value_str(wanted_field),
 					  event_filter_export_query_expr_op(node->op),
 					  name != NULL ? name : "",
 					  source_filename, source_linenum);
@@ -696,7 +909,11 @@ event_match_field(struct event *event, struct event_filter_node *node,
 		} else {
 			char tmp[MAX_INT_STRLEN];
 			i_snprintf(tmp, sizeof(tmp), "%jd", field->value.intmax);
-			return wildcard_match_escaped_icase(tmp, wanted_field->value.str);
+			T_BEGIN {
+				ret = wildcard_match_escaped_icase(tmp,
+					wanted_field_value_str(wanted_field));
+			} T_END;
+			return ret;
 		}
 	case EVENT_FIELD_VALUE_TYPE_TIMEVAL: {
 		/* Filtering for timeval fields is not implemented. */
@@ -733,7 +950,7 @@ event_match_field(struct event *event, struct event_filter_node *node,
 						 &wanted_field->value.ip,
 						 wanted_field->value.ip_bits);
 		}
-		if (use_strcmp) {
+		if ((cmp_flags & CMP_FLAG_WILDCARD) == 0) {
 			/* If the matched value was a number, it was already
 			   matched in the previous branch. So here we have a
 			   non-wildcard IP, which can never be a match to an
@@ -745,17 +962,16 @@ event_match_field(struct event *event, struct event_filter_node *node,
 					  "'%s' against non-IP value '%s'. "
 					  "(event=%s, source=%s:%u)",
 					  wanted_field->key,
-					  wanted_field->value.str,
+					  wanted_field_value_str(wanted_field),
 					  name != NULL ? name : "",
 					  source_filename, source_linenum);
 				node->warned_type_mismatch = TRUE;
 			}
 			return FALSE;
 		}
-		bool ret;
 		T_BEGIN {
 			ret = wildcard_match_escaped_icase(net_ip2addr(&field->value.ip),
-							   wanted_field->value.str);
+							   wanted_field_value_str(wanted_field));
 		} T_END;
 		return ret;
 	case EVENT_FIELD_VALUE_TYPE_STRLIST:
@@ -776,13 +992,17 @@ event_match_field(struct event *event, struct event_filter_node *node,
 			}
 			return FALSE;
 		}
-		return event_match_strlist(event, wanted_field, use_strcmp);
+		T_BEGIN {
+			ret = event_match_strlist(event, wanted_field, cmp_flags);
+		} T_END;
+		return ret;
 	}
 	i_unreached();
 }
 
 static bool
-event_filter_query_match_cmp(struct event_filter_node *node,
+event_filter_query_match_cmp(struct event_filter *filter,
+			     struct event_filter_node *node,
 			     struct event *event, const char *source_filename,
 			     unsigned int source_linenum,
 			     enum event_filter_log_type log_type)
@@ -798,29 +1018,39 @@ event_filter_query_match_cmp(struct event_filter_node *node,
 			i_unreached();
 		case EVENT_FILTER_NODE_TYPE_EVENT_NAME_EXACT:
 			return (event->sending_name != NULL) &&
-			       strcmp(event->sending_name, node->str) == 0;
+			       strcmp(event->sending_name, node->field.value.str) == 0;
 		case EVENT_FILTER_NODE_TYPE_EVENT_NAME_WILDCARD:
 			return (event->sending_name != NULL) &&
-			       wildcard_match_escaped(event->sending_name, node->str);
-		case EVENT_FILTER_NODE_TYPE_EVENT_SOURCE_LOCATION:
-			return !((source_linenum != node->intmax &&
-				  node->intmax != 0) ||
-				 source_filename == NULL ||
-				 strcmp(event->source_filename, node->str) != 0);
+				wildcard_match_escaped(event->sending_name,
+						       node->field.value.str);
+		case EVENT_FILTER_NODE_TYPE_EVENT_SOURCE_LOCATION: {
+			bool ret;
+			if (strchr(node->field.value.str, ':') == NULL)
+				ret = strcmp(node->field.value.str, source_filename) == 0;
+			else T_BEGIN {
+				const char *wanted_str =
+					t_strdup_printf("%s:%u", source_filename, source_linenum);
+				ret = strcmp(node->field.value.str, wanted_str) == 0;
+			} T_END;
+			return ret;
+		}
 		case EVENT_FILTER_NODE_TYPE_EVENT_CATEGORY:
 			return event_has_category(event, node, log_type);
 		case EVENT_FILTER_NODE_TYPE_EVENT_FIELD_EXACT:
-			return event_match_field(event, node, TRUE, source_filename, source_linenum);
+			return event_match_field(filter, event, node, TRUE,
+					source_filename, source_linenum);
 		case EVENT_FILTER_NODE_TYPE_EVENT_FIELD_WILDCARD:
 		case EVENT_FILTER_NODE_TYPE_EVENT_FIELD_NUMERIC_WILDCARD:
-			return event_match_field(event, node, FALSE, source_filename, source_linenum);
+			return event_match_field(filter, event, node, FALSE,
+					source_filename, source_linenum);
 	}
 
 	i_unreached();
 }
 
 bool
-event_filter_query_match_eval(struct event_filter_node *node,
+event_filter_query_match_eval(struct event_filter *filter,
+			      struct event_filter_node *node,
 			      struct event *event, const char *source_filename,
 			      unsigned int source_linenum,
 			      enum event_filter_log_type log_type)
@@ -831,33 +1061,29 @@ event_filter_query_match_eval(struct event_filter_node *node,
 	case EVENT_FILTER_OP_CMP_LT:
 	case EVENT_FILTER_OP_CMP_GE:
 	case EVENT_FILTER_OP_CMP_LE:
-		return event_filter_query_match_cmp(node, event, source_filename,
-						    source_linenum, log_type);
+		return event_filter_query_match_cmp(filter, node, event,
+				source_filename, source_linenum, log_type);
 	case EVENT_FILTER_OP_AND:
-		return event_filter_query_match_eval(node->children[0], event,
-						     source_filename, source_linenum,
-						     log_type) &&
-		       event_filter_query_match_eval(node->children[1], event,
-						     source_filename, source_linenum,
-						     log_type);
+		return event_filter_query_match_eval(filter, node->children[0],
+			event, source_filename, source_linenum, log_type) &&
+			event_filter_query_match_eval(filter, node->children[1],
+				event, source_filename, source_linenum, log_type);
 	case EVENT_FILTER_OP_OR:
-		return event_filter_query_match_eval(node->children[0], event,
-						     source_filename, source_linenum,
-						     log_type) ||
-		       event_filter_query_match_eval(node->children[1], event,
-						     source_filename, source_linenum,
-						     log_type);
+		return event_filter_query_match_eval(filter, node->children[0],
+				event, source_filename, source_linenum, log_type) ||
+			event_filter_query_match_eval(filter, node->children[1],
+				event, source_filename, source_linenum, log_type);
 	case EVENT_FILTER_OP_NOT:
-		return !event_filter_query_match_eval(node->children[0], event,
-						      source_filename, source_linenum,
-						      log_type);
+		return !event_filter_query_match_eval(filter, node->children[0],
+				event, source_filename, source_linenum, log_type);
 	}
 
 	i_unreached();
 }
 
 static bool
-event_filter_query_match(const struct event_filter_query_internal *query,
+event_filter_query_match(struct event_filter *filter,
+			 const struct event_filter_query_internal *query,
 			 struct event *event, const char *source_filename,
 			 unsigned int source_linenum,
 			 const struct failure_context *ctx)
@@ -867,8 +1093,9 @@ event_filter_query_match(const struct event_filter_query_internal *query,
 	i_assert(ctx->type < N_ELEMENTS(event_filter_log_type_map));
 	log_type = event_filter_log_type_map[ctx->type].log_type;
 
-	return event_filter_query_match_eval(query->expr, event, source_filename,
-					     source_linenum, log_type);
+	return event_filter_query_match_eval(filter, query->expr, event,
+					     source_filename, source_linenum,
+					     log_type);
 }
 
 static bool
@@ -905,11 +1132,23 @@ bool event_filter_match_source(struct event_filter *filter, struct event *event,
 		return FALSE;
 
 	array_foreach(&filter->queries, query) {
-		if (event_filter_query_match(query, event, source_filename,
-					     source_linenum, ctx))
+		if (event_filter_query_match(filter, query, event,
+					     source_filename, source_linenum,
+					     ctx))
 			return TRUE;
 	}
 	return FALSE;
+}
+
+struct event_filter_node *
+event_filter_get_root_node(struct event_filter *filter, unsigned int idx)
+{
+	if (idx >= array_count(&filter->queries))
+		return NULL;
+
+	const struct event_filter_query_internal *query =
+		array_idx(&filter->queries, idx);
+	return query->expr;
 }
 
 struct event_filter_match_iter {
@@ -948,7 +1187,7 @@ void *event_filter_match_iter_next(struct event_filter_match_iter *iter)
 
 		iter->idx++;
 		if (query->context != NULL &&
-		    event_filter_query_match(query, iter->event,
+		    event_filter_query_match(iter->filter, query, iter->event,
 					     iter->event->source_filename,
 					     iter->event->source_linenum,
 					     iter->failure_ctx))
@@ -963,6 +1202,16 @@ void event_filter_match_iter_deinit(struct event_filter_match_iter **_iter)
 
 	*_iter = NULL;
 	i_free(iter);
+}
+
+void event_filter_register_cmp(struct event_filter *filter, const char *key,
+			       event_filter_cmp *cmp)
+{
+	/* for now we need to support just one */
+	i_assert(filter->cmp_key == NULL);
+
+	filter->cmp_key = p_strdup(filter->pool, key);
+	filter->cmp_key_func = cmp;
 }
 
 static void

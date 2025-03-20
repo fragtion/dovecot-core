@@ -12,9 +12,10 @@
 #include "index-mail.h"
 #include "fts-parser.h"
 #include "fts-user.h"
-#include "fts-language.h"
-#include "fts-tokenizer.h"
-#include "fts-filter.h"
+#include "language.h"
+#include "lang-tokenizer.h"
+#include "lang-filter.h"
+#include "lang-user.h"
 #include "fts-api-private.h"
 #include "fts-build-mail.h"
 
@@ -33,7 +34,7 @@ struct fts_mail_build_context {
 	struct fts_parser *body_parser;
 
 	buffer_t *word_buf, *pending_input;
-	struct fts_user_language *cur_user_lang;
+	struct language_user *cur_user_lang;
 };
 
 static int fts_build_data(struct fts_mail_build_context *ctx,
@@ -106,7 +107,7 @@ fts_build_unstructured_header(struct fts_mail_build_context *ctx,
 }
 
 static void fts_mail_build_ctx_set_lang(struct fts_mail_build_context *ctx,
-					struct fts_user_language *user_lang)
+					struct language_user *user_lang)
 {
 	i_assert(user_lang != NULL);
 
@@ -114,7 +115,7 @@ static void fts_mail_build_ctx_set_lang(struct fts_mail_build_context *ctx,
 	/* reset tokenizer between fields - just to be sure no state
 	   leaks between fields (especially if previous indexing had
 	   failed) */
-	fts_tokenizer_reset(user_lang->index_tokenizer);
+	lang_tokenizer_reset(user_lang->index_tokenizer);
 }
 
 static void
@@ -123,14 +124,14 @@ fts_build_tokenized_hdr_update_lang(struct fts_mail_build_context *ctx,
 {
 	/* Headers that don't contain any human language will only be
 	   translated to lowercase - no stemming or other filtering. There's
-	   unfortunately no pefect way of detecting which headers contain
+	   unfortunately no perfect way of detecting which headers contain
 	   human languages, so we check with fts_header_has_language if the
 	   header is something that's supposed to containing human text. */
 	if (fts_header_has_language(hdr->name))
 		ctx->cur_user_lang = NULL;
 	else {
 		fts_mail_build_ctx_set_lang(ctx,
-			fts_user_get_data_lang(ctx->update_ctx->backend->ns->user));
+			lang_user_get_data_lang(ctx->update_ctx->backend->ns->user));
 	}
 }
 
@@ -182,10 +183,10 @@ static int fts_build_mail_header(struct fts_mail_build_context *ctx,
 	if ((ctx->update_ctx->backend->flags &
 	     FTS_BACKEND_FLAG_TOKENIZED_INPUT) != 0) {
 		/* index the header name itself using data-language. */
-		struct fts_user_language *prev_lang = ctx->cur_user_lang;
+		struct language_user *prev_lang = ctx->cur_user_lang;
 
 		fts_mail_build_ctx_set_lang(ctx,
-			fts_user_get_data_lang(ctx->update_ctx->backend->ns->user));
+			lang_user_get_data_lang(ctx->update_ctx->backend->ns->user));
 		key.hdr_name = "";
 		if (fts_backend_update_set_build_key(ctx->update_ctx, &key)) {
 			if (fts_build_data(ctx, (const void *)hdr->name,
@@ -231,7 +232,7 @@ fts_build_body_begin(struct fts_mail_build_context *ctx,
 	} T_END;
 
 	if (fts_parser_init(&parser_context, &ctx->body_parser)) {
-		/* extract text using the the returned parser */
+		/* extract text using the returned parser */
 		*binary_body_r = TRUE;
 		key.type = FTS_BACKEND_BUILD_KEY_BODY_PART;
 	} else if (str_begins_with(parser_context.content_type, "text/") ||
@@ -267,15 +268,15 @@ static int
 fts_build_add_tokens_with_filter(struct fts_mail_build_context *ctx,
 				 const unsigned char *data, size_t size)
 {
-	struct fts_tokenizer *tokenizer = ctx->cur_user_lang->index_tokenizer;
-	struct fts_filter *filter = ctx->cur_user_lang->filter;
+	struct lang_tokenizer *tokenizer = ctx->cur_user_lang->index_tokenizer;
+	struct lang_filter *filter = ctx->cur_user_lang->filter;
 	const char *token, *error;
 	int ret = 1, ret2;
 
 	while (ret > 0) T_BEGIN {
-		ret = ret2 = fts_tokenizer_next(tokenizer, data, size, &token, &error);
+		ret = ret2 = lang_tokenizer_next(tokenizer, data, size, &token, &error);
 		if (ret2 > 0 && filter != NULL)
-			ret2 = fts_filter_filter(filter, &token, &error);
+			ret2 = lang_filter(filter, &token, &error);
 		if (ret2 < 0) {
 			mail_set_critical(ctx->mail,
 				"fts: Couldn't create indexable tokens: %s",
@@ -296,31 +297,31 @@ fts_build_add_tokens_with_filter(struct fts_mail_build_context *ctx,
 static int
 fts_detect_language(struct fts_mail_build_context *ctx,
 		    const unsigned char *data, size_t size, bool last,
-		    const struct fts_language **lang_r)
+		    const struct language **lang_r)
 {
 	struct mail_user *user = ctx->update_ctx->backend->ns->user;
-	struct fts_language_list *lang_list = fts_user_get_language_list(user);
-	const struct fts_language *lang;
+	struct language_list *lang_list = lang_user_get_language_list(user);
+	const struct language *lang;
 	const char *error;
 
-	switch (fts_language_detect(lang_list, data, size, &lang, &error)) {
-	case FTS_LANGUAGE_RESULT_SHORT:
+	switch (language_detect(lang_list, data, size, &lang, &error)) {
+	case LANGUAGE_DETECT_RESULT_SHORT:
 		/* save the input so far and try again later */
 		buffer_append(ctx->pending_input, data, size);
 		if (last) {
 			/* we've run out of data. use the default language. */
-			*lang_r = fts_language_list_get_first(lang_list);
+			*lang_r = language_list_get_first(lang_list);
 			return 1;
 		}
 		return 0;
-	case FTS_LANGUAGE_RESULT_UNKNOWN:
+	case LANGUAGE_DETECT_RESULT_UNKNOWN:
 		/* use the default language */
-		*lang_r = fts_language_list_get_first(lang_list);
+		*lang_r = language_list_get_first(lang_list);
 		return 1;
-	case FTS_LANGUAGE_RESULT_OK:
+	case LANGUAGE_DETECT_RESULT_OK:
 		*lang_r = lang;
 		return 1;
-	case FTS_LANGUAGE_RESULT_ERROR:
+	case LANGUAGE_DETECT_RESULT_ERROR:
 		/* internal language detection library failure
 		   (e.g. invalid config). don't index anything. */
 		mail_set_critical(ctx->mail,
@@ -337,8 +338,10 @@ fts_build_tokenized(struct fts_mail_build_context *ctx,
 		    const unsigned char *data, size_t size, bool last)
 {
 	struct mail_user *user = ctx->update_ctx->backend->ns->user;
-	const struct fts_language *lang;
+	const struct language *lang;
 	int ret;
+
+	i_assert(ctx->pending_input != NULL);
 
 	if (ctx->cur_user_lang != NULL) {
 		/* we already have a language */
@@ -348,7 +351,7 @@ fts_build_tokenized(struct fts_mail_build_context *ctx,
 		/* wait for more data */
 		return 0;
 	} else {
-		fts_mail_build_ctx_set_lang(ctx, fts_user_language_find(user, lang));
+		fts_mail_build_ctx_set_lang(ctx, lang_user_language_find(user, lang));
 
 		if (ctx->pending_input->used > 0) {
 			if (fts_build_add_tokens_with_filter(ctx,
@@ -489,40 +492,40 @@ static int fts_body_parser_finish(struct fts_mail_build_context *ctx,
 }
 
 static void
-load_header_filter(const char *key, struct fts_backend *backend,
-		   ARRAY_TYPE(const_string) list, bool *matches_all_r)
+parse_header_filter(const ARRAY_TYPE(const_string) *values, pool_t pool,
+		    ARRAY_TYPE(const_string) *list_r, bool *matches_all_r)
 {
-	const char *str = mail_user_plugin_getenv(backend->ns->user, key);
-
 	*matches_all_r = FALSE;
-	if (str == NULL || *str == '\0')
+	if (array_is_empty(values))
 		return;
 
-	char **entries = p_strsplit_spaces(backend->header_filters.pool, str, " ");
-	for (char **entry = entries; *entry != NULL; ++entry) {
-		const char *value = str_lcase(*entry);
-		array_push_back(&list, &value);
+	const char *entry;
+	array_foreach_elem(values, entry) {
+		const char *value = p_strdup(pool, t_str_lcase(entry));
+		array_push_back(list_r, &value);
 		if (*value == '*') {
 			*matches_all_r = TRUE;
 			break;
 		}
 	}
-	array_sort(&list, i_strcmp_p);
+	array_sort(list_r, i_strcmp_p);
 }
 
 static struct fts_header_filters *
 load_header_filters(struct fts_backend *backend)
 {
+	const struct fts_settings *set = fts_user_get_settings(backend->ns->user);
 	struct fts_header_filters *filters = &backend->header_filters;
 	if (!filters->loaded) {
 		bool match_all;
+		/* match_all used just as dummy output here */
+		parse_header_filter(&set->header_includes, filters->pool,
+				    &filters->includes, &match_all);
 
-		/* match_all return ignored in includes */
-		load_header_filter("fts_header_includes", backend,
-				   filters->includes, &match_all);
+		/* match_all from this call is relevant instead */
+		parse_header_filter(&set->header_excludes, filters->pool,
+				    &filters->excludes, &match_all);
 
-		load_header_filter("fts_header_excludes", backend,
-				   filters->excludes, &match_all);
 		filters->loaded = TRUE;
 		filters->exclude_is_default = match_all;
 	}
@@ -585,6 +588,10 @@ fts_build_mail_real(struct fts_backend_update_context *update_ctx,
 	bool binary_body;
 	const char *error;
 	int ret;
+	size_t fts_message_max_size, orig_fts_message_max_size;
+
+	fts_message_max_size = orig_fts_message_max_size =
+		fts_mail_user_message_max_size(update_ctx->cur_box->storage->user);
 
 	*may_need_retry_r = FALSE;
 	if (mail_get_stream_because(mail, NULL, NULL, "fts indexing", &input) < 0) {
@@ -660,6 +667,23 @@ fts_build_mail_real(struct fts_backend_update_context *update_ctx,
 		if (!message_decoder_decode_next_block(decoder, &raw_block,
 						       &block))
 			continue;
+
+		/* If the block size exceeds limit, we truncate the block
+		   which would have exceeded to final size, and parse it.
+		   Then we ignore the rest body parts. */
+		if (body_part && orig_fts_message_max_size > 0) {
+			if (fts_message_max_size > block.size) {
+				fts_message_max_size -= block.size;
+			} else if (fts_message_max_size == 0) {
+				continue;
+			} else {
+				e_debug(mail->box->event,
+					"UID %u: Body size exceeds %zu, truncating and skipping",
+					mail->uid, orig_fts_message_max_size);
+				block.size = fts_message_max_size;
+				fts_message_max_size = 0;
+			}
+		}
 
 		if (block.hdr != NULL) {
 			fts_parse_mail_header(&ctx, &raw_block);

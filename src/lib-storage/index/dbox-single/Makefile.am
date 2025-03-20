@@ -10,19 +10,22 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-index \
 	-I$(top_srcdir)/src/lib-storage \
 	-I$(top_srcdir)/src/lib-storage/index \
-	-I$(top_srcdir)/src/lib-storage/index/dbox-common
+	-I$(top_srcdir)/src/lib-storage/index/dbox-common \
+	-I$(top_srcdir)/src/lib-var-expand
 
 libstorage_dbox_single_la_SOURCES = \
 	sdbox-copy.c \
 	sdbox-file.c \
 	sdbox-mail.c \
 	sdbox-save.c \
+	sdbox-settings.c \
 	sdbox-sync.c \
 	sdbox-sync-rebuild.c \
 	sdbox-storage.c
 
 headers = \
 	sdbox-file.h \
+	sdbox-settings.h \
 	sdbox-storage.h \
 	sdbox-sync.h
 

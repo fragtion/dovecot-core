@@ -27,8 +27,8 @@ extern struct fs_api_module_register fs_api_module_register;
 
 struct fs_vfuncs {
 	struct fs *(*alloc)(void);
-	int (*init)(struct fs *fs, const char *args,
-		    const struct fs_settings *set, const char **error_r);
+	int (*init)(struct fs *fs, const struct fs_parameters *params,
+		    const char **error_r);
 	void (*deinit)(struct fs *fs);
 	void (*free)(struct fs *fs);
 
@@ -90,9 +90,12 @@ struct fs {
 	char *temp_path_prefix;
 	int refcount;
 
-	char *username, *session_id;
+	/* Set only during initialization: */
+	const ARRAY_TYPE(const_string) *init_fs_list;
+	unsigned int init_fs_list_idx;
+	unsigned int *init_fs_last_list_idx;
 
-	struct fs_settings set;
+	char *username, *session_id;
 
 	/* may be used by fs_wait_async() to do the waiting */
 	struct ioloop *wait_ioloop, *prev_ioloop;
@@ -102,6 +105,7 @@ struct fs {
 	struct fs_iter *iters;
 	struct event *event;
 
+	bool enable_timing;
 	struct fs_stats stats;
 
 	ARRAY(union fs_api_module_context *) module_contexts;
@@ -175,6 +179,9 @@ extern const struct fs fs_class_sis_queue;
 extern const struct fs fs_class_test;
 
 void fs_class_register(const struct fs *fs_class);
+
+int fs_init_parent(struct fs *fs, const struct fs_parameters *params,
+		   const char **error_r);
 
 /* Event must be fs_file or fs_iter events. Set errno from err. */
 void fs_set_error(struct event *event, int err,

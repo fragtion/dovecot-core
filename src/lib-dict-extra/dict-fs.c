@@ -25,31 +25,19 @@ struct fs_dict_iterate_context {
 };
 
 static int
-fs_dict_init(struct dict *driver, const char *uri,
-	     const struct dict_settings *set,
+fs_dict_init(const struct dict *dict_driver, struct event *event,
 	     struct dict **dict_r, const char **error_r)
 {
-	struct fs_settings fs_set;
+	struct fs_parameters fs_param;
 	struct fs *fs;
 	struct fs_dict *dict;
-	const char *p, *fs_driver, *fs_args;
 
-	p = strchr(uri, ':');
-	if (p == NULL) {
-		fs_driver = uri;
-		fs_args = "";
-	} else {
-		fs_driver = t_strdup_until(uri, p);
-		fs_args = p+1;
-	}
-
-	i_zero(&fs_set);
-	fs_set.base_dir = set->base_dir;
-	if (fs_init(fs_driver, fs_args, &fs_set, &fs, error_r) < 0)
+	i_zero(&fs_param);
+	if (fs_init_auto(event, &fs_param, &fs, error_r) <= 0)
 		return -1;
 
 	dict = i_new(struct fs_dict, 1);
-	dict->dict = *driver;
+	dict->dict = *dict_driver;
 	dict->fs = fs;
 
 	*dict_r = &dict->dict;
@@ -204,12 +192,12 @@ static bool fs_dict_iterate(struct dict_iterate_context *ctx,
 	}
 	iter->key_count++;
 
-	path = t_strconcat(iter->path, *key_r, NULL);
+	p_clear(iter->value_pool);
+	path = p_strconcat(iter->value_pool, iter->path, *key_r, NULL);
 	if ((iter->flags & DICT_ITERATE_FLAG_NO_VALUE) != 0) {
 		*key_r = path;
 		return TRUE;
 	}
-	p_clear(iter->value_pool);
 	struct dict_op_settings set = {
 		.username = ctx->set.username,
 	};

@@ -5,25 +5,18 @@
 #include "settings-parser.h"
 #include "smtp-submit-settings.h"
 
-#include <stddef.h>
-
 static bool smtp_submit_settings_check(void *_set, pool_t pool, const char **error_r);
 
 #undef DEF
-#undef DEFLIST
 #define DEF(type, name) \
 	SETTING_DEFINE_STRUCT_##type(#name, name, struct smtp_submit_settings)
-#define DEFLIST(field, name, defines) \
-	{ .type = SET_DEFLIST, .key = name, \
-	  .offset = offsetof(struct smtp_submit_settings, field), \
-	  .list_info = defines }
 
 static const struct setting_define smtp_submit_setting_defines[] = {
 	DEF(STR, hostname),
 	DEF(BOOL, mail_debug),
 
-	DEF(STR_VARS, submission_host),
-	DEF(STR_VARS, sendmail_path),
+	DEF(STR, submission_host),
+	DEF(STR, sendmail_path),
 	DEF(TIME, submission_timeout),
 
 	DEF(ENUM, submission_ssl),
@@ -43,14 +36,13 @@ static const struct smtp_submit_settings smtp_submit_default_settings = {
 };
 
 const struct setting_parser_info smtp_submit_setting_parser_info = {
-	.module_name = "smtp-submit",
+	.name = "smtp_submit",
+
 	.defines = smtp_submit_setting_defines,
 	.defaults = &smtp_submit_default_settings,
 
-	.type_offset = SIZE_MAX,
 	.struct_size = sizeof(struct smtp_submit_settings),
-
-	.parent_offset = SIZE_MAX,
+	.pool_offset1 = 1 + offsetof(struct smtp_submit_settings, pool),
 
 #ifndef CONFIG_BINARY
 	.check_func = smtp_submit_settings_check,

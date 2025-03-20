@@ -3,18 +3,20 @@
 
 #include "login-interface.h"
 
+#define AUTH_CLIENT_MINOR_VERSION_CHANNEL_BINDING 3
+
+enum auth_client_connection_flags {
+	AUTH_CLIENT_CONNECTION_FLAG_LOGIN_REQUESTS = BIT(0),
+	AUTH_CLIENT_CONNECTION_FLAG_TOKEN_AUTH = BIT(1),
+	AUTH_CLIENT_CONNECTION_FLAG_LEGACY = BIT(2),
+};
+
 struct auth_client_connection {
-	struct auth_client_connection *prev, *next;
+	struct connection conn;
 	struct auth *auth;
 	struct event *event;
 	int refcount;
 
-	int fd;
-	struct io *io;
-	struct istream *input;
-	struct ostream *output;
-
-	unsigned int version_minor;
 	unsigned int pid;
 	unsigned int connect_uid;
 	uint8_t cookie[LOGIN_REQUEST_COOKIE_SIZE];
@@ -23,11 +25,10 @@ struct auth_client_connection {
 	bool login_requests:1;
 	bool version_received:1;
 	bool token_auth:1;
+	bool handshake_finished:1;
 };
-
-void auth_client_connection_create(struct auth *auth, int fd,
-				   bool login_requests, bool token_auth);
-void auth_client_connection_destroy(struct auth_client_connection **conn);
+void auth_client_connection_create(struct auth *auth, int fd, const char *name,
+				   enum auth_client_connection_flags flags);
 
 struct auth_client_connection *
 auth_client_connection_lookup(unsigned int pid);

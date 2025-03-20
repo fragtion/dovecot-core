@@ -3,15 +3,15 @@
 #include "lib.h"
 #include "settings-parser.h"
 #include "mail-storage-settings.h"
+#include "dbox-storage.h"
 #include "mdbox-settings.h"
-
-#include <stddef.h>
 
 #undef DEF
 #define DEF(type, name) \
 	SETTING_DEFINE_STRUCT_##type(#name, name, struct mdbox_settings)
 
 static const struct setting_define mdbox_setting_defines[] = {
+	{ .type = SET_FILTER_NAME, .key = "mdbox" },
 	DEF(BOOL, mdbox_preallocate_space),
 	DEF(SIZE, mdbox_rotate_size),
 	DEF(TIME, mdbox_rotate_interval),
@@ -25,19 +25,20 @@ static const struct mdbox_settings mdbox_default_settings = {
 	.mdbox_rotate_interval = 0
 };
 
-static const struct setting_parser_info mdbox_setting_parser_info = {
-	.module_name = "mdbox",
-	.defines = mdbox_setting_defines,
-	.defaults = &mdbox_default_settings,
-
-	.type_offset = SIZE_MAX,
-	.struct_size = sizeof(struct mdbox_settings),
-
-	.parent_offset = SIZE_MAX,
-	.parent = &mail_user_setting_parser_info
+static const struct setting_keyvalue mdbox_default_settings_keyvalue[] = {
+	{ "mdbox/mailbox_root_directory_name", DBOX_MAILBOX_DIR_NAME },
+	{ "mdbox/mailbox_directory_name", DBOX_MAILDIR_NAME },
+	{ "mdbox/mail_path", "%{home}/mdbox" },
+	{ NULL, NULL }
 };
 
-const struct setting_parser_info *mdbox_get_setting_parser_info(void)
-{
-	return &mdbox_setting_parser_info;
-}
+const struct setting_parser_info mdbox_setting_parser_info = {
+	.name = "mdbox",
+
+	.defines = mdbox_setting_defines,
+	.defaults = &mdbox_default_settings,
+	.default_settings = mdbox_default_settings_keyvalue,
+
+	.struct_size = sizeof(struct mdbox_settings),
+	.pool_offset1 = 1 + offsetof(struct mdbox_settings, pool),
+};

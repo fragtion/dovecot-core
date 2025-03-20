@@ -58,6 +58,11 @@ struct login_proxy_settings {
 
 /* Called when new input comes from proxy. */
 typedef void login_proxy_input_callback_t(struct client *client);
+/* Called when new input comes from multiplex istream side channel.
+   Returns 0 if ok, -1 to log the error and disconnect client. */
+typedef int login_proxy_side_channel_input_callback_t(struct client *client,
+						      const char *const *args,
+						      const char **error_r);
 /* Called when proxying fails. If reconnecting=TRUE, this is just an
    intermediate notification that the proxying will attempt to reconnect soon
    before failing. */
@@ -76,6 +81,7 @@ typedef void login_proxy_redirect_callback_t(struct client *client,
 int login_proxy_new(struct client *client, struct event *event,
 		    const struct login_proxy_settings *set,
 		    login_proxy_input_callback_t *input_callback,
+		    login_proxy_side_channel_input_callback_t *side_callback,
 		    login_proxy_failure_callback_t *failure_callback,
 		    login_proxy_redirect_callback_t *redirect_callback);
 /* Free the proxy. This should be called if authentication fails. */
@@ -95,6 +101,7 @@ bool login_proxy_failed(struct login_proxy *proxy, struct event *event,
 /* Return TRUE if host/port/destuser combination points to same as current
    connection. */
 bool login_proxy_is_ourself(const struct client *client, const char *host,
+		            const struct ip_addr *hostip,
 			    in_port_t port, const char *destuser);
 
 /* Detach proxy from client. This is done after the authentication is
@@ -103,9 +110,22 @@ void login_proxy_detach(struct login_proxy *proxy);
 
 /* STARTTLS command was issued. */
 int login_proxy_starttls(struct login_proxy *proxy);
+/* MULTIPLEX input was started. */
+void login_proxy_multiplex_input_start(struct login_proxy *proxy);
 
-struct istream *login_proxy_get_istream(struct login_proxy *proxy);
-struct ostream *login_proxy_get_ostream(struct login_proxy *proxy);
+void login_proxy_replace_client_iostream_pre(struct login_proxy *proxy);
+void login_proxy_replace_client_iostream_post(struct login_proxy *proxy,
+					      struct istream *new_input,
+					      struct ostream *new_output);
+
+struct istream *login_proxy_get_client_istream(struct login_proxy *proxy);
+struct ostream *login_proxy_get_client_ostream(struct login_proxy *proxy);
+
+struct istream *login_proxy_get_server_istream(struct login_proxy *proxy);
+struct ostream *login_proxy_get_server_ostream(struct login_proxy *proxy);
+
+/* Returns "ip:port" or "host[ip]:port" */
+const char *login_proxy_get_hostport(const struct login_proxy *proxy);
 
 void login_proxy_append_success_log_info(struct login_proxy *proxy,
 					 string_t *str);

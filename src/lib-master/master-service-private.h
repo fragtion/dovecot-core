@@ -39,8 +39,7 @@ struct master_service {
 	const char *version_string;
 	char *config_path;
 	ARRAY_TYPE(const_string) config_overrides;
-	void *config_mmap_base;
-	size_t config_mmap_size;
+	struct settings_root *settings_root;
 	int syslog_facility;
 	data_stack_frame_t datastack_frame_id;
 
@@ -48,11 +47,11 @@ struct master_service {
 	unsigned int socket_count;
 
 	struct io *io_status_write, *io_status_error;
-	unsigned int service_count_left;
+	unsigned int restart_request_count_left;
 	unsigned int total_available_count;
 	unsigned int process_limit;
 	unsigned int process_min_avail;
-	unsigned int idle_kill_secs;
+	unsigned int idle_kill_interval_secs;
 
 	struct master_status master_status;
 	unsigned int last_sent_status_avail_count;
@@ -61,6 +60,9 @@ struct master_service {
 
 	bool (*idle_die_callback)(void);
 	void (*die_callback)(void);
+	master_service_killed_callback_t *killed_callback;
+	void *killed_context;
+
 	struct timeout *to_die;
 
 	master_service_avail_overflow_callback_t *avail_overflow_callback;
@@ -71,9 +73,7 @@ struct master_service {
 
 	master_service_connection_callback_t *callback;
 
-	pool_t set_pool;
 	const struct master_service_settings *set;
-	struct setting_parser_context *set_parser;
 
 	struct ssl_iostream_context *ssl_ctx;
 	time_t ssl_params_last_refresh;
@@ -82,6 +82,7 @@ struct master_service {
 	char *last_kick_signal_user;
 	siginfo_t killed_signal_info;
 	volatile sig_atomic_t last_kick_signal_user_accessed;
+	volatile sig_atomic_t last_kick_signal_user_matched;
 	volatile sig_atomic_t killed_signal;
 	volatile struct timeval killed_time;
 
@@ -98,7 +99,6 @@ struct master_service {
 	bool config_path_changed_with_param:1;
 	bool have_admin_sockets:1;
 	bool want_ssl_server:1;
-	bool ssl_ctx_initialized:1;
 	bool config_path_from_master:1;
 	bool log_initialized:1;
 	bool init_finished:1;

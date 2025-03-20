@@ -12,15 +12,16 @@
 #include "process-title.h"
 #include "restrict-access.h"
 #include "fd-util.h"
-#include "settings-parser.h"
+#include "settings.h"
 #include "master-service.h"
+#include "master-service-settings.h"
 #include "login-server.h"
 #include "master-service-settings.h"
 #include "master-interface.h"
 #include "master-admin-client.h"
-#include "var-expand.h"
 #include "mail-error.h"
 #include "mail-user.h"
+#include "mailbox-attribute.h"
 #include "mail-storage-service.h"
 #include "smtp-server.h"
 #include "smtp-client.h"
@@ -190,8 +191,14 @@ client_create_from_input(const struct mail_storage_service_input *input,
 
 	restrict_access_allow_coredumps(TRUE);
 
-	set = settings_parser_get_root_set(mail_user->set_parser,
-			&submission_setting_parser_info);
+	if (settings_get(mail_user->event, &submission_setting_parser_info, 0,
+			 &set, error_r) < 0) {
+		send_error(fd_out, event, my_hostname,
+			"4.7.0", MAIL_ERRSTR_CRITICAL_MSG);
+		mail_user_deinit(&mail_user);
+		event_unref(&event);
+		return -1;
+	}
 	if (set->verbose_proctitle)
 		verbose_proctitle = TRUE;
 
@@ -205,6 +212,15 @@ client_create_from_input(const struct mail_storage_service_input *input,
 		event_unref(&event);
 		return -1;
 	}
+	int ret = mailbox_attribute_dict_is_enabled(mail_user, error_r);
+	if (ret < 0) {
+		send_error(fd_out, event, my_hostname,
+			"4.7.0", MAIL_ERRSTR_CRITICAL_MSG);
+		mail_user_deinit(&mail_user);
+		event_unref(&event);
+		return -1;
+	}
+	bool have_mailbox_attribute_dict = ret > 0;
 
 	/* parse input data */
 	data = NULL;
@@ -220,14 +236,14 @@ client_create_from_input(const struct mail_storage_service_input *input,
 			/* nothing to do */
 		}
 
-		/* NOTE: actually, pipelining the AUTH command is stricly
+		/* NOTE: actually, pipelining the AUTH command is strictly
 		         speaking not allowed, but we support it anyway.
 		 */
 	}
 
 	(void)client_create(fd_in, fd_out, event, mail_user,
 			    set, helo, &proxy_data, data, data_len,
-			    no_greeting);
+			    no_greeting, have_mailbox_attribute_dict);
 	event_unref(&event);
 	return 0;
 }
@@ -315,7 +331,7 @@ master_admin_cmd_kick_user(const char *user, const guid_128_t conn_guid)
 		if (strcmp(client->user->username, user) == 0 &&
 		    (guid_128_is_empty(conn_guid) ||
 		     guid_128_cmp(client->anvil_conn_guid, conn_guid) == 0))
-			client_kick(client);
+			client_kick(client, FALSE);
 	}
 	return count;
 }
@@ -335,10 +351,6 @@ static void client_connected(struct master_service_connection *conn)
 
 int main(int argc, char *argv[])
 {
-	static const struct setting_parser_info *set_roots[] = {
-		&submission_setting_parser_info,
-		NULL
-	};
 	struct login_server_settings login_set;
 	enum master_service_flags service_flags = 0;
 	enum mail_storage_service_flags storage_service_flags = 0;
@@ -413,9 +425,12 @@ int main(int argc, char *argv[])
 	master_admin_clients_init(&admin_callbacks);
 	master_service_set_die_callback(master_service, submission_die);
 
+	if (master_service_settings_read_simple(master_service, &error) < 0)
+		i_fatal("%s", error);
+
 	storage_service =
 		mail_storage_service_init(master_service,
-					  set_roots, storage_service_flags);
+					  storage_service_flags);
 
 	/* initialize SMTP server */
 	i_zero(&smtp_server_set);

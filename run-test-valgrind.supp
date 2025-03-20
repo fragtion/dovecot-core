@@ -114,3 +114,39 @@
    fun:_dl_catch_exception
    ...
 }
+{
+   <iconv_dlopen_origin_path_16>
+   Memcheck:Addr16
+   fun:strncmp
+   fun:is_dst
+   fun:_dl_dst_count
+   ...
+   fun:decompose_rpath
+   ...
+   fun:_dl_catch_exception
+   ...
+}
+{
+   <iconv_dlopen_origin_path2_16>
+   Memcheck:Addr16
+   fun:strncmp
+   fun:is_dst
+   fun:_dl_dst_substitute
+   ...
+   fun:decompose_rpath
+   ...
+   fun:_dl_catch_exception
+   ...
+}
+{
+   <test_lib_fatal_ostream_file>
+   Memcheck:Leak
+   match-leak-kinds: definite
+   fun:calloc
+   fun:pool_system_malloc
+   fun:p_malloc
+   fun:o_stream_create_fd_common
+   ...
+   fun:fatal_ostream_file
+   ...
+}

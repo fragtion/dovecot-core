@@ -61,7 +61,7 @@ struct mail_transaction_log_header {
 
 	   These are mainly useful to optimize syncing when the start position
 	   is (prev_file_seq, prev_file_offset). Then it's it's already known
-	   that the syncing can be started from this log file wihtout having
+	   that the syncing can be started from this log file without having
 	   to open the previous log file only to realize that there is nothing
 	   to sync. (Which could have also lead to an error if the .log.2 was
 	   already deleted.) */
@@ -385,9 +385,6 @@ int mail_transaction_log_open(struct mail_transaction_log *log);
 int mail_transaction_log_create(struct mail_transaction_log *log, bool reset);
 /* Close all the open transactions log files. */
 void mail_transaction_log_close(struct mail_transaction_log *log);
-
-/* Notify of indexid change */
-void mail_transaction_log_indexid_changed(struct mail_transaction_log *log);
 
 /* Returns the file seq/offset where the mailbox is currently synced at.
    Since the log is rotated only when mailbox is fully synced, the sequence

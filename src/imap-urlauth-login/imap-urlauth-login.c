@@ -11,15 +11,12 @@
 #include "master-service.h"
 #include "auth-client.h"
 #include "client-common.h"
-#include "imap-urlauth-login-settings.h"
 
 #define IMAP_URLAUTH_PROTOCOL_MAJOR_VERSION 2
 #define IMAP_URLAUTH_PROTOCOL_MINOR_VERSION 0
 
 struct imap_urlauth_client {
 	struct client common;
-
-	const struct imap_urlauth_login_settings *set;
 
 	bool version_received:1;
 };
@@ -143,14 +140,9 @@ static struct client *imap_urlauth_client_alloc(pool_t pool)
 	return &uauth_client->common;
 }
 
-static void imap_urlauth_client_create
-(struct client *client, void **other_sets)
+static int imap_urlauth_client_create(struct client *client ATTR_UNUSED)
 {
-	struct imap_urlauth_client *uauth_client =
-		(struct imap_urlauth_client *)client;
-
-	uauth_client->set = other_sets[0];
-	client->io = io_add_istream(client->input, client_input, client);
+	return 0;
 }
 
 static void imap_urlauth_client_notify_auth_ready(struct client *client)
@@ -166,11 +158,12 @@ static void imap_urlauth_client_notify_auth_ready(struct client *client)
 	client_send_raw(client, str_c(version));
 
 	client->banner_sent = TRUE;
+	i_assert(client->io == NULL);
+	client->io = io_add_istream(client->input, client_input, client);
 }
 
 static void imap_urlauth_login_preinit(void)
 {
-	login_set_roots = imap_urlauth_login_setting_roots;
 }
 
 static void imap_urlauth_login_init(void)
@@ -207,6 +200,10 @@ static struct login_binary imap_urlauth_login_binary = {
 	.deinit = imap_urlauth_login_deinit,
 
 	.anonymous_login_acceptable = TRUE,
+
+	.application_protocols = (const char *const[]) {
+		"imap", NULL
+	},
 };
 
 int main(int argc, char *argv[])

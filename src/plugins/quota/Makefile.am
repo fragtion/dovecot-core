@@ -21,6 +21,7 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-storage/index/maildir \
 	-I$(top_srcdir)/src/lib-program-client \
 	-I$(top_srcdir)/src/lib-doveadm \
+	-I$(top_srcdir)/src/lib-var-expand \
 	-I$(top_srcdir)/src/doveadm \
 	$(LIBTIRPC_CFLAGS)
 
@@ -31,28 +32,16 @@ lib10_quota_plugin_la_LDFLAGS = -module -avoid-version
 module_LTLIBRARIES = \
 	lib10_quota_plugin.la
 
-quota_dist_sources = \
+lib10_quota_plugin_la_SOURCES = \
 	quota.c \
 	quota-count.c \
 	quota-fs.c \
 	quota-imapc.c \
 	quota-maildir.c \
         quota-plugin.c \
+	quota-settings.c \
 	quota-storage.c \
 	quota-util.c
-
-quota_common_objects = \
-	quota.lo \
-	quota-count.lo \
-	quota-fs.lo \
-	quota-imapc.lo \
-	quota-maildir.lo \
-        quota-plugin.lo \
-	quota-storage.lo \
-	quota-util.lo \
-	$(RQUOTA_XDR_LO)
-
-lib10_quota_plugin_la_SOURCES = $(quota_dist_sources)
 nodist_lib10_quota_plugin_la_SOURCES = $(RQUOTA_XDR)
 lib10_quota_plugin_la_LIBADD = $(QUOTA_LIBS)
 
@@ -68,13 +57,13 @@ quota_status_SOURCES = \
 
 quota_status_CPPFLAGS = $(AM_CPPFLAGS) $(BINARY_CFLAGS)
 quota_status_LDADD = \
-	$(quota_common_objects) \
+	lib10_quota_plugin.la \
 	$(LIBDOVECOT_STORAGE) \
 	$(LIBDOVECOT) \
 	$(QUOTA_LIBS) \
 	$(BINARY_LDFLAGS)
 quota_status_DEPENDENCIES = \
-	$(quota_common_objects) \
+	lib10_quota_plugin.la \
 	$(LIBDOVECOT_STORAGE_DEPS) \
 	$(LIBDOVECOT_DEPS)
 
@@ -83,7 +72,6 @@ if HAVE_RQUOTA
 BUILT_SOURCES = rquota_xdr.c rquota.h
 
 RQUOTA_XDR = rquota_xdr.c
-RQUOTA_XDR_LO = rquota_xdr.lo
 
 rquota_xdr.c: rquota.h rquota.x
 	$(AM_V_GEN)(echo '#include "lib.h"'; \
@@ -116,7 +104,8 @@ pkginc_lib_HEADERS = \
 	quota.h \
 	quota-fs.h \
 	quota-plugin.h \
-	quota-private.h
+	quota-private.h \
+	quota-settings.h
 noinst_HEADERS = \
 	quota-status-settings.h
 
@@ -133,9 +122,11 @@ test_programs = \
 noinst_PROGRAMS = $(test_programs)
 
 test_libs = \
-	../../lib-test/libtest.la \
-	../../lib/liblib.la
-test_deps = $(noinst_LTLIBRARIES) $(test_libs)
+	$(LIBDOVECOT_STORAGE) \
+	$(LIBDOVECOT)
+test_deps = $(noinst_LTLIBRARIES) \
+	$(LIBDOVECOT_STORAGE_DEPS) \
+	$(LIBDOVECOT_DEPS)
 
 test_quota_util_SOURCES = test-quota-util.c
 test_quota_util_LDADD = quota-util.lo $(test_libs)

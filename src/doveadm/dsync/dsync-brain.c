@@ -136,7 +136,7 @@ dsync_brain_common_init(struct mail_user *user, struct dsync_ibc *ibc,
 	const struct master_service_settings *service_set;
 	pool_t pool;
 
-	service_set = master_service_settings_get(master_service);
+	service_set = master_service_get_service_settings(master_service);
 	mail_user_ref(user);
 
 	pool = pool_alloconly_create("dsync brain", 10240);
@@ -280,7 +280,6 @@ dsync_brain_master_init(struct mail_user *user, struct dsync_ibc *ibc,
 	ibc_set.sync_type = sync_type;
 	ibc_set.hdr_hash_v2 = TRUE;
 	ibc_set.lock_timeout = set->lock_timeout_secs;
-	ibc_set.import_commit_msgs_interval = set->import_commit_msgs_interval;
 	ibc_set.hashed_headers = set->hashed_headers;
 	/* reverse the backup direction for the slave */
 	ibc_set.brain_flags = flags & ENUM_NEGATE(DSYNC_BRAIN_FLAG_BACKUP_SEND |
@@ -302,7 +301,8 @@ dsync_brain_master_init(struct mail_user *user, struct dsync_ibc *ibc,
 struct dsync_brain *
 dsync_brain_slave_init(struct mail_user *user, struct dsync_ibc *ibc,
 		       bool local, const char *process_title_prefix,
-		       char default_alt_char)
+		       char default_alt_char,
+		       unsigned int import_commit_msgs_interval)
 {
 	struct dsync_ibc_settings ibc_set;
 	struct dsync_brain *brain;
@@ -314,6 +314,7 @@ dsync_brain_slave_init(struct mail_user *user, struct dsync_ibc *ibc,
 	brain->process_title_prefix =
 		p_strdup(brain->pool, process_title_prefix);
 	brain->state = DSYNC_STATE_SLAVE_RECV_HANDSHAKE;
+	brain->import_commit_msgs_interval = import_commit_msgs_interval;
 
 	if (local) {
 		/* both master and slave are running within the same process,
@@ -344,7 +345,7 @@ static void dsync_brain_purge(struct dsync_brain *brain)
 		storage = mail_namespace_get_default_storage(ns);
 		if (mail_storage_purge(storage) < 0) {
 			e_error(brain->event,
-				"Purging namespace '%s' failed: %s", ns->prefix,
+				"Purging namespace %s failed: %s", ns->set->name,
 				mail_storage_get_last_internal_error(storage, NULL));
 		}
 	}
@@ -883,13 +884,8 @@ bool dsync_brain_want_namespace(struct dsync_brain *brain,
 			return TRUE;
 		return FALSE;
 	} else {
-		/* By default sync only namespaces that have empty location.
-		   The unexpanded_location can be already expanded if it
-		   came from userdb or -o parameter. */
-		return strcmp(ns->set->unexpanded_location,
-			      SETTING_STRVAR_UNEXPANDED) == 0 ||
-			strcmp(ns->set->unexpanded_location,
-			       SETTING_STRVAR_EXPANDED) == 0;
+		/* By default sync only the INBOX namespace. */
+		return (ns->flags & NAMESPACE_FLAG_INBOX_USER) != 0;
 	}
 }
 

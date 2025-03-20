@@ -1,6 +1,7 @@
 /* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
+#include "connection.h"
 #include "llist.h"
 #include "ioloop.h"
 #include "str-sanitize.h"
@@ -176,7 +177,7 @@ static int get_ssl_tlv(const unsigned char *kvdata, size_t dlen,
 	if (dlen < SIZEOF_PP2_TLV_SSL)
 		return -1;
 	kv->client = kvdata[0];
-	/* spec does not specify the endianess of this field */
+	/* spec does not specify the endianness of this field */
 	kv->verify = cpu32_to_cpu_unaligned(kvdata+1);
 	kv->data = kvdata+SIZEOF_PP2_TLV_SSL;
 	kv->len = dlen - SIZEOF_PP2_TLV_SSL;
@@ -261,6 +262,12 @@ master_service_haproxy_parse_tlv(struct master_service_haproxy_conn *hpconn,
                         /* store hostname somewhere */
                         hpconn->conn.haproxy.hostname =
 				p_strndup(hpconn->pool, kv.data, kv.len);
+			if (!connection_is_valid_dns_name(hpconn->conn.haproxy.hostname)) {
+				*error_r = t_strdup_printf(
+						"get_tlv(%d) failed: Invalid characters in value",
+						PP2_TYPE_AUTHORITY);
+				return -1;
+			}
                         break;
                 case PP2_TYPE_SSL:
 			if (get_ssl_tlv(kv.data, kv.len, &ssl_kv) < 0) {

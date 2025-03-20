@@ -21,6 +21,8 @@ struct login_binary {
 	const char *protocol;
 	/* e.g. imap-login, pop3-login */
 	const char *process_name;
+	/* e.g. ManageSieve, h2.. */
+	const char *const *application_protocols;
 
 	/* e.g. 143, 110 */
 	in_port_t default_port;
@@ -52,19 +54,20 @@ extern struct login_client_list *login_client_list;
 extern bool closing_down, login_debug;
 extern struct anvil_client *anvil;
 extern const char *login_rawlog_dir;
-extern unsigned int initial_service_count;
+extern unsigned int initial_restart_request_count;
 /* NULL-terminated array of all alt_usernames seen so far. Existing fields are
    never removed. */
 extern ARRAY_TYPE(string) global_alt_usernames;
 extern bool login_ssl_initialized;
 
 extern const struct login_settings *global_login_settings;
-extern const struct master_service_ssl_settings *global_ssl_settings;
-extern void **global_other_settings;
+extern const struct ssl_settings *global_ssl_settings;
 
-extern const struct ip_addr *login_source_ips;
-extern unsigned int login_source_ips_idx, login_source_ips_count;
+extern const struct ip_addr *login_source_v4_ips;
+extern unsigned int login_source_v4_ips_idx, login_source_v4_ips_count;
 
+extern const struct ip_addr *login_source_v6_ips;
+extern unsigned int login_source_v6_ips_idx, login_source_v6_ips_count;
 
 void login_refresh_proctitle(void);
 void login_client_destroyed(void);

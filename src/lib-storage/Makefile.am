@@ -13,10 +13,12 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-master \
 	-I$(top_srcdir)/src/lib-settings \
 	-I$(top_srcdir)/src/lib-charset \
+	-I$(top_srcdir)/src/lib-language \
 	-I$(top_srcdir)/src/lib-mail \
 	-I$(top_srcdir)/src/lib-smtp \
 	-I$(top_srcdir)/src/lib-imap \
 	-I$(top_srcdir)/src/lib-index \
+	-I$(top_srcdir)/src/lib-var-expand \
 	-DPKG_RUNDIR=\""$(rundir)"\" \
 	-DMODULEDIR=\""$(moduledir)"\"
 
@@ -60,12 +62,12 @@ libstorage_la_SOURCES = \
 	mailbox-list.c \
 	mailbox-list-notify.c \
 	mailbox-list-register.c \
-	mailbox-match-plugin.c \
 	mailbox-recent-flags.c \
 	mailbox-search-result.c \
 	mailbox-tree.c \
 	mailbox-uidvalidity.c \
 	mailbox-watch.c \
+	lang-user.c \
 	test-mail-storage-common.c
 
 headers = \
@@ -98,12 +100,12 @@ headers = \
 	mailbox-list-iter.h \
 	mailbox-list-private.h \
 	mailbox-list-notify.h \
-	mailbox-match-plugin.h \
 	mailbox-recent-flags.h \
 	mailbox-search-result-private.h \
 	mailbox-tree.h \
 	mailbox-uidvalidity.h \
 	mailbox-watch.h \
+	lang-user.h \
 	test-mail-storage-common.h
 
 shlibs = \
@@ -120,7 +122,8 @@ shlibs = \
 	list/libstorage_list.la \
 	index/libstorage_index.la \
 	../lib-index/libindex.la \
-	../lib-imap-storage/libimap-storage.la
+	../lib-imap-storage/libimap-storage.la \
+	../lib-language/liblanguage.la
 
 libstorage_la_LIBADD = $(shlibs)
 libstorage_la_DEPENDENCIES = $(shlibs)
@@ -129,11 +132,10 @@ pkglib_LTLIBRARIES = libdovecot-storage.la
 libdovecot_storage_la_SOURCES =
 libdovecot_storage_la_LIBADD = \
 	libstorage.la \
-	../lib-dovecot/libdovecot.la \
+	$(LIBDOVECOT) \
 	$(LINKED_STORAGE_LDADD)
 libdovecot_storage_la_DEPENDENCIES = \
 	libstorage.la \
-	../lib-dovecot/libdovecot.la \
 	$(LIBDOVECOT_DEPS)
 libdovecot_storage_la_LDFLAGS = -export-dynamic
 
@@ -173,6 +175,7 @@ test_programs = \
 noinst_PROGRAMS = $(test_programs)
 
 test_libs = \
+	$(top_builddir)/src/lib-var-expand/libvar_expand.la \
 	$(top_builddir)/src/lib-test/libtest.la \
 	$(top_builddir)/src/lib/liblib.la
 

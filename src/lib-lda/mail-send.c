@@ -33,11 +33,10 @@ get_var_expand_table(struct mail *mail,
 		subject = "";
 
 	const struct var_expand_table stack_tab[] = {
-		{ 'n', "\r\n", "crlf" },
-		{ 'r', reason, "reason" },
-		{ 's', str_sanitize(subject, 80), "subject" },
-		{ 't', smtp_address_encode(recipient), "to" },
-		{ '\0', NULL, NULL }
+		{ .key = "reason", .value = reason },
+		{ .key = "subject", .value = str_sanitize(subject, 80) },
+		{ .key = "to", .value = smtp_address_encode(recipient) },
+		VAR_EXPAND_TABLE_END
 	};
 	struct var_expand_table *tab;
 
@@ -51,7 +50,6 @@ int mail_send_rejection(struct mail_deliver_context *ctx,
 			const char *reason)
 {
 	struct mail_user *user = ctx->rcpt_user;
-	struct ssl_iostream_settings ssl_set;
 	struct mail *mail = ctx->src_mail;
 	struct istream *input;
 	struct smtp_submit_input smtp_input;
@@ -60,7 +58,6 @@ int mail_send_rejection(struct mail_deliver_context *ctx,
 	const struct message_address *postmaster_addr;
 	const struct smtp_address *return_addr;
 	const char *hdr, *value, *msgid, *orig_msgid, *boundary, *error;
-	const struct var_expand_table *vtable;
 	string_t *str;
 	int ret;
 
@@ -96,12 +93,12 @@ int mail_send_rejection(struct mail_deliver_context *ctx,
 		smtp_address_encode(return_addr),
 		str_sanitize(reason, 512));
 
-	vtable = get_var_expand_table(mail, recipient, reason);
-
-	mail_user_init_ssl_client_settings(user, &ssl_set);
+	const struct var_expand_params params = {
+		.table = get_var_expand_table(mail, recipient, reason),
+		.event = ctx->event,
+	};
 
 	i_zero(&smtp_input);
-	smtp_input.ssl = &ssl_set;
 	smtp_submit = smtp_submit_init_simple(&smtp_input, ctx->smtp_set, NULL);
 	smtp_submit_add_rcpt(smtp_submit, return_addr);
 	output = smtp_submit_send(smtp_submit);
@@ -124,7 +121,7 @@ int mail_send_rejection(struct mail_deliver_context *ctx,
 		boundary);
 	str_append(str, "Subject: ");
 	if (var_expand(str, ctx->set->rejection_subject,
-		vtable, &error) <= 0) {
+		       &params, &error) < 0) {
 		e_error(ctx->event,
 			"Failed to expand rejection_subject=%s: %s",
 			ctx->set->rejection_subject, error);
@@ -142,7 +139,7 @@ int mail_send_rejection(struct mail_deliver_context *ctx,
 	str_append(str, "Content-Transfer-Encoding: 8bit\r\n\r\n");
 
 	if (var_expand(str, ctx->set->rejection_reason,
-		vtable, &error) <= 0) {
+		       &params, &error) < 0) {
 		e_error(ctx->event,
 			"Failed to expand rejection_reason=%s: %s",
 			ctx->set->rejection_reason, error);

@@ -31,6 +31,8 @@ doveadm_cmd_context_create(enum doveadm_client_type conn_type, bool forced_debug
 	struct doveadm_cmd_context *cctx = p_new(pool, struct doveadm_cmd_context, 1);
 	cctx->pool = pool;
 	cctx->event = event;
+	cctx->set_event = event;
+	event_ref(cctx->set_event);
 	cctx->conn_type = conn_type;
 	return cctx;
 }
@@ -41,7 +43,16 @@ void doveadm_cmd_context_unref(struct doveadm_cmd_context **_cctx)
 	*_cctx = NULL;
 
 	event_unref(&cctx->event);
+	event_unref(&cctx->set_event);
 	pool_unref(&cctx->pool);
+}
+
+void doveadm_cmd_context_replace_set_event(struct doveadm_cmd_context *cctx,
+					   struct event *set_event)
+{
+	event_unref(&cctx->set_event);
+	cctx->set_event = set_event;
+	event_ref(set_event);
 }
 
 static const struct doveadm_cmd_param *
@@ -374,12 +385,14 @@ int doveadm_cmdline_run(int argc, const char *const argv[],
 {
 	ARRAY_TYPE(doveadm_cmd_param_arr_t) pargv;
 	unsigned int pargc;
-	pool_t pool = pool_datastack_create();
+	pool_t pool = pool_alloconly_create("doveadm cmdline", 1024);
 
 	i_getopt_reset();
 	p_array_init(&pargv, pool, 20);
-	if (doveadm_cmd_process_options(argc, argv, cctx, pool, &pargv) < 0)
+	if (doveadm_cmd_process_options(argc, argv, cctx, pool, &pargv) < 0) {
+		pool_unref(&pool);
 		return -1;
+	}
 
 	unsigned int ptr_count;
 	struct doveadm_cmd_param *ptr = array_get_modifiable(&pargv, &ptr_count);
@@ -411,6 +424,7 @@ int doveadm_cmdline_run(int argc, const char *const argv[],
 				e_error(cctx->event, "Invalid parameter: %s",
 					t_strarray_join(argv + optind, " "));
 				doveadm_cmd_params_clean(&pargv);
+				pool_unref(&pool);
 				return -1;
 			}
 			found = TRUE;
@@ -420,6 +434,7 @@ int doveadm_cmdline_run(int argc, const char *const argv[],
 			e_error(cctx->event, "Extraneous arguments found: %s",
 				t_strarray_join(argv + optind, " "));
 			doveadm_cmd_params_clean(&pargv);
+			pool_unref(&pool);
 			return -1;
 		}
 		if (is_keyvalue)
@@ -439,6 +454,7 @@ int doveadm_cmdline_run(int argc, const char *const argv[],
 		cctx->cmd->cmd(cctx);
 
 	doveadm_cmd_params_clean(&pargv);
+	pool_unref(&pool);
 	return 0;
 }
 

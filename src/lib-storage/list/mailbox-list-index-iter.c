@@ -72,7 +72,7 @@ mailbox_list_get_escaped_mailbox_name(struct mailbox_list *list,
 				      string_t *escaped_name)
 {
 	const char escape_chars[] = {
-		list->set.storage_name_escape_char,
+		list->mail_set->mailbox_list_storage_escape_char[0],
 		mailbox_list_get_hierarchy_sep(list),
 		'\0'
 	};
@@ -223,9 +223,11 @@ mailbox_list_index_iter_next(struct mailbox_list_iterate_context *_ctx)
 		follow_children = (match & (IMAP_MATCH_YES |
 					    IMAP_MATCH_CHILDREN)) != 0;
 		if (match == IMAP_MATCH_YES && iter_subscriptions_ok(ctx)) {
-			/* If this is a) \NoSelect leaf, b) not LAYOUT=index
+			/* If this is a) \NoSelect leaf,
+			   b) not mailbox_list_layout=index
 			   and c) NO-NOSELECT is set, try to rmdir the leaf
-			   directories from filesystem. (With LAYOUT=index the
+			   directories from filesystem. (With
+			   mailbox_list_layout=index the
 			   \NoSelect mailboxes aren't on the filesystem.) */
 			if (ilist->has_backing_store &&
 			    mailbox_list_iter_try_delete_noselect(_ctx, &ctx->info,

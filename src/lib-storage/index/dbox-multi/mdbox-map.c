@@ -32,13 +32,10 @@ void mdbox_map_set_corrupted(struct mdbox_map *map, const char *format, ...)
 	va_list args;
 
 	va_start(args, format);
-	mail_storage_set_critical(MAP_STORAGE(map),
-				  "mdbox map %s corrupted: %s",
-				  map->index->filepath,
-				  t_strdup_vprintf(format, args));
+	mdbox_storage_set_corrupted(map->storage, "map %s corrupted: %s",
+				    map->index->filepath,
+				    t_strdup_vprintf(format, args));
 	va_end(args);
-
-	mdbox_storage_set_corrupted(map->storage);
 }
 
 struct mdbox_map *
@@ -87,7 +84,7 @@ static void mdbox_map_deinit_cleanup(struct mdbox_map *map)
 
 	const struct mail_index_header *hdr =
 		mail_index_get_header(map->view);
-	if (dbox_mailbox_list_cleanup(map->storage->storage.storage.user,
+	if (dbox_mailbox_list_cleanup(&map->storage->storage.storage,
 				      map->path, hdr->last_temp_file_scan) > 0)
 		index_mailbox_view_update_last_temp_file_scan(map->view);
 }
@@ -96,6 +93,8 @@ void mdbox_map_deinit(struct mdbox_map **_map)
 {
 	struct mdbox_map *map = *_map;
 
+	if (map == NULL)
+		return;
 	*_map = NULL;
 
 	mdbox_map_deinit_cleanup(map);
@@ -227,8 +226,10 @@ int mdbox_map_refresh(struct mdbox_map *map)
 		mail_storage_set_index_error(MAP_STORAGE(map), map->index);
 		ret = -1;
 	}
-	if (fscked)
-		mdbox_storage_set_corrupted(map->storage);
+	if (fscked) {
+		mdbox_storage_set_corrupted(map->storage,
+			"dovecot.index.map was fsck'd (refresh)");
+	}
 	return ret;
 }
 
@@ -475,7 +476,6 @@ static void
 mdbox_map_sync_handle(struct mdbox_map *map,
 		      struct mail_index_sync_ctx *sync_ctx)
 {
-	struct event *event = map->event;
 	struct mail_index_sync_rec sync_rec;
 	uint32_t seq1, seq2;
 	uoff_t offset1, offset2;
@@ -483,10 +483,10 @@ mdbox_map_sync_handle(struct mdbox_map *map,
 	mail_index_sync_get_offsets(sync_ctx, &seq1, &offset1, &seq2, &offset2);
 	if (offset1 != offset2 || seq1 != seq2) {
 		/* something had crashed. need a full resync. */
-		e_warning(event, "Inconsistency in map index "
-			  "(%u,%"PRIuUOFF_T" != %u,%"PRIuUOFF_T")",
-			  seq1, offset1, seq2, offset2);
-		mdbox_storage_set_corrupted(map->storage);
+		mdbox_storage_set_corrupted(map->storage,
+			"Inconsistency in map index "
+			"(%u,%"PRIuUOFF_T" != %u,%"PRIuUOFF_T")",
+			seq1, offset1, seq2, offset2);
 	}
 	while (mail_index_sync_next(sync_ctx, &sync_rec)) ;
 }
@@ -507,8 +507,10 @@ int mdbox_map_atomic_lock(struct mdbox_map_atomic_context *atomic,
 	ret = mail_index_sync_begin(atomic->map->index, &atomic->sync_ctx,
 				    &atomic->sync_view, &atomic->sync_trans,
 				    MAIL_INDEX_SYNC_FLAG_UPDATE_TAIL_OFFSET);
-	if (mail_index_reset_fscked(atomic->map->index))
-		mdbox_storage_set_corrupted(atomic->map->storage);
+	if (mail_index_reset_fscked(atomic->map->index)) {
+		mdbox_storage_set_corrupted(atomic->map->storage,
+			"dovecot.index.map was fsck'd (atomic lock)");
+	}
 	if (ret <= 0) {
 		i_assert(ret != 0);
 		mail_storage_set_index_error(MAP_STORAGE(atomic->map),
@@ -543,7 +545,8 @@ void mdbox_map_atomic_set_success(struct mdbox_map_atomic_context *atomic)
 
 void mdbox_map_atomic_unset_fscked(struct mdbox_map_atomic_context *atomic)
 {
-	mail_index_unset_fscked(atomic->sync_trans);
+	if (atomic->sync_trans != NULL)
+		mail_index_unset_fscked(atomic->sync_trans);
 }
 
 int mdbox_map_atomic_finish(struct mdbox_map_atomic_context **_atomic)

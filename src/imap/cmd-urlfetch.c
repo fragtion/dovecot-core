@@ -189,34 +189,27 @@ static int cmd_urlfetch_url_success(struct client_command_context *cmd,
 		client_send_line(cmd->client, str_c(response));
 		i_assert(reply->size == 0 || reply->input != NULL);
 	} else {
-		bool metadata = FALSE;
-
 		/* extended */
 		ctx->extended = TRUE;
 
-		str_append(response, " (");
 		if ((reply->flags & IMAP_URLAUTH_FETCH_FLAG_BODYPARTSTRUCTURE) != 0 &&
 		    reply->bodypartstruct != NULL) {
-			str_append(response, "BODYPARTSTRUCTURE (");
+			str_append(response, " (BODYPARTSTRUCTURE (");
 			str_append(response, reply->bodypartstruct);
-			str_append_c(response, ')');
-			metadata = TRUE;
+			str_append(response, "))");
 		}
 		if ((reply->flags & IMAP_URLAUTH_FETCH_FLAG_BODY) != 0 ||
 		    (reply->flags & IMAP_URLAUTH_FETCH_FLAG_BINARY) != 0) {
-			if (metadata)
-				str_append_c(response, ' ');
 			if ((reply->flags & IMAP_URLAUTH_FETCH_FLAG_BODY) != 0) {
-				str_append(response, "BODY ");
+				str_append(response, " (BODY ");
 			} else {
-				str_append(response, "BINARY ");
+				str_append(response, " (BINARY ");
 				if (reply->binary_has_nuls)
 					str_append_c(response, '~');
 			}
 			str_printfa(response, "{%"PRIuUOFF_T"}", reply->size);
 			i_assert(reply->size == 0 || reply->input != NULL);
 		} else {
-			str_append_c(response, ')');
 			ctx->extended = FALSE;
 		}
 
@@ -259,11 +252,7 @@ cmd_urlfetch_url_callback(struct imap_urlauth_fetch_reply *reply,
 
 	if (!in_io_handler)
 		o_stream_cork(client->output);
-	if (reply == NULL) {
-		/* fatal failure */
-		ctx->failed = TRUE;
-		ret = -1;
-	} else if (reply->succeeded) {
+	if (reply->succeeded) {
 		/* URL fetch succeeded */
 		ret = cmd_urlfetch_url_success(cmd, reply);
 	} else {

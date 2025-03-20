@@ -15,19 +15,24 @@ EXTRA_DIST = \
 	ChangeLog \
 	README.md \
 	INSTALL.md \
+	SECURITY.md \
 	update-version.sh \
 	run-test-valgrind.supp \
 	dovecot.service.in \
 	dovecot.socket \
 	version \
+	build-aux/git-abi-version-gen \
+	build-aux/git-version-gen \
 	$(conf_DATA)
 
 noinst_DATA = dovecot-config
 
 nodist_pkginclude_HEADERS = config.h
 
+distuninstallcheck_listfiles = find . -type f \! -name '*.conf' -print
+
 version:
-	$(AM_V_GEN)$(top_srcdir)/build-aux/git-version-gen > $@
+	$(AM_V_GEN)env VERSION=$(PACKAGE_VERSION) $(top_srcdir)/build-aux/git-version-gen > $@
 
 aclocal_DATA = m4/dovecot.m4
 
@@ -73,12 +78,14 @@ install-exec-hook:
 	-e "s|^\(LIBDOVECOT\)=.*$$|\1='-L$(pkglibdir) -ldovecot'|" \
 	-e "s|^\(LIBDOVECOT_LOGIN\)=.*$$|\1='-ldovecot-login $(SSL_LIBS)'|" \
 	-e "s|^\(LIBDOVECOT_SQL\)=.*$$|\1=-ldovecot-sql|" \
+	-e "s|^\(LIBDOVECOT_LDAP\)=.*$$|\1=-ldovecot-ldap|" \
 	-e "s|^\(LIBDOVECOT_COMPRESS\)=.*$$|\1=-ldovecot-compression|" \
 	-e "s|^\(LIBDOVECOT_DSYNC\)=.*$$|\1=-ldovecot-dsync|" \
 	-e "s|^\(LIBDOVECOT_LDA\)=.*$$|\1=-ldovecot-lda|" \
-	-e "s|^\(LIBDOVECOT_LIBFTS\)=.*$$|\1=-ldovecot-fts|" \
+	-e "s|^\(LIBDOVECOT_LIBLANG\)=.*$$|\1=-ldovecot-language|" \
 	-e "s|^\(LIBDOVECOT_LUA\)=.*$$|\1=-ldovecot-lua|" \
 	-e "s|^\(LIBDOVECOT_STORAGE\)=.*$$|\1='-ldovecot-storage $(LINKED_STORAGE_LDADD)'|" \
+	-e "s|^\(LIBDOVECOT_OPENSSL\)=.*$$|\1=-lssl_iostream_openssl|" \
 	-e "s|^\(LIBDOVECOT_INCLUDE\)=.*$$|\1=-I$(pkgincludedir)|" \
 	> $(DESTDIR)$(pkglibdir)/dovecot-config
 

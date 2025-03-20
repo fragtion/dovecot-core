@@ -46,26 +46,11 @@ static struct fs *fs_metawrap_alloc(void)
 }
 
 static int
-fs_metawrap_init(struct fs *_fs, const char *args,
-		 const struct fs_settings *set, const char **error_r)
+fs_metawrap_init(struct fs *_fs, const struct fs_parameters *params,
+		 const char **error_r)
 {
 	struct metawrap_fs *fs = METAWRAP_FS(_fs);
-	const char *parent_name, *parent_args;
-
-	if (*args == '\0') {
-		*error_r = "Parent filesystem not given as parameter";
-		return -1;
-	}
-
-	parent_args = strchr(args, ':');
-	if (parent_args == NULL) {
-		parent_name = args;
-		parent_args = "";
-	} else {
-		parent_name = t_strdup_until(args, parent_args);
-		parent_args++;
-	}
-	if (fs_init(parent_name, parent_args, set, &_fs->parent, error_r) < 0)
+	if (fs_init_parent(_fs, params, error_r) < 0)
 		return -1;
 	if ((fs_get_properties(_fs->parent) & FS_PROPERTY_METADATA) == 0)
 		fs->wrap_metadata = TRUE;
@@ -86,6 +71,7 @@ static enum fs_properties fs_metawrap_get_properties(struct fs *_fs)
 
 	props = fs_get_properties(_fs->parent);
 	if (fs->wrap_metadata) {
+		props |= FS_PROPERTY_METADATA;
 		/* we don't have a quick stat() to see the file's size,
 		   because of the metadata header */
 		props &= ENUM_NEGATE(FS_PROPERTY_STAT);
@@ -161,6 +147,8 @@ fs_metawrap_set_metadata(struct fs_file *_file, const char *key,
 		fs_set_metadata(_file->parent, key, value);
 	else {
 		fs_default_set_metadata(_file, key, value);
+		if (file->super_read != NULL)
+			fs_set_metadata(file->super_read, key, value);
 		file->metadata_changed_since_write = TRUE;
 	}
 }
@@ -258,6 +246,11 @@ fs_metawrap_read_stream(struct fs_file *_file, size_t max_buffer_size)
 	}
 
 	input = fs_read_stream(file->super_read, max_buffer_size);
+	if (input->stream_errno != 0) {
+		file->input = input;
+		i_stream_ref(file->input);
+		return file->input;
+	}
 	file->input = i_stream_create_metawrap(input, fs_metawrap_callback, file);
 	i_stream_unref(&input);
 	i_stream_ref(file->input);

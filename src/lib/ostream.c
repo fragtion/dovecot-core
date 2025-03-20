@@ -55,8 +55,16 @@ static void o_stream_close_full(struct ostream *stream, bool close_parents)
 	   complexity for many callers. Just require that at this point
 	   after flushing there isn't anything in the output buffer or that
 	   we're ignoring all errors. */
+	bool last_errors_not_checked =
+		stream->real_stream->last_errors_not_checked;
+
 	if (o_stream_flush(stream) == 0)
 		i_assert(stream->real_stream->error_handling_disabled);
+
+	/* We don't want this auto-flushing to remove the need for
+	   proper error checking. */
+	if (last_errors_not_checked)
+		stream->real_stream->last_errors_not_checked = TRUE;
 
 	if (!stream->closed && !stream->real_stream->closing) {
 		/* first mark the stream as being closed so the
@@ -146,6 +154,14 @@ void o_stream_unset_flush_callback(struct ostream *stream)
 	struct ostream_private *_stream = stream->real_stream;
 
 	_stream->set_flush_callback(_stream, NULL, NULL);
+}
+
+stream_flush_callback_t *
+o_stream_get_flush_callback(struct ostream *stream, void **context_r)
+{
+	struct ostream_private *_stream = stream->real_stream;
+	*context_r = _stream->context;
+	return _stream->callback;
 }
 
 void o_stream_set_max_buffer_size(struct ostream *stream, size_t max_size)

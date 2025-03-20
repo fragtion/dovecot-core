@@ -13,19 +13,21 @@ struct http_request;
 struct http_server;
 struct http_server_resource;
 struct http_server_request;
+struct http_server_request_limits;
 struct http_server_response;
+
+struct ssl_iostream_settings;
+
+#define HTTP_SERVER_DEFAULT_MAX_PAYLOAD_SIZE (1024 * 1024 * 1024 * 10ULL)
 
 /*
  * Server settings
  */
 
 struct http_server_settings {
-	const char *default_host;
-
+	pool_t pool;
+	const char *base_dir;
 	const char *rawlog_dir;
-
-	/* SSL settings; if NULL, master_service_ssl_init() is used instead */
-	const struct ssl_iostream_settings *ssl;
 
 	/* The maximum time in milliseconds a client is allowed to be idle
 	   before it is disconnected. */
@@ -35,20 +37,24 @@ struct http_server_settings {
 	unsigned int max_pipelined_requests;
 
 	/* Request limits */
-	struct http_request_limits request_limits;
+	uoff_t request_max_target_length;
+	uoff_t request_max_payload_size;
+	/* Request header limits */
+	uoff_t request_hdr_max_size;
+	uoff_t request_hdr_max_field_size;
+	unsigned int request_hdr_max_fields;
 
+	/* Hidden settings */
+	const char *default_host;
 	/* The kernel send/receive buffer sizes used for the connection sockets.
 	   Configuring this is mainly useful for the test suite. The kernel
 	   defaults are used when these settings are 0. */
-	size_t socket_send_buffer_size;
-	size_t socket_recv_buffer_size;
-
-	/* Event to use for the http server. */
-	struct event *event;
-
-	/* Enable logging debug messages */
-	bool debug;
+	uoff_t socket_send_buffer_size;
+	uoff_t socket_recv_buffer_size;
 };
+
+
+extern const struct setting_parser_info http_server_setting_parser_info;
 
 /*
  * Response
@@ -182,6 +188,9 @@ pool_t http_server_request_get_pool(struct http_server_request *req);
    http_server_response_create(), or NULL if none. */
 struct http_server_response *
 http_server_request_get_response(struct http_server_request *req);
+/* Get the server for this request. */
+struct http_server *
+http_server_request_get_server(struct http_server_request *req);
 /* Returns TRUE if request is finished either because a response was sent
    or because the request was aborted. */
 bool http_server_request_is_finished(struct http_server_request *req);
@@ -414,7 +423,11 @@ void http_server_resource_set_destroy_callback(struct http_server_resource *res,
  * Server
  */
 
-struct http_server *http_server_init(const struct http_server_settings *set);
+void http_server_settings_init(pool_t pool, struct http_server_settings *set_r);
+int http_server_init_auto(struct event *event_parent,
+			  struct http_server **server_r, const char **error_r);
+struct http_server *http_server_init(const struct http_server_settings *set,
+				     struct event *event_parent);
 void http_server_deinit(struct http_server **_server);
 
 /* Shut down the server; accept no new requests and drop connections once
@@ -424,4 +437,8 @@ void http_server_shut_down(struct http_server *server);
 /* Switch this server to the current ioloop */
 void http_server_switch_ioloop(struct http_server *server);
 
+/* Specify the SSL settings. By default lib-ssl-iostream automatically looks
+   them up from settings. */
+void http_server_set_ssl_settings(struct http_server *server,
+				  const struct ssl_iostream_settings *ssl);
 #endif

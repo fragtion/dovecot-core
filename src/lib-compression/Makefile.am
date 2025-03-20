@@ -3,6 +3,8 @@ noinst_LTLIBRARIES = libcompression.la
 AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib \
 	-I$(top_srcdir)/src/lib-test \
+	-I$(top_srcdir)/src/lib-settings \
+	-I$(top_srcdir)/src/lib-var-expand \
 	$(ZSTD_CFLAGS)
 
 libcompression_la_SOURCES = \
@@ -31,8 +33,8 @@ noinst_HEADERS = \
 
 pkglib_LTLIBRARIES = libdovecot-compression.la
 libdovecot_compression_la_SOURCES =
-libdovecot_compression_la_LIBADD = libcompression.la ../lib-dovecot/libdovecot.la $(COMPRESS_LIBS)
-libdovecot_compression_la_DEPENDENCIES = libcompression.la ../lib-dovecot/libdovecot.la
+libdovecot_compression_la_LIBADD = libcompression.la $(LIBDOVECOT) $(COMPRESS_LIBS)
+libdovecot_compression_la_DEPENDENCIES = libcompression.la $(LIBDOVECOT_DEPS)
 libdovecot_compression_la_LDFLAGS = -export-dynamic
 
 test_programs = \
@@ -42,8 +44,8 @@ noinst_PROGRAMS = $(test_programs) bench-compression
 
 test_libs = \
 	$(noinst_LTLIBRARIES) \
-	../lib-test/libtest.la \
-	../lib/liblib.la
+	../lib-dovecot/libdovecot.la
+
 test_deps = $(test_libs)
 
 test_compression_SOURCES = test-compression.c

@@ -4,7 +4,6 @@
 #include "str.h"
 #include "istream.h"
 #include "array.h"
-#include "var-expand.h"
 #include "dlua-script.h"
 #include "dlua-script-private.h"
 #include "mail-storage.h"
@@ -38,7 +37,6 @@ static struct dlua_table_values lua_storage_mail_storage_flags[] = {
 	DLUA_TABLE_ENUM(MAILBOX_FLAG_AUTO_SUBSCRIBE),
 
 	DLUA_TABLE_ENUM(MAILBOX_SYNC_FLAG_FULL_READ),
-	DLUA_TABLE_ENUM(MAILBOX_SYNC_FLAG_FULL_WRITE),
 	DLUA_TABLE_ENUM(MAILBOX_SYNC_FLAG_FAST),
 	DLUA_TABLE_ENUM(MAILBOX_SYNC_FLAG_NO_EXPUNGES),
 	DLUA_TABLE_ENUM(MAILBOX_SYNC_FLAG_FIX_INCONSISTENT),

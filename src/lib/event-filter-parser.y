@@ -57,6 +57,7 @@ static struct event_filter_node *key_value(struct event_filter_parser_state *sta
 	node = p_new(state->pool, struct event_filter_node, 1);
 	node->type = type;
 	node->op = op;
+	node->case_sensitive = state->case_sensitive;
 
 	switch (type) {
 	case EVENT_FILTER_NODE_TYPE_LOGIC:
@@ -64,32 +65,14 @@ static struct event_filter_node *key_value(struct event_filter_parser_state *sta
 	case EVENT_FILTER_NODE_TYPE_EVENT_NAME_WILDCARD: {
 		if (wildcard_is_escaped_literal(b)) {
 			node->type = EVENT_FILTER_NODE_TYPE_EVENT_NAME_EXACT;
-			node->str = str_unescape(p_strdup(state->pool, b));
+			node->field.value.str = str_unescape(p_strdup(state->pool, b));
 		} else {
-			node->str = p_strdup(state->pool, b);
+			node->field.value.str = p_strdup(state->pool, b);
 		}
 		break;
 	}
 	case EVENT_FILTER_NODE_TYPE_EVENT_SOURCE_LOCATION: {
-		const char *colon = strrchr(b, ':');
-		char *file;
-		uintmax_t line;
-
-		/* split "filename:line-number", but also handle "filename" */
-		if (colon != NULL) {
-			if (str_to_uintmax(colon + 1, &line) < 0) {
-				file = p_strdup(state->pool, b);
-				line = 0;
-			} else {
-				file = p_strdup_until(state->pool, b, colon);
-			}
-		} else {
-			file = p_strdup(state->pool, b);
-			line = 0;
-		}
-
-		node->str = str_unescape(file);
-		node->intmax = line;
+		node->field.value.str = str_unescape(p_strdup(state->pool, b));
 		break;
 	}
 	case EVENT_FILTER_NODE_TYPE_EVENT_CATEGORY:
@@ -99,10 +82,7 @@ static struct event_filter_node *key_value(struct event_filter_parser_state *sta
 		}
 		break;
 	case EVENT_FILTER_NODE_TYPE_EVENT_FIELD_WILDCARD: {
-		char *b_duped = p_strdup(state->pool, b);
 		node->field.key = p_strdup(state->pool, a);
-		node->field.value.str = b_duped;
-		node->field.value_type = EVENT_FIELD_VALUE_TYPE_STR;
 
 		/* Filter currently supports only comparing strings
 		   and numbers. */
@@ -119,7 +99,6 @@ static struct event_filter_node *key_value(struct event_filter_parser_state *sta
 			/* This field contains no valid number.
 			   Either this is a string that contains a size unit, a
 			   number with wildcard or another arbitrary string. */
-			node->field.value.intmax = INT_MIN;
 
 			/* If the field contains a size unit, take that. */
 			uoff_t bytes;
@@ -130,6 +109,7 @@ static struct event_filter_node *key_value(struct event_filter_parser_state *sta
 				   whether it's MB or minutes. A warning will
 				   be logged later on about this. */
 				node->field.value_type = EVENT_FIELD_VALUE_TYPE_STR;
+				node->field.value.str = p_strdup(state->pool, b);
 				node->ambiguous_unit = TRUE;
 				break;
 			}
@@ -153,12 +133,15 @@ static struct event_filter_node *key_value(struct event_filter_parser_state *sta
 				break;
 			}
 
+			char *b_duped = p_strdup(state->pool, b);
 			if (wildcard_is_escaped_literal(b)) {
 				node->type = EVENT_FILTER_NODE_TYPE_EVENT_FIELD_EXACT;
 				str_unescape(b_duped);
 			} else if (strspn(b, "0123456789*?") == strlen(b)) {
 				node->type = EVENT_FILTER_NODE_TYPE_EVENT_FIELD_NUMERIC_WILDCARD;
 			}
+			node->field.value.str = b_duped;
+			node->field.value_type = EVENT_FIELD_VALUE_TYPE_STR;
 		}
 
 		break;

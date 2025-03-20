@@ -381,30 +381,49 @@ int main(int argc, char *argv[])
 		dns_client = NULL;
 	}
 	i_zero(&ssl_set);
+	ssl_set.pool = null_pool;
 	ssl_set.allow_invalid_cert = TRUE;
 	if (stat("/etc/ssl/certs", &st) == 0 && S_ISDIR(st.st_mode))
 		ssl_set.ca_dir = "/etc/ssl/certs"; /* debian */
-	if (stat("/etc/ssl/certs", &st) == 0 && S_ISREG(st.st_mode))
-		ssl_set.ca_file = "/etc/pki/tls/cert.pem"; /* redhat */
+	if (stat("/etc/ssl/certs", &st) == 0 && S_ISREG(st.st_mode)) {
+		/* redhat */
+		const char *ca_value;
+		if (settings_parse_read_file("/etc/pki/tls/cert.pem",
+					     "/etc/pki/tls/cert.pem",
+					     unsafe_data_stack_pool, NULL,
+					     &ca_value, &error) < 0)
+			i_fatal("%s", error);
+		settings_file_get(ca_value, unsafe_data_stack_pool,
+				  &ssl_set.ca);
+	}
 
-	i_zero(&http_set);
-	http_set.ssl = &ssl_set;
-	http_set.dns_client = dns_client;
+	http_client_settings_init(null_pool, &http_set);
 	http_set.max_idle_time_msecs = 5*1000;
 	http_set.max_parallel_connections = 4;
 	http_set.max_pipelined_requests = 4;
-	http_set.max_redirects = 2;
+	http_set.request_max_redirects = 2;
 	http_set.request_timeout_msecs = 10*1000;
-	http_set.max_attempts = 1;
-	http_set.debug = TRUE;
+	http_set.request_max_attempts = 1;
 	http_set.rawlog_dir = "/tmp/http-test";
 
-	http_cctx = http_client_context_create(&http_set);
+	http_cctx = http_client_context_create();
 
-	http_client1 = http_client_init_shared(http_cctx, NULL);
-	http_client2 = http_client_init_shared(http_cctx, NULL);
-	http_client3 = http_client_init_shared(http_cctx, NULL);
-	http_client4 = http_client_init_shared(http_cctx, NULL);
+	struct event *event = event_create(NULL);
+	event_set_forced_debug(event, TRUE);
+	http_client1 = http_client_init_shared(http_cctx, &http_set, event);
+	http_client2 = http_client_init_shared(http_cctx, &http_set, event);
+	http_client3 = http_client_init_shared(http_cctx, &http_set, event);
+	http_client4 = http_client_init_shared(http_cctx, &http_set, event);
+	event_unref(&event);
+
+	http_client_set_ssl_settings(http_client1, &ssl_set);
+	http_client_set_ssl_settings(http_client2, &ssl_set);
+	http_client_set_ssl_settings(http_client3, &ssl_set);
+	http_client_set_ssl_settings(http_client4, &ssl_set);
+	http_client_set_dns_client(http_client1, dns_client);
+	http_client_set_dns_client(http_client2, dns_client);
+	http_client_set_dns_client(http_client3, dns_client);
+	http_client_set_dns_client(http_client4, dns_client);
 
 	switch (argc) {
 	case 1:

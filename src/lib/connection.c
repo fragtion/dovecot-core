@@ -16,11 +16,17 @@
 
 #include <unistd.h>
 
-static void connection_handshake_ready(struct connection *conn)
+void connection_set_handshake_ready(struct connection *conn)
 {
-	conn->handshake_received = TRUE;
+	i_assert(conn->handshake_finished.tv_sec == 0);
+	conn->handshake_finished = ioloop_timeval;
 	if (conn->v.handshake_ready != NULL)
 		conn->v.handshake_ready(conn);
+}
+
+bool connection_handshake_received(struct connection *conn)
+{
+	return conn->handshake_finished.tv_sec != 0;
 }
 
 static void connection_closed(struct connection *conn,
@@ -40,6 +46,53 @@ static void connection_connect_timeout(struct connection *conn)
 	connection_closed(conn, CONNECTION_DISCONNECT_CONNECT_TIMEOUT);
 }
 
+static int connection_flush_callback(struct connection *conn)
+{
+	int ret;
+	stream_flush_callback_t *callback = conn->flush_callback;
+	if (conn->flush_callback != NULL) {
+		ret = callback(conn->flush_context);
+	} else {
+		ret = o_stream_flush(conn->output);
+	}
+	if (ret < 0) {
+		e_error(conn->event, "write(%s) failed: %s", conn->name,
+			o_stream_get_error(conn->output));
+	} else if (o_stream_get_buffer_used_size(conn->output) <=
+		   conn->list->set.output_throttle_size / 3) {
+		/* resume connection reading */
+		e_debug(conn->event, "Output buffer has flushed enough - "
+			"resuming input");
+		connection_input_resume(conn);
+		o_stream_unset_flush_callback(conn->output);
+		if (callback != NULL)
+			o_stream_set_flush_callback(conn->output, *callback,
+						    conn->flush_context);
+		conn->flush_context = NULL;
+		conn->flush_callback = NULL;
+	}
+	return ret;
+}
+
+static inline bool connection_output_throttle(struct connection *conn)
+{
+	/* not enabled */
+	if (conn->list->set.output_throttle_size != 0 &&
+	    conn->output != NULL &&
+	    o_stream_get_buffer_used_size(conn->output) >=
+	    conn->list->set.output_throttle_size) {
+		conn->flush_callback =
+			o_stream_get_flush_callback(conn->output, &conn->flush_context);
+		o_stream_set_flush_callback(conn->output,
+					    connection_flush_callback, conn);
+		e_debug(conn->event, "Output buffer has reached throttle limit - "
+			"halting input");
+		connection_input_halt(conn);
+		return TRUE;
+	}
+	return FALSE;
+}
+
 static int connection_input_parse_lines(struct connection *conn)
 {
 	const char *line;
@@ -56,11 +109,11 @@ static int connection_input_parse_lines(struct connection *conn)
 	}
 	while (!input->closed && (line = i_stream_next_line(input)) != NULL) {
 		T_BEGIN {
-			if (!conn->handshake_received &&
+			if (!connection_handshake_received(conn) &&
 			    conn->v.handshake_line != NULL) {
 				ret = conn->v.handshake_line(conn, line);
 				if (ret > 0)
-					connection_handshake_ready(conn);
+					connection_set_handshake_ready(conn);
 				else if (ret == 0)
 					/* continue reading */
 					ret = 1;
@@ -71,6 +124,9 @@ static int connection_input_parse_lines(struct connection *conn)
 				ret = conn->v.input_line(conn, line);
 			}
 		} T_END;
+		/* If throttled, stop reading */
+		if (ret > 0 && connection_output_throttle(conn))
+			ret = 0;
 		if (ret <= 0)
 			break;
 		if (conn->input != input) {
@@ -100,7 +156,7 @@ void connection_input_default(struct connection *conn)
 {
 	int ret;
 
-	if (!conn->handshake_received &&
+	if (!connection_handshake_received(conn) &&
 	    conn->v.handshake != NULL) {
 		if ((ret = conn->v.handshake(conn)) < 0) {
 			connection_closed(
@@ -109,7 +165,7 @@ void connection_input_default(struct connection *conn)
 		} else if (ret == 0) {
 			return;
 		} else {
-			connection_handshake_ready(conn);
+			connection_set_handshake_ready(conn);
 		}
 	}
 
@@ -186,22 +242,22 @@ int connection_input_line_default(struct connection *conn, const char *line)
 		return -1;
 	}
 
-	if (!conn->handshake_received &&
+	if (!connection_handshake_received(conn) &&
 	    (conn->v.handshake_args != connection_handshake_args_default ||
 	     conn->list->set.major_version != 0)) {
 		int ret;
 		if ((ret = conn->v.handshake_args(conn, args)) == 0)
 			ret = 1; /* continue reading */
 		else if (ret > 0)
-			connection_handshake_ready(conn);
+			connection_set_handshake_ready(conn);
 		else {
 			conn->disconnect_reason =
 				CONNECTION_DISCONNECT_HANDSHAKE_FAILED;
 		}
 		return ret;
-	} else if (!conn->handshake_received) {
+	} else if (!connection_handshake_received(conn)) {
 		/* we don't do handshakes */
-		connection_handshake_ready(conn);
+		connection_set_handshake_ready(conn);
 	}
 
 	/* version must be handled though, by something */
@@ -401,6 +457,8 @@ void connection_update_event(struct connection *conn)
 		event_add_int(conn->event, "remote_pid", conn->remote_pid);
 	if (conn->remote_uid != (uid_t)-1)
 		event_add_int(conn->event, "remote_uid", conn->remote_uid);
+	if (conn->remote_gid != (gid_t)-1)
+		event_add_int(conn->event, "remote_gid", conn->remote_gid);
 }
 
 void connection_update_properties(struct connection *conn)
@@ -430,6 +488,8 @@ void connection_update_properties(struct connection *conn)
 		} else if (net_getunixcred(fd, &cred) == 0) {
 			conn->remote_pid = cred.pid;
 			conn->remote_uid = cred.uid;
+			conn->remote_gid = cred.gid;
+			conn->have_unix_credentials = TRUE;
 		}
 		conn->unix_peer_checked = TRUE;
 	}
@@ -452,7 +512,7 @@ static void connection_init_streams(struct connection *conn)
 	i_assert(conn->output == NULL);
 	i_assert(conn->to == NULL);
 
-	conn->handshake_received = FALSE;
+	i_zero(&conn->handshake_finished);
 	conn->version_received = set->major_version == 0;
 
 	if (set->input_max_size != 0) {
@@ -536,11 +596,15 @@ connection_init_full(struct connection_list *list, struct connection *conn,
 		conn->id = list->id_counter++;
 	}
 
+	i_zero(&conn->connect_started);
+	i_zero(&conn->connect_finished);
+
 	conn->ioloop = current_ioloop;
 	conn->fd_in = fd_in;
 	conn->fd_out = fd_out;
 	conn->disconnected = TRUE;
 	conn->remote_uid = (uid_t)-1;
+	conn->remote_gid = (gid_t)-1;
 	conn->remote_pid = (pid_t)-1;
 
 	i_free(conn->base_name);
@@ -591,6 +655,10 @@ void connection_init_server(struct connection_list *list,
 	e_debug(e->event(), "Server accepted connection (fd=%d)", fd_in);
 
 	connection_init_streams(conn);
+	/* Client has finished connecting to server, so record it
+	   here. */
+	conn->connect_finished = ioloop_timeval;
+
 	if (conn->v.init != NULL)
 		conn->v.init(conn);
 }
@@ -824,6 +892,8 @@ void connection_disconnect(struct connection *conn)
 	i_stream_destroy(&conn->input);
 	o_stream_close(conn->output);
 	o_stream_destroy(&conn->output);
+	if (conn->fd_in == conn->fd_out)
+		(void)shutdown(conn->fd_out, SHUT_RDWR);
 	fd_close_maybe_stdio(&conn->fd_in, &conn->fd_out);
 	conn->disconnected = TRUE;
 }
@@ -915,21 +985,22 @@ const char *connection_disconnect_reason(struct connection *conn)
 const char *connection_input_timeout_reason(struct connection *conn)
 {
 	if (conn->last_input_tv.tv_sec != 0) {
-		int diff = timeval_diff_msecs(&ioloop_timeval,
-					      &conn->last_input_tv);
-		return t_strdup_printf("No input for %u.%03u secs",
+		long long diff = timeval_diff_msecs(&ioloop_timeval,
+						    &conn->last_input_tv);
+		return t_strdup_printf("No input for %lld.%03lld secs",
 				       diff/1000, diff%1000);
 	} else if (conn->connect_finished.tv_sec != 0) {
-		int diff = timeval_diff_msecs(&ioloop_timeval,
-					      &conn->connect_finished);
+		long long diff = timeval_diff_msecs(&ioloop_timeval,
+						    &conn->connect_finished);
 		return t_strdup_printf(
-			"No input since connected %u.%03u secs ago",
+			"No input since connected %lld.%03lld secs ago",
 			diff/1000, diff%1000);
 	} else {
-		int diff = timeval_diff_msecs(&ioloop_timeval,
-					      &conn->connect_started);
-		return t_strdup_printf("connect(%s) timed out after %u.%03u secs",
-				       conn->name, diff/1000, diff%1000);
+		long long diff = timeval_diff_msecs(&ioloop_timeval,
+						    &conn->connect_started);
+		return t_strdup_printf(
+			"connect(%s) timed out after %lld.%03lld secs",
+			conn->name, diff/1000, diff%1000);
 	}
 }
 
@@ -1002,6 +1073,8 @@ void connection_list_deinit(struct connection_list **_list)
 	struct connection_list *list = *_list;
 	struct connection *conn;
 
+	if (list == NULL)
+		return;
 	*_list = NULL;
 
 	while (list->connections != NULL) {
@@ -1010,4 +1083,22 @@ void connection_list_deinit(struct connection_list **_list)
 		i_assert(conn != list->connections);
 	}
 	i_free(list);
+}
+
+bool connection_is_valid_dns_name(const char *name)
+{
+	const char *p = name;
+	if (*name == '\0')
+		return FALSE;
+	if (strstr(name, "..") != NULL)
+		return FALSE;
+	for (; *p != '\0'; p++) {
+		if ((*p < '0' || *p > '9') &&
+		    (*p < 'A' || *p > 'Z') &&
+		    (*p < 'a' || *p > 'z') &&
+		    *p != '.' && *p != '-' &&
+		    *p != '_' && *p != ':')
+			return FALSE;
+	}
+	return p - name < 256; /* maximum length is 255 by RFC 952 */
 }

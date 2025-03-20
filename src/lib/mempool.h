@@ -46,6 +46,7 @@ struct pool_vfuncs {
 
 struct pool {
 	const struct pool_vfuncs *v;
+	ARRAY(pool_t) external_refs;
 
 	bool alloconly_pool:1;
 	bool datastack_pool:1;
@@ -58,6 +59,11 @@ extern struct pool static_system_pool;
 /* memory allocated from data_stack is valid only until next t_pop() call.
    No checks are performed. */
 extern pool_t unsafe_data_stack_pool;
+
+/* null_pool can be used to have a memory pool where referencing and
+   unreferencing it are ignored. Any attempt to allocate memory from it will
+   panic. */
+extern pool_t null_pool;
 
 /* Create a new alloc-only pool. Note that `size' specifies the initial
    malloc()ed block size, part of it is used internally. */
@@ -86,15 +92,23 @@ pool_t pool_allocfree_create_clean(const char *name);
    old_size + 1. */
 size_t pool_get_exp_grown_size(pool_t pool, size_t old_size, size_t min_size);
 
+/* Reference another memory pool in the given pool. This call also increases
+   the ref_pool's reference count. When the pool is freed, the referenced
+   memory pools are also unreferenced. */
+void pool_add_external_ref(pool_t pool, pool_t ref_pool);
+
 /* We require sizeof(type) to be <= UINT_MAX. This allows compiler to optimize
    away the entire MALLOC_MULTIPLY() call on 64bit systems. */
 #define p_new(pool, type, count) \
+	/* NOLINTNEXTLINE(bugprone-sizeof-expression) */ \
 	((type *) p_malloc(pool, MALLOC_MULTIPLY((unsigned int)sizeof(type), (count))) + \
 	 COMPILE_ERROR_IF_TRUE(sizeof(type) > UINT_MAX))
 
 #define p_realloc_type(pool, mem, type, old_count, new_count) \
 	((type *) p_realloc(pool, mem, \
+	/* NOLINTNEXTLINE(bugprone-sizeof-expression) */ \
 	 MALLOC_MULTIPLY((unsigned int)sizeof(type), (old_count)), \
+	 /* NOLINTNEXTLINE(bugprone-sizeof-expression) */ \
 	 MALLOC_MULTIPLY((unsigned int)sizeof(type), (new_count))) + \
 		COMPILE_ERROR_IF_TRUE(sizeof(type) > UINT_MAX))
 
@@ -107,6 +121,8 @@ p_malloc(pool_t pool, size_t size)
 	return pool->v->malloc(pool, size);
 }
 
+/* For allocfree and system pools you can use SIZE_MAX
+   to indicate that you have no knowledge of the old size. */
 static inline void * ATTR_WARN_UNUSED_RESULT ATTR_RETURNS_NONNULL
 p_realloc(pool_t pool, void *mem, size_t old_size, size_t new_size)
 {
@@ -175,5 +191,6 @@ size_t pool_allocfree_get_total_alloc_size(pool_t pool);
 
 /* private: */
 void pool_system_free(pool_t pool, void *mem);
+void pool_external_refs_unref(pool_t pool);
 
 #endif

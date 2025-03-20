@@ -2,6 +2,7 @@
 #define IMAP_CLIENT_H
 
 #include "imap-commands.h"
+#include "imap-stats.h"
 #include "message-size.h"
 
 #define CLIENT_COMMAND_QUEUE_MAX_SIZE 4
@@ -17,6 +18,11 @@ struct lda_settings;
 struct imap_parser;
 struct imap_arg;
 struct imap_urlauth_context;
+
+enum client_create_flags {
+	CLIENT_CREATE_FLAG_UNHIBERNATED = BIT(0),
+	CLIENT_CREATE_FLAG_MULTIPLEX_OUTPUT = BIT(1),
+};
 
 struct mailbox_keywords {
 	/* All keyword names. The array itself exists in mail_index.
@@ -125,7 +131,7 @@ struct client_command_context {
 
 struct imap_client_vfuncs {
 	/* Perform client initialization. This is called when client creation is
-	   finished completely. Particulary, at this point the namespaces are
+	   finished completely. Particularly, at this point the namespaces are
 	   fully initialized, which is not the case for the client create hook.
 	 */
 	void (*init)(struct client *client);
@@ -164,6 +170,7 @@ struct client {
 	struct io *io;
 	struct istream *input, *pre_rawlog_input, *post_rawlog_input;
 	struct ostream *output, *pre_rawlog_output, *post_rawlog_output;
+	struct ostream *multiplex_output, *side_channel_output;
 	struct timeout *to_idle, *to_idle_output, *to_delayed_input;
 	guid_128_t anvil_conn_guid;
 
@@ -171,6 +178,7 @@ struct client {
 	const struct imap_settings *set;
 	const struct smtp_submit_settings *smtp_set;
 	string_t *capability_string;
+	const char *init_error;
 	const char *disconnect_reason;
 
         struct mail_user *user;
@@ -199,11 +207,7 @@ struct client {
 	uint64_t highest_fetch_modseq;
 	ARRAY_TYPE(seq_range) fetch_failed_uids;
 
-	/* For imap_logout_format statistics: */
-	unsigned int fetch_hdr_count, fetch_body_count;
-	uint64_t fetch_hdr_bytes, fetch_body_bytes;
-	unsigned int deleted_count, expunged_count, trashed_count;
-	unsigned int autoexpunged_count, append_count;
+	struct imap_logout_stats logout_stats;
 
 	/* SEARCHRES extension: Last saved SEARCH result */
 	ARRAY_TYPE(seq_range) search_saved_uidset;
@@ -267,10 +271,12 @@ extern unsigned int imap_client_count;
 
 extern unsigned int imap_feature_condstore;
 extern unsigned int imap_feature_qresync;
+extern unsigned int imap_feature_utf8accept;
 
 /* Create new client with specified input/output handles. socket specifies
    if the handle is a socket. */
-struct client *client_create(int fd_in, int fd_out, bool unhibernated,
+struct client *client_create(int fd_in, int fd_out,
+			     enum client_create_flags flags,
 			     struct event *event, struct mail_user *user,
 			     const struct imap_settings *set,
 			     const struct smtp_submit_settings *smtp_set);
@@ -285,7 +291,7 @@ void client_destroy(struct client *client, const char *reason) ATTR_NULL(2);
 void client_disconnect(struct client *client, const char *reason);
 void client_disconnect_with_error(struct client *client,
 				  const char *client_error);
-void client_kick(struct client *client);
+void client_kick(struct client *client, bool shutdown);
 
 /* Add the given capability to the CAPABILITY reply. If imap_capability setting
    has an explicit capability, nothing is changed. */
@@ -326,7 +332,9 @@ void client_args_finished(struct client_command_context *cmd,
    have to wait for an existing SEARCH SAVE to finish. */
 bool client_handle_search_save_ambiguity(struct client_command_context *cmd);
 
-void client_enable(struct client *client, unsigned int feature_idx);
+/* Enable an IMAP feature. Returns TRUE if the feature was actually enabled
+   (or it was already enabled before). */
+bool client_enable(struct client *client, unsigned int feature_idx);
 /* Returns TRUE if the given feature is enabled */
 bool client_has_enabled(struct client *client, unsigned int feature_idx);
 /* Returns mailbox features that are currently enabled. */

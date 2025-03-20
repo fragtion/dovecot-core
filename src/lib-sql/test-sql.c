@@ -1,28 +1,31 @@
 /* Copyright (c) 2021 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
+#include "settings.h"
 #include "test-common.h"
-#include "sql-api.h"
+#include "sql-api-private.h"
 #include "driver-test.h"
 
 static struct sql_db *setup_sql(void)
 {
-	const struct sql_settings set = {
-		.driver = "sqlite",
-		.connect_string = "",
-	};
+	struct settings_simple set;
+	settings_simple_init(&set, (const char *const []) {
+		"sql_driver", "sqlite",
+		NULL,
+	});
 	struct sql_db *sql = NULL;
 	const char *error = NULL;
 
-	sql_drivers_init();
+	sql_drivers_init_without_drivers();
 	sql_driver_test_register();
 
-	test_assert(sql_init_full(&set, &sql, &error) == 0 &&
-		    sql != NULL &&
-		    error == NULL);
+	if (sql_init_auto(set.event, &sql, &error) <= 0)
+		i_fatal("%s", error);
+	test_assert(sql != NULL && error == NULL);
 
 	test_assert(sql_connect(sql) == 0);
 	sql_disconnect(sql);
+	settings_simple_deinit(&set);
 	return sql;
 }
 
@@ -37,7 +40,7 @@ static void deinit_sql(struct sql_db **_sql)
 	sql_unref(&sql);
 
 	sql_driver_test_unregister();
-	sql_drivers_deinit();
+	sql_drivers_deinit_without_drivers();
 }
 
 #define setup_result_1(sql) \
