@@ -32,9 +32,12 @@ All 'new/' folders should be replaced with symbolic links pointing to the 'cur/'
 
 This project is still experimental, so reliability cannot be guaranteed, especially in production environments. Proceed at your own risk! This probably breaks RFC/spec, and might not scale so well! It works great for me... but YMMV - proceed at own risk.
 
-### Donate
+## Coffee
+
 Did this make you happy? I'd love to do more development like this! Please donate to show your support :)
 
-BTC: 1Q4QkBn2Rx4hxFBgHEwRJXYHJjtfusnYfy
+**PayPal**: [![Donate](https://img.shields.io/badge/Donate-PayPal-green.svg)](https://www.paypal.com/donate/?business=2CGE77L7BZS3S&no_recurring=0)
 
-XMR: 4AfeGxGR4JqDxwVGWPTZHtX5QnQ3dTzwzMWLBFvysa6FTpTbz8Juqs25XuysVfowQoSYGdMESqnvrEQ969nR9Q7mEgpA5Zm
+**BTC:** 1Q4QkBn2Rx4hxFBgHEwRJXYHJjtfusnYfy
+
+**XMR:** 4AfeGxGR4JqDxwVGWPTZHtX5QnQ3dTzwzMWLBFvysa6FTpTbz8Juqs25XuysVfowQoSYGdMESqnvrEQ969nR9Q7mEgpA5Zm
