@@ -2,7 +2,6 @@
 
 #include "imap-common.h"
 #include "ioloop.h"
-#include "buffer.h"
 #include "llist.h"
 #include "str.h"
 #include "hostpid.h"
@@ -95,31 +94,11 @@ imap_unset_capability(struct settings_instance *set_instance, const char *capabi
 			  "no", SETTINGS_OVERRIDE_TYPE_CODE);
 }
 
-static void
-client_add_istream_prefix(struct client *client,
-			  const unsigned char *data, size_t size)
-{
-	i_assert(client->io == NULL);
-
-	struct istream *inputs[] = {
-		i_stream_create_copy_from_data(data, size),
-		client->input,
-		NULL
-	};
-	client->input = i_stream_create_concat(inputs);
-	i_stream_copy_fd(client->input, inputs[1]);
-	i_stream_unref(&inputs[0]);
-	i_stream_unref(&inputs[1]);
-
-	i_stream_set_input_pending(client->input, TRUE);
-}
-
 struct client *client_create(int fd_in, int fd_out,
 			     enum client_create_flags flags,
 			     struct event *event, struct mail_user *user,
 			     const struct imap_settings *set,
-			     const struct smtp_submit_settings *smtp_set,
-			     const buffer_t *input_buf)
+			     const struct smtp_submit_settings *smtp_set)
 {
 	struct client *client;
 	pool_t pool;
@@ -157,15 +136,6 @@ struct client *client_create(int fd_in, int fd_out,
 	o_stream_set_name(client->output, "<imap client>");
 
 	o_stream_set_flush_callback(client->output, client_output, client);
-
-	/* Prepend the input that the login or the imap-hibernate process had
-	   already read. This must happen before hook_client_created(), so that
-	   plugins wrapping client->input also see the commands that the client
-	   pipelined with the authentication. */
-	if (input_buf != NULL && input_buf->used > 0) {
-		client_add_istream_prefix(client, input_buf->data,
-					  input_buf->used);
-	}
 
 	p_array_init(&client->module_contexts, client->pool, 5);
 	client->last_input = ioloop_time;
@@ -284,6 +254,24 @@ int client_create_finish(struct client *client, const char **error_r)
 					      &imap_storage_callbacks, client);
 	client->v.init(client);
 	return 0;
+}
+
+void client_add_istream_prefix(struct client *client,
+			       const unsigned char *data, size_t size)
+{
+	i_assert(client->io == NULL);
+
+	struct istream *inputs[] = {
+		i_stream_create_copy_from_data(data, size),
+		client->input,
+		NULL
+	};
+	client->input = i_stream_create_concat(inputs);
+	i_stream_copy_fd(client->input, inputs[1]);
+	i_stream_unref(&inputs[0]);
+	i_stream_unref(&inputs[1]);
+
+	i_stream_set_input_pending(client->input, TRUE);
 }
 
 static void client_default_init(struct client *client ATTR_UNUSED)

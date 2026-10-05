@@ -18,9 +18,6 @@ static const struct {
 	{ "ALL NOT ALL TEXT foo", "NOT ALL" },
 	{ "OR ALL NOT ALL", "ALL" },
 	{ "OR ALL OR NOT ALL TEXT foo", "ALL" },
-	/* the dropped args must be deinitialized (checked by valgrind) */
-	{ "OR ALL KEYWORD k1", "ALL" },
-	{ "NOT ALL KEYWORD k1", "NOT ALL" },
 	{ "OR ALL OR TEXT foo TEXT bar", "ALL" },
 	{ "OR TEXT FOO ( ALL NOT ALL )", "TEXT FOO" },
 	{ "TEXT FOO OR ALL NOT ALL", "TEXT FOO" },
@@ -76,11 +73,6 @@ static const struct {
 	{ "OR KEYWORD foo KEYWORD foo", "KEYWORD foo" },
 	{ "NOT KEYWORD foo NOT KEYWORD foo", "NOT KEYWORD foo" },
 
-	/* keywords are case-insensitive */
-	{ "KEYWORD a OR KEYWORD A KEYWORD z", "KEYWORD a" },
-	{ "OR $ OR KEYWORD oR $ OR KEYWORD k22aaaaaaaaaaaaaaaaR!$ OR KEYWORD OR $ OR KEYWORD ka2 1",
-	  "KEYWORD oR OR KEYWORD ka2 1" },
-
 	{ "1:* 1:*", "ALL" },
 	{ "OR 1:5 6:*", "ALL" },
 
@@ -128,13 +120,6 @@ static const struct {
 	{ "OR SINCE 01-Aug-2014 SINCE 02-Aug-2014", "SINCE \"01-Aug-2014\"" },
 	{ "OR SINCE 01-Aug-2014 OR SINCE 03-Aug-2014 SINCE 02-Aug-2014", "SINCE \"01-Aug-2014\"" },
 	{ "SINCE 03-Aug-2014 NOT SINCE 01-Aug-2014 SINCE 02-Aug-2014", "SINCE \"03-Aug-2014\" NOT SINCE \"01-Aug-2014\"" },
-	{ "NOT BEFORE 01-Aug-2014 NOT BEFORE 02-Aug-2014", "NOT BEFORE \"02-Aug-2014\"" },
-	{ "OR NOT BEFORE 01-Aug-2014 NOT BEFORE 02-Aug-2014", "NOT BEFORE \"01-Aug-2014\"" },
-	{ "NOT ( BEFORE 01-Aug-2014 BEFORE 02-Aug-2014 )", "NOT BEFORE \"01-Aug-2014\"" },
-	{ "NOT SINCE 01-Aug-2014 NOT SINCE 02-Aug-2014", "NOT SINCE \"01-Aug-2014\"" },
-	{ "OR NOT SINCE 01-Aug-2014 NOT SINCE 02-Aug-2014", "NOT SINCE \"02-Aug-2014\"" },
-	{ "NOT ( SINCE 01-Aug-2014 SINCE 02-Aug-2014 )", "NOT SINCE \"02-Aug-2014\"" },
-	{ "OR ( SINCE 01-Aug-2014 SINCE 02-Aug-2014 ) NOT ( SINCE 01-Aug-2014 SINCE 02-Aug-2014 )", "OR SINCE \"02-Aug-2014\" NOT SINCE \"02-Aug-2014\"" },
 	{ "SENTSINCE 03-Aug-2014 SENTSINCE 01-Aug-2014 SENTSINCE 02-Aug-2014", "SENTSINCE \"03-Aug-2014\"" },
 	{ "SENTSINCE 03-Aug-2014 SINCE 01-Aug-2014 SENTSINCE 02-Aug-2014", "SENTSINCE \"03-Aug-2014\" SINCE \"01-Aug-2014\"" },
 
@@ -149,13 +134,6 @@ static const struct {
 	{ "OR LARGER 1 LARGER 2", "LARGER 1" },
 	{ "OR LARGER 1 OR LARGER 3 LARGER 2", "LARGER 1" },
 	{ "LARGER 3 NOT LARGER 1 LARGER 2", "LARGER 3 NOT LARGER 1" },
-	{ "NOT SMALLER 1 NOT SMALLER 2", "NOT SMALLER 2" },
-	{ "OR NOT SMALLER 1 NOT SMALLER 2", "NOT SMALLER 1" },
-	{ "NOT ( SMALLER 1 SMALLER 2 )", "NOT SMALLER 1" },
-	{ "NOT LARGER 1 NOT LARGER 2", "NOT LARGER 1" },
-	{ "OR NOT LARGER 1 NOT LARGER 2", "NOT LARGER 2" },
-	{ "NOT ( LARGER 1 LARGER 2 )", "NOT LARGER 2" },
-	{ "OR ( LARGER 1 LARGER 2 ) NOT ( LARGER 1 LARGER 2 )", "OR LARGER 2 NOT LARGER 2" },
 
 	{ "SUBJECT foo SUBJECT foo", "SUBJECT foo" },
 	{ "SUBJECT foo NOT SUBJECT foo", "NOT ALL" },
@@ -210,16 +188,6 @@ static const struct {
 	{ "OR ( TEXT common1 TEXT common2 TEXT unique1 ) ( TEXT common1 TEXT common2 TEXT unique2 )", "OR TEXT unique1 TEXT unique2 TEXT common2 TEXT common1" },
 	{ "OR ( TEXT common1 TEXT common2 TEXT unique1 TEXT unique2 ) ( TEXT common1 TEXT common2 TEXT unique3 TEXT unique4 )", "OR (TEXT unique1 TEXT unique2) (TEXT unique3 TEXT unique4) TEXT common2 TEXT common1" },
 
-	/* NOT (SUB) must be converted with De Morgan before dropping redundant
-	   args or extracting common args */
-	{ "OR ( TEXT foo TEXT bar ) NOT ( TEXT foo TEXT bar )", "OR (TEXT foo TEXT bar) OR NOT TEXT foo NOT TEXT bar" },
-	{ "OR TEXT foo NOT ( TEXT foo TEXT baz )", "ALL" },
-	{ "OR ( TEXT foo TEXT bar ) NOT ( TEXT foo TEXT baz )", "OR (TEXT foo TEXT bar) OR NOT TEXT foo NOT TEXT baz" },
-	{ "OR NOT ( TEXT foo TEXT bar ) ( TEXT foo TEXT bar TEXT baz )", "OR NOT TEXT foo OR NOT TEXT bar (TEXT foo TEXT bar TEXT baz)" },
-	{ "OR NOT ( TEXT foo TEXT bar ) NOT ( TEXT foo TEXT bar TEXT baz )", "OR NOT TEXT foo OR NOT TEXT bar NOT TEXT baz" },
-	{ "OR TEXT x ( ( OR TEXT foo TEXT bar ) NOT ( OR TEXT foo TEXT baz ) )", "OR TEXT x (OR TEXT foo TEXT bar NOT TEXT foo NOT TEXT baz)" },
-	{ "( OR TEXT x ( OR TEXT foo TEXT bar ) ) ( OR TEXT x NOT ( OR TEXT foo TEXT baz ) )", "OR (OR TEXT foo TEXT bar NOT TEXT foo NOT TEXT baz) TEXT x" },
-
 	/* non-matching cases */
 	{ "OR ( TEXT unique1 TEXT unique2 ) TEXT unique3", "OR (TEXT unique1 TEXT unique2) TEXT unique3" },
 	{ "OR ( TEXT unique1 TEXT unique2 ) ( TEXT unique3 TEXT unique4 )", "OR (TEXT unique1 TEXT unique2) (TEXT unique3 TEXT unique4)" },
@@ -234,24 +202,6 @@ static const struct {
 	{ "( OR TEXT common1 TEXT common2 ) ( OR TEXT common1 OR TEXT common2 TEXT unique1 )", "OR TEXT common1 TEXT common2" },
 	{ "TEXT common1 ( OR TEXT unique1 TEXT common1 ) ( OR TEXT unique3 TEXT common1 )", "TEXT common1" },
 	{ "OR ( TEXT common1 ( OR TEXT unique1 TEXT common1 ) ) TEXT unique1", "OR TEXT common1 TEXT unique1" },
-
-	/* args that are redundant with each other: only one is dropped */
-	{ "( OR BODY x BODY y ) ( OR BODY y BODY x )", "OR BODY x BODY y" },
-	{ "OR ( BODY x BODY y ) ( BODY y BODY x )", "BODY x BODY y" },
-	{ "TEXT z ( OR BODY x BODY y ) ( OR BODY y BODY x )", "TEXT z OR BODY x BODY y" },
-	{ "( OR BODY x BODY y ) ( OR BODY y BODY x ) BODY x", "BODY x" },
-	{ "( OR BODY a OR BODY b BODY c ) ( OR BODY c OR BODY b BODY a )", "OR BODY a OR BODY b BODY c" },
-
-	/* extracted common args must stay initialized */
-	{ "( OR KEYWORD k1 BODY x ) ( OR KEYWORD k1 BODY y )", "OR (BODY x BODY y) KEYWORD k1" },
-	{ "OR ( KEYWORD k1 BODY x ) ( KEYWORD k1 BODY y )", "OR BODY x BODY y KEYWORD k1" },
-	{ "OR ( KEYWORD k1 ( TEXT d TEXT e ) ) ( KEYWORD k1 TEXT d TEXT e )", "TEXT d TEXT e KEYWORD k1" },
-
-	/* one of the args is entirely the common arg */
-	{ "OR UID 2:5 ( OR OR BODY a BODY b ( BODY s1 BODY s2 ) OR BODY a BODY b )", "OR UID 2:5 OR BODY a BODY b" },
-	{ "OR BODY q ( ( OR BODY a BODY b ) OR BODY b BODY a )", "OR BODY q OR BODY a BODY b" },
-	/* .. and the already extracted common args are kept */
-	{ "OR ( TEXT c ( TEXT d TEXT e ) ) ( TEXT c TEXT d TEXT e )", "TEXT d TEXT e TEXT c" },
 
 	/* SUB: extract common OR */
 	{ "( OR TEXT common1 TEXT unique1 ) ( OR TEXT common1 TEXT unique2 )", "OR (TEXT unique1 TEXT unique2) TEXT common1" },
@@ -279,30 +229,6 @@ static const struct {
 	{ "( OR BODY z BODY y ) ( OR BODY z BODY w ) BODY x BODY y BODY w",  "BODY x BODY y BODY w" },
 
 	{ "subject y", "SUBJECT y"},
-
-	/* negated INTHREAD */
-	{ "NOT INTHREAD REFS BODY x", "NOT INTHREAD REFS (BODY x)" },
-	{ "TEXT a NOT INTHREAD REFS BODY x", "TEXT a NOT INTHREAD REFS (BODY x)" },
-	{ "NOT INTHREAD REFS ( BODY x OR BODY y BODY z )", "NOT INTHREAD REFS (BODY x OR BODY y BODY z)" },
-
-	/* INTHREAD's search key is kept as it is */
-	{ "INTHREAD REFS ( TEXT w OR BODY a BODY b )", "INTHREAD REFS (TEXT w OR BODY a BODY b)" },
-	{ "INTHREAD REFS ( OR BODY a BODY b TEXT w )", "INTHREAD REFS (OR BODY a BODY b TEXT w)" },
-	{ "INTHREAD REFS ( TEXT w OR BODY a BODY b TEXT x )", "INTHREAD REFS (TEXT w OR BODY a BODY b TEXT x)" },
-	{ "INTHREAD REFS ALL", "ALL" },
-	{ "INTHREAD REFS NOT ALL", "NOT ALL" },
-	{ "NOT INTHREAD REFS NOT ALL", "ALL" },
-
-	/* nested INTHREADs are moved out of the outer INTHREAD */
-	{ "INTHREAD REFS INTHREAD REFS BODY a", "INTHREAD REFS (BODY a)" },
-	{ "INTHREAD REFS NOT INTHREAD REFS BODY a", "NOT INTHREAD REFS (BODY a)" },
-	{ "INTHREAD REFS ( TEXT w INTHREAD REFS BODY a )", "INTHREAD REFS (BODY a) INTHREAD REFS (TEXT w)" },
-	{ "INTHREAD REFS ( INTHREAD REFS BODY a INTHREAD REFS BODY b )", "INTHREAD REFS (BODY a) INTHREAD REFS (BODY b)" },
-	{ "INTHREAD REFS ( TEXT w INTHREAD REFS ( BODY a INTHREAD REFS BODY b ) )", "INTHREAD REFS (BODY b) INTHREAD REFS (BODY a) INTHREAD REFS (TEXT w)" },
-	{ "INTHREAD REFS OR TEXT w INTHREAD REFS BODY a", "OR INTHREAD REFS (BODY a) (NOT INTHREAD REFS (BODY a) INTHREAD REFS (TEXT w))" },
-	{ "INTHREAD REFS ( TEXT w OR BODY a INTHREAD REFS BODY b )", "OR (INTHREAD REFS (BODY b) INTHREAD REFS (TEXT w)) (NOT INTHREAD REFS (BODY b) INTHREAD REFS (TEXT w BODY a))" },
-	{ "NOT INTHREAD REFS ( TEXT w INTHREAD REFS BODY a )", "OR NOT INTHREAD REFS (BODY a) NOT INTHREAD REFS (TEXT w)" },
-	{ "INTHREAD REFS ( KEYWORD k1 INTHREAD REFS KEYWORD k2 )", "INTHREAD REFS (KEYWORD k2) INTHREAD REFS (KEYWORD k1)" },
 };
 
 static struct mail_search_args *
@@ -338,9 +264,6 @@ static bool test_search_args_are_initialized(struct mail_search_arg *arg)
 				return FALSE;
 			break;
 		case SEARCH_INTHREAD:
-			if (arg->initialized.search_args == NULL)
-				return FALSE;
-			/* fall through */
 		case SEARCH_SUB:
 		case SEARCH_OR:
 			if (!test_search_args_are_initialized(arg->value.subargs))
@@ -386,101 +309,6 @@ static void test_mail_search_args_simplify(void)
 	test_end();
 }
 
-static const struct {
-	const char *input;
-	const char *output;
-} uninit_tests[] = {
-	/* mail_search_args_init() simplifies the args before it initializes
-	   them, but with init_refcount already set. Dropping an uninitialized
-	   INTHREAD arg must not crash. */
-	{ "OR ( INTHREAD REFS BODY x BODY y ) ( INTHREAD REFS BODY x BODY y BODY z )", "INTHREAD REFS (BODY x) BODY y" },
-	{ "OR ( INTHREAD REFS BODY x BODY y ) ( INTHREAD REFS BODY x BODY z )", "OR BODY y BODY z INTHREAD REFS (BODY x)" },
-	{ "( OR INTHREAD REFS BODY x BODY y ) ( OR BODY y INTHREAD REFS BODY x )", "OR INTHREAD REFS (BODY x) BODY y" },
-	/* dropped by ALL */
-	{ "OR ALL INTHREAD REFS BODY x", "ALL" },
-	{ "NOT ALL INTHREAD REFS BODY x", "NOT ALL" },
-	/* negated INTHREAD */
-	{ "NOT INTHREAD REFS BODY x", "NOT INTHREAD REFS (BODY x)" },
-	/* nested INTHREADs */
-	{ "INTHREAD REFS ( TEXT w INTHREAD REFS BODY a )", "INTHREAD REFS (BODY a) INTHREAD REFS (TEXT w)" },
-	{ "NOT INTHREAD REFS ( KEYWORD k1 INTHREAD REFS KEYWORD k2 )", "OR NOT INTHREAD REFS (KEYWORD k2) NOT INTHREAD REFS (KEYWORD k1)" },
-};
-
-static void test_mail_search_args_simplify_uninitialized(void)
-{
-	struct mail_search_args *args;
-	struct mail_storage_settings set = { .mail_max_keyword_length = 100 };
-	struct mail_storage storage = { .set = &set };
-	struct mailbox box = { .opened = TRUE, .storage = &storage };
-	string_t *str = t_str_new(256);
-	const char *error;
-	unsigned int i;
-
-	test_begin("mail search args simplify uninitialized");
-	box.index = mail_index_alloc(NULL, NULL, "dovecot.index.");
-	for (i = 0; i < N_ELEMENTS(uninit_tests); i++) {
-		args = test_build_search_args(uninit_tests[i].input);
-		mail_search_args_init(args, &box, FALSE, NULL);
-
-		str_truncate(str, 0);
-		test_assert(mail_search_args_to_imap(str, args->args, FALSE,
-						     &error));
-		test_assert_idx(strcmp(str_c(str), uninit_tests[i].output) == 0, i);
-
-		test_assert_idx(test_search_args_are_initialized(args->args), i);
-		mail_search_args_deinit(args);
-		mail_search_args_unref(&args);
-	}
-	mail_index_free(&box.index);
-	test_end();
-}
-
-static bool
-test_search_args_build_fails(const char *args, const char *error_prefix)
-{
-	struct mail_search_parser *parser;
-	struct mail_search_args *sargs;
-	const char *error, *charset = "UTF-8";
-	int ret;
-
-	parser = mail_search_parser_init_cmdline(t_strsplit(args, " "));
-	ret = mail_search_build(mail_search_register_get_imap4rev1(),
-				parser, &charset, &sargs, &error);
-	mail_search_parser_deinit(&parser);
-	if (ret == 0) {
-		mail_search_args_unref(&sargs);
-		return FALSE;
-	}
-	return str_begins_with(error, error_prefix);
-}
-
-static void test_mail_search_args_nested_inthreads_limit(void)
-{
-	test_begin("mail search args nested inthreads limit");
-	test_assert(!test_search_args_build_fails(
-		"INTHREAD REFS ( INTHREAD REFS BODY a INTHREAD REFS BODY b INTHREAD REFS BODY c INTHREAD REFS BODY d )", ""));
-	test_assert(test_search_args_build_fails(
-		"INTHREAD REFS ( INTHREAD REFS BODY a INTHREAD REFS BODY b INTHREAD REFS BODY c INTHREAD REFS BODY d INTHREAD REFS BODY e )",
-		"Too many nested INTHREADs"));
-	test_assert(test_search_args_build_fails(
-		"INTHREAD REFS INTHREAD REFS INTHREAD REFS INTHREAD REFS INTHREAD REFS INTHREAD REFS BODY a",
-		"Too many nested INTHREADs"));
-	test_end();
-}
-
-static void test_mail_search_args_inthread_algorithm(void)
-{
-	test_begin("mail search args inthread algorithm");
-	test_assert(!test_search_args_build_fails("INTHREAD REFS BODY a", ""));
-	test_assert(!test_search_args_build_fails("INTHREAD REFERENCES BODY a", ""));
-	/* mail_thread_finish() can't do ORDEREDSUBJECT */
-	test_assert(test_search_args_build_fails("INTHREAD ORDEREDSUBJECT BODY a",
-						 "INTHREAD doesn't support ORDEREDSUBJECT"));
-	test_assert(test_search_args_build_fails("INTHREAD BOGUS BODY a",
-						 "Unknown thread algorithm"));
-	test_end();
-}
-
 static void test_mail_search_args_simplify_empty_lists(void)
 {
 	struct mail_search_args *args;
@@ -499,9 +327,6 @@ int main(void)
 	static void (*const test_functions[])(void) = {
 		mail_storage_init,
 		test_mail_search_args_simplify,
-		test_mail_search_args_simplify_uninitialized,
-		test_mail_search_args_nested_inthreads_limit,
-		test_mail_search_args_inthread_algorithm,
 		test_mail_search_args_simplify_empty_lists,
 		mail_storage_deinit,
 		NULL

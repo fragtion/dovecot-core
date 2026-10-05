@@ -2723,13 +2723,11 @@ settings_mmap_key_in_blocks(struct settings_mmap *mmap, const char *key,
 			    const char *const *names)
 {
 	enum setting_type set_type ATTR_UNUSED;
-	const void *blocks = NULL;
+	const void *blocks;
 	uint32_t i, count, block_idx;
 
-	i_assert(mmap != NULL);
 	if (!settings_mmap_lookup_key(mmap, key, &set_type, &blocks))
 		return FALSE;
-	i_assert(blocks != NULL);
 
 	memcpy(&count, blocks, sizeof(count));
 	blocks = CONST_PTR_OFFSET(blocks, sizeof(count));
