@@ -37,8 +37,7 @@ struct imap_settings {
 	bool imap_compress_on_proxy;
 	bool imap4rev2_enable;
 	bool mail_utf8_extensions;
-	unsigned int imap_hibernate_timeout_secs;
-	unsigned int imap_hibernate_nonidle_timeout_secs;
+	unsigned int imap_hibernate_timeout;
 	ARRAY_TYPE(const_string) imap_id_send;
 
 	/* imap urlauth: */

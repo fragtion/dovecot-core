@@ -169,7 +169,7 @@ AS_HELP_STRING([--with-textcat], [Build with libtextcat support (for lib-languag
   want_textcat=auto)
 
 AC_ARG_WITH(icu,
-AS_HELP_STRING([--with-icu], [Build with libicu support (for lib-language custom normalizer IDs) (auto)]),
+AS_HELP_STRING([--with-icu], [Build with libicu support (for lib-language normalization) (auto)]),
   want_icu=$withval,
   want_icu=auto)
 
@@ -352,7 +352,7 @@ AC_DEFINE(PACKAGE_WEBPAGE, "https://www.dovecot.org/", [Support URL])
 AC_CHECK_FUNCS(flock pread setproctitle setresgid \
 	       getmntinfo setpriority quotactl getmntent kqueue kevent \
 	       backtrace_symbols walkcontext dirfd clearenv \
-	       malloc_usable_size malloc_trim glob fallocate posix_fadvise \
+	       malloc_usable_size glob fallocate posix_fadvise \
 	       getpeereid getpeerucred inotify_init timegm memrchr)
 
 AC_CHECK_HEADERS([valgrind/valgrind.h])
@@ -608,7 +608,6 @@ LIBDOVECOT_LA_LIBS='\
 	$(top_builddir)/src/lib-dcrypt/libdcrypt.la \
 	$(top_builddir)/src/lib-json/libjson.la \
 	$(top_builddir)/src/lib-regex/libdregex.la \
-	$(top_builddir)/src/lib-url/liburl.la \
 	$(top_builddir)/src/lib-test/libtest.la \
 	$(top_builddir)/src/lib/liblib.la'
 # This is used in dovecot-config, which is grepped in dovecot.m4,
@@ -754,14 +753,6 @@ DOVECOT_WANT_STEMMER
 DOVECOT_WANT_TEXTCAT
 
 DOVECOT_WANT_ICU
-AS_IF([test "$have_icu" = "yes"], [
-  # The libicu helper functions are in a separate library. External plugins
-  # linking with lib-language get it too for backwards compatibility.
-  LIBDOVECOT_LIBLANG_ICU='$(top_builddir)/src/lib-language/libdovecot-language-icu.la'
-  LINKED_LIBLANG_LDADD="-ldovecot-language-icu"
-])
-AC_SUBST(LIBDOVECOT_LIBLANG_ICU)
-AC_SUBST(LINKED_LIBLANG_LDADD)
 DOVECOT_WANT_PCRE
 
 DOVECOT_WANT_APPARMOR
@@ -857,7 +848,6 @@ doc/index.html
 doc/dovecot.conf
 src/Makefile
 src/lib/Makefile
-src/lib-url/Makefile
 src/lib-sql/Makefile
 src/lib-auth/Makefile
 src/lib-auth-client/Makefile

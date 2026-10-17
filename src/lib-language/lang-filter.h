@@ -23,19 +23,17 @@ extern const struct lang_filter *lang_filter_stopwords;
 extern const struct lang_filter *lang_filter_stemmer_snowball;
 
 /*
- Settings: filter_normalizer_icu_id, description of the
- normalizing/transliterating rules to use. See
- https://unicode-org.github.io/icu/userguide/transforms/general/#transliterator-identifiers
- for syntax. Defaults to
- "Any-Lower; NFKD; [: Nonspacing Mark :] Remove; NFC; [\x20] Remove"
+ Settings: "id", description of the normalizing/transliterating rules
+ to use.  See
+ http://userguide.icu-project.org/transforms/general#TOC-Transliterator-Identifiers
+ for syntax. Defaults to "Any-Lower; NFKD; [: Nonspacing Mark :] Remove; NFC"
 
- The default ID and its variants without "NFC" and/or "[\x20] Remove" are
- implemented internally. Other IDs require the lang_filter_normalizer_icu
- module, which uses libicu.
+ "maxlen", maximum length of tokens that ICU normalizer will output.
+  Defaults to 250.
  */
 extern const struct lang_filter *lang_filter_normalizer_icu;
 
-/* Lowercases the input. */
+/* Lowercases the input. Supports UTF8, if libicu is available. */
 extern const struct lang_filter *lang_filter_lowercase;
 
 /* Removes <'s> suffix from words. */

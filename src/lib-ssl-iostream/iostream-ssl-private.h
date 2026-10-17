@@ -78,17 +78,6 @@ void iostream_ssl_module_init(const struct iostream_ssl_vfuncs *vfuncs);
 bool ssl_iostream_settings_equals(const struct ssl_iostream_settings *set1,
 				  const struct ssl_iostream_settings *set2);
 
-/* Returns TRUE if both application protocol lists are equal. The order of the
-   protocols matters, since it is the preference order. */
-bool ssl_iostream_application_protocols_equals(const char *const *protos1,
-					       const char *const *protos2);
-
-/* Set the ALPN protocols for the context. This can be done only once for a
-   context, and only before it is used. Contexts returned by the context cache
-   already have their protocols set - use the cache's parameter instead. */
-void ssl_iostream_context_set_application_protocols(struct ssl_iostream_context *ssl_ctx,
-						    const char *const *names);
-
 void ssl_iostream_unref(struct ssl_iostream **ssl_io);
 
 #endif

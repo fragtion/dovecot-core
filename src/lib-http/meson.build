@@ -1,6 +1,5 @@
 deps = [
   dep_lib,
-  dep_url,
   dep_settings,
   dep_dns_client,
   dep_ssl_iostream,
@@ -34,6 +33,7 @@ lib_http = static_library(
   'http-server-response.c',
   'http-server-settings.c',
   'http-transfer-chunked.c',
+  'http-url.c',
   dependencies: [deps, dir_defines],
 )
 
@@ -46,6 +46,7 @@ dep_http = declare_dependency(
 install_headers(
   'http-common.h',
   'http-date.h',
+  'http-url.h',
   'http-parser.h',
   'http-header.h',
   'http-header-parser.h',
@@ -86,6 +87,7 @@ tests = [
   'response-parser',
   'server-errors',
   'transfer',
+  'url',
 ]
 
 executable(

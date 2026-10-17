@@ -50,7 +50,6 @@ struct imap_notify_context {
 
 	struct imap_fetch_context *fetch_ctx;
 	struct timeout *to_watch;
-	struct timeout *to_overflow;
 
 	bool have_subscriptions:1;
 	bool selected_set:1;
@@ -59,7 +58,6 @@ struct imap_notify_context {
 	bool watching_mailbox:1;
 	bool notifying:1;
 	bool utf8:1;
-	bool overflowed:1;
 };
 
 bool imap_notify_match_mailbox(struct imap_notify_namespace *notify_ns,
@@ -72,8 +70,6 @@ void imap_client_notify_finished(struct client *client);
 void imap_client_notify_command_allocated(struct client *client);
 void imap_client_notify_command_freed(struct client *client);
 
-struct imap_notify_context *
-imap_notify_context_alloc(struct client *client, bool utf8);
 int imap_notify_begin(struct imap_notify_context *ctx);
 void imap_notify_deinit(struct imap_notify_context **ctx);
 

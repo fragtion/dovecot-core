@@ -449,8 +449,7 @@ imap_acl_get_mailbox_name(const struct mail_namespace *ns, const char *mailbox)
 
 	i_assert(ns->prefix_len >= 1);
 
-	if (strlen(mailbox) >= ns->prefix_len - 1 &&
-	    (mailbox[ns->prefix_len-1] == '\0' ||
+	if ((mailbox[ns->prefix_len-1] == '\0' ||
 	     mailbox[ns->prefix_len] == '\0') &&
 	    strncmp(mailbox, ns->prefix, ns->prefix_len-1) == 0 &&
 	    ns->type == MAIL_NAMESPACE_TYPE_SHARED) {

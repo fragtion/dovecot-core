@@ -10,7 +10,6 @@
 #include "compression.h"
 #include "imap-util.h"
 #include "mail-search-build.h"
-#include "mail-namespace.h"
 #include "mail-storage-private.h"
 #include "mailbox-recent-flags.h"
 #include "imap-client.h"
@@ -28,17 +27,9 @@ enum imap_state_type_public {
 };
 
 enum imap_state_type_internal {
-	IMAP_STATE_TYPE_NAMESPACES		= 'N',
 	IMAP_STATE_TYPE_ID_LOGGED		= 'I',
-	IMAP_STATE_TYPE_TLS_COMPRESSION		= 'T',
+	IMAP_STATE_TYPE_TLS_COMPRESSION		= 'C',
 };
-
-/* The namespace flags that are visible to the client via the LIST and
-   NAMESPACE replies. */
-#define IMAP_STATE_NAMESPACE_FLAGS_MASK \
-	(NAMESPACE_FLAG_INBOX_USER | NAMESPACE_FLAG_INBOX_ANY | \
-	 NAMESPACE_FLAG_HIDDEN | NAMESPACE_FLAG_LIST_PREFIX | \
-	 NAMESPACE_FLAG_LIST_CHILDREN | NAMESPACE_FLAG_SUBSCRIPTIONS)
 
 struct mailbox_import_state {
 	const char *vname;
@@ -113,96 +104,21 @@ int imap_state_import_seq_range(const unsigned char **data,
 	return 0;
 }
 
-static int
-imap_state_export_check_delayed_expunges(struct client *client,
-					 const char **error_r)
-{
-	struct mailbox *box = client->mailbox;
-	const struct mail_index_header *view_hdr;
-	struct mail_index_view *head_view;
-	uint32_t seq1, seq2, old_count = 0;
-
-	/* Expunges that haven't been sent to the client yet can't be sent at
-	   unhibernation, so the client would have to relogin. Count how many
-	   of the messages known by the client's view still exist in the
-	   latest index state. Messages added after the view was synced
-	   have UIDs >= the view's UIDNEXT, so they aren't counted. */
-	view_hdr = mail_index_get_header(box->view);
-	/* Make sure expunges committed by other processes are seen. */
-	if (mail_index_refresh(box->index) < 0) {
-		mailbox_set_index_error(box);
-		*error_r = mailbox_get_last_internal_error(box, NULL);
-		return -1;
-	}
-	head_view = mail_index_view_open(box->index);
-	if (view_hdr->next_uid > 1 &&
-	    mail_index_lookup_seq_range(head_view, 1, view_hdr->next_uid - 1,
-					&seq1, &seq2))
-		old_count = seq2 - seq1 + 1;
-	mail_index_view_close(&head_view);
-
-	if (old_count != view_hdr->messages_count) {
-		*error_r = "Expunges not sent to client yet";
-		return 0;
-	}
-	return 1;
-}
-
-static int
-imap_state_export_check_nonidle(struct client *client, const char **error_r)
-{
-	i_assert(!client->syncing);
-
-	if ((client->set->parsed_workarounds & WORKAROUND_DELAY_NEWMAIL) != 0) {
-		/* Unhibernation sends EXISTS before the next command. This
-		   workaround exists to avoid that. */
-		*error_r = "delay-newmail workaround enabled";
-		return 0;
-	}
-	if (client->input_skip_line) {
-		*error_r = "Skipping the rest of a command line";
-		return 0;
-	}
-	if (array_is_created(&client->fetch_failed_uids) &&
-	    array_not_empty(&client->fetch_failed_uids)) {
-		*error_r = "FETCH failures pending";
-		return 0;
-	}
-	if (client->mailbox == NULL)
-		return 1;
-
-	if (mailbox_transaction_get_count(client->mailbox) > 0) {
-		*error_r = "Mailbox transactions open";
-		return 0;
-	}
-	if (client->sync_last_full_modseq == 0) {
-		/* checked again by the mailbox export */
-		*error_r = "No modseq tracking";
-		return 0;
-	}
-	return imap_state_export_check_delayed_expunges(client, error_r);
-}
-
 int imap_state_export_internal(struct client *client, buffer_t *dest,
 			       const char **error_r)
 {
-	int ret;
-
-	/* The only IMAP command we allow running is IDLE. Otherwise there must
-	   not be any commands running. */
+	/* the only IMAP command we allow running is IDLE */
 	if (client->command_queue_size > 1) {
 		*error_r = "Multiple commands in progress";
 		return 0;
 	}
-	if (client->command_queue != NULL &&
+	if (client->command_queue == NULL ||
 	    strcasecmp(client->command_queue->name, "IDLE") != 0) {
-		*error_r = "Command in progress";
+		/* this would require saving the seq <-> uid mapping
+		   and restore it on import. quite a lot of trouble if
+		   messages have been expunged in the mean time. */
+		*error_r = "Non-IDLE connections not supported currently";
 		return 0;
-	}
-	if (client->command_queue == NULL) {
-		ret = imap_state_export_check_nonidle(client, error_r);
-		if (ret <= 0)
-			return ret;
 	}
 	return client->v.state_export(client, TRUE, dest, error_r);
 }
@@ -241,67 +157,6 @@ imap_state_import_external(struct client *client,
 			   const char **error_r)
 {
 	return imap_state_import(client, FALSE, data, size, error_r);
-}
-
-static void
-imap_state_append_missing_caps(string_t *dest, const char *prefix,
-			       const char *const *caps,
-			       const char *const *other_caps)
-{
-	bool first = TRUE;
-
-	for (unsigned int i = 0; caps[i] != NULL; i++) {
-		if (str_array_icase_find(other_caps, caps[i]))
-			continue;
-		str_append(dest, first ? prefix : " ");
-		str_append(dest, caps[i]);
-		first = FALSE;
-	}
-}
-
-/* Returns a description of how the hibernated client's CAPABILITY differs
-   from the current one. */
-static const char *
-imap_state_capability_diff(const char *old_capability,
-			   const char *new_capability)
-{
-	const char *const *old_caps = t_strsplit_spaces(old_capability, " ");
-	const char *const *new_caps = t_strsplit_spaces(new_capability, " ");
-	string_t *str = t_str_new(64);
-
-	imap_state_append_missing_caps(str, "removed: ", old_caps, new_caps);
-	imap_state_append_missing_caps(str, str_len(str) == 0 ?
-				       "added: " : ", added: ",
-				       new_caps, old_caps);
-	if (str_len(str) == 0) {
-		/* only the order changed */
-		str_printfa(str, "'%s' -> '%s'", old_capability, new_capability);
-	}
-	return str_c(str);
-}
-
-enum imap_state_result
-imap_state_verify_capability(struct client *client, const char *old_capability,
-			     const char **error_r)
-{
-	const char *capability;
-
-	if (old_capability == NULL) {
-		/* The client was hibernated by an older Dovecot version, which
-		   didn't send the CAPABILITY. It can't be verified to be
-		   unchanged, so don't continue the session. */
-		*error_r = "CAPABILITY missing";
-		return IMAP_STATE_INCONSISTENT;
-	}
-	capability = client->capability_string == NULL ? "" :
-		str_c(client->capability_string);
-	/* capabilities are case-insensitive */
-	if (strcasecmp(old_capability, capability) != 0) {
-		*error_r = t_strdup_printf("CAPABILITY has changed (%s)",
-			imap_state_capability_diff(old_capability, capability));
-		return IMAP_STATE_INCONSISTENT;
-	}
-	return IMAP_STATE_OK;
 }
 
 static int
@@ -369,10 +224,6 @@ imap_state_export_mailbox(buffer_t *dest, struct client *client,
 		*error_r = "Nonpermanent modseqs";
 		return 0;
 	}
-	if (client->sync_last_full_modseq == 0) {
-		*error_r = "No modseq tracking";
-		return 0;
-	}
 
 	if (mailbox_get_metadata(box, MAILBOX_METADATA_GUID, &metadata) < 0) {
 		*error_r = mailbox_get_last_internal_error(box, &mail_error);
@@ -388,9 +239,11 @@ imap_state_export_mailbox(buffer_t *dest, struct client *client,
 	numpack_encode(dest, status.uidvalidity);
 	numpack_encode(dest, status.uidnext);
 	numpack_encode(dest, status.messages);
-	/* The view's highest_modseq may already be past expunges that
-	   haven't been sent to the client yet. */
-	numpack_encode(dest, client->sync_last_full_modseq);
+	if (client_has_enabled(client, imap_feature_qresync) &&
+	    !client->nonpermanent_modseqs)
+		numpack_encode(dest, client->sync_last_full_modseq);
+	else
+		numpack_encode(dest, status.highest_modseq);
 
 	/* keywords count + CRC32 should be enough to figure out if it
 	   needs to be resent */
@@ -401,27 +254,6 @@ imap_state_export_mailbox(buffer_t *dest, struct client *client,
 	   checksum of the currently existing UIDs and verify it when
 	   importing. this also writes the list of recent UIDs. */
 	return imap_state_export_mailbox_mails(dest, box, error_r);
-}
-
-/* Returns a string that describes the namespaces as the client sees them. */
-static const char *imap_state_namespaces_string(struct mail_user *user)
-{
-	struct mail_namespace *ns;
-	string_t *str = t_str_new(128);
-
-	for (ns = user->namespaces; ns != NULL; ns = ns->next) {
-		/* Shared namespaces are created on demand, so they don't
-		   necessarily exist in both processes. */
-		if ((ns->flags & NAMESPACE_FLAG_AUTOCREATED) != 0)
-			continue;
-		if (str_len(str) > 0)
-			str_append_c(str, '\n');
-		str_printfa(str, "%u:%x:%c:%s", (unsigned int)ns->type,
-			    (unsigned int)(ns->flags &
-					   IMAP_STATE_NAMESPACE_FLAGS_MASK),
-			    mail_namespace_get_sep(ns), ns->prefix);
-	}
-	return str_c(str);
 }
 
 int imap_state_export_base(struct client *client, bool internal,
@@ -447,17 +279,6 @@ int imap_state_export_base(struct client *client, bool internal,
 	    client->multiplex_output == NULL && internal) {
 		*error_r = "COMPRESS enabled without multiplex ostream";
 		return 0;
-	}
-
-	if (internal) {
-		/* The client has seen the namespaces' prefixes and separators
-		   in the LIST and NAMESPACE replies. The configuration may be
-		   reloaded while the client is hibernated, so the unhibernating
-		   imap process verifies that they're still the same. */
-		const char *namespaces =
-			imap_state_namespaces_string(client->user);
-		buffer_append_c(dest, IMAP_STATE_TYPE_NAMESPACES);
-		buffer_append(dest, namespaces, strlen(namespaces) + 1);
 	}
 
 	if (client->mailbox != NULL) {
@@ -512,7 +333,7 @@ int imap_state_import_string(const unsigned char **data,
 	return 0;
 }
 
-static enum imap_state_result
+static int
 import_send_expunges(struct client *client,
 		     const struct mailbox_import_state *state,
 		     unsigned int *expunge_count_r,
@@ -536,11 +357,11 @@ import_send_expunges(struct client *client,
 	if (state->messages == 0) {
 		/* the mailbox was empty originally - there couldn't be any
 		   pending expunges. */
-		return IMAP_STATE_OK;
+		return 0;
 	}
 	if (state->uidnext <= 1) {
 		*error_r = "Invalid UIDNEXT";
-		return IMAP_STATE_ERROR;
+		return -1;
 	}
 
 	/* get all the message UIDs expunged since the last known modseq */
@@ -549,25 +370,11 @@ import_send_expunges(struct client *client,
 	seq_range_array_add_range(&uids_filter, 1, state->uidnext-1);
 	if (!mailbox_get_expunged_uids(client->mailbox, state->highest_modseq,
 				       &uids_filter, &expunged_uids)) {
-		/* The transaction log no longer goes back to the saved
-		   modseq, or reading it failed. lib-index has already logged
-		   the read errors. Either way the expunges can't be found,
-		   so the client must relogin. */
 		*error_r = t_strdup_printf(
-			"Couldn't find expunges since hibernation "
+			"Couldn't get recently expunged UIDs "
 			"(uidnext=%u highest_modseq=%"PRIu64")",
 			state->uidnext, state->highest_modseq);
-		return IMAP_STATE_INCONSISTENT;
-	}
-	if (client->state_import_nonidle &&
-	    array_not_empty(&expunged_uids)) {
-		/* The client's next command hasn't started yet, so EXPUNGEs
-		   can't be sent. The client's sequence numbers can't be kept
-		   in sync. */
-		*error_r = t_strdup_printf(
-			"%u messages expunged during hibernation",
-			seq_range_count(&expunged_uids));
-		return IMAP_STATE_INCONSISTENT;
+		return -1;
 	}
 	seq_range_array_iter_init(&iter, &expunged_uids);
 
@@ -614,7 +421,7 @@ import_send_expunges(struct client *client,
 	}
 	(void)mailbox_transaction_commit(&trans);
 	if (ret < 0)
-		return IMAP_STATE_ERROR;
+		return -1;
 
 	seqs = array_get(&expunged_seqs, &expunge_count);
 	if (client->messages_count + expunge_count < state->messages) {
@@ -622,12 +429,12 @@ import_send_expunges(struct client *client,
 					   "handling expunges (%u < %u)",
 					   client->messages_count + expunge_count,
 					   state->messages);
-		return IMAP_STATE_ERROR;
+		return -1;
 	}
 	if (crc != state->uids_crc32) {
 		*error_r = t_strdup_printf("Message UIDs CRC32 mismatch (%u != %u)",
 					   crc, state->uids_crc32);
-		return IMAP_STATE_ERROR;
+		return -1;
 	}
 
 	if (!client_has_enabled(client, imap_feature_qresync)) {
@@ -646,7 +453,7 @@ import_send_expunges(struct client *client,
 		str_free(&str);
 	}
 	*expunge_count_r = expunge_count;
-	return IMAP_STATE_OK;
+	return 0;
 }
 
 static int
@@ -856,9 +663,8 @@ import_state_mailbox_open(struct client *client,
 	client->uidvalidity = status.uidvalidity;
 	client->notify_uidnext = status.uidnext;
 
-	result = import_send_expunges(client, state, &expunge_count, error_r);
-	if (result != IMAP_STATE_OK)
-		return result;
+	if (import_send_expunges(client, state, &expunge_count, error_r) < 0)
+		return IMAP_STATE_ERROR;
 	i_assert(expunge_count <= state->messages);
 	if (state->messages - expunge_count > client->messages_count) {
 		*error_r = t_strdup_printf("Mailbox message count shrank %u -> %u",
@@ -906,9 +712,8 @@ import_state_mailbox_open(struct client *client,
 		client_send_line(client, t_strdup_printf(
 			"* OK [HIGHESTMODSEQ %"PRIu64"] Highest",
 			status.highest_modseq));
+		client->sync_last_full_modseq = status.highest_modseq;
 	}
-	/* all expunges have been sent */
-	client->sync_last_full_modseq = status.highest_modseq;
 	e_debug(client->event,
 		"Unhibernation sync: %u expunges, %u new messages, %u flag changes, %"PRIu64" modseq changes",
 		expunge_count, new_mails_count, flag_change_count,
@@ -988,11 +793,9 @@ imap_state_import_enabled_feature(struct client *client,
 		return IMAP_STATE_CORRUPTED;
 	}
 	if (!client_enable(client, feature_idx)) {
-		/* The feature was enabled before the hibernation, so the
-		   configuration must have been changed to disable it. */
-		*error_r = t_strdup_printf("Feature '%s' can't be enabled anymore",
+		*error_r = t_strdup_printf("Feature '%s' couldn't be enabled",
 					   name);
-		return IMAP_STATE_INCONSISTENT;
+		return IMAP_STATE_CORRUPTED;
 	}
 	*skip_r = (p - data) + 1;
 	return IMAP_STATE_OK;
@@ -1012,29 +815,6 @@ imap_state_import_searchres(struct client *client, const unsigned char *data,
 	if (imap_state_import_seq_range(&p, data+size, &client->search_saved_uidset) < 0) {
 		*error_r = "Invalid SEARCHRES seq-range";
 		return IMAP_STATE_CORRUPTED;
-	}
-	*skip_r = (p - data) + 1;
-	return IMAP_STATE_OK;
-}
-
-static enum imap_state_result
-import_state_namespaces(struct client *client, const unsigned char *data,
-			size_t size, size_t *skip_r, const char **error_r)
-{
-	const unsigned char *p = data, *end = data + size;
-	const char *old_namespaces, *namespaces;
-
-	if (imap_state_import_string(&p, end, &old_namespaces) < 0) {
-		*error_r = "Namespaces state truncated";
-		return IMAP_STATE_CORRUPTED;
-	}
-	namespaces = imap_state_namespaces_string(client->user);
-	if (strcmp(old_namespaces, namespaces) != 0) {
-		*error_r = t_strdup_printf(
-			"Namespaces have changed ('%s' -> '%s')",
-			t_str_replace(old_namespaces, '\n', ' '),
-			t_str_replace(namespaces, '\n', ' '));
-		return IMAP_STATE_INCONSISTENT;
 	}
 	*skip_r = (p - data) + 1;
 	return IMAP_STATE_OK;
@@ -1116,7 +896,6 @@ static struct {
 		(*import)(struct client *client, const unsigned char *data,
 			  size_t size, size_t *skip_r, const char **error_r);
 } imap_states_internal[] = {
-	{ IMAP_STATE_TYPE_NAMESPACES, import_state_namespaces },
 	{ IMAP_STATE_TYPE_ID_LOGGED, import_state_id_logged },
 	{ IMAP_STATE_TYPE_TLS_COMPRESSION, import_state_tls_compression }
 };

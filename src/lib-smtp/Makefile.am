@@ -16,7 +16,6 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-program-client \
 	-I$(top_srcdir)/src/lib-mail \
 	-I$(top_srcdir)/src/lib-var-expand \
-	-I$(top_srcdir)/src/lib-url \
 	-DTEST_BIN_DIR=\"$(abs_srcdir)/test-bin\"
 
 smtp_server_cmds = \
@@ -129,7 +128,6 @@ test_libs = \
 	../lib-var-expand/libvar_expand.la \
 	../lib-regex/libdregex.la \
 	../lib-test/libtest.la \
-	../lib-url/liburl.la \
 	../lib/liblib.la \
 	$(LIBDOVECOT_TEST_LIBS)
 
@@ -154,7 +152,6 @@ test_deps = \
 	../lib-json/libjson.la \
 	../lib-var-expand/libvar_expand.la \
 	../lib-regex/libdregex.la \
-	../lib-url/liburl.la \
 	../lib-test/libtest.la \
 	../lib/liblib.la
 

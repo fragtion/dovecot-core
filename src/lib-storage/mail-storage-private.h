@@ -4,7 +4,6 @@
 #include "module-context.h"
 #include "unichar.h"
 #include "file-lock.h"
-#include "rate-limit.h"
 #include "str-sanitize.h"
 #include "mail-storage.h"
 #include "mail-storage-hooks.h"
@@ -489,7 +488,6 @@ struct mailbox {
 	void *notify_context;
 	struct timeout *to_notify, *to_notify_delay;
 	struct mailbox_notify_file *notify_files;
-	struct rate_limit notify_rate_limit;
 
 	/* Increased by one for each new struct mailbox. */
 	unsigned int generation_sequence;
@@ -846,9 +844,6 @@ extern struct mail_module_register mail_module_register;
 extern struct event_category event_category_storage;
 extern struct event_category event_category_mailbox;
 extern struct event_category event_category_mail;
-
-/* Rate limit for mailbox change notifications */
-extern const struct rate_limit_settings mailbox_notify_rate_limit_set;
 
 #define MAIL_STORAGE_CONTEXT(obj) \
 	MODULE_CONTEXT(obj, mail_storage_mail_index_module)

@@ -6,7 +6,26 @@
 #include "net.h"
 #include "uri-util.h"
 
-#include "http-url-private.h"
+#include "http-url.h"
+#include "http-request.h"
+
+/*
+ * HTTP URL parser
+ */
+
+struct http_url_parser {
+	struct uri_parser parser;
+
+	enum http_url_parse_flags flags;
+
+	struct http_url *url;
+	struct http_url *base;
+
+	enum http_request_target_format req_format;
+
+ 	bool relative:1;
+	bool request_target:1;
+};
 
 static bool http_url_parse_authority_form(struct http_url_parser *url_parser);
 
@@ -307,7 +326,7 @@ http_url_parse_fragment(struct http_url_parser *url_parser, bool have_path)
 	return TRUE;
 }
 
-bool http_url_do_parse(struct http_url_parser *url_parser)
+static bool http_url_do_parse(struct http_url_parser *url_parser)
 {
 	struct uri_parser *parser = &url_parser->parser;
 	struct http_url *url = url_parser->url, *base = url_parser->base;
@@ -463,7 +482,6 @@ int http_url_parse(const char *url, struct http_url *base,
 	   certain flags may also dictate whether relative URLs are
 	   allowed/required. */
 	i_assert((flags & HTTP_URL_PARSE_SCHEME_EXTERNAL) == 0 || base == NULL);
-	i_assert(base == NULL || !http_url_is_empty(base));
 
 	i_zero(&url_parser);
 	uri_parser_init(&url_parser.parser, pool, url);
@@ -478,30 +496,86 @@ int http_url_parse(const char *url, struct http_url *base,
 		return -1;
 	}
 	*url_r = url_parser.url;
-	/* http_url_is_empty() relies on this being set on every success. */
-	i_assert(url_parser.url != NULL &&
-		 url_parser.url->host.name != NULL);
 	return 0;
 }
 
-/*
- * HTTP URL evaluation
- */
-
-/* Must compare every field of struct http_url except host.ip, which is
-   deliberately excluded: uri_do_parse_host() derives it from host.name,
-   so comparing host.name already covers it. */
-bool http_url_equals(const struct http_url *url1, const struct http_url *url2)
+int http_url_request_target_parse(const char *request_target,
+				  const char *host_header,
+				  const struct http_url *default_base,
+				  pool_t pool,
+				  struct http_request_target *target,
+				  const char **error_r)
 {
-	return null_strcmp(url1->host.name, url2->host.name) == 0 &&
-	       null_strcmp(url1->user, url2->user) == 0 &&
-	       null_strcmp(url1->password, url2->password) == 0 &&
-	       null_strcmp(url1->enc_path, url2->enc_path) == 0 &&
-	       null_strcmp(url1->path, url2->path) == 0 &&
-	       null_strcmp(url1->enc_query, url2->enc_query) == 0 &&
-	       null_strcmp(url1->enc_fragment, url2->enc_fragment) == 0 &&
-	       url1->port == url2->port &&
-	       url1->have_ssl == url2->have_ssl;
+	struct http_url_parser url_parser;
+	struct uri_authority auth;
+	struct http_url base;
+
+	if (default_base == NULL)
+		i_zero(&base);
+	else
+		http_url_init_authority_from(&base, default_base);
+	if (host_header != NULL && *host_header != '\0') {
+		struct uri_parser *parser;
+
+		i_zero(&url_parser);
+		parser = &url_parser.parser;
+		uri_parser_init(parser, pool, host_header);
+
+		if (uri_parse_host_authority(parser, &auth) <= 0) {
+			*error_r = t_strdup_printf("Invalid Host header: %s",
+						   parser->error);
+			return -1;
+		}
+
+		if (parser->cur != parser->end) {
+			*error_r = t_strdup_printf(
+				"Invalid Host header: "
+				"Contains invalid character %s",
+				uri_char_sanitize(*parser->cur));
+			return -1;
+		}
+		if (auth.enc_userinfo != NULL) {
+			*error_r = "Invalid Host header: "
+				"Contains inappropriate 'userinfo@' part";
+			return -1;
+		}
+
+		base.host = auth.host;
+		base.port = auth.port;
+	} else if (default_base == NULL) {
+		*error_r = "Empty Host header";
+		return -1;
+	} else {
+		i_assert(default_base != NULL);
+	}
+
+	if (request_target[0] == '*' && request_target[1] == '\0') {
+		struct http_url *url = p_new(pool, struct http_url, 1);
+
+		uri_host_copy(pool, &url->host, &base.host);
+		url->port = base.port;
+		target->url = url;
+		target->format = HTTP_REQUEST_TARGET_FORMAT_ASTERISK;
+		return 0;
+	}
+
+	i_zero(&url_parser);
+	uri_parser_init(&url_parser.parser, pool, request_target);
+
+	url_parser.url = p_new(pool, struct http_url, 1);
+	url_parser.request_target = TRUE;
+	url_parser.req_format = HTTP_REQUEST_TARGET_FORMAT_ORIGIN;
+	url_parser.base = &base;
+	url_parser.flags = 0;
+
+	if (!http_url_do_parse(&url_parser)) {
+		*error_r = url_parser.parser.error;
+		return -1;
+	}
+
+	target->url = url_parser.url;
+	target->format = url_parser.req_format;
+	return 0;
 }
 
 /*
@@ -594,8 +668,6 @@ http_url_add_scheme(string_t *urlstr, const struct http_url *url)
 static void
 http_url_add_authority(string_t *urlstr, const struct http_url *url)
 {
-	/* Userinfo is intentionally left out, so that credentials don't end
-	   up in logs and other output. */
 	/* host */
 	uri_append_host(urlstr, &url->host);
 	/* port */

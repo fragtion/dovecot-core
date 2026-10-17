@@ -20,7 +20,7 @@
 
 struct fts_parser_tika_user {
 	union mail_user_module_context module_ctx;
-	const struct http_url *http_url;
+	struct http_url *http_url;
 	struct http_client *http_client;
 	bool initialized;
 };
@@ -65,16 +65,18 @@ void fts_tika_mail_user_created(struct mail_user *user)
 
 static int
 tika_get_http_client_url(struct fts_parser_context *parser_context,
-			 const struct http_url **http_url_r,
+			 struct http_url **http_url_r,
 			 struct http_client **http_client_r)
 {
 	struct mail_user *user = parser_context->user;
 	const struct fts_settings *set = fts_user_get_settings(user);
 	struct fts_parser_tika_user *tuser = TIKA_USER_CONTEXT(user);
-	const char *error;
+	const char *url, *error;
 
 	if (set->parsed_decoder_driver != FTS_DECODER_TIKA)
 		return -1;
+
+	url = set->decoder_tika_url;
 
 	i_assert(tuser != NULL);
 	if (tuser->initialized) {
@@ -84,12 +86,12 @@ tika_get_http_client_url(struct fts_parser_context *parser_context,
 	}
 	tuser->initialized = TRUE;
 
-	if (http_url_is_empty(&set->decoder_tika_url)) {
+	if (http_url_parse(url, NULL, HTTP_URL_ALLOW_USERINFO_PART, user->pool,
+			   &tuser->http_url, &error) < 0) {
 		e_error(parser_context->event,
-			"fts_tika: decoder_tika_url is not set");
+			"fts_tika: Failed to parse HTTP url %s: %s", url, error);
 		return -1;
 	}
-	tuser->http_url = &set->decoder_tika_url;
 
 	/* FIXME: We should initialize a shared client instead. However,
 		  this is currently not possible due to an obscure bug
@@ -138,7 +140,7 @@ fts_tika_parser_response(const struct http_response *response,
 	case 415: /* Unsupported Media Type */
 	case 422: /* Unprocessable Entity */
 		e_debug(parser->user->event, "fts_tika: PUT %s failed: %s",
-			http_url_create(&set->decoder_tika_url),
+			set->decoder_tika_url,
 			http_response_get_message(response));
 		parser->payload = i_stream_create_from_data("", 0);
 		break;
@@ -159,7 +161,7 @@ fts_tika_parser_response(const struct http_response *response,
 			retry = TRUE;
 		} else {
 			e_error(event, "fts_tika: PUT %s failed: %s",
-				http_url_create(&set->decoder_tika_url),
+				set->decoder_tika_url,
 				http_response_get_message(response));
 			parser->failed = TRUE;
 		}
@@ -171,7 +173,7 @@ fts_tika_parser_response(const struct http_response *response,
 		i_free(parser->parser.retriable_error_msg);
 		parser->parser.retriable_error_msg =
 			i_strdup_printf("fts_tika: PUT %s failed: %s",
-				http_url_create(&set->decoder_tika_url),
+				set->decoder_tika_url,
 				http_response_get_message(response));
 		parser->payload = i_stream_create_from_data("", 0);
 	}
@@ -184,17 +186,15 @@ static struct fts_parser *
 fts_parser_tika_try_init(struct fts_parser_context *parser_context)
 {
 	struct tika_fts_parser *parser;
-	const struct http_url *tika_url;
+	struct http_url *http_url;
 	struct http_client *http_client;
 	struct http_client_request *http_req;
-	struct http_url http_url;
 
-	if (tika_get_http_client_url(parser_context, &tika_url,
+	if (tika_get_http_client_url(parser_context, &http_url,
 				     &http_client) < 0)
 		return NULL;
-	http_url = *tika_url;
-	if (http_url.path == NULL)
-		http_url.path = "/";
+	if (http_url->path == NULL)
+		http_url->path = "/";
 
 	parser = i_new(struct tika_fts_parser, 1);
 	parser->parser.v = fts_parser_tika;
@@ -202,16 +202,16 @@ fts_parser_tika_try_init(struct fts_parser_context *parser_context)
 	parser->http_client = http_client;
 
 	http_req = http_client_request(parser->http_client, "PUT",
-			http_url.host.name,
-			t_strconcat(http_url.path, http_url.enc_query, NULL),
+			http_url->host.name,
+			t_strconcat(http_url->path, http_url->enc_query, NULL),
 			fts_tika_parser_response, parser);
-	if (http_url.user != NULL) {
+	if (http_url->user != NULL) {
 		http_client_request_set_auth_simple(
-			http_req, http_url.user, http_url.password);
+			http_req, http_url->user, http_url->password);
 	}
 
-	http_client_request_set_port(http_req, http_url.port);
-	http_client_request_set_ssl(http_req, http_url.have_ssl);
+	http_client_request_set_port(http_req, http_url->port);
+	http_client_request_set_ssl(http_req, http_url->have_ssl);
 	if (parser_context->content_type != NULL)
 		http_client_request_add_header(http_req, "Content-Type",
 					       parser_context->content_type);

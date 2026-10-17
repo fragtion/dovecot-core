@@ -2,7 +2,6 @@
 
 #include "imap-common.h"
 #include "ioloop.h"
-#include "buffer.h"
 #include "llist.h"
 #include "str.h"
 #include "hostpid.h"
@@ -17,7 +16,6 @@
 #include "time-util.h"
 #include "settings.h"
 #include "master-service.h"
-#include "imap-keepalive.h"
 #include "imap-resp-code.h"
 #include "imap-util.h"
 #include "imap-urlauth.h"
@@ -96,31 +94,11 @@ imap_unset_capability(struct settings_instance *set_instance, const char *capabi
 			  "no", SETTINGS_OVERRIDE_TYPE_CODE);
 }
 
-static void
-client_add_istream_prefix(struct client *client,
-			  const unsigned char *data, size_t size)
-{
-	i_assert(client->io == NULL);
-
-	struct istream *inputs[] = {
-		i_stream_create_copy_from_data(data, size),
-		client->input,
-		NULL
-	};
-	client->input = i_stream_create_concat(inputs);
-	i_stream_copy_fd(client->input, inputs[1]);
-	i_stream_unref(&inputs[0]);
-	i_stream_unref(&inputs[1]);
-
-	i_stream_set_input_pending(client->input, TRUE);
-}
-
 struct client *client_create(int fd_in, int fd_out,
 			     enum client_create_flags flags,
 			     struct event *event, struct mail_user *user,
 			     const struct imap_settings *set,
-			     const struct smtp_submit_settings *smtp_set,
-			     const buffer_t *input_buf)
+			     const struct smtp_submit_settings *smtp_set)
 {
 	struct client *client;
 	pool_t pool;
@@ -159,20 +137,10 @@ struct client *client_create(int fd_in, int fd_out,
 
 	o_stream_set_flush_callback(client->output, client_output, client);
 
-	/* Prepend the input that the login or the imap-hibernate process had
-	   already read. This must happen before hook_client_created(), so that
-	   plugins wrapping client->input also see the commands that the client
-	   pipelined with the authentication. */
-	if (input_buf != NULL && input_buf->used > 0) {
-		client_add_istream_prefix(client, input_buf->data,
-					  input_buf->used);
-	}
-
 	p_array_init(&client->module_contexts, client->pool, 5);
 	client->last_input = ioloop_time;
-	client->to_idle =
-		timeout_add(IMAP_CLIENT_INACTIVITY_TIMEOUT_SECS * 1000,
-			    client_idle_timeout, client);
+	client->to_idle = timeout_add(CLIENT_IDLE_TIMEOUT_MSECS,
+				      client_idle_timeout, client);
 
 	client->command_pool =
 		pool_alloconly_create(MEMPOOL_GROWING"client command", 1024*2);
@@ -252,8 +220,6 @@ struct client *client_create(int fd_in, int fd_out,
 	return client;
 }
 
-static void client_hibernate_timeout_start(struct client *client);
-
 void client_create_finish_io(struct client *client)
 {
 	if (client->set->rawlog_dir[0] != '\0') {
@@ -287,10 +253,25 @@ int client_create_finish(struct client *client, const char **error_r)
 	mail_namespaces_set_storage_callbacks(client->user->namespaces,
 					      &imap_storage_callbacks, client);
 	client->v.init(client);
-	/* Start the non-IDLE hibernation timer also when no command gets run,
-	   e.g. right after login or after unhibernation finished IDLE. */
-	client_hibernate_timeout_start(client);
 	return 0;
+}
+
+void client_add_istream_prefix(struct client *client,
+			       const unsigned char *data, size_t size)
+{
+	i_assert(client->io == NULL);
+
+	struct istream *inputs[] = {
+		i_stream_create_copy_from_data(data, size),
+		client->input,
+		NULL
+	};
+	client->input = i_stream_create_concat(inputs);
+	i_stream_copy_fd(client->input, inputs[1]);
+	i_stream_unref(&inputs[0]);
+	i_stream_unref(&inputs[1]);
+
+	i_stream_set_input_pending(client->input, TRUE);
 }
 
 static void client_default_init(struct client *client ATTR_UNUSED)
@@ -560,7 +541,6 @@ static void client_default_destroy(struct client *client, const char *reason)
 	io_remove(&client->io);
 	timeout_remove(&client->to_idle_output);
 	timeout_remove(&client->to_idle);
-	timeout_remove(&client->to_hibernate);
 
 	if (!client->hibernated && client->fd_in == client->fd_out)
 		(void)shutdown(client->fd_out, SHUT_RDWR);
@@ -573,11 +553,9 @@ static void client_default_destroy(struct client *client, const char *reason)
 	   because this is background work and shouldn't really be counted
 	   as an active IMAP session for the user.
 
-	   Don't autoexpunge if the client is hibernated. It was already done
-	   before the hibernation by imap_client_hibernate_autoexpunge(), which
-	   also rate limits it for frequent hibernations. Doing it here would
-	   stall the client, because imap-hibernate waits for this process to
-	   finish before it starts handling the client.
+	   Don't autoexpunge if the client is hibernated - it shouldn't be any
+	   different from the non-hibernating IDLE case. For frequent
+	   hibernations it could also be doing unnecessarily much work.
 
 	   Don't perform autoexpunging if whole Dovecot is shutting down. This
 	   could lead to a load spike and unnecessarily slowing down the
@@ -587,8 +565,8 @@ static void client_default_destroy(struct client *client, const char *reason)
 	if (!client->hibernated) {
 		if (!master_service_is_killed(master_service) &&
 		    !master_service_is_master_stopped(master_service)) {
-			client->logout_stats.autoexpunged_count +=
-				mail_user_autoexpunge(client->user, NULL);
+			client->logout_stats.autoexpunged_count =
+				mail_user_autoexpunge(client->user);
 		}
 		client_log_disconnect(client, reason);
 	}
@@ -1045,40 +1023,6 @@ static bool client_command_is_ambiguous(struct client_command_context *cmd)
 	return TRUE;
 }
 
-static void client_hibernate_timeout(struct client *client)
-{
-	const char *reason;
-
-	i_assert(client->command_queue == NULL);
-
-	timeout_remove(&client->to_hibernate);
-	if (client->disconnected)
-		return;
-	if (o_stream_get_buffer_used_size(client->output) > 0) {
-		/* Output is still being sent. Try again later. */
-		client_hibernate_timeout_start(client);
-		return;
-	}
-	imap_client_hibernate_autoexpunge(client);
-	if (!imap_client_hibernate(&client, -1, &reason)) {
-		/* retried the next time the command queue becomes empty */
-		e_debug(client->event, "Hibernation not possible: %s",
-			reason);
-	}
-}
-
-static void client_hibernate_timeout_start(struct client *client)
-{
-	unsigned int secs = client->set->imap_hibernate_nonidle_timeout_secs;
-
-	timeout_remove(&client->to_hibernate);
-	if (secs == 0 || client->disconnected || client->destroyed ||
-	    client->fd_in != client->fd_out)
-		return;
-	client->to_hibernate =
-		timeout_add(secs * 1000, client_hibernate_timeout, client);
-}
-
 struct client_command_context *client_command_alloc(struct client *client)
 {
 	struct client_command_context *cmd;
@@ -1097,7 +1041,6 @@ struct client_command_context *client_command_alloc(struct client *client)
 
 	DLLIST_PREPEND(&client->command_queue, cmd);
 	client->command_queue_size++;
-	timeout_remove(&client->to_hibernate);
 
 	imap_client_notify_command_allocated(client);
 	return cmd;
@@ -1225,7 +1168,6 @@ void client_command_free(struct client_command_context **_cmd)
 		/* no commands left in the queue, we can clear the pool */
 		p_clear(client->command_pool);
 		timeout_remove(&client->to_idle_output);
-		client_hibernate_timeout_start(client);
 	}
 	imap_client_notify_command_freed(client);
 	imap_refresh_proctitle();

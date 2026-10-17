@@ -30,6 +30,7 @@
 
 /* Default values. */
 static const char *const default_events[] = { "MessageNew", NULL };
+static const char *const default_mboxes[] = { "INBOX", NULL };
 
 /* This is data specific to an OX driver. */
 struct push_notification_driver_ox_config {
@@ -93,14 +94,18 @@ push_notification_driver_ox_init(struct mail_user *user, pool_t pool,
 	event_add_category(dconfig->event, &event_category_push_notification);
 	event_set_append_log_prefix(dconfig->event, "push-notification-ox: ");
 
-	if (http_url_is_empty(&ox_settings->url)) {
+	/* The settings check is deliberately only validating a url if it is
+	   given in the settings. Otherwise any file that does not contain
+	   push-notification specific settings would fail the validation.
+	   Thus we need to check here, whether the parsed url exists. */
+	if (ox_settings->parsed_url == NULL) {
 		*error_r = "push_notification_ox_url is missing or empty";
 		event_unref(&dconfig->event);
 		settings_free(ox_settings);
 		return -1;
 	}
 
-	dconfig->http_url = http_url_clone_with_userinfo(pool, &ox_settings->url);
+	dconfig->http_url = http_url_clone_with_userinfo(pool, ox_settings->parsed_url);
 	e_debug(dconfig->event, "Using URL %s",
 		http_url_create(dconfig->http_url));
 
@@ -182,11 +187,8 @@ push_notification_driver_ox_begin_txn(struct push_notification_driver_txn *dtxn)
 {
 	const char *const *args;
 	struct push_notification_event_messagenew_config *config;
-	const char *key, *mbox_curr, *md_value, *value, *user = NULL;
-	bool mbox_found = FALSE, mbox_arg_seen = FALSE;
-	struct mailbox *box = dtxn->ptxn->mbox;
-	struct mail_namespace *box_ns = mailbox_get_namespace(box);
-	string_t *watched = t_str_new(64);
+	const char *key, *mbox_curr, *md_value, *value;
+	bool mbox_found = FALSE;
 	struct push_notification_driver_ox_txn *txn;
 	struct push_notification_driver_ox_config *dconfig =
 		dtxn->duser->context;
@@ -195,10 +197,11 @@ push_notification_driver_ox_begin_txn(struct push_notification_driver_txn *dtxn)
 	if (md_value == NULL)
 		return FALSE;
 
-	/* Unused keys: events, expire */
+	/* Unused keys: events, expire, folder */
 	/* TODO: To be implemented later(?) */
 	const char *const *events = default_events;
 	time_t expire = INT_MAX;
+	const char *const *mboxes = default_mboxes;
 
 	if (expire < ioloop_time) {
 		e_debug(dconfig->event, "Skipped due to expiration (%ld < %ld)",
@@ -206,50 +209,43 @@ push_notification_driver_ox_begin_txn(struct push_notification_driver_txn *dtxn)
 		return FALSE;
 	}
 
-	mbox_curr = mailbox_get_vname(box);
-
-	/* Valid keys: user mailbox */
-	args = t_strsplit_tabescaped(md_value);
-	for (; *args != NULL; args++) {
-		key = *args;
-
-		value = strchr(key, '=');
-		if (value == NULL)
-			continue;
-
-		key = t_strdup_until(key, value++);
-		if (strcmp(key, "user") == 0) {
-			user = value;
-		} else if (strcmp(key, "mailbox") == 0 && value[0] != '\0') {
-			mbox_arg_seen = TRUE;
-			if (str_len(watched) > 0)
-				str_append(watched, ", ");
-			str_append(watched, value);
-			if (mailbox_equals(box, box_ns, value))
-				mbox_found = TRUE;
+	mbox_curr = mailbox_get_vname(dtxn->ptxn->mbox);
+	for (; *mboxes != NULL; mboxes++) {
+		if (strcmp(mbox_curr, *mboxes) == 0) {
+			mbox_found = TRUE;
+			break;
 		}
-	}
-
-	if (!mbox_arg_seen) {
-		str_append(watched, "INBOX");
-		mbox_found = mailbox_equals(box, box_ns, "INBOX");
 	}
 
 	if (mbox_found == FALSE) {
 		e_debug(dconfig->event,
-			"Skipped because %s is not a watched mailbox "
-			"(watching: %s)", mbox_curr, str_c(watched));
-		return FALSE;
-	}
-
-	if (user == NULL) {
-		e_error(dconfig->event, "No user provided in config");
+			"Skipped because %s is not a watched mailbox",
+			mbox_curr);
 		return FALSE;
 	}
 
 	txn = p_new(dtxn->ptxn->pool,
 		    struct push_notification_driver_ox_txn, 1);
-	txn->unsafe_user = p_strdup(dtxn->ptxn->pool, user);
+
+	/* Valid keys: user */
+	args = t_strsplit_tabescaped(md_value);
+	for (; *args != NULL; args++) {
+		key = *args;
+
+		value = strchr(key, '=');
+		if (value != NULL) {
+			key = t_strdup_until(key, value++);
+			if (strcmp(key, "user") == 0) {
+				txn->unsafe_user =
+					p_strdup(dtxn->ptxn->pool, value);
+			}
+		}
+	}
+
+	if (txn->unsafe_user == NULL) {
+		e_error(dconfig->event, "No user provided in config");
+		return FALSE;
+	}
 
 	e_debug(dconfig->event, "User (%s)", txn->unsafe_user);
 

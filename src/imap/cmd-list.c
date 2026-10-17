@@ -299,6 +299,12 @@ static bool cmd_list_continue(struct client_command_context *cmd)
 			continue;
 		}
 
+		if ((strcmp(name, "stfolder") == 0) ||
+		    (strcmp(name, "starchive") == 0) ||
+		    (strcmp(name, "stignore") == 0)) {
+			continue;
+		}
+
 		if (!cmd->utf8) {
 			str_truncate(mutf7_name, 0);
 			if (imap_utf8_to_utf7(name, mutf7_name) < 0)

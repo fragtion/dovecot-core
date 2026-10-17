@@ -20,8 +20,6 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/imap-urlauth \
 	-I$(top_srcdir)/src/lib-storage \
 	-I$(top_srcdir)/src/lib-var-expand \
-	-I$(top_srcdir)/src/lib-url \
-	-I$(top_srcdir)/src/lib-oauth2 \
 	-DPKG_RUNDIR=\""$(rundir)"\" \
 	-DPKG_STATEDIR=\""$(statedir)"\" \
 	-DPKG_LIBEXECDIR=\""$(pkglibexecdir)"\" \
@@ -58,7 +56,6 @@ doveconf_LDADD = \
 doveconf_DEPENDENCIES = $(LIBDOVECOT_DEPS) $(noinst_LTLIBRARIES)
 
 common = \
-	config-bin-filter.c \
 	config-connection.c \
 	config-dump-full.c \
 	config-filter.c \
@@ -79,7 +76,6 @@ doveconf_SOURCES = \
 
 noinst_HEADERS = \
 	all-settings.h \
-	config-bin-filter.h \
 	config-connection.h \
 	config-dump-full.h \
 	default-settings-import.h \
@@ -100,17 +96,11 @@ EXTRA_DIST = \
 	settings-get.pl
 
 test_programs = \
-	test-config-dump-full \
 	test-config-parser
 
 test_libs = \
 	$(noinst_LTLIBRARIES) \
 	$(LIBDOVECOT)
-
-test_config_dump_full_CFLAGS = $(AM_CFLAGS)
-test_config_dump_full_SOURCES = test-config-dump-full.c
-test_config_dump_full_LDADD = $(test_libs)
-test_config_dump_full_DEPENDENCIES = $(LIBDOVECOT_DEPS) $(noinst_LTLIBRARIES)
 
 test_config_parser_CFLAGS = $(AM_CFLAGS)
 test_config_parser_SOURCES = test-config-parser.c

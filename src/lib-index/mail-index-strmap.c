@@ -265,21 +265,6 @@ void mail_index_strmap_view_set_corrupted(struct mail_index_strmap_view *view)
 	mail_index_strmap_view_reset(view);
 }
 
-static int
-mail_index_strmap_header_read_failed(struct mail_index_strmap_view *view)
-{
-	struct mail_index_strmap *strmap = view->strmap;
-
-	if (strmap->input->stream_errno != 0) {
-		mail_index_strmap_set_syscall_error(strmap, "read()");
-		mail_index_strmap_close(strmap);
-	} else {
-		/* file is smaller than the header */
-		mail_index_strmap_view_set_corrupted(view);
-	}
-	return -1;
-}
-
 static int mail_index_strmap_open(struct mail_index_strmap_view *view)
 {
 	struct mail_index_strmap *strmap = view->strmap;
@@ -305,18 +290,32 @@ static int mail_index_strmap_open(struct mail_index_strmap_view *view)
 	   byte before reading the v2 tail. */
 	ret = i_stream_read_bytes(strmap->input, &data, &size,
 				  MAIL_INDEX_STRMAP_HEADER_V1_SIZE);
-	if (ret <= 0)
-		return mail_index_strmap_header_read_failed(view);
+	if (ret <= 0) {
+		if (ret < 0) {
+			mail_index_strmap_set_syscall_error(strmap, "read()");
+			mail_index_strmap_close(strmap);
+		} else {
+			i_assert(ret == 0);
+			mail_index_strmap_view_set_corrupted(view);
+		}
+		return ret;
+	}
 
 	i_zero(&hdr);
 	hdr_size = data[0] == MAIL_INDEX_STRMAP_VERSION_V2 ?
 		MAIL_INDEX_STRMAP_HEADER_V2_SIZE :
 		MAIL_INDEX_STRMAP_HEADER_V1_SIZE;
 	if (hdr_size > MAIL_INDEX_STRMAP_HEADER_V1_SIZE) {
-		ret = i_stream_read_bytes(strmap->input, &data, &size,
-					  hdr_size);
-		if (ret <= 0)
-			return mail_index_strmap_header_read_failed(view);
+		ret = i_stream_read_bytes(strmap->input, &data, &size, hdr_size);
+		if (ret <= 0) {
+			if (ret < 0) {
+				mail_index_strmap_set_syscall_error(strmap, "read()");
+				mail_index_strmap_close(strmap);
+			} else {
+				mail_index_strmap_view_set_corrupted(view);
+			}
+			return ret;
+		}
 	}
 	memcpy(&hdr, data, hdr_size);
 

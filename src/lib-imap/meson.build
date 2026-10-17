@@ -1,6 +1,5 @@
 deps = [
   dep_lib,
-  dep_url,
   dep_charset,
   dep_mail,
 ]

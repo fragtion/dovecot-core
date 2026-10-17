@@ -316,7 +316,6 @@ int fts_search_args_expand(struct fts_backend *backend,
 			   struct mail_search_args *args)
 {
 	struct mail_search_arg *args_dup, *orig_args = args->args;
-	int init_refcount;
 
 	/* don't keep re-expanding every time the search args are used.
 	   this is especially important to avoid an assert-crash in
@@ -335,14 +334,10 @@ int fts_search_args_expand(struct fts_backend *backend,
 	/* we'll need to re-simplify the args if we changed anything */
 	args->simplified = FALSE;
 	args->args = args_dup;
-	/* The duplicated args aren't initialized. The simplifier treats
-	   the args as initialized if init_refcount > 0, so hide it. */
-	i_assert(args->init_refcount > 0);
-	init_refcount = args->init_refcount;
-	args->init_refcount = 0;
 	mail_search_args_simplify(args);
-	args->init_refcount = init_refcount;
 
+	/* duplicated args aren't initialized */
+	i_assert(args->init_refcount > 0);
 	mail_search_arg_init(args, args_dup);
 	mail_search_arg_deinit(orig_args);
 	return 0;

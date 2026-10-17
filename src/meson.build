@@ -1,6 +1,5 @@
 subdir('lib-test')
 subdir('lib')
-subdir('lib-url')
 subdir('lib-regex')
 subdir('lib-var-expand')
 subdir('lib-dns')

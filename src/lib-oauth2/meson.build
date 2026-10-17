@@ -1,4 +1,4 @@
-deps = [dep_lib, dep_url, dep_settings, dep_json, dep_var_expand, dep_dcrypt, dep_dict, dep_http]
+deps = [dep_lib, dep_settings, dep_json, dep_var_expand, dep_dcrypt, dep_dict, dep_http]
 
 lib_oauth2 = static_library(
   'oauth2',
@@ -27,7 +27,7 @@ test_deps = [
   dep_dcrypt_openssl_static,
   dep_ssl_iostream_openssl_static,
 ]
-tests = ['json', 'jwt', 'url', 'request']
+tests = ['json', 'jwt']
 
 foreach test_name : tests
   exe = f'test-oauth2-@test_name@'

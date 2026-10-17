@@ -2,7 +2,6 @@
 #define FTS_SETTINGS_H
 
 #include "settings-consts.h"
-#include "http-url.h"
 
 /* <settings checks> */
 #define FTS_FILTER		"fts"
@@ -29,7 +28,7 @@ struct fts_settings {
 	const char *autoindex;
 	const char *decoder_driver;
 	const char *decoder_script_socket_path;
-	struct http_url decoder_tika_url;
+	const char *decoder_tika_url;
 	const char *driver;
 	bool search;
 	const char *search_add_missing;

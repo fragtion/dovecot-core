@@ -32,8 +32,6 @@ static const struct {
 	{ "localhost", "0\t127.0.0.1\t::1\n" },
 	{ "127.0.0.1", "0\tlocalhost\n" },
 	{ "once-host", "0\t127.0.0.2\n" },
-	/* Malformed reply: return code without the mandatory second field. */
-	{ "badreply", "-1\n" },
 };
 
 static struct test_server {
@@ -67,9 +65,6 @@ test_dns_client_input_args(struct connection *client, const char *const *args)
 	if (strcmp(args[0], "IP") != 0 && strcmp(args[0], "NAME") != 0)
 		return -1;
 	test_server.lookup_counter++;
-	/* close the connection without replying */
-	if (strcmp(args[1], "closeconn") == 0)
-		return -1;
 	/* never finish this query */
 	if (str_begins(args[1], "waitfor", &value)) {
 		unsigned int msecs;
@@ -319,28 +314,6 @@ static void test_dns_lookup_abort(void)
 	test_end();
 }
 
-static void test_dns_lookup_malformed(void)
-{
-	test_begin("dns lookup (malformed reply)");
-	create_dns_server(&test_server);
-
-	struct dns_lookup *lookup;
-	struct test_expect_result ctx = {
-		.ret = EAI_FAIL,
-		.result = NULL,
-	};
-
-	/* Server replies with only a return code and no second field, so
-	   args[1] is NULL. This must be treated as a protocol error rather
-	   than dereferencing the missing argument. */
-	dns_lookup("badreply", NULL, test_set.event,
-		   test_callback_ips, &ctx, &lookup);
-	io_loop_run(test_server.loop);
-
-	destroy_dns_server(&test_server);
-	test_end();
-}
-
 static void test_dns_lookup_cached(void)
 {
 	struct test_expect_result ctx;
@@ -371,11 +344,7 @@ static void test_dns_lookup_cached(void)
 	io_loop_run(current_ioloop);
 	test_assert_cmp(test_server.lookup_counter, ==, 1);
 
-	/* The cache uses ioloop_time, so with a 4s TTL the entry is refreshed
-	   when its age in whole seconds is 2..3 and expires at 4. Waiting
-	   2.5s gives an age of 2 or 3 regardless of where within the second
-	   the entry was added. Waiting 3s would randomly give 4. */
-	to = timeout_add(2500, io_loop_stop, test_server.loop);
+	to = timeout_add(3*1000, io_loop_stop, test_server.loop);
 	io_loop_run(current_ioloop);
 	timeout_remove(&to);
 
@@ -420,7 +389,7 @@ static void test_dns_lookup_cached(void)
 	io_loop_run(current_ioloop);
 	test_assert_cmp(test_server.lookup_counter, ==, 6);
 
-	to = timeout_add(2500, io_loop_stop, test_server.loop);
+	to = timeout_add(3*1000, io_loop_stop, test_server.loop);
 	io_loop_run(current_ioloop);
 	timeout_remove(&to);
 
@@ -455,99 +424,6 @@ static void test_dns_lookup_cached(void)
 	test_end();
 }
 
-static void test_server_close_clients(void)
-{
-	while (test_dns_clients->connections != NULL)
-		test_dns_client_destroy(test_dns_clients->connections);
-}
-
-static void test_dns_wait_msecs(unsigned int msecs)
-{
-	struct timeout *to = timeout_add_short(msecs, io_loop_stop,
-					       current_ioloop);
-	io_loop_run(current_ioloop);
-	timeout_remove(&to);
-}
-
-static void test_dns_client_lookup_ips(struct dns_client *client,
-				       const char *name, const char *result)
-{
-	struct dns_lookup *lookup;
-	struct test_expect_result ctx = {
-		.ret = result == NULL ? EAI_FAIL : 0,
-		.result = result
-	};
-
-	dns_client_lookup(client, name, test_set.event, test_callback_ips,
-			  &ctx, &lookup);
-	io_loop_run(current_ioloop);
-}
-
-static void test_dns_lookup_reconnect(void)
-{
-	struct dns_client *client;
-	const struct dns_client_parameters params = {
-		.idle_timeout_msecs = 10000,
-	};
-	const char *error;
-
-	test_begin("dns lookup (shared client, server closes idle connection)");
-	settings_simple_update(&test_set, set_dns_test);
-	create_dns_server(&test_server);
-	test_assert(dns_client_init(&params, test_set.event, &client, &error) == 0);
-
-	test_dns_client_lookup_ips(client, "localhost", "127.0.0.1\t::1");
-	test_server_close_clients();
-	test_dns_wait_msecs(100);
-	test_dns_client_lookup_ips(client, "localhost", "127.0.0.1\t::1");
-
-	dns_client_deinit(&client);
-	destroy_dns_server(&test_server);
-	test_end();
-}
-
-static void test_dns_lookup_reconnect_pending(void)
-{
-	struct dns_client *client;
-	const struct dns_client_parameters params = {
-		.idle_timeout_msecs = 10000,
-	};
-	const char *error;
-
-	test_begin("dns lookup (shared client, server closes pending lookup)");
-	settings_simple_update(&test_set, set_dns_test);
-	create_dns_server(&test_server);
-	test_assert(dns_client_init(&params, test_set.event, &client, &error) == 0);
-
-	test_dns_client_lookup_ips(client, "closeconn", NULL);
-	test_assert(!dns_client_has_pending_queries(client));
-	test_dns_client_lookup_ips(client, "localhost", "127.0.0.1\t::1");
-
-	dns_client_deinit(&client);
-	destroy_dns_server(&test_server);
-	test_end();
-}
-
-static void test_dns_lookup_closed_private(void)
-{
-	test_begin("dns lookup (server closes private client)");
-	settings_simple_update(&test_set, set_dns_test);
-	create_dns_server(&test_server);
-
-	struct dns_lookup *lookup;
-	struct test_expect_result ctx = {
-		.ret = EAI_FAIL,
-	};
-
-	dns_lookup("closeconn", NULL, test_set.event, test_callback_ips,
-		   &ctx, &lookup);
-	io_loop_run(current_ioloop);
-	test_dns_expect_result_ips("localhost", "127.0.0.1\t::1");
-
-	destroy_dns_server(&test_server);
-	test_end();
-}
-
 int main(void)
 {
 	static void (*const test_functions[])(void) = {
@@ -556,11 +432,7 @@ int main(void)
 		test_dns_lookup_ip,
 		test_dns_lookup_timeout,
 		test_dns_lookup_abort,
-		test_dns_lookup_malformed,
 		test_dns_lookup_cached,
-		test_dns_lookup_reconnect,
-		test_dns_lookup_reconnect_pending,
-		test_dns_lookup_closed_private,
 		NULL
 	};
 

@@ -142,8 +142,15 @@ static int mdbox_sync_index(struct mdbox_sync_context *ctx)
 
 	hdr = mail_index_get_header(ctx->sync_view);
 	if (hdr->uid_validity == 0) {
-		/* The mailbox indexes are created by mdbox_sync_try_begin()
-		   before the sync begins, so the index is broken. */
+		/* newly created index file */
+		if (hdr->next_uid == 1) {
+			/* could be just a race condition where we opened the
+			   mailbox between mkdir and index creation. fix this
+			   silently. */
+			if (mdbox_mailbox_create_indexes(box, NULL, ctx->trans) < 0)
+				return -1;
+			return 1;
+		}
 		mdbox_set_mailbox_corrupted(box, "Broken index: missing UIDVALIDITY");
 		return 0;
 	}
@@ -203,28 +210,6 @@ static int mdbox_sync_try_begin(struct mdbox_sync_context *ctx,
 	}
 	if (ret <= 0)
 		return ret; /* error / nothing to do */
-
-	const struct mail_index_header *hdr =
-		mail_index_get_header(ctx->sync_view);
-	if (!ctx->index_created && hdr->uid_validity == 0 &&
-	    hdr->next_uid == 1) {
-		/* The mailbox indexes aren't created yet, e.g. the mailbox was
-		   opened between the mkdir and the index creation. Create them
-		   before the mailbox index is locked: creating them locks the
-		   map, which must be locked first, and the indexes are
-		   committed while the index isn't being synced, so the created
-		   UIDVALIDITY and mdbox header become visible to this process
-		   as well. */
-		mail_index_sync_set_reason(ctx->index_sync_ctx,
-					   "mdbox index creation");
-		mail_index_sync_rollback(&ctx->index_sync_ctx);
-		index_storage_expunging_deinit(&ctx->mbox->box);
-
-		ctx->index_created = TRUE;
-		if (dbox_mailbox_create_indexes(&mbox->box, NULL) < 0)
-			return -1;
-		return mdbox_sync_try_begin(ctx, sync_flags);
-	}
 
 	if (!mdbox_map_atomic_is_locked(ctx->atomic) &&
 	    mail_index_sync_has_expunges(ctx->index_sync_ctx)) {
@@ -324,11 +309,8 @@ int mdbox_sync_finish(struct mdbox_sync_context **_ctx, bool success)
 		mail_index_sync_rollback(&ctx->index_sync_ctx);
 	}
 
-	if (storage->rebuild_list_index) {
+	if (storage->rebuild_list_index)
 		ret = mail_storage_list_index_rebuild_and_set_uncorrupted(storage);
-		if (ret == 0)
-			ret = mdbox_storage_rebuild_deferred(ctx->mbox->storage);
-	}
 
 	i_free(ctx);
 	return ret;
@@ -341,7 +323,7 @@ int mdbox_sync(struct mdbox_mailbox *mbox, enum mdbox_sync_flags flags)
 	struct mdbox_sync_context *sync_ctx;
 	struct mdbox_map_atomic_context *atomic;
 	enum mdbox_rebuild_reason rebuild_reason = 0;
-	bool corrupted, storage_rebuilt = FALSE, rebuild_skipped = FALSE;
+	bool corrupted, storage_rebuilt = FALSE;
 	int ret;
 
 	if (mbox->storage->corrupted_reason != NULL)
@@ -350,34 +332,15 @@ int mdbox_sync(struct mdbox_mailbox *mbox, enum mdbox_sync_flags flags)
 		rebuild_reason |= MDBOX_REBUILD_REASON_MAILBOX_FSCKD;
 	if (mdbox_map_is_fscked(mbox->storage->map))
 		rebuild_reason |= MDBOX_REBUILD_REASON_MAP_FSCKD;
-	if ((flags & MDBOX_SYNC_FLAG_FORCE_REBUILD) == 0)
-		;
-	else if (mbox->box.storage->rebuilding_list_index) {
-		/* The mailbox list index rebuild force-resyncs the mailboxes
-		   it recovers. Don't rebuild the storage until the list index
-		   rebuild is finished: the storage rebuild uses the list index
-		   to find out which mails are still used, so the mails of the
-		   mailboxes that weren't recovered yet would look lost. They
-		   would be restored to new mailboxes, which take the names of
-		   the actual mailboxes, e.g. Trash would become
-		   "Trash-<random>". */
-		mbox->storage->rebuild_after_list_index_rebuild = TRUE;
-	} else {
+	if ((flags & MDBOX_SYNC_FLAG_FORCE_REBUILD) != 0)
 		rebuild_reason |= MDBOX_REBUILD_REASON_FORCED;
-	}
 	if (rebuild_reason != 0) {
-		ret = mdbox_storage_rebuild(mbox->storage, &mbox->box,
-					    rebuild_reason);
-		if (ret < 0)
+		if (mdbox_storage_rebuild(mbox->storage, &mbox->box,
+					  rebuild_reason) < 0)
 			return -1;
-		if (ret > 0) {
-			mailbox_recent_flags_reset(&mbox->box);
-			storage_rebuilt = TRUE;
-			flags |= MDBOX_SYNC_FLAG_FORCE;
-		} else {
-			/* the rebuild couldn't be done now */
-			rebuild_skipped = TRUE;
-		}
+		mailbox_recent_flags_reset(&mbox->box);
+		storage_rebuilt = TRUE;
+		flags |= MDBOX_SYNC_FLAG_FORCE;
 	}
 
 	atomic = mdbox_map_atomic_begin(mbox->storage->map);
@@ -388,17 +351,6 @@ int mdbox_sync(struct mdbox_mailbox *mbox, enum mdbox_sync_flags flags)
 			mailbox_set_critical(&mbox->box,
 				"mdbox: Storage keeps breaking: %s",
 				mbox->storage->corrupted_reason);
-			(void)mdbox_map_atomic_finish(&atomic);
-			return -1;
-		}
-
-		if (rebuild_skipped) {
-			/* Retrying wouldn't do anything differently, because
-			   the rebuild is skipped again. */
-			mailbox_set_critical(&mbox->box,
-				"mdbox: Storage is corrupted, but it can't be rebuilt now: %s",
-				mbox->storage->corrupted_reason);
-			(void)mdbox_map_atomic_finish(&atomic);
 			return -1;
 		}
 

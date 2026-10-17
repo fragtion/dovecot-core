@@ -4,7 +4,6 @@
 #include "test-common.h"
 #include "test-dir.h"
 #include "test-subprocess.h"
-#include "ioloop.h"
 #include "istream.h"
 #include "istream-unix.h"
 #include "strescape.h"
@@ -16,9 +15,7 @@
 #include "smtp-submit.h"
 #include "mail-storage-service.h"
 #include "mail-storage-private.h"
-#include "mail-autoexpunge.h"
 #include "buffer.h"
-#include "seq-range-array.h"
 #include "imap-common.h"
 #include "imap-settings.h"
 #include "imap-client.h"
@@ -35,8 +32,6 @@ struct test_imap_client_hibernate {
 	struct client *client;
 	int fd_listen;
 	bool has_mailbox;
-	bool has_notify_fd;
-	bool idle_cmd;
 	const char *reply;
 };
 
@@ -52,7 +47,6 @@ int client_create_from_input(const struct mail_storage_service_input *input ATTR
 			     const struct imap_logout_stats *stats ATTR_UNUSED,
 			     int fd_in ATTR_UNUSED, int fd_out ATTR_UNUSED,
 			     enum client_create_flags flags ATTR_UNUSED,
-			     const buffer_t *input_buf ATTR_UNUSED,
 			     struct client **client_r ATTR_UNUSED,
 			     const char **error_r ATTR_UNUSED) { return -1; }
 
@@ -90,7 +84,7 @@ static int imap_hibernate_server(struct test_imap_client_hibernate *ctx)
 	if (write(fd, ctx->reply, strlen(ctx->reply)) != (ssize_t)strlen(ctx->reply))
 		i_fatal("write(imap-hibernate client command) failed: %m");
 
-	if (ctx->has_notify_fd) {
+	if (ctx->has_mailbox) {
 		/* read mailbox notify fd */
 		i_stream_unix_set_read_fd(input);
 		if (i_stream_read_next_line(input) == NULL)
@@ -114,7 +108,6 @@ static int imap_hibernate_server(struct test_imap_client_hibernate *ctx)
 	test_assert(str_begins_with(args[i++], "peer_ino="));
 	test_assert_strcmp(args[i++], "session="EVILSTR"session");
 	test_assert(str_begins_with(args[i++], "session_created="));
-	test_assert_strcmp(args[i++], "autoexpunge_next_check=1234567890");
 	test_assert_strcmp(args[i++], "lip=127.0.0.1");
 	test_assert_strcmp(args[i++], "lport=1234");
 	test_assert_strcmp(args[i++], "rip=127.0.0.2");
@@ -123,18 +116,12 @@ static int imap_hibernate_server(struct test_imap_client_hibernate *ctx)
 	test_assert(str_begins_with(args[i++], "gid="));
 	if (ctx->has_mailbox)
 		test_assert_strcmp(args[i++], "mailbox="EVILSTR"mailbox");
-	if (ctx->idle_cmd)
-		test_assert_strcmp(args[i++], "tag="EVILSTR"tag");
+	test_assert_strcmp(args[i++], "tag="EVILSTR"tag");
 	test_assert_strcmp(args[i++], "auth_token=asdf");
 	test_assert(str_begins_with(args[i++], "session_pid="));
 	test_assert(args[i] != NULL && str_begins_with(args[i++], "stats="));
-	test_assert(args[i] != NULL &&
-		    str_begins_with(args[i++], "capability="));
-	if (ctx->idle_cmd)
-		test_assert_strcmp(args[i++], "idle-cmd");
-	else
-		test_assert(args[i] != NULL && str_begins_with(args[i++], "last_input="));
-	if (ctx->has_notify_fd)
+	test_assert_strcmp(args[i++], "idle-cmd");
+	if (ctx->has_mailbox)
 		test_assert_strcmp(args[i++], "notify_fd");
 
 	const char *const stats_prefixes[] = {
@@ -174,27 +161,24 @@ mailbox_notify_callback(struct mailbox *box ATTR_UNUSED,
 {
 }
 
-static void test_client_set_mailbox_modseq(struct client *client)
+static void test_imap_client_hibernate(void)
 {
-	struct mailbox_status status;
-
-	/* SELECT would do this */
-	mailbox_get_open_status(client->mailbox, STATUS_HIGHESTMODSEQ,
-				&status);
-	client->sync_last_full_modseq = status.highest_modseq;
-}
-
-static struct client *test_client_create(int *peer_fd_r)
-{
-	/* the client keeps a pointer to this */
-	static struct smtp_submit_settings smtp_set;
+	struct client *client;
+	struct smtp_submit_settings smtp_set;
 	struct mail_user *mail_user;
+	struct test_imap_client_hibernate ctx;
 	const char *error;
+
+	storage_service = mail_storage_service_init(master_service,
+		MAIL_STORAGE_SERVICE_FLAG_ALLOW_ROOT |
+		MAIL_STORAGE_SERVICE_FLAG_NO_LOG_INIT |
+		MAIL_STORAGE_SERVICE_FLAG_NO_CHDIR |
+		MAIL_STORAGE_SERVICE_FLAG_NO_RESTRICT_ACCESS);
 
 	const char *const input_userdb[] = {
 		"mailbox_list_index=no",
-		"mail_driver=maildir",
-		t_strdup_printf("mail_path=%s/maildir", test_dir_get()),
+		"mail_driver=mbox",
+		t_strdup_printf("mail_path=%s/mbox", test_dir_get()),
 		t_strdup_printf("base_dir=%s", test_dir_get()),
 		"mail_log_prefix="EVILSTR"%u",
 		"auth_token=asdf",
@@ -211,138 +195,30 @@ static struct client *test_client_create(int *peer_fd_r)
 	test_assert(net_addr2ip("127.0.0.2", &input.remote_ip) == 0);
 	test_assert(mail_storage_service_lookup_next(storage_service, &input,
 						     &mail_user, &error) == 1);
+	i_zero(&smtp_set);
+	i_zero(&ctx);
 
-	if (master_service_get_client_limit(master_service) == 0) {
-		/* The previous client's destroy used up the std client.
-		   Account for a new one. */
-		master_service_set_client_limit(master_service, 1);
-		master_service_set_restart_request_count(master_service, 1);
-		master_service_client_connection_created(master_service);
-	}
-
-	int client_fds[2];
-	if (socketpair(AF_UNIX, SOCK_STREAM, 0, client_fds) < 0)
-		i_fatal("socketpair() failed: %m");
 	struct event *event = event_create(NULL);
-	struct client *client =
-		client_create(client_fds[0], client_fds[0], 0, event,
-			      mail_user, imap_setting_parser_info.defaults,
-			      &smtp_set, NULL);
-	event_unref(&event);
-	client->autoexpunge_next_check = 1234567890;
-	*peer_fd_r = client_fds[1];
-	return client;
-}
+	int client_fd = dup(dev_null_fd);
+	client = client_create(client_fd, client_fd, 0, event, mail_user,
+			       imap_setting_parser_info.defaults, &smtp_set);
+	ctx.client = client;
 
-static void test_mail_save(struct mailbox *box, const char *data)
-{
-	struct mailbox_transaction_context *trans;
-	struct mail_save_context *save_ctx;
-	struct istream *input;
-	ssize_t ret;
+	/* can't hibernate without IDLE */
+	test_begin("imap client hibernate: non-IDLE");
+	test_assert(!imap_client_hibernate(&client, &error));
+	test_assert_strcmp(error, "Non-IDLE connections not supported currently");
+	test_end();
 
-	input = i_stream_create_from_data(data, strlen(data));
-	trans = mailbox_transaction_begin(box,
-			MAILBOX_TRANSACTION_FLAG_EXTERNAL, __func__);
-	save_ctx = mailbox_save_alloc(trans);
-	test_assert(mailbox_save_begin(&save_ctx, input) == 0);
-	do {
-		test_assert(mailbox_save_continue(save_ctx) == 0);
-	} while ((ret = i_stream_read(input)) > 0);
-	test_assert(ret == -1);
-	test_assert(mailbox_save_finish(&save_ctx) == 0);
-	test_assert(mailbox_transaction_commit(&trans) == 0);
-	i_stream_unref(&input);
-}
-
-static void test_mail_save_other(struct mail_user *user, const char *vname)
-{
-	struct mailbox *box =
-		mailbox_alloc(user->namespaces->list, vname, 0);
-	test_assert(mailbox_open(box) == 0);
-	test_mail_save(box, "Subject: new\n\nbody\n");
-	mailbox_free(&box);
-}
-
-static void test_mail_expunge_first(struct mail_user *user, const char *vname)
-{
-	struct mailbox *box =
-		mailbox_alloc(user->namespaces->list, vname, 0);
-	test_assert(mailbox_sync(box, 0) == 0);
-	struct mailbox_transaction_context *trans =
-		mailbox_transaction_begin(box, 0, __func__);
-	struct mail *mail = mail_alloc(trans, 0, NULL);
-	mail_set_seq(mail, 1);
-	mail_expunge(mail);
-	mail_free(&mail);
-	test_assert(mailbox_transaction_commit(&trans) == 0);
-	test_assert(mailbox_sync(box, 0) == 0);
-	mailbox_free(&box);
-}
-
-static int test_mail_expunge_first_child(struct test_imap_client_hibernate *ctx)
-{
-	test_mail_expunge_first(ctx->client->user, "nonidlebox");
-
-	/* Free the client and mail user inherited from the parent. Mark the
-	   client hibernated, so destroying it doesn't shutdown() the socket
-	   shared with the parent, autoexpunge or log a disconnect. */
-	ctx->client->hibernated = TRUE;
-	client_destroy(ctx->client, NULL);
-
-	mail_storage_service_deinit(&storage_service);
-	master_service_deinit_forked(&master_service);
-	return test_has_failed() ? 1 : 0;
-}
-
-static void test_mailbox_sync_no_expunges(struct mailbox *box)
-{
-	struct mailbox_sync_context *sync_ctx;
-	struct mailbox_sync_rec sync_rec;
-	struct mailbox_sync_status sync_status;
-
-	/* like imap_sync_init() does for FETCH */
-	sync_ctx = mailbox_sync_init(box, MAILBOX_SYNC_FLAG_NO_EXPUNGES);
-	while (mailbox_sync_next(sync_ctx, &sync_rec)) ;
-	test_assert(mailbox_sync_deinit(&sync_ctx, &sync_status) == 0);
-	test_assert(sync_status.sync_delayed_expunges);
-}
-
-static void
-test_imap_client_hibernate_idle(struct test_imap_client_hibernate *ctx)
-{
-	struct client *client;
-	const char *error;
-	int peer_fd;
-
-	client = test_client_create(&peer_fd);
-	ctx->client = client;
-
-	/* can't hibernate when a command other than IDLE is running */
-	test_begin("imap client hibernate: command in progress");
 	struct client_command_context *cmd = client_command_alloc(client);
 	cmd->tag = EVILSTR"tag";
-	cmd->name = "NOOP";
-	test_assert(!imap_client_hibernate(&client, -1, &error));
-	test_assert_strcmp(error, "Command in progress");
-	test_end();
-
 	cmd->name = "IDLE";
-
-	/* partial input line is buffered */
-	test_begin("imap client hibernate: input pending");
-	if (write(peer_fd, "DON", 3) != 3)
-		i_fatal("write(client) failed: %m");
-	test_assert(i_stream_read(client->input) == 3);
-	test_assert(!imap_client_hibernate(&client, -1, &error));
-	test_assert_strcmp(error, "input pending from client");
-	i_stream_skip(client->input, 3);
-	test_end();
+	event_unref(&event);
 
 	/* imap-hibernate socket doesn't exist */
 	test_begin("imap client hibernate: socket not found");
 	test_expect_error_string("/imap-hibernate) failed: No such file or directory");
-	test_assert(!imap_client_hibernate(&client, -1, &error));
+	test_assert(!imap_client_hibernate(&client, &error));
 	test_expect_no_more_errors();
 	test_assert(strstr(error, "net_connect_unix") != NULL);
 	test_end();
@@ -350,19 +226,18 @@ test_imap_client_hibernate_idle(struct test_imap_client_hibernate *ctx)
 	/* imap-hibernate socket times out */
 	const char *socket_path = t_strdup_printf("%s/imap-hibernate",
 						  test_dir_get());
-	ctx->fd_listen = net_listen_unix(socket_path, 1);
-	if (ctx->fd_listen == -1)
+	ctx.fd_listen = net_listen_unix(socket_path, 1);
+	if (ctx.fd_listen == -1)
 		i_fatal("net_listen_unix(%s) failed: %m", socket_path);
-	fd_set_nonblock(ctx->fd_listen, FALSE);
+	fd_set_nonblock(ctx.fd_listen, FALSE);
 
 	/* imap-hibernate socket returns failure */
 	test_begin("imap client hibernate: error returned");
-	ctx->reply = "-notgood\n";
-	ctx->idle_cmd = TRUE;
-	test_subprocess_fork(imap_hibernate_server, ctx, FALSE);
+	ctx.reply = "-notgood\n";
+	test_subprocess_fork(imap_hibernate_server, &ctx, FALSE);
 
 	test_expect_error_string("/imap-hibernate returned failure: notgood");
-	test_assert(!imap_client_hibernate(&client, -1, &error));
+	test_assert(!imap_client_hibernate(&client, &error));
 	test_expect_no_more_errors();
 	test_assert(strstr(error, "notgood") != NULL);
 	test_end();
@@ -387,7 +262,6 @@ test_imap_client_hibernate_idle(struct test_imap_client_hibernate *ctx)
 	test_assert(mailbox_open(import_box) == 0);
 	test_assert(mailbox_sync(import_box, 0) == 0);
 	client->mailbox = import_box;
-	test_client_set_mailbox_modseq(client);
 
 	buffer_t *state = t_buffer_create(256);
 	test_assert(imap_state_export_internal(client, state, &error) == 1);
@@ -422,276 +296,20 @@ test_imap_client_hibernate_idle(struct test_imap_client_hibernate *ctx)
 	memset(update.mailbox_guid, 0x12, sizeof(update.mailbox_guid));
 	test_assert(mailbox_create(client->mailbox, &update, FALSE) == 0);
 	test_assert(mailbox_open(client->mailbox) == 0);
-	test_client_set_mailbox_modseq(client);
 	client->mailbox->vname = EVILSTR"mailbox";
 
 	/* successful hibernation */
 	test_begin("imap client hibernate: success");
-	ctx->reply = "+\n";
-	ctx->has_mailbox = TRUE;
-	ctx->has_notify_fd = TRUE;
-	test_subprocess_fork(imap_hibernate_server, ctx, FALSE);
+	ctx.reply = "+\n";
+	ctx.has_mailbox = TRUE;
+	test_subprocess_fork(imap_hibernate_server, &ctx, FALSE);
 	/* start notification only after forking or we'll have trouble
 	   deinitializing cleanly */
 	mailbox_notify_changes(client->mailbox, mailbox_notify_callback, client);
-	test_assert(imap_client_hibernate(&client, -1, &error));
+	test_assert(imap_client_hibernate(&client, &error));
 	test_subprocess_kill_all(SERVER_KILL_TIMEOUT_SECS);
+
 	test_end();
-
-	i_close_fd(&peer_fd);
-}
-
-static void test_pipe_assert_closed(int fd_pipe[2])
-{
-	char c;
-
-	/* EOF only when all the write end's fds have been closed. Otherwise
-	   the non-blocking read fails with EAGAIN. */
-	fd_set_nonblock(fd_pipe[0], TRUE);
-	test_assert(read(fd_pipe[0], &c, 1) == 0);
-	i_close_fd(&fd_pipe[0]);
-}
-
-static void
-test_imap_client_hibernate_idle_fd(struct test_imap_client_hibernate *ctx)
-{
-	struct client *client;
-	const char *error;
-	int peer_fd, fd_pipe[2];
-
-	client = test_client_create(&peer_fd);
-	ctx->client = client;
-	ctx->idle_cmd = TRUE;
-	ctx->has_mailbox = TRUE;
-	ctx->has_notify_fd = TRUE;
-	ctx->reply = "+\n";
-
-	struct client_command_context *cmd = client_command_alloc(client);
-	cmd->tag = EVILSTR"tag";
-	cmd->name = "NOOP";
-
-	test_begin("imap client hibernate: given notify fd closed on failure");
-	if (pipe(fd_pipe) < 0)
-		i_fatal("pipe() failed: %m");
-	test_assert(!imap_client_hibernate(&client, fd_pipe[1], &error));
-	test_assert_strcmp(error, "Command in progress");
-	test_pipe_assert_closed(fd_pipe);
-	test_end();
-
-	cmd->name = "IDLE";
-	client->mailbox = mailbox_alloc(client->user->namespaces->list,
-					"fdbox", 0);
-	test_assert(mailbox_create(client->mailbox, NULL, FALSE) == 0);
-	test_assert(mailbox_open(client->mailbox) == 0);
-	test_client_set_mailbox_modseq(client);
-	client->mailbox->vname = EVILSTR"mailbox";
-
-	/* No mailbox_notify_changes(), so extracting a notify fd would fail.
-	   The given fd is sent instead. */
-	test_begin("imap client hibernate: given notify fd sent");
-	if (pipe(fd_pipe) < 0)
-		i_fatal("pipe() failed: %m");
-	test_subprocess_fork(imap_hibernate_server, ctx, FALSE);
-	test_assert(imap_client_hibernate(&client, fd_pipe[1], &error));
-	test_subprocess_kill_all(SERVER_KILL_TIMEOUT_SECS);
-	test_pipe_assert_closed(fd_pipe);
-	test_end();
-
-	i_close_fd(&peer_fd);
-}
-
-static void
-test_imap_client_hibernate_nonidle_no_mailbox(
-	struct test_imap_client_hibernate *ctx)
-{
-	struct client *client;
-	const char *error;
-	int peer_fd;
-
-	client = test_client_create(&peer_fd);
-	ctx->client = client;
-	ctx->idle_cmd = FALSE;
-	ctx->has_mailbox = FALSE;
-	ctx->has_notify_fd = FALSE;
-	ctx->reply = "+\n";
-
-	test_begin("imap client hibernate: non-IDLE delay-newmail");
-	const struct imap_settings *orig_set = client->set;
-	struct imap_settings set = *orig_set;
-	set.parsed_workarounds |= WORKAROUND_DELAY_NEWMAIL;
-	client->set = &set;
-	test_assert(!imap_client_hibernate(&client, -1, &error));
-	test_assert_strcmp(error, "delay-newmail workaround enabled");
-	client->set = orig_set;
-	test_end();
-
-	test_begin("imap client hibernate: non-IDLE skipping input line");
-	client->input_skip_line = TRUE;
-	test_assert(!imap_client_hibernate(&client, -1, &error));
-	test_assert_strcmp(error, "Skipping the rest of a command line");
-	client->input_skip_line = FALSE;
-	test_end();
-
-	test_begin("imap client hibernate: non-IDLE FETCH failures");
-	p_array_init(&client->fetch_failed_uids, client->pool, 1);
-	seq_range_array_add(&client->fetch_failed_uids, 1);
-	test_assert(!imap_client_hibernate(&client, -1, &error));
-	test_assert_strcmp(error, "FETCH failures pending");
-	array_clear(&client->fetch_failed_uids);
-	test_end();
-
-	test_begin("imap client hibernate: non-IDLE without mailbox");
-	test_subprocess_fork(imap_hibernate_server, ctx, FALSE);
-	test_assert(imap_client_hibernate(&client, -1, &error));
-	test_subprocess_kill_all(SERVER_KILL_TIMEOUT_SECS);
-	test_end();
-
-	i_close_fd(&peer_fd);
-}
-
-static void
-test_imap_client_hibernate_nonidle_mailbox(
-	struct test_imap_client_hibernate *ctx)
-{
-	struct client *client;
-	buffer_t *state;
-	const char *error;
-	int peer_fd;
-
-	client = test_client_create(&peer_fd);
-	ctx->client = client;
-	ctx->idle_cmd = FALSE;
-	ctx->has_mailbox = TRUE;
-	ctx->has_notify_fd = FALSE;
-	ctx->reply = "+\n";
-
-	client->mailbox = mailbox_alloc(client->user->namespaces->list,
-					"nonidlebox", 0);
-	test_assert(mailbox_create(client->mailbox, NULL, FALSE) == 0);
-	test_assert(mailbox_open(client->mailbox) == 0);
-	test_mail_save(client->mailbox, "Subject: 1\n\nbody\n");
-	test_mail_save(client->mailbox, "Subject: 2\n\nbody\n");
-	test_assert(mailbox_sync(client->mailbox, 0) == 0);
-	test_client_set_mailbox_modseq(client);
-
-	test_begin("imap client hibernate: non-IDLE transaction open");
-	struct mailbox_transaction_context *trans =
-		mailbox_transaction_begin(client->mailbox, 0, __func__);
-	test_assert(!imap_client_hibernate(&client, -1, &error));
-	test_assert_strcmp(error, "Mailbox transactions open");
-	mailbox_transaction_rollback(&trans);
-	test_end();
-
-	test_begin("imap client hibernate: non-IDLE delayed expunges");
-	test_mail_expunge_first(client->user, "nonidlebox");
-	/* The view hasn't been synced yet, but the expunge is visible in the
-	   index already */
-	test_assert(!imap_client_hibernate(&client, -1, &error));
-	test_assert_strcmp(error, "Expunges not sent to client yet");
-	/* Sync without expunges, like FETCH does. The expunge is now delayed
-	   in the view, and the client hasn't been told about it. */
-	test_mailbox_sync_no_expunges(client->mailbox);
-	test_assert(!imap_client_hibernate(&client, -1, &error));
-	test_assert_strcmp(error, "Expunges not sent to client yet");
-	/* After a full sync the expunge is sent and hibernation is allowed */
-	test_assert(mailbox_sync(client->mailbox, 0) == 0);
-	test_client_set_mailbox_modseq(client);
-	state = t_buffer_create(256);
-	test_assert(imap_state_export_internal(client, state, &error) == 1);
-	test_end();
-
-	test_begin("imap client hibernate: non-IDLE new mail");
-	/* new messages above the view's UIDNEXT aren't counted as expunges */
-	test_mail_save_other(client->user, "nonidlebox");
-	buffer_set_used_size(state, 0);
-	test_assert(imap_state_export_internal(client, state, &error) == 1);
-	test_end();
-
-	test_begin("imap client hibernate: non-IDLE new mail and delayed expunges");
-	test_assert(mailbox_sync(client->mailbox, 0) == 0);
-	test_client_set_mailbox_modseq(client);
-	test_mail_expunge_first(client->user, "nonidlebox");
-	test_mailbox_sync_no_expunges(client->mailbox);
-	test_mail_save_other(client->user, "nonidlebox");
-	test_assert(!imap_client_hibernate(&client, -1, &error));
-	test_assert_strcmp(error, "Expunges not sent to client yet");
-	test_assert(mailbox_sync(client->mailbox, 0) == 0);
-	test_client_set_mailbox_modseq(client);
-	buffer_set_used_size(state, 0);
-	test_assert(imap_state_export_internal(client, state, &error) == 1);
-	test_end();
-
-	test_begin("imap client hibernate: non-IDLE expunge by another process");
-	/* The expunge is committed by another process, so it isn't in this
-	   process's index map until the index is refreshed. */
-	test_subprocess_fork(test_mail_expunge_first_child, ctx, FALSE);
-	test_subprocess_wait_all(SERVER_KILL_TIMEOUT_SECS);
-	test_assert(!imap_client_hibernate(&client, -1, &error));
-	test_assert_strcmp(error, "Expunges not sent to client yet");
-	test_assert(mailbox_sync(client->mailbox, 0) == 0);
-	test_client_set_mailbox_modseq(client);
-	buffer_set_used_size(state, 0);
-	test_assert(imap_state_export_internal(client, state, &error) == 1);
-	test_end();
-
-	test_begin("imap client hibernate: non-IDLE with mailbox");
-	client->mailbox->vname = EVILSTR"mailbox";
-	test_subprocess_fork(imap_hibernate_server, ctx, FALSE);
-	test_assert(imap_client_hibernate(&client, -1, &error));
-	test_subprocess_kill_all(SERVER_KILL_TIMEOUT_SECS);
-	test_end();
-
-	i_close_fd(&peer_fd);
-}
-
-static void test_imap_client_hibernate_autoexpunge(void)
-{
-	struct client *client;
-	int peer_fd;
-
-	client = test_client_create(&peer_fd);
-
-	test_begin("imap client hibernate: autoexpunge next check not reached");
-	client->autoexpunge_next_check = ioloop_time + 60;
-	imap_client_hibernate_autoexpunge(client);
-	test_assert(client->autoexpunge_next_check == ioloop_time + 60);
-	test_end();
-
-	test_begin("imap client hibernate: autoexpunge next check reached");
-	client->autoexpunge_next_check = ioloop_time;
-	imap_client_hibernate_autoexpunge(client);
-	test_assert(client->autoexpunge_next_check == ioloop_time +
-		    MAIL_AUTOEXPUNGE_CHECK_MAX_INTERVAL_SECS);
-	test_end();
-
-	test_begin("imap client hibernate: autoexpunge after time moved backwards");
-	client->autoexpunge_next_check = ioloop_time +
-		MAIL_AUTOEXPUNGE_CHECK_MAX_INTERVAL_SECS + 1;
-	imap_client_hibernate_autoexpunge(client);
-	test_assert(client->autoexpunge_next_check == ioloop_time +
-		    MAIL_AUTOEXPUNGE_CHECK_MAX_INTERVAL_SECS);
-	test_end();
-
-	client_destroy(client, NULL);
-	i_close_fd(&peer_fd);
-}
-
-static void test_imap_client_hibernate(void)
-{
-	struct test_imap_client_hibernate ctx;
-
-	storage_service = mail_storage_service_init(master_service,
-		MAIL_STORAGE_SERVICE_FLAG_ALLOW_ROOT |
-		MAIL_STORAGE_SERVICE_FLAG_NO_LOG_INIT |
-		MAIL_STORAGE_SERVICE_FLAG_NO_CHDIR |
-		MAIL_STORAGE_SERVICE_FLAG_NO_RESTRICT_ACCESS);
-	i_zero(&ctx);
-
-	test_imap_client_hibernate_idle(&ctx);
-	test_imap_client_hibernate_idle_fd(&ctx);
-	test_imap_client_hibernate_nonidle_no_mailbox(&ctx);
-	test_imap_client_hibernate_nonidle_mailbox(&ctx);
-	test_imap_client_hibernate_autoexpunge();
 
 	i_close_fd(&ctx.fd_listen);
 	mail_storage_service_deinit(&storage_service);

@@ -4,7 +4,6 @@
 #include "str.h"
 #include "buffer.h"
 #include "unichar.h"
-#include "unicode-transform.h"
 
 static void test_unichar_uni_utf8_strlen(void)
 {
@@ -104,48 +103,6 @@ static void test_unichar_valid_unicode(void)
 			test_assert_idx(uni_utf8_get_char(test_cases[i].input, &chr) < 1, i);
 		}
 	}
-
-	test_end();
-}
-
-static void test_unichar_invalid_lead_octet(void)
-{
-	unichar_t chr;
-
-	test_begin("unichar invalid lead octet");
-
-	/* 0xc0 and 0xc1 would be overlong, 0xf5..0xf7 would be above
-	   U+10FFFF and RFC 3629 dropped 0xf8..0xfd. None of them can begin
-	   a valid character, so however many of the following octets are
-	   available, this is invalid input and not an incomplete trailing
-	   character. */
-	for (unsigned int lead = 0xc0; lead <= 0xfd; lead++) {
-		const unsigned char input[] = {
-			(unsigned char)lead,
-			0xa1, 0xa1, 0xa1, 0xa1, 0xa1
-		};
-		const char cstr[] = { (char)lead, '\0' };
-
-		if (lead >= 0xc2 && lead <= 0xf4)
-			continue;
-		for (size_t size = 1; size <= sizeof(input); size++) {
-			test_assert_idx(uni_utf8_get_char_n(input, size,
-							    &chr) < 0, lead);
-		}
-		test_assert_idx(uni_utf8_get_char_buf(input, 1, &chr) < 0, lead);
-		test_assert_idx(uni_utf8_get_char(cstr, &chr) < 0, lead);
-	}
-
-	/* 0xc2..0xf4 do begin a valid character, so a truncated one of those
-	   must still be reported as incomplete rather than invalid. */
-	for (unsigned int lead = 0xc2; lead <= 0xf4; lead++) {
-		const char cstr[] = { (char)lead, '\0' };
-
-		test_assert_idx(uni_utf8_get_char(cstr, &chr) == 0, lead);
-	}
-	test_assert(uni_utf8_get_char_n("\xf0\x9f\x98\x80", 3, &chr) == 0);
-	test_assert(uni_utf8_get_char_n("\xf0\x9f\x98\x80", 4, &chr) == 4 &&
-		    chr == 0x1F600);
 
 	test_end();
 }
@@ -257,64 +214,6 @@ static void test_unichar_grapheme_clusters(void)
 	test_end();
 }
 
-struct test_refusing_transform {
-	struct unicode_transform transform;
-	unsigned int calls;
-};
-
-static ssize_t
-test_refusing_transform_input(struct unicode_transform *trans,
-			      const struct unicode_transform_buffer *buf,
-			      const char **error_r)
-{
-	struct test_refusing_transform *rt =
-		container_of(trans, struct test_refusing_transform, transform);
-
-	/* Refuse the input twice, so unicode_transform_input() returns 0
-	   even after flushing. */
-	if (++rt->calls % 3 != 0)
-		return 0;
-	return uniform_transform_forward(trans, buf->cp, buf->cp_data, 1,
-					 error_r);
-}
-
-static const struct unicode_transform_def test_refusing_transform_def = {
-	.input = test_refusing_transform_input,
-};
-
-static void test_unichar_run_transform(void)
-{
-	static const struct {
-		const char *input, *output;
-		int ret;
-	} tests[] = {
-		{ "abc", "abc", 0 },
-		{ "a\xc3\xa4o", "a\xc3\xa4o", 0 },
-		{ "a\xff\xff\xff" "b", "a" UNICODE_REPLACEMENT_CHAR_UTF8 "b", -1 },
-		{ "\xff" "a\xfe\xc3", UNICODE_REPLACEMENT_CHAR_UTF8 "a"
-		  UNICODE_REPLACEMENT_CHAR_UTF8, -1 },
-	};
-	struct test_refusing_transform rt;
-	buffer_t *output = t_buffer_create(64);
-	const char *error;
-	unsigned int i;
-	int ret;
-
-	test_begin("uni_utf8_run_transform()");
-	for (i = 0; i < N_ELEMENTS(tests); i++) {
-		i_zero(&rt);
-		unicode_transform_init(&rt.transform,
-				       &test_refusing_transform_def);
-		buffer_set_used_size(output, 0);
-		ret = uni_utf8_run_transform(tests[i].input,
-					     strlen(tests[i].input),
-					     &rt.transform, output, &error);
-		test_assert_idx(ret == tests[i].ret, i);
-		test_assert_strcmp_idx(str_c(output), tests[i].output, i);
-	}
-	test_end();
-}
-
 void test_unichar(void)
 {
 	static const char overlong_utf8[] = "\xf8\x80\x95\x81\xa1";
@@ -368,9 +267,7 @@ void test_unichar(void)
 	test_unichar_uni_utf8_strlen();
 	test_unichar_uni_utf8_partial_strlen_n();
 	test_unichar_valid_unicode();
-	test_unichar_invalid_lead_octet();
 	test_unichar_surrogates();
 
 	test_unichar_grapheme_clusters();
-	test_unichar_run_transform();
 }

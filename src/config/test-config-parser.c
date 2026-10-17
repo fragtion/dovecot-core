@@ -1,13 +1,9 @@
 /* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
-#include "array.h"
-#include "str.h"
 #include "ostream.h"
 #include "service-settings.h"
 #include "settings-parser.h"
-#include "settings-parser-http-url.h"
-#include "http-url.h"
 #include "config-filter.h"
 #include "config-request.h"
 #include "test-common.h"
@@ -38,8 +34,6 @@ struct test_settings {
 	const char *key_file;
 	const char *key_novars;
 	ARRAY_TYPE(const_string) key_strlist;
-	struct http_url key_url;
-	struct http_url key_url_auth;
 };
 
 static const struct setting_define test_settings_defs[] = {
@@ -59,8 +53,6 @@ static const struct setting_define test_settings_defs[] = {
 	SETTING_DEFINE_STRUCT_FILE("key_file", key_file, struct test_settings),
 	SETTING_DEFINE_STRUCT_STR_NOVARS("key_novars", key_novars, struct test_settings),
 	SETTING_DEFINE_STRUCT_STRLIST("key_strlist", key_strlist, struct test_settings),
-	SETTING_DEFINE_STRUCT_HTTP_URL("key_url", key_url, struct test_settings),
-	SETTING_DEFINE_STRUCT_HTTP_URL_AUTH("key_url_auth", key_url_auth, struct test_settings),
 	SETTING_DEFINE_LIST_END
 };
 
@@ -80,8 +72,6 @@ static const struct test_settings test_settings_defaults = {
 	.at_group_name = "",
 	.key_file = "",
 	.key_novars = "",
-	.key_url = HTTP_URL_INIT_EMPTY,
-	.key_url_auth = HTTP_URL_INIT_EMPTY,
 };
 
 const struct setting_parser_info test_settings_info = {
@@ -99,33 +89,6 @@ static const struct setting_parser_info *const infos[] = {
 };
 
 const struct setting_parser_info *const *all_infos = infos;
-
-struct test_missing_plugin_settings {
-	pool_t pool;
-	const char *missing_plugin_key;
-};
-
-static const struct setting_define test_missing_plugin_settings_defs[] = {
-	{ .type = SET_FILTER_NAME, .key = "missing_plugin" },
-	SETTING_DEFINE_STRUCT_STR("missing_plugin_key", missing_plugin_key,
-				  struct test_missing_plugin_settings),
-	SETTING_DEFINE_LIST_END
-};
-
-static const struct test_missing_plugin_settings
-test_missing_plugin_settings_defaults = {
-	.missing_plugin_key = "",
-};
-
-static const struct setting_parser_info test_missing_plugin_settings_info = {
-	.name = "test_missing_plugin",
-	.plugin_dependency = "lib99_nonexistent_test_plugin",
-	.defines = test_missing_plugin_settings_defs,
-	.defaults = &test_missing_plugin_settings_defaults,
-
-	.struct_size = sizeof(struct test_missing_plugin_settings),
-	.pool_offset1 = 1 + offsetof(struct test_missing_plugin_settings, pool),
-};
 
 static void write_config_file(const char *contents)
 {
@@ -620,374 +583,6 @@ static void test_config_parser_str_novars_var_expand(void)
 	test_end();
 }
 
-static void test_config_parser_missing_plugin(void)
-{
-	static const struct {
-		const char *config;
-		const char *error;
-	} tests[] = {
-		{ "missing_plugin_key = foo\n",
-		  "Unknown setting: missing_plugin_key (Setting missing_plugin_key requires plugin "MODULEDIR"/lib99_nonexistent_test_plugin"MODULE_SUFFIX", which isn't installed)" },
-		{ "missing_plugin {\n}\n",
-		  "Unknown section name: missing_plugin (Setting missing_plugin requires plugin "MODULEDIR"/lib99_nonexistent_test_plugin"MODULE_SUFFIX", which isn't installed)" },
-		{ "missing_plugin {\n  key = foo\n}\n",
-		  "Unknown section name: missing_plugin (Setting missing_plugin requires plugin "MODULEDIR"/lib99_nonexistent_test_plugin"MODULE_SUFFIX", which isn't installed)" },
-		{ "unknown_key = foo\n",
-		  "Unknown setting: unknown_key" },
-	};
-	static const struct setting_parser_info *const test_infos[] = {
-		&test_settings_info,
-		&test_missing_plugin_settings_info,
-		NULL
-	};
-	const struct setting_parser_info *const *orig_all_infos = all_infos;
-	ARRAY_TYPE(setting_parser_info_p) available_infos;
-	struct config_parsed *config;
-	const char *error;
-	const char *config_file = test_dir_prepend(TEST_CONFIG_FILE);
-
-	for (unsigned int i = 0; i < N_ELEMENTS(tests); i++) {
-		test_begin(t_strdup_printf(
-			"config_parse_file - missing plugin hint %u", i));
-		all_infos = test_infos;
-		t_array_init(&available_infos, 4);
-		config_parser_add_available_infos(&available_infos);
-		test_assert(array_count(&available_infos) == 1);
-		array_append_zero(&available_infos);
-		all_infos = array_front(&available_infos);
-
-		write_config_file(t_strconcat(
-			"dovecot_config_version = "DOVECOT_CONFIG_VERSION"\n",
-			tests[i].config, NULL));
-		error = NULL;
-		test_assert_idx(config_parse_file(config_file,
-				CONFIG_PARSE_FLAG_NO_DEFAULTS,
-				NULL, &config, &error) < 0, i);
-		test_assert_idx(error != NULL &&
-				str_ends_with(error, tests[i].error), i);
-		if (error != NULL && !str_ends_with(error, tests[i].error))
-			i_error("config_parse_file(): %s", error);
-		if (config != NULL)
-			config_parsed_free(&config);
-		config_parser_deinit();
-		all_infos = orig_all_infos;
-		i_unlink_if_exists(config_file);
-		test_end();
-	}
-}
-
-static void test_config_parser_nested_local_name(void)
-{
-	static const struct {
-		const char *config;
-		/* NULL = parsing succeeds */
-		const char *error;
-	} tests[] = {
-		/* the inner name narrows the outer name */
-		{ "local_name *.example.com {\n"
-		  "  local_name imap.example.com {\n"
-		  "    key = foo\n"
-		  "  }\n"
-		  "}\n", NULL },
-		{ "local_name *.example.com {\n"
-		  "  local_name IMAP.EXAMPLE.COM {\n"
-		  "    key = foo\n"
-		  "  }\n"
-		  "}\n", NULL },
-		{ "local_name imap.example.com {\n"
-		  "  local_name imap.example.com {\n"
-		  "    key = foo\n"
-		  "  }\n"
-		  "}\n", NULL },
-		/* the inner name doesn't match the outer name */
-		{ "local_name *.example.com {\n"
-		  "  local_name imap.example.org {\n"
-		  "    key = foo\n"
-		  "  }\n"
-		  "}\n", "requires name2 to be a hostname matching name1" },
-		{ "local_name *.example.com {\n"
-		  "  local_name sub.imap.example.com {\n"
-		  "    key = foo\n"
-		  "  }\n"
-		  "}\n", "requires name2 to be a hostname matching name1" },
-		/* the inner name is a wildcard */
-		{ "local_name *.example.com {\n"
-		  "  local_name *.example.com {\n"
-		  "    key = foo\n"
-		  "  }\n"
-		  "}\n", "requires name2 to be a hostname matching name1" },
-		{ "local_name imap.example.com {\n"
-		  "  local_name *.example.com {\n"
-		  "    key = foo\n"
-		  "  }\n"
-		  "}\n", "requires name2 to be a hostname matching name1" },
-	};
-	struct config_parsed *config;
-	const char *error;
-	const char *config_file = test_dir_prepend(TEST_CONFIG_FILE);
-
-	for (unsigned int i = 0; i < N_ELEMENTS(tests); i++) {
-		test_begin(t_strdup_printf(
-			"config_parse_file - nested local_name %u", i));
-		write_config_file(t_strconcat(
-			"dovecot_config_version = "DOVECOT_CONFIG_VERSION"\n",
-			tests[i].config, NULL));
-		error = NULL;
-		config = NULL;
-		int ret = config_parse_file(config_file,
-					    CONFIG_PARSE_FLAG_NO_DEFAULTS,
-					    NULL, &config, &error);
-		if (tests[i].error == NULL) {
-			test_assert_idx(ret == 1, i);
-			if (error != NULL)
-				i_error("config_parse_file(): %s", error);
-		} else {
-			test_assert_idx(ret < 0, i);
-			test_assert_idx(error != NULL &&
-					strstr(error, tests[i].error) != NULL, i);
-			if (error != NULL && strstr(error, tests[i].error) == NULL)
-				i_error("config_parse_file(): %s", error);
-		}
-		if (config != NULL)
-			config_parsed_free(&config);
-		i_unlink_if_exists(config_file);
-		test_end();
-	}
-}
-
-struct http_url_export_ctx {
-	pool_t pool;
-	const char *key;
-	const char *value; /* NULL until the key is seen */
-};
-
-static void
-test_config_http_url_export_callback(const struct config_export_setting *set,
-				     struct http_url_export_ctx *ctx)
-{
-	/* set->value points into a buffer owned by the export callback's
-	   own temporary-memory frame, so it must be copied into a pool that
-	   outlives config_export_parser() before returning it to the
-	   caller. */
-	if (strcmp(set->key, ctx->key) == 0)
-		ctx->value = p_strdup(ctx->pool, set->value);
-}
-
-/* Export "key" from global_filter under the given scope and return the
-   value config_export_parser() produced for it, or NULL if it was never
-   dumped. The returned string is allocated from "pool". */
-static const char *
-test_config_http_url_export(pool_t pool,
-			    struct config_filter_parser *global_filter,
-			    enum config_dump_scope scope, const char *key)
-{
-	struct http_url_export_ctx export_ctx = { .pool = pool, .key = key };
-	struct config_export_context *ectx =
-		config_export_init(scope, 0, DOVECOT_CONFIG_VERSION, "",
-				   test_config_http_url_export_callback,
-				   &export_ctx);
-	config_export_set_module_parsers(ectx, global_filter->module_parsers);
-	const char *exp_error;
-	for (unsigned int i = 0; i < config_export_get_parser_count(ectx); i++) {
-		if (config_export_parser(ectx, i, &exp_error) < 0) {
-			i_error("config_export_parser: %s", exp_error);
-			break;
-		}
-	}
-	config_export_free(&ectx);
-	return export_ctx.value;
-}
-
-enum http_url_roundtrip_extra {
-	HTTP_URL_EXTRA_NONE,
-	/* a path-less URL must not be reported empty by
-	   config_export_type(), which is the only place
-	   http_url_is_empty() gates a stringification. */
-	HTTP_URL_EXTRA_PATHLESS,
-	/* an explicitly-set value's export must keep userinfo. It
-	   never goes through config_export_type()/http_url_create(),
-	   which would drop it (see config-request.c's settings_export()). */
-	HTTP_URL_EXTRA_CREDENTIALS,
-};
-
-struct http_url_roundtrip_test {
-	const char *name;
-	const char *key;
-	const char *config_value;
-	const char *expected_export;
-	enum http_url_roundtrip_extra extra;
-};
-
-static const struct http_url_roundtrip_test http_url_roundtrip_tests[] = {
-	/* full URL with path and query round-trips byte-identical */
-	{ "full URL with path and query", "key_url",
-	  "https://host/path?q=1", "https://host/path?q=1",
-	  HTTP_URL_EXTRA_NONE },
-	/* path-less URL is set, not empty, and exports unchanged */
-	{ "path-less URL", "key_url",
-	  "http://host", "http://host",
-	  HTTP_URL_EXTRA_PATHLESS },
-	/* an explicitly empty value exports as "" */
-	{ "explicitly empty", "key_url", "", "",
-	  HTTP_URL_EXTRA_NONE },
-	/* a %{variable} is not touched by config and survives export */
-	{ "unexpanded %{variable}", "key_url",
-	  "https://%{user}.example.com/", "https://%{user}.example.com/",
-	  HTTP_URL_EXTRA_NONE },
-	/* SET_HTTP_URL_AUTH keeps userinfo on the raw-string path */
-	{ "userinfo credentials", "key_url_auth",
-	  "https://u:p@host/x", "https://u:p@host/x",
-	  HTTP_URL_EXTRA_CREDENTIALS },
-};
-
-static void test_config_parser_http_url_roundtrip(void)
-{
-	for (unsigned int i = 0; i < N_ELEMENTS(http_url_roundtrip_tests); i++) {
-		const struct http_url_roundtrip_test *test =
-			&http_url_roundtrip_tests[i];
-		struct config_parsed *config;
-		const char *error = NULL;
-		const char *config_file = test_dir_prepend(TEST_CONFIG_FILE);
-
-		test_begin(t_strdup_printf(
-			"config_parse_file - SET_HTTP_URL round-trip: %s",
-			test->name));
-
-		write_config_file(t_strdup_printf(
-			"dovecot_config_version = "DOVECOT_CONFIG_VERSION"\n"
-			"%s = %s\n", test->key, test->config_value));
-		test_assert(config_parse_file(config_file,
-					      CONFIG_PARSE_FLAG_EXPAND_VALUES |
-					      CONFIG_PARSE_FLAG_NO_DEFAULTS,
-					      NULL, &config, &error) == 1);
-		if (error != NULL)
-			i_error("config_parse_file(): %s", error);
-
-		pool_t pool = pool_alloconly_create("http url roundtrip", 1024);
-		struct config_filter_parser *global_filter =
-			config_parsed_get_global_filter_parser(config);
-		const struct config_module_parser *p = global_filter->module_parsers;
-		struct setting_parser_context *set_parser =
-			settings_parser_init(pool, p->info, 0);
-		config_fill_set_parser(set_parser, p, TRUE);
-		struct test_settings *set1 = settings_parser_get_set(set_parser);
-
-		const char *exported = test_config_http_url_export(
-			pool, global_filter, CONFIG_DUMP_SCOPE_SET, test->key);
-		test_assert_strcmp_idx(exported, test->expected_export, i);
-
-		/* Third leg: feed the exported string back through
-		   settings_parse_keyvalue() and assert the result matches
-		   the originally parsed struct. */
-		pool_t pool2 = pool_alloconly_create("http url roundtrip 2", 1024);
-		struct setting_parser_context *set_parser2 =
-			settings_parser_init(pool2, p->info, 0);
-		test_assert_idx(settings_parse_keyvalue(set_parser2, test->key,
-							exported) == 1, i);
-		struct test_settings *set2 = settings_parser_get_set(set_parser2);
-		test_assert_idx(settings_equal(p->info, set1, set2, NULL), i);
-		settings_parser_unref(&set_parser2);
-		pool_unref(&pool2);
-
-		switch (test->extra) {
-		case HTTP_URL_EXTRA_NONE:
-			break;
-		case HTTP_URL_EXTRA_PATHLESS: {
-			string_t *export_type_str = t_str_new(64);
-			test_assert_idx(config_export_type(export_type_str,
-				&set1->key_url, SET_HTTP_URL), i);
-			pool_t pool3 = pool_alloconly_create("http url roundtrip 3", 128);
-			struct setting_parser_context *set_parser3 =
-				settings_parser_init(pool3, p->info, 0);
-			test_assert_idx(settings_parse_keyvalue(set_parser3,
-				test->key, str_c(export_type_str)) == 1, i);
-			struct test_settings *set3 =
-				settings_parser_get_set(set_parser3);
-			test_assert_idx(!http_url_is_empty(&set3->key_url), i);
-			settings_parser_unref(&set_parser3);
-			pool_unref(&pool3);
-			break;
-		}
-		case HTTP_URL_EXTRA_CREDENTIALS:
-			/* Credentials must survive on the raw-passthrough
-			   export path, since that is the only path an
-			   explicitly-set value takes (config_export_type(),
-			   which stringifies via http_url_create(), is never
-			   reached here - see config-request.c's
-			   settings_export()). */
-			test_assert_idx(strstr(exported, "u:p@") != NULL, i);
-			break;
-		}
-
-		settings_parser_unref(&set_parser);
-		pool_unref(&pool);
-		config_parsed_free(&config);
-		config_parser_deinit();
-		i_unlink_if_exists(config_file);
-		test_end();
-	}
-}
-
-static void test_config_parser_http_url_default_unset(void)
-{
-	/* an unset SET_HTTP_URL exports as "" under a scope that dumps
-	   defaults. "key" must also be set so that this info's
-	   change_counters array isn't NULL (it stays NULL until the first
-	   setting in the info is changed). */
-	struct config_parsed *config;
-	const char *error = NULL;
-	const char *config_file = test_dir_prepend(TEST_CONFIG_FILE);
-
-	test_begin("config_parse_file - SET_HTTP_URL unset exports as \"\"");
-	write_config_file(
-"dovecot_config_version = "DOVECOT_CONFIG_VERSION"\n"
-"key = value\n"
-	);
-	test_assert(config_parse_file(config_file,
-				      CONFIG_PARSE_FLAG_EXPAND_VALUES |
-				      CONFIG_PARSE_FLAG_NO_DEFAULTS,
-				      NULL, &config, &error) == 1);
-	if (error != NULL)
-		i_error("config_parse_file(): %s", error);
-
-	pool_t pool = pool_alloconly_create("http url default export", 128);
-	struct config_filter_parser *global_filter =
-		config_parsed_get_global_filter_parser(config);
-	const char *exported = test_config_http_url_export(
-		pool, global_filter, CONFIG_DUMP_SCOPE_ALL_WITH_HIDDEN, "key_url");
-	test_assert_strcmp(exported, "");
-	pool_unref(&pool);
-
-	config_parsed_free(&config);
-	config_parser_deinit();
-	i_unlink_if_exists(config_file);
-	test_end();
-}
-
-static void test_config_parser_http_url_parse_error(void)
-{
-	/* an unparsable URL fails config_parse_file() itself. */
-	struct config_parsed *config;
-	const char *error = NULL;
-	const char *config_file = test_dir_prepend(TEST_CONFIG_FILE);
-
-	test_begin("config_parse_file - SET_HTTP_URL parse error is rejected");
-	write_config_file(
-"dovecot_config_version = "DOVECOT_CONFIG_VERSION"\n"
-"key_url = ::: not a url\n"
-	);
-	test_assert(config_parse_file(config_file,
-				      CONFIG_PARSE_FLAG_EXPAND_VALUES |
-				      CONFIG_PARSE_FLAG_NO_DEFAULTS,
-				      NULL, &config, &error) < 0);
-	test_assert(error != NULL);
-	if (config != NULL)
-		config_parsed_free(&config);
-	config_parser_deinit();
-	i_unlink_if_exists(config_file);
-	test_end();
-}
-
 int main(void)
 {
 	static void (*const test_functions[])(void) = {
@@ -998,11 +593,6 @@ int main(void)
 		test_config_parser_set_file_inline_export,
 		test_config_parser_heredoc_in_strlist,
 		test_config_parser_str_novars_var_expand,
-		test_config_parser_missing_plugin,
-		test_config_parser_nested_local_name,
-		test_config_parser_http_url_roundtrip,
-		test_config_parser_http_url_default_unset,
-		test_config_parser_http_url_parse_error,
 		NULL
 	};
 

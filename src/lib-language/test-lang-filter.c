@@ -1,24 +1,19 @@
 /* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
-#include "module-dir.h"
 #include "sha2.h"
 #include "str.h"
 #include "unichar.h"
 #include "test-common.h"
 #include "language.h"
-#include "lang-filter-private.h"
+#include "lang-filter.h"
 #include "settings.h"
 #include "lang-settings.h"
 
 #include <stdio.h>
-#ifdef HAVE_LANG_STEMMER
-#  include <libstemmer.h>
-#endif
 
 #define MALFORMED "malformed"
 #define UNKNOWN "bebobidoop"
-#define LANG_EL "el"
 #define LANG_EN "en"
 #define LANG_FI "fi"
 #define LANG_FR "fr"
@@ -142,6 +137,7 @@ static void test_lang_filter_lowercase(void)
 	test_end();
 }
 
+#ifdef HAVE_LIBICU
 static void test_lang_filter_lowercase_utf8(void)
 {
 	static const struct {
@@ -168,6 +164,7 @@ static void test_lang_filter_lowercase_utf8(void)
 	lang_filter_unref(&filter);
 	test_end();
 }
+#endif
 
 static void test_lang_filter_stopwords_eng(void)
 {
@@ -450,58 +447,6 @@ static void test_lang_filter_stemmer_snowball_stem_french(void)
 	test_end();
 }
 
-static void test_lang_filter_stemmer_snowball_unknown_language(void)
-{
-	struct lang_filter *stemmer;
-	const char *error;
-	const char *token;
-
-	test_begin("lang filter stem unknown language");
-	test_assert(lang_filter_create(lang_filter_stemmer_snowball, NULL, make_settings(UNKNOWN, NULL), event, &stemmer, &error) == 0);
-	for (unsigned int i = 0; i < 2; i++) {
-		token = "foo";
-		error = NULL;
-		test_assert_idx(lang_filter(stemmer, &token, &error) < 0, i);
-		test_assert_idx(token == NULL, i);
-		test_assert_idx(error != NULL, i);
-	}
-	lang_filter_unref(&stemmer);
-	test_end();
-}
-
-static void test_lang_filter_stemmer_snowball_stem_failure(void)
-{
-	struct lang_filter *stemmer;
-	const char *error;
-	/* libstemmer v2.2.0 Greek stemmer fails with these words, newer
-	   versions stem them successfully. */
-	const char * const tokens[] = {
-		"\xCE\xB9\xCF\x83\xCE\xB1\xCE\xB9\xCF\x83\xCE\xB1",
-		"\xCE\xAF\xCF\x83\xCE\xB1\xCE\xAF\xCF\x83\xCE\xB1",
-		NULL
-	};
-	const char *token;
-
-	/* Old libstemmer versions don't support Greek */
-	struct sb_stemmer *sb = sb_stemmer_new(LANG_EL, "UTF_8");
-	if (sb == NULL) {
-		i_info("Greek not supported by libstemmer, "
-		       "skipping stem failure test");
-		return;
-	}
-	sb_stemmer_delete(sb);
-
-	test_begin("lang filter stem failure");
-	test_assert(lang_filter_create(lang_filter_stemmer_snowball, NULL, make_settings(LANG_EL, NULL), event, &stemmer, &error) == 0);
-	for (unsigned int i = 0; tokens[i] != NULL; i++) {
-		token = tokens[i];
-		test_assert_idx(lang_filter(stemmer, &token, &error) > 0, i);
-		test_assert_idx(token != NULL && token[0] != '\0', i);
-	}
-	lang_filter_unref(&stemmer);
-	test_end();
-}
-
 static void test_lang_filter_stopwords_stemmer_eng(void)
 {
 	int ret;
@@ -550,24 +495,7 @@ static void test_lang_filter_stopwords_stemmer_eng(void)
 }
 #endif
 
-static void test_lang_filter_normalizer_module_missing(void)
-{
-	struct lang_settings set = lang_default_settings;
-	set.filter_normalizer_icu_id = "Any-Lower";
-	const char *old_module_dir = lang_filter_module_dir;
-	struct lang_filter *norm = NULL;
-	const char *error = NULL;
-
-	test_begin("lang filter normalizer custom ID without libicu module");
-	/* no modules in the stopwords directory */
-	lang_filter_module_dir = TEST_STOPWORDS_DIR;
-	test_assert(lang_filter_create(lang_filter_normalizer_icu, NULL, make_settings(NULL, &set), event, &norm, &error) < 0);
-	test_assert(norm == NULL);
-	test_assert(error != NULL && strstr(error, "requires libicu") != NULL);
-	lang_filter_module_dir = old_module_dir;
-	test_end();
-}
-
+#ifdef HAVE_LIBICU
 static void test_lang_filter_normalizer_swedish_short(void)
 {
 	struct lang_filter *norm = NULL;
@@ -644,20 +572,20 @@ static void test_lang_filter_normalizer_french(void)
 	FILE *input;
 	struct lang_settings set = lang_default_settings;
 	set.filter_normalizer_icu_id = "Any-Lower; NFKD; [: Nonspacing Mark :] Remove";
-	char buf[1024] = {0};
+	char buf[250] = {0};
 	const char *error = NULL;
 	const char *tokens;
 	unsigned char sha512_digest[SHA512_RESULTLEN];
 	struct sha512_ctx ctx;
 	const unsigned char correct_digest[] = {
-		0x78, 0x1e, 0xb9, 0x04, 0xa4, 0x92, 0xca, 0x88,
-		0x1e, 0xef, 0x7b, 0xc8, 0x3e, 0x4a, 0xa8, 0xdb,
-		0x9c, 0xd4, 0x42, 0x5c, 0x64, 0x81, 0x06, 0xd5,
-		0x72, 0x93, 0x38, 0x0c, 0x09, 0xce, 0xbe, 0xdf,
-		0x65, 0xff, 0x36, 0x35, 0x05, 0x77, 0xcc, 0xc6,
-		0xff, 0x44, 0x2c, 0x31, 0x10, 0x00, 0xf6, 0x8d,
-		0x15, 0x25, 0x1e, 0x54, 0x67, 0x2a, 0x5b, 0xc1,
-		0xdb, 0x84, 0xc5, 0x0d, 0x43, 0x7e, 0x8c, 0x70};
+		0x06, 0x80, 0xf1, 0x81, 0xf2, 0xed, 0xfb, 0x6d,
+		0xcd, 0x7d, 0xcb, 0xbd, 0xc4, 0x87, 0xc3, 0xf6,
+		0xb8, 0x6a, 0x01, 0x82, 0xdf, 0x0a, 0xb5, 0x92,
+		0x6b, 0x9b, 0x7b, 0x21, 0x5e, 0x62, 0x40, 0xbd,
+		0xbf, 0x15, 0xb9, 0x7b, 0x75, 0x9c, 0x4e, 0xc9,
+		0xe8, 0x48, 0xaa, 0x08, 0x63, 0xf2, 0xa0, 0x6c,
+		0x20, 0x4c, 0x01, 0xe3, 0xb3, 0x4f, 0x15, 0xc6,
+		0x8c, 0xd6, 0x7a, 0xb7, 0xc5, 0xc6, 0x85, 0x00};
 	const char *udhr_path;
 
 	test_begin("lang filter normalizer French UDHR");
@@ -740,157 +668,6 @@ static void test_lang_filter_normalizer_baddata(void)
 	test_end();
 }
 
-static void test_lang_filter_normalizer_final_sigma(void)
-{
-	static const struct {
-		const char *input;
-		const char *output;
-	} tests[] = {
-		/* U+03A3 alone is not final */
-		{ "\xCE\xA3", "\xCF\x83" },
-		{ "1\xCE\xA3", "1\xCF\x83" },
-		/* U+03A3 after a cased letter */
-		{ "\xCE\x9F\xCE\x94\xCE\x9F\xCE\xA3",
-		  "\xCE\xBF\xCE\xB4\xCE\xBF\xCF\x82" },
-		{ "A\xCE\xA3", "a\xCF\x82" },
-		{ "A\xCE\xA3""1", "a\xCF\x82""1" },
-		/* followed by a cased letter */
-		{ "\xCE\xA3\xCE\x91", "\xCF\x83\xCE\xB1" },
-		{ "A\xCE\xA3\xCE\xA3", "a\xCF\x83\xCF\x82" },
-		/* U+0027 is case-ignorable */
-		{ "A'\xCE\xA3", "a'\xCF\x82" },
-		{ "A\xCE\xA3'", "a\xCF\x82'" },
-		{ "A\xCE\xA3'A", "a\xCF\x83'a" },
-		{ "''\xCE\xA3", "''\xCF\x83" },
-		/* U+0345 is both cased and case-ignorable. It's handled as
-		   case-ignorable. NFKD + nonspacing mark removal drops it. */
-		{ "1\xCD\x85\xCE\xA3", "1\xCF\x83" },
-		{ "A\xCE\xA3\xCD\x85", "a\xCF\x82" },
-	};
-	struct lang_filter *norm;
-	const char *error, *token;
-	unsigned int i;
-
-	test_begin("lang filter normalizer final sigma");
-	test_assert(lang_filter_create(lang_filter_normalizer_icu, NULL, make_settings(NULL, NULL), event, &norm, &error) == 0);
-	for (i = 0; i < N_ELEMENTS(tests); i++) {
-		token = tests[i].input;
-		test_assert_idx(lang_filter(norm, &token, &error) == 1, i);
-		test_assert_strcmp_idx(token, tests[i].output, i);
-	}
-	lang_filter_unref(&norm);
-	test_end();
-}
-
-static void test_lang_filter_normalizer_builtin_ids(void)
-{
-	/* "A\u0301 \uD55C" - A with combining acute, space, Hangul syllable */
-	static const char *input = "A\xCC\x81 \xED\x95\x9C";
-	static const struct {
-		const char *id;
-		const char *output;
-	} tests[] = {
-		{ "Any-Lower; NFKD; [: Nonspacing Mark :] Remove; NFC; [\\x20] Remove",
-		  "a\xED\x95\x9C" },
-		{ "Any-Lower; NFKD; [: Nonspacing Mark :] Remove; [\\x20] Remove",
-		  "a\xE1\x84\x92\xE1\x85\xA1\xE1\x86\xAB" },
-		{ "Any-Lower; NFKD; [: Nonspacing Mark :] Remove; NFC",
-		  "a \xED\x95\x9C" },
-		{ "Any-Lower; NFKD; [: Nonspacing Mark :] Remove",
-		  "a \xE1\x84\x92\xE1\x85\xA1\xE1\x86\xAB" },
-	};
-	struct lang_settings set = lang_default_settings;
-	const char *old_module_dir = lang_filter_module_dir;
-	string_t *long_input = t_str_new(256), *long_output = t_str_new(256);
-	struct lang_filter *norm;
-	const char *error, *token;
-	unsigned int i;
-
-	/* Long runs of combining marks and Hangul vowel jamo */
-	str_append(long_input, "A");
-	for (i = 0; i < 64; i++)
-		str_append(long_input, "\xCC\x81");
-	str_append(long_input, "B");
-	str_append(long_output, "ab");
-	for (i = 0; i < 40; i++) {
-		str_append(long_input, "\xE1\x85\xA1");
-		str_append(long_output, "\xE1\x85\xA1");
-	}
-
-	test_begin("lang filter normalizer built-in IDs");
-	/* make sure the libicu module isn't used */
-	lang_filter_module_dir = "/nonexistent";
-	for (i = 0; i < N_ELEMENTS(tests); i++) {
-		set.filter_normalizer_icu_id = tests[i].id;
-		test_assert_idx(lang_filter_create(lang_filter_normalizer_icu, NULL, make_settings(NULL, &set), event, &norm, &error) == 0, i);
-		token = input;
-		test_assert_idx(lang_filter(norm, &token, &error) == 1, i);
-		test_assert_strcmp_idx(token, tests[i].output, i);
-		/* the same as above, but in ASCII-only fast path */
-		token = "Foo Bar";
-		test_assert_idx(lang_filter(norm, &token, &error) == 1, i);
-		test_assert_strcmp_idx(token, strstr(tests[i].id, "x20") != NULL ?
-				       "foobar" : "foo bar", i);
-		token = " ";
-		test_assert_idx(lang_filter(norm, &token, &error) ==
-				(strstr(tests[i].id, "x20") != NULL ? 0 : 1), i);
-		token = str_c(long_input);
-		test_assert_idx(lang_filter(norm, &token, &error) == 1, i);
-		test_assert_strcmp_idx(token, str_c(long_output), i);
-		lang_filter_unref(&norm);
-	}
-	lang_filter_module_dir = old_module_dir;
-	test_end();
-}
-
-#ifdef HAVE_LIBICU
-static struct module *test_lang_filter_module_preload(void)
-{
-	const char *module_names[] = { "lang_filter_normalizer_icu", NULL };
-	struct module_dir_load_settings mod_set;
-	struct module *modules;
-
-	/* load the module like mail_plugins does */
-	i_zero(&mod_set);
-	mod_set.abi_version = DOVECOT_ABI_VERSION;
-	mod_set.setting_name = "mail_plugins";
-	mod_set.require_init_funcs = TRUE;
-	modules = module_dir_load(TEST_MODULE_DIR, module_names, &mod_set);
-	module_dir_init(modules);
-	return modules;
-}
-
-static void test_lang_filter_normalizer_module_upper(void)
-{
-	struct lang_settings set = lang_default_settings;
-	set.filter_normalizer_icu_id = "Any-Upper";
-	struct lang_filter *norm = NULL;
-	const char *error = NULL, *token = "foo";
-
-	test_assert(lang_filter_create(lang_filter_normalizer_icu, NULL, make_settings(NULL, &set), event, &norm, &error) == 0);
-	if (norm == NULL)
-		return;
-	test_assert(lang_filter(norm, &token, &error) == 1);
-	test_assert_strcmp(token, "FOO");
-	lang_filter_unref(&norm);
-}
-
-static void test_lang_filter_normalizer_module_preloaded(void)
-{
-	const char *old_module_dir = lang_filter_module_dir;
-	struct module *modules;
-
-	test_begin("lang filter normalizer libicu module via mail_plugins");
-	modules = test_lang_filter_module_preload();
-	/* the module isn't loaded again, which would fail e.g. after
-	   chrooting */
-	lang_filter_module_dir = "/nonexistent";
-	test_lang_filter_normalizer_module_upper();
-	lang_filter_module_dir = old_module_dir;
-	module_dir_unload(&modules);
-	test_end();
-}
-
 static void test_lang_filter_normalizer_invalid_id(void)
 {
 	struct lang_filter *norm = NULL;
@@ -906,32 +683,7 @@ static void test_lang_filter_normalizer_invalid_id(void)
 	test_end();
 }
 
-static void test_lang_filter_normalizer_module(void)
-{
-	struct lang_filter *norm = NULL;
-	struct lang_settings set = lang_default_settings;
-	set.filter_normalizer_icu_id = "Any-Upper";
-	const char *error = NULL, *token = "foo\xC3\xA4";
-	struct module *modules;
-
-	test_begin("lang filter normalizer libicu module");
-	test_assert(lang_filter_create(lang_filter_normalizer_icu, NULL, make_settings(NULL, &set), event, &norm, &error) == 0);
-	test_assert(lang_filter(norm, &token, &error) == 1);
-	test_assert_strcmp(token, "FOO\xC3\x84");
-	lang_filter_unref(&norm);
-
-	/* loading the module also via mail_plugins and unloading it keeps
-	   the class registered */
-	modules = test_lang_filter_module_preload();
-	test_lang_filter_normalizer_module_upper();
-	module_dir_unload(&modules);
-	test_lang_filter_normalizer_module_upper();
-	test_end();
-}
-#endif
-
 #ifdef HAVE_LANG_STEMMER
-#ifdef HAVE_LIBICU
 static void test_lang_filter_normalizer_stopwords_stemmer_eng(void)
 {
 	int ret;
@@ -986,7 +738,6 @@ static void test_lang_filter_normalizer_stopwords_stemmer_eng(void)
 	test_assert(normalizer == NULL);
 	test_end();
 }
-#endif
 
 static void test_lang_filter_stopwords_normalizer_stemmer_no(void)
 {
@@ -1101,6 +852,7 @@ static void test_lang_filter_stopwords_normalizer_stemmer_sv(void)
 	test_end();
 }
 #endif
+#endif
 
 static void test_lang_filter_english_possessive(void)
 {
@@ -1167,7 +919,9 @@ int main(void)
 		test_lang_filter_contractions_fail,
 		test_lang_filter_contractions_fr,
 		test_lang_filter_lowercase,
+#ifdef HAVE_LIBICU
 		test_lang_filter_lowercase_utf8,
+#endif
 		test_lang_filter_stopwords_eng,
 		test_lang_filter_stopwords_fin,
 		test_lang_filter_stopwords_fra,
@@ -1177,30 +931,20 @@ int main(void)
 #ifdef HAVE_LANG_STEMMER
 		test_lang_filter_stemmer_snowball_stem_english,
 		test_lang_filter_stemmer_snowball_stem_french,
-		test_lang_filter_stemmer_snowball_unknown_language,
-		test_lang_filter_stemmer_snowball_stem_failure,
 		test_lang_filter_stopwords_stemmer_eng,
 #endif
-		/* run before any test loads the libicu module */
-		test_lang_filter_normalizer_module_missing,
+#ifdef HAVE_LIBICU
 		test_lang_filter_normalizer_swedish_short,
 		test_lang_filter_normalizer_swedish_short_default_id,
 		test_lang_filter_normalizer_french,
 		test_lang_filter_normalizer_empty,
 		test_lang_filter_normalizer_baddata,
-		test_lang_filter_normalizer_final_sigma,
-		test_lang_filter_normalizer_builtin_ids,
-#ifdef HAVE_LIBICU
-		test_lang_filter_normalizer_module_preloaded,
 		test_lang_filter_normalizer_invalid_id,
-		test_lang_filter_normalizer_module,
-#endif
 #ifdef HAVE_LANG_STEMMER
-#ifdef HAVE_LIBICU
 		test_lang_filter_normalizer_stopwords_stemmer_eng,
-#endif
 		test_lang_filter_stopwords_normalizer_stemmer_no,
 		test_lang_filter_stopwords_normalizer_stemmer_sv,
+#endif
 #endif
 		test_lang_filter_english_possessive,
 		NULL
@@ -1208,7 +952,6 @@ int main(void)
 	int ret;
 
 	lang_filters_init();
-	lang_filter_module_dir = TEST_MODULE_DIR;
 	ret = test_run(test_functions);
 	lang_filters_deinit();
 	return ret;

@@ -32,7 +32,6 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-sasl \
 	-I$(top_srcdir)/src/stats \
 	-I$(top_srcdir)/src/lib-var-expand \
-	-I$(top_srcdir)/src/lib-url \
 	-DMODULEDIR=\""$(moduledir)"\" \
 	-DAUTH_MODULE_DIR=\""$(moduledir)/auth"\" \
 	-DDOVEADM_MODULEDIR=\""$(doveadm_moduledir)"\" \

@@ -1,6 +1,5 @@
 deps = [
   dep_lib,
-  dep_url,
   dep_settings,
   dep_ssl_iostream,
   dep_mail,

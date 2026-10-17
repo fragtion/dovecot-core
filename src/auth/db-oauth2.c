@@ -6,11 +6,9 @@
 #include "strescape.h"
 #include "env-util.h"
 #include "settings.h"
-#include "var-expand.h"
 #include "oauth2.h"
 #include "http-client.h"
 #include "http-url.h"
-#include "settings-parser-http-url.h"
 #include "iostream-ssl.h"
 #include "auth-request.h"
 #include "auth-settings.h"
@@ -31,9 +29,9 @@
 static time_t last_warned_aud_fallback = 0;
 
 static const struct setting_define auth_oauth2_setting_defines[] = {
-	DEF(STR_NOVARS, tokeninfo_url),
-	DEF(HTTP_URL_AUTH, grant_url),
-	DEF(STR_NOVARS, introspection_url),
+	DEF(STR, tokeninfo_url),
+	DEF(STR, grant_url),
+	DEF(STR, introspection_url),
 	DEF(BOOLLIST, scope),
 	DEF(BOOLLIST, audience),
 	DEF(ENUM, introspection_mode),
@@ -44,7 +42,7 @@ static const struct setting_define auth_oauth2_setting_defines[] = {
 	DEF(STR, client_id),
 	DEF(STR, client_secret),
 	DEF(BOOLLIST, issuers),
-	DEF(HTTP_URL, openid_configuration_url),
+	DEF(STR, openid_configuration_url),
 	DEF_SECS(TIME, token_expire_grace),
 	DEF(BOOL, force_introspection),
 	DEF(BOOL, send_auth_headers),
@@ -57,7 +55,7 @@ static const struct setting_define auth_oauth2_setting_defines[] = {
 
 static const struct auth_oauth2_settings auth_oauth2_default_settings = {
 	.tokeninfo_url = "",
-	.grant_url = HTTP_URL_INIT_EMPTY,
+	.grant_url = "",
 	.introspection_url = "",
 	.scope = ARRAY_INIT,
 	.audience = ARRAY_INIT,
@@ -70,7 +68,7 @@ static const struct auth_oauth2_settings auth_oauth2_default_settings = {
 	.client_id = "",
 	.client_secret = "",
 	.issuers = ARRAY_INIT,
-	.openid_configuration_url = HTTP_URL_INIT_EMPTY,
+	.openid_configuration_url = "",
 	.token_expire_grace_secs = 60,
 	.send_auth_headers = FALSE,
 	.use_worker_with_mech = FALSE,
@@ -78,116 +76,13 @@ static const struct auth_oauth2_settings auth_oauth2_default_settings = {
 
 /* <settings checks> */
 
-/* Substituted for %{access_token} when parsing a template that has no other
-   variables: never actually sent anywhere. */
-#define AUTH_OAUTH2_URL_TEMPLATE_MARKER "dovecot-access-token"
-
-enum auth_oauth2_url_template_req {
-	AUTH_OAUTH2_URL_TEMPLATE_REQUIRED,
-	AUTH_OAUTH2_URL_TEMPLATE_FORBIDDEN,
-	AUTH_OAUTH2_URL_TEMPLATE_ANY,
-};
-
-/* Check that value (an oauth2_tokeninfo_url or oauth2_introspection_url
-   setting) is empty, or a syntactically valid var-expand URL template
-   using only %{access_token} and builtin variable providers, with
-   %{access_token} required/forbidden/either per req, and - if present -
-   placed in the URL's path or query, never in its host or userinfo. The
-   placement is decided from the template's text alone, so this gives the
-   same result in doveconf and in the auth process. */
-static bool
-auth_oauth2_url_template_check(const char *name, const char *value,
-			       enum auth_oauth2_url_template_req req,
-			       const char *introspection_mode,
-			       const char **error_r)
-{
-	struct var_expand_program *prog;
-	const char *error = NULL;
-
-	if (*value == '\0')
-		return TRUE;
-
-	if (var_expand_program_create(value, &prog, &error) < 0) {
-		*error_r = t_strdup_printf("Invalid %s: %s", name, error);
-		return FALSE;
-	}
-
-	bool has_access_token =
-		var_expand_program_has_variable(prog, "access_token", FALSE);
-
-	if (req == AUTH_OAUTH2_URL_TEMPLATE_REQUIRED && !has_access_token) {
-		error = t_strdup_printf("%s must contain %%{access_token}",
-					name);
-	} else if (req == AUTH_OAUTH2_URL_TEMPLATE_FORBIDDEN &&
-		   has_access_token) {
-		error = t_strdup_printf(
-			"%s can't contain %%{access_token} with "
-			"oauth2_introspection_mode=%s", name,
-			introspection_mode);
-	} else {
-		const char *const *vars = var_expand_program_variables(prog);
-		for (; error == NULL && *vars != NULL; vars++) {
-			if (strcmp(*vars, "access_token") == 0)
-				continue;
-			const char *colon = strchr(*vars, ':');
-			const char *prefix = colon == NULL ? *vars :
-				t_strdup_until(*vars, colon);
-			if (!var_expand_provider_is_builtin(prefix)) {
-				error = t_strdup_printf(
-					"%s: Unsupported variable %%{%s}",
-					name, *vars);
-			}
-		}
-	}
-
-	if (error == NULL && oauth2_url_template_check(prog, &error) < 0)
-		error = t_strdup_printf("%s: %s", name, error);
-
-	/* With no variables other than %{access_token} the URL can be
-	   checked completely, because the token only expands to unreserved
-	   characters. Otherwise what the variables expand to is not known
-	   here. If the filters can't handle the marker, the template is
-	   left unparsed. */
-	const char *const *vars = var_expand_program_variables(prog);
-	if (error == NULL &&
-	    (*vars == NULL ||
-	     (strcmp(*vars, "access_token") == 0 && vars[1] == NULL))) {
-		const struct var_expand_table table[] = {
-			{ .key = "access_token",
-			  .value = AUTH_OAUTH2_URL_TEMPLATE_MARKER },
-			VAR_EXPAND_TABLE_END
-		};
-		const struct var_expand_params params = { .table = table };
-		string_t *dest = t_str_new(128);
-		struct http_url *url;
-		const char *expand_error;
-
-		if (var_expand_program_execute(dest, prog, &params,
-					       &expand_error) == 0 &&
-		    http_url_parse(str_c(dest), NULL,
-				   HTTP_URL_ALLOW_USERINFO_PART,
-				   pool_datastack_create(), &url,
-				   &expand_error) < 0) {
-			error = t_strdup_printf("Invalid %s: %s", name,
-						expand_error);
-		}
-	}
-
-	var_expand_program_free(&prog);
-	if (error != NULL) {
-		*error_r = error;
-		return FALSE;
-	}
-	return TRUE;
-}
-
 static bool auth_oauth2_settings_check(struct event *event ATTR_UNUSED, void *_set,
 				       pool_t pool ATTR_UNUSED, const char **error_r)
 {
 	const struct auth_oauth2_settings *set = _set;
 
 	if (*set->introspection_mode == '\0') {
-		if (!http_url_is_empty(&set->grant_url) ||
+		if (*set->grant_url != '\0' ||
 		    *set->tokeninfo_url != '\0' ||
 		    *set->introspection_url != '\0') {
 			*error_r = "Missing oauth2_introspection_mode";
@@ -203,7 +98,7 @@ static bool auth_oauth2_settings_check(struct event *event ATTR_UNUSED, void *_s
 		}
 	}
 
-	if (!http_url_is_empty(&set->grant_url) && *set->client_id == '\0') {
+	if (*set->grant_url != '\0' && *set->client_id == '\0') {
 		*error_r = "oauth2_client_id is required with oauth2_grant_url";
 		return FALSE;
 	}
@@ -219,26 +114,6 @@ static bool auth_oauth2_settings_check(struct event *event ATTR_UNUSED, void *_s
 		*error_r = "Cannot have empty active_attribute if active_value is set";
 		return FALSE;
 	}
-
-	if (!auth_oauth2_url_template_check(
-		"oauth2_tokeninfo_url", set->tokeninfo_url,
-		AUTH_OAUTH2_URL_TEMPLATE_REQUIRED, set->introspection_mode,
-		error_r))
-		return FALSE;
-
-	enum auth_oauth2_url_template_req introspection_req;
-	if (strcmp(set->introspection_mode, "get") == 0)
-		introspection_req = AUTH_OAUTH2_URL_TEMPLATE_REQUIRED;
-	else if (strcmp(set->introspection_mode, "auth") == 0 ||
-		 strcmp(set->introspection_mode, "post") == 0)
-		introspection_req = AUTH_OAUTH2_URL_TEMPLATE_FORBIDDEN;
-	else
-		introspection_req = AUTH_OAUTH2_URL_TEMPLATE_ANY;
-
-	if (!auth_oauth2_url_template_check(
-		"oauth2_introspection_url", set->introspection_url,
-		introspection_req, set->introspection_mode, error_r))
-		return FALSE;
 
 	return TRUE;
 }
@@ -302,16 +177,6 @@ struct db_oauth2 {
 	struct http_client *client;
 	struct oauth2_settings oauth2_set;
 
-	/* Owns the programs oauth2_set.tokeninfo_url/introspection_url
-	   point to; oauth2_set's fields are const, so they can't be freed
-	   directly. */
-	struct var_expand_program *tokeninfo_url_template;
-	struct var_expand_program *introspection_url_template;
-	/* Templates expanded with an empty token and stripped of userinfo,
-	   for debug logging; never the actual request URL. */
-	const char *tokeninfo_url_log;
-	const char *introspection_url_log;
-
 	struct db_oauth2_request *head;
 };
 
@@ -321,24 +186,6 @@ static void db_oauth2_callback(struct db_oauth2_request *req,
 			       enum passdb_result result,
 			       const char *error_prefix, const char *error);
 static void db_oauth2_free(struct db_oauth2 **_db);
-
-/* Expand template with an empty token and strip its userinfo, for safe
-   debug logging of a request URL that may be built from %{access_token}
-   or %{env:user:password@...}. Falls back to "(invalid)" on failure,
-   which should not happen since the config-time check already passed. */
-static const char *
-db_oauth2_template_log_string(const struct var_expand_program *template)
-{
-	string_t *dest = t_str_new(64);
-	struct http_url *url;
-	const char *error;
-
-	if (oauth2_url_template_expand(template, "", dest, &error) < 0 ||
-	    http_url_parse(str_c(dest), NULL, HTTP_URL_ALLOW_USERINFO_PART,
-			   pool_datastack_create(), &url, &error) < 0)
-		return "(invalid)";
-	return http_url_create(url);
-}
 
 static int db_oauth2_setup(struct db_oauth2 *db, const char **error_r)
 {
@@ -352,25 +199,9 @@ static int db_oauth2_setup(struct db_oauth2 *db, const char **error_r)
 
 	i_zero(&db->oauth2_set);
 	db->oauth2_set.client = db->client;
-	if (*db->set->tokeninfo_url != '\0') {
-		if (var_expand_program_create(db->set->tokeninfo_url,
-					      &db->tokeninfo_url_template,
-					      error_r) < 0)
-			return -1;
-		db->oauth2_set.tokeninfo_url = db->tokeninfo_url_template;
-		db->tokeninfo_url_log = p_strdup(db->pool,
-			db_oauth2_template_log_string(db->tokeninfo_url_template));
-	}
-	db->oauth2_set.grant_url = &db->set->grant_url;
-	if (*db->set->introspection_url != '\0') {
-		if (var_expand_program_create(db->set->introspection_url,
-					      &db->introspection_url_template,
-					      error_r) < 0)
-			return -1;
-		db->oauth2_set.introspection_url = db->introspection_url_template;
-		db->introspection_url_log = p_strdup(db->pool,
-			db_oauth2_template_log_string(db->introspection_url_template));
-	}
+	db->oauth2_set.tokeninfo_url = db->set->tokeninfo_url,
+	db->oauth2_set.grant_url = db->set->grant_url,
+	db->oauth2_set.introspection_url = db->set->introspection_url;
 	db->oauth2_set.client_id = db->set->client_id;
 	db->oauth2_set.client_secret = db->set->client_secret;
 	db->oauth2_set.send_auth_headers = db->set->send_auth_headers;
@@ -429,43 +260,19 @@ static int db_oauth2_setup(struct db_oauth2 *db, const char **error_r)
 		db->oauth2_set.key_cache = oauth2_validation_key_cache_init();
 	}
 
-	return 0;
-}
-
-/* Warn once per process if an oauth2_fields value uses the deprecated
-   %{token}. The values can't be checked when they are expanded, because the
-   settings check can only fail, not warn. */
-static void db_oauth2_warn_token_alias(struct db_oauth2 *db)
-{
-	static bool warned = FALSE;
-	const struct auth_oauth2_post_settings *set;
-	const char *error;
-
-	if (warned)
-		return;
-	/* A failure is reported by the first lookup. */
-	if (settings_get(db->event, &auth_oauth2_post_setting_parser_info,
-			 SETTINGS_GET_FLAG_NO_EXPAND, &set, &error) < 0)
-		return;
-
-	unsigned int n = 0;
-	const char *const *fields = array_is_empty(&set->fields) ? NULL :
-		array_get(&set->fields, &n);
-	for (unsigned int i = 0; i + 1 < n && !warned; i += 2) {
-		struct var_expand_program *prog;
-
-		if (var_expand_program_create(fields[i + 1], &prog,
-					      &error) < 0)
-			continue;
-		if (var_expand_program_has_variable(prog, "token", FALSE)) {
-			e_warning(db->event, "oauth2_fields %s uses the "
-				  "deprecated %%{token}, use %%{access_token}",
-				  fields[i]);
-			warned = TRUE;
+	if (*db->set->openid_configuration_url != '\0') {
+		struct http_url *parsed_url ATTR_UNUSED;
+		const char *error;
+		if (http_url_parse(db->set->openid_configuration_url, NULL, 0,
+				   pool_datastack_create(), &parsed_url,
+				   &error) < 0) {
+			*error_r = t_strdup_printf("Invalid openid_configuration_url: %s",
+						   error);
+			return -1;
 		}
-		var_expand_program_free(&prog);
 	}
-	settings_free(set);
+
+	return 0;
 }
 
 int db_oauth2_init(struct event *event, bool use_grant_password, struct db_oauth2 **db_r,
@@ -510,7 +317,6 @@ int db_oauth2_init(struct event *event, bool use_grant_password, struct db_oauth
 		return -1;
 	}
 	db->oauth2_set.use_grant_password = use_grant_password;
-	db_oauth2_warn_token_alias(db);
 
 	*db_r = db;
 	return 0;
@@ -545,8 +351,6 @@ static void db_oauth2_free(struct db_oauth2 **_db)
 	if (db->oauth2_set.key_dict != NULL)
 		dict_deinit(&db->oauth2_set.key_dict);
 	oauth2_validation_key_cache_deinit(&db->oauth2_set.key_cache);
-	var_expand_program_free(&db->tokeninfo_url_template);
-	var_expand_program_free(&db->introspection_url_template);
 	settings_free(db->set);
 	event_unref(&db->event);
 	pool_unref(&db->pool);
@@ -554,9 +358,7 @@ static void db_oauth2_free(struct db_oauth2 **_db)
 
 const char *db_oauth2_get_openid_configuration_url(const struct db_oauth2 *db)
 {
-	if (http_url_is_empty(&db->set->openid_configuration_url))
-		return "";
-	return http_url_create(&db->set->openid_configuration_url);
+	return db->set->openid_configuration_url;
 }
 
 const char *db_oauth2_get_scope(const struct db_oauth2 *db)
@@ -597,15 +399,12 @@ db_oauth2_add_extra_fields(struct db_oauth2_request *req, const char **error_r)
 		{ "oauth2", db_oauth2_var_expand_func_oauth2 },
 		{ NULL, NULL }
 	};
-	/* include access_token and the deprecated token alias */
-	unsigned int count = 2;
+	/* include token */
+	unsigned int count = 1;
 	struct var_expand_table *table =
 		auth_request_get_var_expand_table_full(req->auth_request, req->username, &count);
-	table[0].key = "access_token";
+	table[0].key = "token";
 	table[0].value = req->token;
-	/* deprecated: use access_token */
-	table[1].key = "token";
-	table[1].value = req->token;
 	struct var_expand_params params = {
 		.table = table,
 		.providers = func_table,
@@ -913,7 +712,7 @@ static void db_oauth2_lookup_introspect(struct db_oauth2_request *req)
 
 	e_debug(authdb_event(req->auth_request),
 		"Making introspection request to %s",
-		req->db->introspection_url_log);
+		req->db->set->introspection_url);
 	input.token = req->token;
 	input.local_ip = req->auth_request->fields.local_ip;
 	input.local_port = req->auth_request->fields.local_port;
@@ -1080,26 +879,24 @@ void db_oauth2_lookup(struct db_oauth2 *db, struct db_oauth2_request *req,
 
 	}
 	if (db->oauth2_set.use_grant_password) {
-		if (!http_url_is_empty(&db->set->grant_url)) {
-			e_debug(authdb_event(req->auth_request),
-				"Making grant url request to %s",
-				http_url_create(&db->set->grant_url));
-		}
+		e_debug(authdb_event(req->auth_request),
+			"Making grant url request to %s",
+			db->set->grant_url);
 		/* There is no valid token until grant looks it up. */
 		req->token = NULL;
 		req->req = oauth2_passwd_grant_start(&db->oauth2_set, &input,
 						     request->fields.user, request->mech_password,
 						     db_oauth2_lookup_passwd_grant, req);
-	} else if (db->oauth2_set.tokeninfo_url == NULL) {
+	} else if (*db->oauth2_set.tokeninfo_url == '\0') {
 		e_debug(authdb_event(req->auth_request),
 			"Making introspection request to %s",
-			db->introspection_url_log);
+			db->set->introspection_url);
 		req->req = oauth2_introspection_start(&req->db->oauth2_set, &input,
 						      db_oauth2_introspect_continue, req);
 	} else {
 		e_debug(authdb_event(req->auth_request),
 			"Making token validation lookup to %s",
-			db->tokeninfo_url_log);
+			db->oauth2_set.tokeninfo_url);
 		req->req = oauth2_token_validation_start(&db->oauth2_set, &input,
 							 db_oauth2_lookup_continue, req);
 	}

@@ -180,23 +180,13 @@ static void destroy_test_endpoint(struct test_endpoint **_ep)
 	pool_unref(&ep->pool);
 }
 
-/* Run the handshake between a server and a client over the given contexts,
-   which this function takes ownership of. On success *alpn_r is set to the
-   negotiated application protocol, or NULL if there was none. */
-static int
-test_iostream_ssl_handshake_ctx(struct ssl_iostream_context *server_ctx,
-				const struct ssl_iostream_settings *server_set,
-				struct ssl_iostream_context *client_ctx,
-				const struct ssl_iostream_settings *client_set,
-				const char *hostname, const char **alpn_r)
+static int test_iostream_ssl_handshake_real(struct ssl_iostream_settings *server_set,
+					    struct ssl_iostream_settings *client_set,
+					    const char *hostname)
 {
 	const char *error;
 	struct test_endpoint *server, *client;
-	struct timeout *to;
 	int fd[2], ret = 0;
-
-	if (alpn_r != NULL)
-		*alpn_r = NULL;
 
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, fd) < 0)
 		i_fatal("socketpair() failed: %m");
@@ -207,11 +197,24 @@ test_iostream_ssl_handshake_ctx(struct ssl_iostream_context *server_ctx,
 	client = create_test_endpoint(fd[1], client_set);
 	client->hostname = hostname;
 	client->client = TRUE;
-	server->ctx = server_ctx;
-	client->ctx = client_ctx;
 
 	server->other = client;
 	client->other = server;
+
+	if (ssl_iostream_context_init_server(server->set, &server->ctx,
+					     &error) < 0) {
+		i_error("server: %s", error);
+		destroy_test_endpoint(&client);
+		destroy_test_endpoint(&server);
+		return -1;
+	}
+	if (ssl_iostream_context_init_client(client->set, &client->ctx,
+					     &error) < 0) {
+		i_error("client: %s", error);
+		destroy_test_endpoint(&client);
+		destroy_test_endpoint(&server);
+		return -1;
+	}
 
 	if (io_stream_create_ssl_server(server->ctx, NULL,
 					&server->input, &server->output,
@@ -228,13 +231,10 @@ test_iostream_ssl_handshake_ctx(struct ssl_iostream_context *server_ctx,
 	client->io = io_add_istream(client->input, handshake_input_callback, client);
 	server->io = io_add_istream(server->input, handshake_input_callback, server);
 
-	/* don't hang forever if the handshake never completes nor fails */
-	to = timeout_add(30000, io_loop_stop, current_ioloop);
 	if (ssl_iostream_handshake(client->iostream) < 0)
 		ret = -1;
 	else
 		io_loop_run(current_ioloop);
-	timeout_remove(&to);
 
 	if (client->failed || server->failed)
 		ret = -1;
@@ -260,9 +260,6 @@ test_iostream_ssl_handshake_ctx(struct ssl_iostream_context *server_ctx,
 						    &error) != SSL_IOSTREAM_CERT_VALIDITY_OK) {
 		i_error("server: %s", error);
 		ret = -1;
-	} else if (alpn_r != NULL) {
-		*alpn_r = t_strdup(ssl_iostream_get_application_protocol(
-					client->iostream));
 	}
 
 	i_stream_unref(&server->input);
@@ -274,123 +271,6 @@ test_iostream_ssl_handshake_ctx(struct ssl_iostream_context *server_ctx,
 	destroy_test_endpoint(&server);
 
 	return ret;
-}
-
-static int test_iostream_ssl_handshake_real(struct ssl_iostream_settings *server_set,
-					    struct ssl_iostream_settings *client_set,
-					    const char *hostname)
-{
-	struct ssl_iostream_context *server_ctx, *client_ctx;
-	const char *error;
-
-	if (ssl_iostream_context_init_server(server_set, &server_ctx,
-					     &error) < 0) {
-		i_error("server: %s", error);
-		return -1;
-	}
-	if (ssl_iostream_context_init_client(client_set, &client_ctx,
-					     &error) < 0) {
-		i_error("client: %s", error);
-		ssl_iostream_context_unref(&server_ctx);
-		return -1;
-	}
-	return test_iostream_ssl_handshake_ctx(server_ctx, server_set,
-					       client_ctx, client_set,
-					       hostname, NULL);
-}
-
-/* Handshake using contexts taken from the context cache, returning the
-   application protocol the client ended up negotiating. */
-static int
-test_iostream_ssl_alpn_handshake(const struct ssl_iostream_settings *server_set,
-				 const struct ssl_iostream_settings *client_set,
-				 const char *const *server_protos,
-				 const char *const *client_protos,
-				 const char **proto_r)
-{
-	struct ssl_iostream_context *server_ctx, *client_ctx;
-	const char *error;
-
-	*proto_r = NULL;
-	/* NOTE: the cache keeps a pointer to the settings, so they must
-	   outlive the cache - the caller's settings do. */
-	if (ssl_iostream_server_context_cache_get(server_set, server_protos,
-						  &server_ctx, &error) < 0) {
-		i_error("server context cache: %s", error);
-		return -1;
-	}
-	if (ssl_iostream_client_context_cache_get(client_set, client_protos,
-						  &client_ctx, &error) < 0) {
-		i_error("client context cache: %s", error);
-		ssl_iostream_context_unref(&server_ctx);
-		return -1;
-	}
-	return test_iostream_ssl_handshake_ctx(server_ctx, server_set,
-					       client_ctx, client_set,
-					       "localhost", proto_r);
-}
-
-static void test_iostream_ssl_context_cache_alpn(void)
-{
-	struct ssl_iostream_settings server_set, client_set;
-	struct ssl_iostream_context *ctx1, *ctx2, *ctx3;
-	const char *const imap_protos[] = { "imap", NULL };
-	const char *const http_protos[] = { "http/1.1", NULL };
-	const char *error, *proto;
-	struct ioloop *ioloop;
-
-	test_begin("ssl: context cache application protocols");
-
-	ssl_iostream_test_settings_server(&server_set);
-	ssl_iostream_test_settings_client(&client_set);
-	client_set.allow_invalid_cert = TRUE;
-
-	/* The ALPN protocols are part of the SSL_CTX, so contexts wanting
-	   different protocols must not be shared. */
-	test_assert(ssl_iostream_client_context_cache_get(
-		&client_set, http_protos, &ctx1, &error) == 0);
-	test_assert(ssl_iostream_client_context_cache_get(
-		&client_set, imap_protos, &ctx2, &error) == 0);
-	test_assert(ctx1 != ctx2);
-	/* ... while the same protocols still share one context. */
-	test_assert(ssl_iostream_client_context_cache_get(
-		&client_set, imap_protos, &ctx3, &error) == 0);
-	test_assert(ctx3 == ctx2);
-	ssl_iostream_context_unref(&ctx1);
-	ssl_iostream_context_unref(&ctx2);
-	ssl_iostream_context_unref(&ctx3);
-
-	/* Wanting no protocols isn't the same as wanting some. */
-	test_assert(ssl_iostream_client_context_cache_get(
-		&client_set, NULL, &ctx1, &error) == 0);
-	test_assert(ssl_iostream_client_context_cache_get(
-		&client_set, imap_protos, &ctx2, &error) == 0);
-	test_assert(ctx1 != ctx2);
-	ssl_iostream_context_unref(&ctx1);
-	ssl_iostream_context_unref(&ctx2);
-
-	ioloop = io_loop_create();
-
-	/* An HTTP client that initialized its context first must not make an
-	   imap connection using the same settings send ALPN http/1.1. */
-	test_assert(ssl_iostream_client_context_cache_get(
-		&client_set, http_protos, &ctx1, &error) == 0);
-	test_assert(test_iostream_ssl_alpn_handshake(&server_set, &client_set,
-						     imap_protos, imap_protos,
-						     &proto) == 0);
-	test_assert(null_strcmp(proto, "imap") == 0);
-	ssl_iostream_context_unref(&ctx1);
-
-	/* Sending the wrong ALPN is what made the server reject the
-	   handshake with no_application_protocol. */
-	test_assert(test_iostream_ssl_alpn_handshake(&server_set, &client_set,
-						     imap_protos, http_protos,
-						     &proto) < 0);
-
-	io_loop_destroy(&ioloop);
-	ssl_iostream_context_cache_free();
-
-	test_end();
 }
 
 static void test_iostream_ssl_handshake(void)
@@ -671,389 +551,12 @@ static void test_iostream_ssl_small_packets(void)
 	test_end();
 }
 
-static void cork_input_callback(struct test_endpoint *ep)
-{
-	const unsigned char *data;
-	size_t size;
-	ssize_t ret;
-
-	while ((ret = i_stream_read_more(ep->input, &data, &size)) > 0) {
-		test_assert(ep->last_write->used >= size);
-		if (ep->last_write->used >= size) {
-			test_assert(memcmp(ep->last_write->data, data,
-					   size) == 0);
-			buffer_delete(ep->last_write, 0, size);
-		}
-		i_stream_skip(ep->input, size);
-	}
-	if (ret < 0)
-		test_assert(ep->input->stream_errno == 0);
-	if (ep->last_write->used == 0)
-		io_loop_stop(current_ioloop);
-}
-
-static void cork_timeout_callback(struct test_endpoint *ep)
-{
-	ep->failed = TRUE;
-	io_loop_stop(current_ioloop);
-}
-
-/* Run ioloop until the client has read everything the server wrote */
-static void test_iostream_ssl_cork_wait(struct test_endpoint *client)
-{
-	struct timeout *to;
-
-	to = timeout_add(5000, cork_timeout_callback, client);
-	io_loop_run(current_ioloop);
-	timeout_remove(&to);
-	test_assert(!client->failed);
-	test_assert(client->last_write->used == 0);
-}
-
-static void
-test_ssl_endpoints_create(struct test_endpoint **server_r,
-			  struct test_endpoint **client_r)
-{
-	struct ssl_iostream_settings set;
-	struct test_endpoint *server, *client;
-	int fd[2];
-	const char *error;
-
-	if (socketpair(AF_UNIX, SOCK_STREAM, 0, fd) < 0)
-		i_fatal("socketpair() failed: %m");
-	fd_set_nonblock(fd[0], TRUE);
-	fd_set_nonblock(fd[1], TRUE);
-
-	ssl_iostream_test_settings_server(&set);
-	server = create_test_endpoint(fd[0], &set);
-	ssl_iostream_test_settings_client(&set);
-	set.allow_invalid_cert = TRUE;
-	client = create_test_endpoint(fd[1], &set);
-	client->client = TRUE;
-
-	test_assert(ssl_iostream_context_init_server(server->set, &server->ctx,
-						     &error) == 0);
-	test_assert(ssl_iostream_context_init_client(client->set, &client->ctx,
-						     &error) == 0);
-
-	client->other = server;
-	server->other = client;
-
-	test_assert(io_stream_create_ssl_server(server->ctx, NULL,
-						&server->input, &server->output,
-						&server->iostream,
-						&error) == 0);
-	test_assert(io_stream_create_ssl_client(client->ctx, "localhost",
-						NULL, 0,
-						&client->input, &client->output,
-						&client->iostream,
-						&error) == 0);
-	o_stream_set_no_error_handling(server->output, TRUE);
-
-	*server_r = server;
-	*client_r = client;
-}
-
-static void
-test_ssl_endpoints_destroy(struct test_endpoint **server,
-			   struct test_endpoint **client)
-{
-	i_stream_unref(&(*server)->input);
-	o_stream_unref(&(*server)->output);
-	i_stream_unref(&(*client)->input);
-	o_stream_unref(&(*client)->output);
-
-	destroy_test_endpoint(server);
-	destroy_test_endpoint(client);
-	ssl_iostream_context_cache_free();
-}
-
-static void test_iostream_ssl_cork(void)
-{
-	static const char line[] = "hello world\n";
-	static const size_t iov_lens[] = { 700, 0, 700, 8000 };
-	struct test_endpoint *server, *client;
-	struct ioloop *ioloop;
-	struct ostream *plain_output;
-	struct const_iovec iov[N_ELEMENTS(iov_lens)];
-	unsigned char data[10000];
-	uoff_t plain_offset;
-	size_t pos;
-
-	test_begin("ssl: o_stream_cork");
-
-	ioloop = io_loop_create();
-	test_ssl_endpoints_create(&server, &client);
-
-	/* handshake */
-	server->io = io_add_istream(server->input, handshake_input_callback,
-				    server);
-	client->io = io_add_istream(client->input, handshake_input_callback,
-				    client);
-	test_assert(ssl_iostream_handshake(client->iostream) == 0);
-	io_loop_run(ioloop);
-	test_assert(ssl_iostream_is_handshaked(server->iostream));
-	test_assert(ssl_iostream_is_handshaked(client->iostream));
-	io_remove(&server->io);
-	io_remove(&client->io);
-	client->io = io_add_istream(client->input, cork_input_callback, client);
-
-	plain_output = server->iostream->plain_output;
-
-	/* corked writes are only buffered, nothing reaches the plain ostream
-	   until uncorking. (The output's max_buffer_size is 1024.) */
-	plain_offset = plain_output->offset;
-	o_stream_cork(server->output);
-	for (unsigned int i = 0; i < 50; i++) {
-		o_stream_nsend_str(server->output, line);
-		buffer_append(client->last_write, line, strlen(line));
-	}
-	test_assert(plain_output->offset == plain_offset);
-	test_assert(o_stream_get_buffer_used_size(server->output) ==
-		    50 * strlen(line));
-	o_stream_uncork(server->output);
-	test_assert(server->output->stream_errno == 0);
-	test_assert(plain_output->offset > plain_offset);
-	test_assert(o_stream_get_buffer_used_size(server->output) == 0);
-	test_iostream_ssl_cork_wait(client);
-
-	/* uncorked writes are written immediately */
-	plain_offset = plain_output->offset;
-	o_stream_nsend_str(server->output, line);
-	buffer_append(client->last_write, line, strlen(line));
-	test_assert(plain_output->offset > plain_offset);
-	test_iostream_ssl_cork_wait(client);
-
-	/* a write larger than max_buffer_size doesn't overflow the stream */
-	random_fill(data, sizeof(data));
-	o_stream_set_max_buffer_size(server->output, 1024);
-	o_stream_nsend(server->output, data, sizeof(data));
-	buffer_append(client->last_write, data, sizeof(data));
-	test_assert(!server->output->overflow);
-	test_assert(o_stream_flush(server->output) >= 0);
-	test_assert(server->output->stream_errno == 0);
-	test_iostream_ssl_cork_wait(client);
-
-	/* same while corked */
-	o_stream_cork(server->output);
-	o_stream_nsend(server->output, data, sizeof(data));
-	buffer_append(client->last_write, data, sizeof(data));
-	test_assert(!server->output->overflow);
-	o_stream_uncork(server->output);
-	test_assert(server->output->stream_errno == 0);
-	test_iostream_ssl_cork_wait(client);
-
-	/* same with multiple iovecs, so the full buffer is flushed in the
-	   middle of an iovec. Do it uncorked and corked. */
-	for (unsigned int n = 0; n < 2; n++) {
-		pos = 0;
-		for (unsigned int i = 0; i < N_ELEMENTS(iov_lens); i++) {
-			iov[i].iov_base = data + pos;
-			iov[i].iov_len = iov_lens[i];
-			pos += iov_lens[i];
-		}
-		i_assert(pos <= sizeof(data));
-		buffer_append(client->last_write, data, pos);
-		if (n == 1)
-			o_stream_cork(server->output);
-		o_stream_nsendv(server->output, iov, N_ELEMENTS(iov));
-		test_assert(!server->output->overflow);
-		if (n == 1)
-			o_stream_uncork(server->output);
-		else
-			test_assert(o_stream_flush(server->output) >= 0);
-		test_assert(server->output->stream_errno == 0);
-		test_iostream_ssl_cork_wait(client);
-	}
-
-	/* with unlimited max_buffer_size, corked writes don't grow the buffer
-	   without limit. Full TLS records are written out. */
-	o_stream_set_max_buffer_size(server->output, SIZE_MAX);
-	plain_offset = plain_output->offset;
-	o_stream_cork(server->output);
-	for (unsigned int i = 0; i < 1000; i++) {
-		o_stream_nsend(server->output, data, 100);
-		buffer_append(client->last_write, data, 100);
-	}
-	test_assert(plain_output->offset > plain_offset);
-	/* the SSL ostream's own buffer has less than one TLS record */
-	test_assert(o_stream_get_buffer_used_size(server->output) -
-		    o_stream_get_buffer_used_size(plain_output) <
-		    SSL3_RT_MAX_PLAIN_LENGTH);
-	o_stream_uncork(server->output);
-	test_assert(server->output->stream_errno == 0);
-	test_iostream_ssl_cork_wait(client);
-
-	test_ssl_endpoints_destroy(&server, &client);
-	io_loop_destroy(&ioloop);
-	test_end();
-}
-
-static int handshake_flush_callback(struct test_endpoint *ep)
-{
-	int ret;
-
-	ep->sent++;
-	if ((ret = o_stream_flush(ep->output)) <= 0)
-		return ret;
-	/* pretend that there's more data to send after the handshake */
-	return ssl_iostream_is_handshaked(ep->iostream) ? 1 : 0;
-}
-
-static void handshake_server_input_callback(struct test_endpoint *ep)
-{
-	/* reading continues the handshake */
-	test_assert(i_stream_read(ep->input) >= 0);
-}
-
-static void handshake_flush_timeout(void *context ATTR_UNUSED)
-{
-	io_loop_stop(current_ioloop);
-}
-
-static void test_iostream_ssl_flush_before_handshake(void)
-{
-	static const char line[] = "hello world\n";
-	struct test_endpoint *server, *client;
-	struct ioloop *ioloop;
-	struct timeout *to;
-
-	test_begin("ssl: o_stream_flush() before handshake");
-
-	ioloop = io_loop_create();
-	test_ssl_endpoints_create(&server, &client);
-	o_stream_set_flush_callback(server->output, handshake_flush_callback,
-				    server);
-
-	/* The client hasn't started the handshake yet. The flush callback
-	   must not be called repeatedly while waiting for its input, even
-	   though it keeps returning 0. */
-	o_stream_set_flush_pending(server->output, TRUE);
-	to = timeout_add_short(100, handshake_flush_timeout, NULL);
-	io_loop_run(ioloop);
-	timeout_remove(&to);
-	test_assert(server->sent > 0 && server->sent < 10);
-
-	/* The data can't be written until the handshake has finished, so
-	   flushing must not return 1. */
-	o_stream_nsend_str(server->output, line);
-	buffer_append(client->last_write, line, strlen(line));
-	test_assert(o_stream_flush(server->output) == 0);
-	test_assert(o_stream_get_buffer_used_size(server->output) > 0);
-
-	/* The flush callback isn't called repeatedly with buffered data
-	   either. */
-	server->sent = 0;
-	to = timeout_add_short(100, handshake_flush_timeout, NULL);
-	io_loop_run(ioloop);
-	timeout_remove(&to);
-	test_assert(server->sent < 10);
-	server->sent = 0;
-
-	/* After the handshake the flush callback is called again and the
-	   data is written */
-	server->io = io_add_istream(server->input,
-				    handshake_server_input_callback, server);
-	client->io = io_add_istream(client->input, cork_input_callback,
-				    client);
-	test_assert(ssl_iostream_handshake(client->iostream) == 0);
-	test_iostream_ssl_cork_wait(client);
-	test_assert(o_stream_get_buffer_used_size(server->output) == 0);
-	test_assert(server->sent > 0);
-
-	test_ssl_endpoints_destroy(&server, &client);
-	io_loop_destroy(&ioloop);
-	test_end();
-}
-
-static int finish_flush_callback(struct test_endpoint *ep)
-{
-	int ret = o_stream_finish(ep->output);
-
-	test_assert(ret >= 0);
-	if (ret > 0) {
-		ep->finished = TRUE;
-		io_loop_stop(current_ioloop);
-	}
-	return ret;
-}
-
-static void close_notify_input_callback(struct test_endpoint *ep)
-{
-	ssize_t ret;
-
-	while ((ret = i_stream_read(ep->input)) > 0)
-		i_stream_skip(ep->input, ret);
-	if (ret == -1) {
-		test_assert(ep->input->stream_errno == 0);
-		ep->finished = TRUE;
-		io_loop_stop(current_ioloop);
-	}
-}
-
-static void test_iostream_ssl_finish(void)
-{
-	static const char line[] = "hello world\n";
-	struct test_endpoint *server, *client;
-	struct ioloop *ioloop;
-	struct timeout *to;
-	int ret;
-
-	test_begin("ssl: o_stream_finish()");
-
-	ioloop = io_loop_create();
-	test_ssl_endpoints_create(&server, &client);
-
-	/* finish the handshake */
-	server->io = io_add_istream(server->input,
-				    handshake_server_input_callback, server);
-	client->io = io_add_istream(client->input, cork_input_callback,
-				    client);
-	o_stream_nsend_str(server->output, line);
-	buffer_append(client->last_write, line, strlen(line));
-	test_assert(ssl_iostream_handshake(client->iostream) == 0);
-	test_iostream_ssl_cork_wait(client);
-
-	/* Finishing sends the close_notify alert. If it can't be done
-	   immediately, the flush callback must be called until it's done. */
-	o_stream_set_flush_callback(server->output, finish_flush_callback,
-				    server);
-	ret = o_stream_finish(server->output);
-	test_assert(ret >= 0);
-	if (ret == 0) {
-		to = timeout_add(5000, cork_timeout_callback, server);
-		io_loop_run(ioloop);
-		timeout_remove(&to);
-		test_assert(!server->failed);
-		test_assert(server->finished);
-	}
-	test_assert(o_stream_get_buffer_used_size(server->output) == 0);
-
-	/* The client sees the close_notify alert as EOF */
-	io_remove(&client->io);
-	client->io = io_add_istream(client->input,
-				    close_notify_input_callback, client);
-	to = timeout_add(5000, cork_timeout_callback, client);
-	io_loop_run(ioloop);
-	timeout_remove(&to);
-	test_assert(!client->failed);
-	test_assert(client->finished);
-
-	test_ssl_endpoints_destroy(&server, &client);
-	io_loop_destroy(&ioloop);
-	test_end();
-}
-
 int main(void)
 {
 	static void (*const test_functions[])(void) = {
 		test_iostream_ssl_handshake,
-		test_iostream_ssl_context_cache_alpn,
 		test_iostream_ssl_get_buffer_avail_size,
 		test_iostream_ssl_small_packets,
-		test_iostream_ssl_cork,
-		test_iostream_ssl_flush_before_handshake,
-		test_iostream_ssl_finish,
 		NULL
 	};
 	ssl_iostream_openssl_init();

@@ -46,10 +46,8 @@ static bool lsb_distro_get(const char *path, const char **name_r)
 	str = t_strcut(str, '\n');
 	if (*str != '"')
 		*name_r = str;
-	else if ((end = strrchr(++str, '"')) == NULL) {
-		/* no closing quote - treat rest of line as value */
-		*name_r = str;
-	} else {
+	else {
+		end = strrchr(++str, '"');
 		*name_r = str_unescape(p_strdup_until(unsafe_data_stack_pool,
 						      str, end));
 	}

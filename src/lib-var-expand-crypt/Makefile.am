@@ -29,7 +29,6 @@ test_libs = \
 	../lib-json/libjson.la \
 	../lib-settings/libsettings.la \
 	../lib-dns/libdns.la \
-	../lib-url/liburl.la \
 	../lib-test/libtest.la \
 	../lib/liblib.la
 

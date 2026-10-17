@@ -7,7 +7,6 @@
 #include "hash.h"
 #include "llist.h"
 #include "strescape.h"
-#include "dns-util.h"
 #include "istream.h"
 #include "module-dir.h"
 #include "version.h"
@@ -21,7 +20,6 @@
 #include "config-dump-full.h"
 #include "config-parser-private.h"
 #include "strfuncs.h"
-#include "http-url.h"
 
 #include "default-settings-import.h"
 
@@ -57,6 +55,8 @@ struct config_parsed {
 	HASH_TABLE_TYPE(config_key) all_keys;
 };
 
+ARRAY_DEFINE_TYPE(setting_parser_info_p, const struct setting_parser_info *);
+
 static const enum settings_parser_flags settings_parser_flags =
 	SETTINGS_PARSER_FLAG_IGNORE_UNKNOWN_KEYS;
 
@@ -68,8 +68,6 @@ int (*hook_config_parser_end)(struct config_parser_context *ctx,
 
 static ARRAY_TYPE(config_service) services_free_at_deinit = ARRAY_INIT;
 static ARRAY_TYPE(setting_parser_info_p) infos_free_at_deinit = ARRAY_INIT;
-/* Settings infos that were dropped, because their plugin isn't installed */
-static ARRAY_TYPE(setting_parser_info_p) missing_plugin_infos = ARRAY_INIT;
 static string_t *config_import;
 
 static struct config_filter_parser *
@@ -615,7 +613,6 @@ settings_value_check(struct config_parser_context *ctx,
 		return 0;
 	const char *value = prefixed_value + 1;
 	int ret;
-	enum http_url_parse_flags url_flags = 0;
 
 	switch (def->type) {
 	case SET_BOOL: {
@@ -741,24 +738,6 @@ settings_value_check(struct config_parser_context *ctx,
 			return -1;
 		}
 		break;
-	case SET_HTTP_URL_AUTH:
-		url_flags = HTTP_URL_ALLOW_USERINFO_PART;
-		/* fall through */
-	case SET_HTTP_URL: {
-		struct http_url *url;
-
-		if ((ret = settings_value_check_common(ctx, value)) <= 0)
-			return ret; /* has %{ or $SET:/$ENV: - validate later */
-		if (value[0] == '\0')
-			break; /* explicitly unset */
-		if (http_url_parse(value, NULL, url_flags,
-				   pool_datastack_create(),
-				   &url, &error) < 0) {
-			ctx->error = p_strdup(ctx->pool, error);
-			return -1;
-		}
-		break;
-	}
 	case SET_FILE:
 	case SET_STRLIST:
 	case SET_BOOLLIST:
@@ -1526,23 +1505,18 @@ config_key_can_autoprefix(struct config_parser_context *ctx, const char *key)
 	return def->type != SET_FILTER_NAME;
 }
 
-static const char *
-config_info_dependency_path(const struct setting_parser_info *info)
-{
-	return t_strconcat(MODULEDIR"/", info->plugin_dependency,
-			   MODULE_SUFFIX, NULL);
-}
-
 static void
-config_set_unknown_key_error_str(struct config_parser_context *ctx,
-				 const char *key, string_t *errstr)
+config_set_unknown_key_error(struct config_parser_context *ctx, const char *key)
 {
+	string_t *errstr = t_str_new(128);
 	str_printfa(errstr, "Unknown setting: %s", key);
 
 	const char *filter_name =
 		ctx->cur_section->filter_parser->filter.filter_name;
-	if (filter_name == NULL)
+	if (filter_name == NULL) {
+		ctx->error = p_strdup(ctx->pool, str_c(errstr));
 		return;
+	}
 	const char *filter_name_key = t_strcut(filter_name, '/');
 	str_printfa(errstr, " (%s_%s", filter_name_key, key);
 	if (ctx->cur_section->filter_parser->filter.filter_name_array) {
@@ -1552,6 +1526,7 @@ config_set_unknown_key_error_str(struct config_parser_context *ctx,
 	str_append(errstr, " not found either.");
 	if (!ctx->cur_section->filter_parser->filter.filter_name_array) {
 		str_append_c(errstr, ')');
+		ctx->error = p_strdup(ctx->pool, str_c(errstr));
 		return;
 	}
 
@@ -1590,63 +1565,6 @@ config_set_unknown_key_error_str(struct config_parser_context *ctx,
 		str_printfa(errstr, " Did you mean one of: %s?)",
 			    str_c(alt_keys));
 	}
-}
-
-static const struct setting_parser_info *
-config_missing_plugin_info_find(const char *key)
-{
-	const struct setting_parser_info *info;
-
-	if (!array_is_created(&missing_plugin_infos))
-		return NULL;
-	array_foreach_elem(&missing_plugin_infos, info) {
-		for (unsigned int i = 0; info->defines[i].key != NULL; i++) {
-			if (strcmp(info->defines[i].key, key) == 0)
-				return info;
-		}
-	}
-	return NULL;
-}
-
-static void
-config_append_missing_plugin_hint(string_t *errstr,
-				  const struct config_filter *filter,
-				  const char *key)
-{
-	const struct setting_parser_info *info;
-	const char *keys[3] = { t_strcut(key, '/'), NULL, NULL };
-
-	if (filter->filter_name != NULL) {
-		const char *filter_key = filter_key_skip_group_prefix(
-			t_strcut(filter->filter_name, '/'));
-		keys[1] = t_strdup_printf("%s_%s", filter_key, keys[0]);
-		if (filter->filter_name_array) {
-			keys[2] = t_strdup_printf("%s_%s",
-				t_str_replace(filter->filter_name, '/', '_'),
-				keys[0]);
-		}
-	}
-	for (unsigned int i = 0; i < N_ELEMENTS(keys); i++) {
-		if (keys[i] == NULL)
-			continue;
-		info = config_missing_plugin_info_find(keys[i]);
-		if (info != NULL) {
-			str_printfa(errstr,
-				" (Setting %s requires plugin %s, which isn't installed)",
-				keys[i], config_info_dependency_path(info));
-			return;
-		}
-	}
-}
-
-static void
-config_set_unknown_key_error(struct config_parser_context *ctx, const char *key)
-{
-	string_t *errstr = t_str_new(128);
-
-	config_set_unknown_key_error_str(ctx, key, errstr);
-	config_append_missing_plugin_hint(errstr,
-		&ctx->cur_section->filter_parser->filter, key);
 	ctx->error = p_strdup(ctx->pool, str_c(errstr));
 }
 
@@ -2009,25 +1927,6 @@ int config_filter_parse(struct config_filter *filter, pool_t pool,
 				"%s { local_name { .. } } not allowed (use local_name { %s { .. } } instead)",
 				t_strcut(parent->filter_name, '/'),
 				t_strcut(parent->filter_name, '/'));
-		else if (parent->local_name != NULL &&
-			 (strpbrk(value, "*?") != NULL ||
-			  dns_match_wildcard(value, parent->local_name) != 0)) {
-			/* A nested local_name must narrow the outer local_name,
-			   the same way as nested local/remote nets must be
-			   inside each other. The settings filters keep only the
-			   innermost local_name, so an inner name that doesn't
-			   match the outer name would widen the filter instead.
-			   Before this check such a block matched only the
-			   connections matching both names, which was usually
-			   nothing.
-
-			   The inner name must be a plain hostname. There is no
-			   reliable way to check that an inner wildcard is
-			   inside the outer one, e.g. "*.example.com" inside
-			   "?.example.com" passes dns_match_wildcard() but
-			   matches more. */
-			*error_r = "local_name name1 { local_name name2 { .. } } requires name2 to be a hostname matching name1";
-		}
 		else
 			filter->local_name = p_strdup(pool, t_str_lcase(value));
 	} else if (strcmp(key, "remote") == 0) {
@@ -3777,15 +3676,11 @@ void config_parser_apply_line(struct config_parser_context *ctx,
 		if (config_key == NULL) {
 			if ((ctx->flags & CONFIG_PARSE_FLAG_IGNORE_UNKNOWN) != 0)
 				break;
-			string_t *errstr = t_str_new(128);
-			str_printfa(errstr, "Unknown section name: %s", key);
-			if (attempts != NULL) {
-				str_append_str(errstr, attempts);
-				str_append(errstr, " not found either.)");
-			}
-			config_append_missing_plugin_hint(errstr, cur_filter,
-							  line->key);
-			ctx->error = p_strdup(ctx->pool, str_c(errstr));
+			if (attempts != NULL)
+				str_append(attempts, " not found either.)");
+			ctx->error = p_strdup_printf(ctx->pool,
+				"Unknown section name: %s%s", key,
+				attempts == NULL ? "" : str_c(attempts));
 			break;
 		}
 
@@ -4459,23 +4354,10 @@ static bool config_have_info_dependency(const struct setting_parser_info *info)
 {
 	if (info->plugin_dependency == NULL)
 		return TRUE;
+	const char *path = t_strconcat(MODULEDIR"/", info->plugin_dependency,
+				       MODULE_SUFFIX, NULL);
 	struct stat st;
-	return stat(config_info_dependency_path(info), &st) == 0;
-}
-
-void config_parser_add_available_infos(ARRAY_TYPE(setting_parser_info_p) *infos)
-{
-	/* drop any default infos which depend on plugins that don't exist,
-	   but remember them for better unknown setting error messages */
-	for (unsigned int i = 0; all_infos[i] != NULL; i++) {
-		if (config_have_info_dependency(all_infos[i]))
-			array_push_back(infos, &all_infos[i]);
-		else {
-			if (!array_is_created(&missing_plugin_infos))
-				i_array_init(&missing_plugin_infos, 8);
-			array_push_back(&missing_plugin_infos, &all_infos[i]);
-		}
-	}
+	return stat(path, &st) == 0;
 }
 
 static void
@@ -4523,7 +4405,11 @@ void config_parse_load_modules(bool dump_config_import)
 	str_append(config_import, stats_metric_defaults);
 	str_append(config_import, mailbox_defaults);
 	i_array_init(&new_infos, 64);
-	config_parser_add_available_infos(&new_infos);
+	/* drop any default infos which depend on plugins that don't exist */
+	for (i = 0; all_infos[i] != NULL; i++) {
+		if (config_have_info_dependency(all_infos[i]))
+			array_push_back(&new_infos, &all_infos[i]);
+	}
 
 	i_array_init(&new_services, 64);
 	for (m = modules; m != NULL; m = m->next) {
@@ -4581,7 +4467,5 @@ void config_parser_deinit(void)
 		array_free(&services_free_at_deinit);
 	if (array_is_created(&infos_free_at_deinit))
 		array_free(&infos_free_at_deinit);
-	if (array_is_created(&missing_plugin_infos))
-		array_free(&missing_plugin_infos);
 	str_free(&config_import);
 }

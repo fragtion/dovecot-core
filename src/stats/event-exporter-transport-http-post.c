@@ -5,7 +5,6 @@
 #include "str.h"
 #include "event-exporter.h"
 #include "settings.h"
-#include "settings-parser-http-url.h"
 #include "http-client.h"
 #include "iostream-ssl.h"
 #include "master-service.h"
@@ -21,7 +20,7 @@ struct http_post_event_exporter {
 struct event_exporter_http_post_settings {
 	pool_t pool;
 
-	struct http_url event_exporter_http_post_url;
+	const char *event_exporter_http_post_url;
 };
 
 #undef DEF
@@ -30,13 +29,13 @@ struct event_exporter_http_post_settings {
 
 static const struct setting_define event_exporter_http_post_setting_defines[] = {
 	{ .type = SET_FILTER_NAME, .key = "event_exporter_http_post", },
-	DEF(HTTP_URL_AUTH, event_exporter_http_post_url),
+	DEF(STR, event_exporter_http_post_url),
 
 	SETTING_DEFINE_LIST_END
 };
 
 static const struct event_exporter_http_post_settings event_exporter_http_post_default_settings = {
-	.event_exporter_http_post_url = HTTP_URL_INIT_EMPTY,
+	.event_exporter_http_post_url = "",
 };
 
 static const struct setting_keyvalue event_exporter_http_post_default_settings_keyvalue[] = {
@@ -65,15 +64,8 @@ event_exporter_http_post_init(pool_t pool, struct event *event,
 	if (settings_get(event, &event_exporter_http_post_setting_parser_info,
 			 0, &exporter->set, error_r) < 0)
 		return -1;
-	if (http_url_is_empty(&exporter->set->event_exporter_http_post_url)) {
-		*error_r = "event_exporter_http_post_url must be set";
-		settings_free(exporter->set);
+	if (http_client_init_auto(event, &exporter->client, error_r) < 0)
 		return -1;
-	}
-	if (http_client_init_auto(event, &exporter->client, error_r) < 0) {
-		settings_free(exporter->set);
-		return -1;
-	}
 	*exporter_r = &exporter->exporter;
 	return 0;
 }
@@ -123,8 +115,8 @@ event_exporter_http_post_send(struct event_exporter *_exporter,
 			     exporter);
 	struct http_client_request *req;
 
-	req = http_client_request_url(exporter->client, "POST",
-		&exporter->set->event_exporter_http_post_url,
+	req = http_client_request_url_str(exporter->client, "POST",
+		exporter->set->event_exporter_http_post_url,
 		response_fxn, NULL);
 	http_client_request_add_header(req, "Content-Type", _exporter->format_mime_type);
 	http_client_request_set_payload_data(req, buf->data, buf->used);

@@ -43,7 +43,6 @@ test_libs = \
 	../lib-var-expand/libvar_expand.la \
 	../lib-regex/libdregex.la \
 	../lib-test/libtest.la \
-	../lib-url/liburl.la \
 	../lib/liblib.la \
 	$(LIBDOVECOT_TEST_LIBS)
 

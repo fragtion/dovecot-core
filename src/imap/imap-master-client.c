@@ -41,13 +41,9 @@ struct imap_master_input {
 	const char *tag;
 	/* Timestamp when hibernation started */
 	struct timeval hibernation_start_time;
-	/* Time when autoexpunging should be checked again */
-	time_t autoexpunge_next_check;
 
 	const char *auth_token;
 	const char *session_pid;
-	/* CAPABILITY that the client was told before hibernation */
-	const char *capability;
 
 	dev_t peer_dev;
 	ino_t peer_ino;
@@ -157,12 +153,6 @@ imap_master_client_parse_input(const char *const *args, pool_t pool,
 					"Invalid session_created value: %s", value);
 				return -1;
 			}
-		} else if (strcmp(key, "autoexpunge_next_check") == 0) {
-			if (str_to_time(value, &master_input_r->autoexpunge_next_check) < 0) {
-				*error_r = t_strdup_printf(
-					"Invalid autoexpunge_next_check value: %s", value);
-				return -1;
-			}
 		} else if (strcmp(key, "hibernation_started") == 0) {
 			if (str_to_timeval(value, &master_input_r->hibernation_start_time) < 0) {
 				*error_r = t_strdup_printf(
@@ -201,8 +191,6 @@ imap_master_client_parse_input(const char *const *args, pool_t pool,
 			master_input_r->auth_token = t_strdup(value);
 		} else if (strcmp(key, "session_pid") == 0) {
 			master_input_r->session_pid = t_strdup(value);
-		} else if (strcmp(key, "capability") == 0) {
-			master_input_r->capability = t_strdup(value);
 		} else if (strcmp(key, "bad-done") == 0) {
 			master_input_r->state_import_bad_idle_done = TRUE;
 		} else if (strcmp(key, "idle-continue") == 0) {
@@ -470,8 +458,7 @@ imap_master_client_input_args(struct connection *conn, const char *const *args,
 	/* NOTE: before client_create_from_input() on failures we need to close
 	   fd_client, but afterward it gets closed by client_destroy() */
 	ret = client_create_from_input(&input, &stats, fd_client, fd_client,
-				       create_flags, master_input.client_input,
-				       &imap_client, &error);
+				       create_flags, &imap_client, &error);
 	if (ret < 0) {
 		e_error(conn->event,
 			"imap-master(%s): Failed to create client: %s",
@@ -489,18 +476,11 @@ imap_master_client_input_args(struct connection *conn, const char *const *args,
 	struct event *event = event_create(imap_client->event);
 	event_set_name(event, "imap_client_unhibernated");
 	event_add_int(event, "hibernation_usecs", hibernation_usecs);
-	imap_client->autoexpunge_next_check =
-		master_input.autoexpunge_next_check;
 	imap_client->state_import_bad_idle_done =
 		master_input.state_import_bad_idle_done;
 	imap_client->state_import_idle_continue =
 		master_input.state_import_idle_continue;
-	/* tag is sent only when IDLE was in progress */
-	imap_client->state_import_nonidle = master_input.tag == NULL;
-	if (imap_client->state_import_nonidle) {
-		reason = "client sent input";
-		event_add_str(event, "reason", "client_input");
-	} else if (imap_client->state_import_bad_idle_done) {
+	if (imap_client->state_import_bad_idle_done) {
 		reason = "IDLE was stopped with BAD command";
 		event_add_str(event, "reason", "idle_bad_reply");
 	} else if (imap_client->state_import_idle_continue) {
@@ -518,6 +498,12 @@ imap_master_client_input_args(struct connection *conn, const char *const *args,
 	   event. */
 	o_stream_nsend_str(conn->output, "+\n");
 	(void)o_stream_flush(conn->output);
+
+	if (master_input.client_input->used > 0) {
+		client_add_istream_prefix(imap_client,
+					  master_input.client_input->data,
+					  master_input.client_input->used);
+	}
 
 	client_create_finish_io(imap_client);
 	if (client_create_finish(imap_client, &error) < 0) {
@@ -537,14 +523,8 @@ imap_master_client_input_args(struct connection *conn, const char *const *args,
 	struct event_reason *event_reason =
 		event_reason_begin("imap:unhibernate");
 	enum imap_state_result result =
-		imap_state_verify_capability(imap_client,
-					     master_input.capability, &error);
-	if (result == IMAP_STATE_OK) {
-		result = imap_state_import_internal(imap_client,
-						    master_input.state->data,
-						    master_input.state->used,
-						    &error);
-	}
+		imap_state_import_internal(imap_client, master_input.state->data,
+					   master_input.state->used, &error);
 	event_reason_end(&event_reason);
 
 	switch (result) {
@@ -557,16 +537,10 @@ imap_master_client_input_args(struct connection *conn, const char *const *args,
 		client_destroy(imap_client, "Client state initialization failed");
 		return -1;
 	case IMAP_STATE_INCONSISTENT:
-		error = t_strdup_printf(
-			"IMAP session state is inconsistent: %s", error);
-		event_add_str(event, "error", error);
 		e_debug(event, "imap-master: Unhibernation failed: %s", error);
 		event_unref(&event);
-		/* The details may contain internal errors, so tell the client
-		   only that it needs to login again. */
-		client_send_line(imap_client,
-			"* BYE IMAP session state is inconsistent, please relogin.");
-		client_disconnect(imap_client, error);
+		client_disconnect_with_error(imap_client,
+			"IMAP session state is inconsistent, please relogin.");
 		return -1;
 	case IMAP_STATE_OK:
 		break;

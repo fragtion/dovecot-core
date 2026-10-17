@@ -175,21 +175,9 @@ http_client_request_url(struct http_client *client,
 			const char *method, const struct http_url *target_url,
 			http_client_request_callback_t *callback, void *context)
 {
-	struct http_client_request *req, *tmpreq;
+	struct http_client_request *req;
 
-	req = tmpreq = http_client_request_new(client, method,
-					       callback, context);
-
-	if (http_url_is_empty(target_url)) {
-		req->label = p_strdup_printf(req->pool, "[Req%u: %s (unset URL)]",
-					     req->id, req->method);
-		http_client_request_error(
-			&tmpreq, HTTP_CLIENT_REQUEST_ERROR_INVALID_URL,
-			"Invalid HTTP URL: URL is not set");
-		http_client_request_update_event(req);
-		return req;
-	}
-
+	req = http_client_request_new(client, method, callback, context);
 	http_url_copy_authority(req->pool, &req->origin_url, target_url);
 	req->target = p_strdup(req->pool, http_url_create_target(target_url));
 	if (target_url->user != NULL && *target_url->user != '\0' &&
@@ -933,10 +921,10 @@ static void http_client_request_do_submit(struct http_client_request *req)
 	struct http_client *client = req->client;
 	struct http_client_host *host;
 	const char *proxy_socket_path = client->set->proxy_socket_path;
-	const struct http_url *proxy_url = &client->set->proxy_url;
+	const struct http_url *proxy_url = client->set->parsed_proxy_url;
 	bool have_proxy =
 		((proxy_socket_path != NULL && proxy_socket_path[0] != '\0') ||
-		 !http_url_is_empty(proxy_url) ||
+		 (proxy_url != NULL) ||
 		 (req->host_socket != NULL) || (req->host_url != NULL));
 	const char *authority, *target;
 
@@ -996,7 +984,7 @@ static void http_client_request_do_submit(struct http_client_request *req)
 				     req->id, req->method, target);
 
 	/* Update request target */
-	if (req->connect_tunnel || (have_proxy && !req->ssl_tunnel))
+	if (req->connect_tunnel || have_proxy)
 		req->target = p_strdup(req->pool, target);
 
 	if (!have_proxy) {

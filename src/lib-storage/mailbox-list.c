@@ -181,45 +181,14 @@ int mailbox_list_create(struct event *event, struct mail_namespace *ns,
 const char *mailbox_list_get_unexpanded_path(struct mailbox_list *list,
 					     enum mailbox_list_path_type type)
 {
-	const struct mail_storage_settings *set = list->mail_set;
-	const char *path;
-
-	/* Follow the same fallbacks as mailbox_list_default_get_root_path():
-	   an unset path setting falls back to another path setting. */
-	for (;;) {
-		path = set->unexpanded_mailbox_list_path[type];
-		if (path != NULL && path[0] != '\0') {
-			if (set->unexpanded_mailbox_list_override[type]) {
-				/* set using -o or userdb lookup. */
-				return "";
-			}
-			if (type != MAILBOX_LIST_PATH_TYPE_LIST_INDEX ||
-			    path[0] == '/')
-				return path;
-			/* relative mailbox_list_index_prefix is under the
-			   index directory */
-		}
-		switch (type) {
-		case MAILBOX_LIST_PATH_TYPE_DIR:
-		case MAILBOX_LIST_PATH_TYPE_ALT_DIR:
-		case MAILBOX_LIST_PATH_TYPE_INDEX_PRIVATE:
-			return "";
-		case MAILBOX_LIST_PATH_TYPE_MAILBOX:
-		case MAILBOX_LIST_PATH_TYPE_CONTROL:
-		case MAILBOX_LIST_PATH_TYPE_INDEX:
-			type = MAILBOX_LIST_PATH_TYPE_DIR;
-			break;
-		case MAILBOX_LIST_PATH_TYPE_ALT_MAILBOX:
-			type = MAILBOX_LIST_PATH_TYPE_ALT_DIR;
-			break;
-		case MAILBOX_LIST_PATH_TYPE_INDEX_CACHE:
-		case MAILBOX_LIST_PATH_TYPE_LIST_INDEX:
-			type = MAILBOX_LIST_PATH_TYPE_INDEX;
-			break;
-		case MAILBOX_LIST_PATH_TYPE_COUNT:
-			i_unreached();
-		}
+	if (list->mail_set->unexpanded_mailbox_list_override[type]) {
+		/* set using -o or userdb lookup. */
+		return "";
 	}
+	if (list->mail_set->unexpanded_mailbox_list_path[type] != NULL)
+		return list->mail_set->unexpanded_mailbox_list_path[type];
+
+	return "";
 }
 
 static bool need_escape_dirstart(const char *vname, const char *maildir_name)
@@ -1025,7 +994,7 @@ mailbox_list_try_mkdir_root_parent(struct mailbox_list *list,
 	   to get expanded="/var/mail/domain/nn" */
 	unexpanded = mailbox_list_get_unexpanded_path(list, type);
 	p = strrchr(unexpanded, '%');
-	if ((p == unexpanded && str_begins_with(unexpanded, "%{home}")) ||
+	if ((p == unexpanded && p[1] == 'h') ||
 	    (p == NULL && unexpanded[0] == '~')) {
 		/* home directory used */
 		if (!mailbox_list_get_root_path(list, type, &expanded))
@@ -1083,7 +1052,7 @@ mailbox_list_try_mkdir_root_parent(struct mailbox_list *list,
 			perm->gid_origin_is_mailbox_path = FALSE;
 		}
 	} else {
-		/* when using %{home} and the parent has setgid-bit,
+		/* when using %h and the parent has setgid-bit,
 		   copy the permissions from it for the home we're creating */
 		perm->file_create_mode = st.st_mode & 0666;
 		perm->dir_create_mode = st.st_mode;

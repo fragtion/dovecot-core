@@ -4,7 +4,6 @@
 #include "array.h"
 #include "hash-method.h"
 #include "settings.h"
-#include "settings-parser-http-url.h"
 #include "master-service-private.h"
 #include "master-service-settings.h"
 #include "service-settings.h"
@@ -324,7 +323,7 @@ static const struct setting_define auth_setting_defines[] = {
 	DEF(TIME_MSECS, internal_failure_delay),
 
 	{ .type = SET_FILTER_NAME, .key = "auth_policy", },
-	DEF(HTTP_URL_AUTH, policy_server_url),
+	DEF(STR, policy_server_url),
 	DEF(STR, policy_server_api_header),
 	DEF(STR, policy_hash_mech),
 	DEF(STR, policy_hash_nonce),
@@ -384,7 +383,7 @@ static const struct auth_settings auth_default_settings = {
 	.failure_delay = 2,
 	.internal_failure_delay = 2000,
 
-	.policy_server_url = HTTP_URL_INIT_EMPTY,
+	.policy_server_url = "",
 	.policy_server_api_header = "",
 	.policy_hash_mech = "sha256",
 	.policy_hash_nonce = "",
@@ -636,7 +635,7 @@ static bool auth_settings_ext_check(struct event *event, void *_set,
 			set->username_translation_map[(int)(uint8_t)*p] = p[1];
 	}
 
-	if (!http_url_is_empty(&set->policy_server_url)) {
+	if (*set->policy_server_url != '\0') {
 		if (*set->policy_hash_nonce == '\0') {
 
 			*error_r = "auth_policy_hash_nonce must be set when policy server is used";

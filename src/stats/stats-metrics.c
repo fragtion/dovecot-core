@@ -202,24 +202,6 @@ stats_metrics_group_by_exponential_check(const struct stats_metric_group_by_meth
 		*error_r = "metric_group_by_method_exponential_base must be 2 or 10";
 		return FALSE;
 	}
-	if (set->exponential_min_magnitude >= set->exponential_max_magnitude) {
-		*error_r = t_strdup_printf(
-			"metric_group_by_method_exponential_min_magnitude (%u) must be "
-			"smaller than metric_group_by_method_exponential_max_magnitude (%u)",
-			set->exponential_min_magnitude,
-			set->exponential_max_magnitude);
-		return FALSE;
-	}
-	unsigned int max_magnitude =
-		metrics_group_by_exponential_max_magnitude(set->exponential_base);
-	if (set->exponential_max_magnitude > max_magnitude) {
-		*error_r = t_strdup_printf(
-			"metric_group_by_method_exponential_max_magnitude (%u) is too "
-			"large for base %u (maximum %u)",
-			set->exponential_max_magnitude, set->exponential_base,
-			max_magnitude);
-		return FALSE;
-	}
 	return TRUE;
 }
 
@@ -265,19 +247,15 @@ stats_metrics_get_group_by_method(struct event *event, pool_t pool,
 		group_by->discrete_modifier =
 			p_strdup_empty(pool, set->discrete_modifier);
 	} else if (strcmp(set->method, "exponential") == 0) {
-		if (!stats_metrics_group_by_exponential_check(set, error_r)) {
-			settings_free(set);
+		if (!stats_metrics_group_by_exponential_check(set, error_r))
 			return -1;
-		}
 		metrics_group_by_exponential_init(group_by, pool,
 			set->exponential_base,
 			set->exponential_min_magnitude,
 			set->exponential_max_magnitude);
 	} else if (strcmp(set->method, "linear") == 0) {
-		if (!stats_metrics_group_by_linear_check(set, error_r)) {
-			settings_free(set);
+		if (!stats_metrics_group_by_linear_check(set, error_r))
 			return -1;
-		}
 		metrics_group_by_linear_init(group_by, pool,
 			set->linear_min, set->linear_max, set->linear_step);
 	} else {
@@ -527,12 +505,8 @@ void stats_metrics_deinit(struct stats_metrics **_metrics)
 
 	event_exporters_deinit();
 
-	/* metrics->metrics isn't created if stats_metrics_add_from_settings()
-	   failed while still adding the exporters. */
-	if (array_is_created(&metrics->metrics)) {
-		array_foreach_elem(&metrics->metrics, metric)
-			stats_metric_free(metric);
-	}
+	array_foreach_elem(&metrics->metrics, metric)
+		stats_metric_free(metric);
 	event_filter_unref(&metrics->filter);
 	event_unref(&metrics->event);
 	pool_unref(&metrics->pool);

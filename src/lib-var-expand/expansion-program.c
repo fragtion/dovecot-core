@@ -242,8 +242,6 @@ bool var_expand_program_has_variable(const struct var_expand_program *program,
 		return str_array_find(var_expand_program_variables(program), variable);
 
 	const struct var_expand_statement *stmt = program->first;
-	if (stmt == NULL)
-		return FALSE;
 	if (stmt->params == NULL && strcmp(stmt->function, variable) == 0)
 		return TRUE;
 	while (stmt != NULL) {
@@ -255,19 +253,6 @@ bool var_expand_program_has_variable(const struct var_expand_program *program,
 			par = par->next;
 		}
 		stmt = stmt->next;
-	}
-	return FALSE;
-}
-
-bool var_expand_program_has_filter(const struct var_expand_program *program,
-				   const char *filter)
-{
-	const struct var_expand_statement *stmt = program->first;
-	if (stmt == NULL)
-		return FALSE;
-	for (stmt = stmt->next; stmt != NULL; stmt = stmt->next) {
-		if (strcmp(stmt->function, filter) == 0)
-			return TRUE;
 	}
 	return FALSE;
 }
@@ -749,10 +734,8 @@ static int var_expand_program_import_stmt(const char *data, size_t size,
 		}
 	}
 
-	if (size >= 1 && *data != '\t') {
+	if (size < 1 || *data != '\t')
 		*error_r = "Missing parameter statement end";
-		return -1;
-	}
 
 	ADVANCE_INPUT(1);
 

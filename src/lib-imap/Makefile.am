@@ -6,8 +6,7 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib \
 	-I$(top_srcdir)/src/lib-test \
 	-I$(top_srcdir)/src/lib-charset \
-	-I$(top_srcdir)/src/lib-mail \
-	-I$(top_srcdir)/src/lib-url
+	-I$(top_srcdir)/src/lib-mail
 
 libimap_la_SOURCES = \
 	imap-arg.c \
@@ -61,7 +60,6 @@ test_programs = \
 test_libs = \
 	../lib-mail/libmail.la \
 	../lib-charset/libcharset.la \
-	../lib-url/liburl.la \
 	../lib-test/libtest.la \
 	../lib/liblib.la \
 	$(LIBDOVECOT_TEST_LIBS)
@@ -105,7 +103,7 @@ test_imap_utf7_LDADD = imap-utf7.lo $(test_libs)
 test_imap_utf7_DEPENDENCIES = $(test_deps)
 
 test_imap_util_SOURCES = test-imap-util.c
-test_imap_util_LDADD = imap-util.lo imap-arg.lo imap-parser.lo $(test_libs)
+test_imap_util_LDADD = imap-util.lo imap-arg.lo $(test_libs)
 test_imap_util_DEPENDENCIES = $(test_deps)
 
 if USE_FUZZER

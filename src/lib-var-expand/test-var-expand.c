@@ -1009,34 +1009,6 @@ static void test_var_expand_merge_tables(void)
 			break;
 		}
 	}
-
-	/* key collision: b's value must override a's value, and it must
-	   be taken from the colliding entry (b[i]) - not always b[0]. */
-	const struct var_expand_table coll_a[] = {
-		{ .key = "alpha", .value = "1" },
-		{ .key = "beta", .value = "2" },
-		VAR_EXPAND_TABLE_END
-	},
-	coll_b[] = {
-		{ .key = "gamma", .value = "3" },
-		{ .key = "beta", .value = "99" },
-		VAR_EXPAND_TABLE_END
-	};
-	struct var_expand_table *coll_merged =
-		var_expand_merge_tables(pool_datastack_create(),
-					coll_a, coll_b);
-	test_assert(var_expand_table_size(coll_merged) == 3);
-	for (unsigned int i = 0; i < var_expand_table_size(coll_merged); i++) {
-		if (strcmp(coll_merged[i].key, "alpha") == 0)
-			test_assert_strcmp(coll_merged[i].value, "1");
-		else if (strcmp(coll_merged[i].key, "beta") == 0)
-			test_assert_strcmp(coll_merged[i].value, "99");
-		else if (strcmp(coll_merged[i].key, "gamma") == 0)
-			test_assert_strcmp(coll_merged[i].value, "3");
-		else
-			test_assert(FALSE);
-	}
-
 	test_end();
 }
 
@@ -1094,40 +1066,6 @@ static int test_filter(const struct var_expand_statement *stmt,
 	return 0;
 }
 
-
-static void test_var_expand_has_filter(void)
-{
-	static const struct {
-		const char *input;
-		bool safe;
-		bool upper;
-	} tests[] = {
-		{ "%{a}", FALSE, FALSE },
-		{ "%{a|safe}", TRUE, FALSE },
-		{ "%{env:a|safe}", TRUE, FALSE },
-		{ "%{a|upper|safe}", TRUE, TRUE },
-		{ "%{a|upper}", FALSE, TRUE },
-		{ "%{safe}", FALSE, FALSE },
-		{ "%{a|default(safe)}", FALSE, FALSE },
-	};
-
-	test_begin("var_expand_program_has_filter");
-
-	for (unsigned int i = 0; i < N_ELEMENTS(tests); i++) {
-		struct var_expand_program *prog;
-		const char *error;
-
-		test_assert_idx(var_expand_program_create(tests[i].input, &prog,
-							  &error) == 0, i);
-		test_assert_idx(var_expand_program_has_filter(prog, "safe") ==
-				tests[i].safe, i);
-		test_assert_idx(var_expand_program_has_filter(prog, "upper") ==
-				tests[i].upper, i);
-		var_expand_program_free(&prog);
-	}
-
-	test_end();
-}
 
 static void test_var_expand_parameter_sorted(void)
 {
@@ -1757,7 +1695,6 @@ int main(int argc, char *const argv[])
 		test_var_expand_value_func,
 		test_var_expand_value_func_arr,
 		test_var_expand_variables,
-		test_var_expand_has_filter,
 		test_var_expand_parameter_sorted,
 		test_var_expand_perc,
 		test_var_expand_set_copy,

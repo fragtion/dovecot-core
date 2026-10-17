@@ -6,10 +6,6 @@
 #include "ostream-private.h"
 #include "iostream-openssl.h"
 
-/* While the stream is corked, write the buffered data once it fills at least
-   one full TLS record. */
-#define OSTREAM_SSL_CORK_FLUSH_SIZE SSL3_RT_MAX_PLAIN_LENGTH
-
 struct ssl_ostream {
 	struct ostream_private ostream;
 	struct ssl_iostream *ssl_io;
@@ -57,7 +53,7 @@ static size_t get_buffer_avail_size(const struct ssl_ostream *sstream)
 
 static size_t
 o_stream_ssl_buffer(struct ssl_ostream *sstream, const struct const_iovec *iov,
-		    unsigned int iov_count, size_t skip)
+		    unsigned int iov_count)
 {
 	size_t avail, size, bytes_sent = 0;
 
@@ -70,24 +66,12 @@ o_stream_ssl_buffer(struct ssl_ostream *sstream, const struct const_iovec *iov,
 		o_stream_set_flush_pending(sstream->ssl_io->plain_output, TRUE);
 
 	for (unsigned int i = 0; i < iov_count; i++) {
-		const unsigned char *data = iov[i].iov_base;
-		size_t len = iov[i].iov_len;
-
-		/* skip the bytes that were already buffered */
-		if (skip >= len) {
-			skip -= len;
-			continue;
-		}
-		data += skip;
-		len -= skip;
-		skip = 0;
-
-		size = I_MIN(len, avail);
-		buffer_append(sstream->buffer, data, size);
+		size = I_MIN(iov[i].iov_len, avail);
+		buffer_append(sstream->buffer, iov[i].iov_base, size);
 		bytes_sent += size;
 		avail -= size;
 
-		if (size != len)
+		if (size != iov[i].iov_len)
 			break;
 	}
 
@@ -95,22 +79,21 @@ o_stream_ssl_buffer(struct ssl_ostream *sstream, const struct const_iovec *iov,
 	return bytes_sent;
 }
 
-static int o_stream_ssl_flush_buffer(struct ssl_ostream *sstream, size_t size)
+static int o_stream_ssl_flush_buffer(struct ssl_ostream *sstream)
 {
 	struct ssl_iostream *ssl_io = sstream->ssl_io;
 	size_t pos = 0;
 	int ret = 1;
 
 	i_assert(!sstream->shutdown);
-	i_assert(size <= sstream->buffer->used);
 
-	while (pos < size) {
+	while (pos < sstream->buffer->used) {
 		/* we're writing plaintext data to OpenSSL, which it encrypts
 		   and writes to bio_int's buffer. ssl_iostream_bio_sync()
 		   reads it from there and adds to plain_output stream. */
 		ret = SSL_write(ssl_io->ssl,
 				CONST_PTR_OFFSET(sstream->buffer->data, pos),
-				size - pos);
+				sstream->buffer->used - pos);
 		if (ret <= 0) {
 			ret = openssl_iostream_handle_error(
 				ssl_io, ret, OPENSSL_IOSTREAM_SYNC_TYPE_WRITE,
@@ -148,6 +131,7 @@ static int o_stream_ssl_flush(struct ostream_private *stream)
 {
 	struct ssl_ostream *sstream = (struct ssl_ostream *)stream;
 	struct ssl_iostream *ssl_io = sstream->ssl_io;
+	struct ostream *plain_output = ssl_io->plain_output;
 	int ret = 1;
 
 	if (!ssl_io->handshaked) {
@@ -173,7 +157,7 @@ static int o_stream_ssl_flush(struct ostream_private *stream)
 
 	if (ret > 0 && sstream->buffer != NULL && sstream->buffer->used > 0) {
 		/* we can try to send some of our buffered data */
-		ret = o_stream_ssl_flush_buffer(sstream, sstream->buffer->used);
+		ret = o_stream_ssl_flush_buffer(sstream);
 	}
 
 	/* Stream is finished; shutdown the SSL write direction once our buffer
@@ -181,10 +165,6 @@ static int o_stream_ssl_flush(struct ostream_private *stream)
 	if (stream->finished && !sstream->shutdown && ret >= 0 &&
 	    (sstream->buffer == NULL || sstream->buffer->used == 0)) {
 		sstream->shutdown = TRUE;
-		/* SSL_shutdown() only writes the close_notify alert to the
-		   SSL BIO. Write it to plain_output immediately, so the peer
-		   sees the TLS shutdown already now instead of only when the
-		   SSL iostream is destroyed. */
 		if (SSL_shutdown(ssl_io->ssl) < 0) {
 			io_stream_set_error(
 				&sstream->ostream.iostream, "%s",
@@ -192,22 +172,12 @@ static int o_stream_ssl_flush(struct ostream_private *stream)
 						openssl_iostream_error()));
 			sstream->ostream.ostream.stream_errno = EIO;
 			ret = -1;
-		} else if (openssl_iostream_bio_sync(
-				ssl_io, OPENSSL_IOSTREAM_SYNC_TYPE_WRITE) < 0) {
-			i_assert(ssl_io->plain_stream_errno != 0 &&
-				 ssl_io->plain_stream_errstr != NULL);
-			io_stream_set_error(&stream->iostream,
-					    "%s", ssl_io->plain_stream_errstr);
-			stream->ostream.stream_errno =
-				ssl_io->plain_stream_errno;
-			ret = -1;
 		}
 	}
 
 	if (ret == 0 && ssl_io->want_read) {
-		/* We need to read more data until we can continue. The SSL
-		   istream sets the flush pending again after reading input. */
-		o_stream_buffering_flush_wait(stream);
+		/* we need to read more data until we can continue. */
+		o_stream_set_flush_pending(plain_output, FALSE);
 		ssl_io->ostream_flush_waiting_input = TRUE;
 		ret = 1;
 	}
@@ -215,32 +185,9 @@ static int o_stream_ssl_flush(struct ostream_private *stream)
 	if (ret <= 0)
 		return ret;
 
-	/* return 1 only when all the output buffers are empty, which is what
-	   the caller expects. */
-	return o_stream_get_buffer_used_size(&stream->ostream) == 0 ? 1 : 0;
-}
-
-/* The buffer is full, but iov still has more data. Flush the buffer to make
-   room for the rest of the data and buffer it. Stop when flushing makes no
-   more progress. Returns the total number of bytes buffered from iov, or -1
-   on error. */
-static ssize_t
-o_stream_ssl_buffer_rest(struct ssl_ostream *sstream,
-			 const struct const_iovec *iov, unsigned int iov_count,
-			 size_t bytes_sent, size_t total_size)
-{
-	while (bytes_sent < total_size) {
-		size_t prev_used = sstream->buffer->used;
-
-		if (o_stream_ssl_flush_buffer(sstream,
-					      sstream->buffer->used) < 0)
-			return -1;
-		if (sstream->buffer->used == prev_used)
-			break;
-		bytes_sent += o_stream_ssl_buffer(sstream, iov, iov_count,
-						  bytes_sent);
-	}
-	return bytes_sent;
+	/* return 1 only when the output buffer is empty, which is what the
+	   caller expects. */
+	return o_stream_get_buffer_used_size(plain_output) == 0 ? 1 : 0;
 }
 
 static ssize_t
@@ -248,38 +195,17 @@ o_stream_ssl_sendv(struct ostream_private *stream,
 		   const struct const_iovec *iov, unsigned int iov_count)
 {
 	struct ssl_ostream *sstream = (struct ssl_ostream *)stream;
-	size_t total_size = 0, flush_size = 0;
 
 	i_assert(!sstream->shutdown);
 
-	for (unsigned int i = 0; i < iov_count; i++)
-		total_size += iov[i].iov_len;
-
-	size_t bytes_sent = o_stream_ssl_buffer(sstream, iov, iov_count, 0);
-	if (!sstream->ssl_io->handshaked) {
-		/* Nothing can be written before the handshake has finished.
-		   The buffer is flushed afterwards. */
-		return bytes_sent;
+	size_t bytes_sent = o_stream_ssl_buffer(sstream, iov, iov_count);
+	if (sstream->ssl_io->handshaked &&
+	    sstream->buffer->used == bytes_sent) {
+		/* buffer was empty before calling this. try to write it
+		   immediately. */
+		if (o_stream_ssl_flush_buffer(sstream) < 0)
+			return -1;
 	}
-	if (bytes_sent < total_size) {
-		return o_stream_ssl_buffer_rest(sstream, iov, iov_count,
-						bytes_sent, total_size);
-	}
-	if (!stream->corked) {
-		/* If the buffer was empty before calling this, try to write
-		   it immediately. */
-		if (sstream->buffer->used == bytes_sent)
-			flush_size = bytes_sent;
-	} else {
-		/* Corked: Write only full TLS records, so the buffer doesn't
-		   grow without limit. Keep the rest buffered. */
-		size_t used = sstream->buffer->used;
-
-		flush_size = used - used % OSTREAM_SSL_CORK_FLUSH_SIZE;
-	}
-	if (flush_size > 0 &&
-	    o_stream_ssl_flush_buffer(sstream, flush_size) < 0)
-		return -1;
 	return bytes_sent;
 }
 

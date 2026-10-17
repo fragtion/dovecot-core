@@ -90,9 +90,8 @@ int imap_seq_set_nostar_parse(const char *str, ARRAY_TYPE(seq_range) *dest)
 	return 0;
 }
 
-int imap_seq_set_ordered_parse(const char *str, ARRAY_TYPE(seq_range) *dest)
+int imap_seq_set_ordered_parse(const char *str, ARRAY_TYPE(uint32_t) *dest)
 {
-	struct seq_range range;
 	uint32_t seq1, seq2;
 
 	for (;;) {
@@ -107,15 +106,11 @@ int imap_seq_set_ordered_parse(const char *str, ARRAY_TYPE(seq_range) *dest)
 			if (seq2 == 0)
 				return -1;
 		}
-		if (seq1 > seq2) {
-			/* swap, as specified by RFC 5267 section 3.2 */
-			range.seq1 = seq2;
-			range.seq2 = seq1;
-		} else {
-			range.seq1 = seq1;
-			range.seq2 = seq2;
-		}
-		array_push_back(dest, &range);
+		if (seq1 > seq2)
+			return -1;
+
+		for (uint32_t seq = seq1; seq <= seq2; seq++)
+			array_push_back(dest, &seq);
 
 		if (*str == '\0')
 			break;

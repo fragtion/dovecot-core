@@ -61,7 +61,6 @@ static const char *post_login_socket;
 static bool shutting_down = FALSE;
 static bool ssl_connections = FALSE;
 static bool auth_connected_once = FALSE;
-static struct event *login_service_event;
 
 static bool get_first_client(struct client **client_r)
 {
@@ -172,7 +171,7 @@ client_connected(struct master_service_connection *conn)
 	/* make sure we're connected (or attempting to connect) to auth */
 	auth_client_connect(auth_client);
 
-	if (client_alloc(conn->fd, conn, login_service_event, &client) < 0) {
+	if (client_alloc(conn->fd, conn, &client) < 0) {
 		net_disconnect(conn->fd);
 		master_service_client_connection_destroyed(master_service);
 		return;
@@ -195,11 +194,6 @@ client_connected(struct master_service_connection *conn)
 					LOG_TYPE_INFO : LOG_TYPE_WARNING);
 
 	timeout_remove(&auth_client_to);
-
-	/* This may destroy the new client as well, if none of the older
-	   clients can be destroyed. */
-	clients_check_unauthenticated_limit(
-		global_login_settings->login_unauthenticated_client_limit);
 }
 
 static unsigned int
@@ -466,7 +460,6 @@ static void main_deinit(void)
 	dsasl_clients_deinit();
 
 	settings_free(global_login_settings);
-	event_unref(&login_service_event);
 	settings_free(global_ssl_settings);
 	settings_free(global_ssl_server_settings);
 }
@@ -517,14 +510,9 @@ int login_binary_run(struct login_binary *binary,
 	};
 	struct master_service_settings_output output;
 	if (master_service_settings_read(master_service, &input,
-					 &output, &error) < 0)
-		i_fatal("%s", error);
-	/* Use the service filter for both global and client settings */
-	login_service_event =
-		event_create(master_service_get_event(master_service));
-	settings_event_add_list_filter_name(login_service_event, "service",
-		master_service_get_name(master_service));
-	if (settings_get(login_service_event, &login_setting_parser_info,
+					 &output, &error) < 0 ||
+	    settings_get(master_service_get_event(master_service),
+			 &login_setting_parser_info,
 			 SETTINGS_GET_FLAG_NO_EXPAND,
 			 &global_login_settings, &error) < 0)
 		i_fatal("%s", error);

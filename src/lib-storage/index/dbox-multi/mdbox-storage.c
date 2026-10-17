@@ -340,16 +340,6 @@ mdbox_write_index_header(struct mailbox *box,
 	return 0;
 }
 
-static int mdbox_mailbox_create_indexes_prepare(struct mailbox *box)
-{
-	struct mdbox_mailbox *mbox = MDBOX_MAILBOX(box);
-
-	/* The map index must be locked before the mailbox index. Open (and
-	   create) the map already here, because mdbox_write_index_header()
-	   would otherwise do it while the mailbox index is locked. */
-	return mdbox_map_open_or_create(mbox->storage->map);
-}
-
 int mdbox_mailbox_create_indexes(struct mailbox *box,
 				 const struct mailbox_update *update,
 				 struct mail_index_transaction *trans)
@@ -473,15 +463,6 @@ mdbox_mailbox_update(struct mailbox *box, const struct mailbox_update *update)
 	return index_storage_mailbox_update_common(box, update);
 }
 
-static int
-mdbox_list_index_rebuild(struct mail_storage *_storage,
-			 enum mail_storage_list_index_rebuild_reason reason)
-{
-	if (mail_storage_list_index_rebuild(_storage, reason) < 0)
-		return -1;
-	return mdbox_storage_rebuild_deferred(MDBOX_STORAGE(_storage));
-}
-
 struct mail_storage mdbox_storage = {
 	.name = MDBOX_STORAGE_NAME,
 	.class_flags = MAIL_STORAGE_CLASS_FLAG_UNIQUE_ROOT |
@@ -498,7 +479,7 @@ struct mail_storage mdbox_storage = {
 		.autodetect = mdbox_storage_autodetect,
 		.mailbox_alloc = mdbox_mailbox_alloc,
 		.purge = mdbox_purge,
-		.list_index_rebuild = mdbox_list_index_rebuild,
+		.list_index_rebuild = mail_storage_list_index_rebuild,
 	}
 };
 
@@ -553,13 +534,12 @@ struct mailbox mdbox_mailbox = {
 };
 
 struct dbox_storage_vfuncs mdbox_dbox_storage_vfuncs = {
-	.file_unrefed = mdbox_file_unrefed,
-	.file_create_fd = mdbox_file_create_fd,
-	.mail_file_set = mdbox_mail_file_set,
-	.mail_open = mdbox_mail_open,
-	.mailbox_create_indexes_prepare = mdbox_mailbox_create_indexes_prepare,
-	.mailbox_create_indexes = mdbox_mailbox_create_indexes,
-	.get_attachment_path_suffix = mdbox_get_attachment_path_suffix,
-	.set_mailbox_corrupted = mdbox_set_mailbox_corrupted,
-	.set_file_corrupted = mdbox_set_file_corrupted,
+	mdbox_file_unrefed,
+	mdbox_file_create_fd,
+	mdbox_mail_file_set,
+	mdbox_mail_open,
+	mdbox_mailbox_create_indexes,
+	mdbox_get_attachment_path_suffix,
+	mdbox_set_mailbox_corrupted,
+	mdbox_set_file_corrupted
 };

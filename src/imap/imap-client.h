@@ -183,9 +183,6 @@ struct client {
 	struct ostream *output, *pre_rawlog_output, *post_rawlog_output;
 	struct ostream *multiplex_output, *side_channel_output;
 	struct timeout *to_idle, *to_idle_output, *to_delayed_input;
-	/* Hibernate the client when no commands have been running for
-	   imap_hibernate_nonidle_timeout. */
-	struct timeout *to_hibernate;
 	guid_128_t anvil_conn_guid;
 
 	pool_t pool;
@@ -204,9 +201,6 @@ struct client {
 	ARRAY(bool) enabled_features;
 
 	time_t last_input, last_output;
-	/* Time when autoexpunging should be checked again at hibernation,
-	   0 = at the next hibernation. Preserved across hibernations. */
-	time_t autoexpunge_next_check;
 	unsigned int bad_counter;
 
 	/* one parser is kept here to be used for new commands */
@@ -271,9 +265,6 @@ struct client {
 	bool nonpermanent_modseqs:1;
 	bool state_import_bad_idle_done:1;
 	bool state_import_idle_continue:1;
-	/* Unhibernating a client that had no IDLE command running. EXPUNGEs
-	   can't be sent to it. */
-	bool state_import_nonidle:1;
 };
 
 struct imap_module_register {
@@ -294,18 +285,17 @@ extern unsigned int imap_feature_qresync;
 extern unsigned int imap_feature_utf8accept;
 
 /* Create new client with specified input/output handles. socket specifies
-   if the handle is a socket. input_buf contains the input that the login or
-   the imap-hibernate process had already read from the client, or NULL if
-   there is none. */
+   if the handle is a socket. */
 struct client *client_create(int fd_in, int fd_out,
 			     enum client_create_flags flags,
 			     struct event *event, struct mail_user *user,
 			     const struct imap_settings *set,
-			     const struct smtp_submit_settings *smtp_set,
-			     const buffer_t *input_buf);
+			     const struct smtp_submit_settings *smtp_set);
 void client_create_finish_io(struct client *client);
 /* Finish creating the client. Returns 0 if ok, -1 if there's an error. */
 int client_create_finish(struct client *client, const char **error_r);
+void client_add_istream_prefix(struct client *client,
+			       const unsigned char *data, size_t size);
 void client_destroy(struct client *client, const char *reason) ATTR_NULL(2);
 
 /* Add the side-channel ostream used to send commands (e.g. dict_reset) back
@@ -368,21 +358,10 @@ enum mailbox_feature client_enabled_mailbox_features(struct client *client);
 /* Returns all enabled features as strings. */
 const char *const *client_enabled_features(struct client *client);
 
-/* Run autoexpunging before the client is hibernated, if the next check
-   time has been reached. The hibernated session may end without being
-   unhibernated, so the autoexpunging at logout can't be relied on. */
-void imap_client_hibernate_autoexpunge(struct client *client);
-/* Returns the imap_client_hibernated event for a hibernation attempt. */
-struct event_passthrough *imap_client_hibernated_event(struct client *client);
-
 /* Send client processing to imap-idle process. If successful, returns TRUE
    and destroys the client. If hibernation failed, the exact reason is
-   returned (mainly for unit tests). fd_notify is the mailbox notification
-   fd to give to imap-hibernate, or -1 to extract one when IDLE is running in
-   a selected mailbox. The function takes ownership of fd_notify and closes
-   it in all cases. */
-bool imap_client_hibernate(struct client **client, int fd_notify,
-			   const char **reason_r);
+   returned (mainly for unit tests). */
+bool imap_client_hibernate(struct client **client, const char **reason_r);
 
 struct imap_search_update *
 client_search_update_lookup(struct client *client, const char *tag,

@@ -1,8 +1,6 @@
 #ifndef PUSH_NOTIFICATION_SETTINGS_H
 #define PUSH_NOTIFICATION_SETTINGS_H
 
-#include "http-url.h"
-
 /* <settings checks> */
 #define PUSH_NOTIFICATION_SETTINGS_FILTER_NAME "push_notification"
 
@@ -20,9 +18,12 @@ struct push_notification_lua_settings {
 struct push_notification_ox_settings {
 	pool_t pool;
 
-	struct http_url url;
+	const char *url;
 	unsigned int cache_ttl;
 	bool user_from_metadata;
+
+	/* Generated: */
+	struct http_url *parsed_url;
 };
 
 struct push_notification_settings {

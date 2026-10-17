@@ -395,14 +395,10 @@ select_open(struct imap_select_context *ctx, const char *mailbox, bool readonly)
 	if (status.nonpermanent_modseqs) {
 		client_send_line(client,
 				 "* OK [NOMODSEQ] No permanent modsequences");
-	} else {
-		if (!status.no_modseq_tracking) {
-			client_send_line(client, t_strdup_printf(
-				"* OK [HIGHESTMODSEQ %"PRIu64"] Highest",
-				status.highest_modseq));
-		}
-		/* The transaction log tracks modseqs even without the
-		   modseq extension, so this is valid for all mailboxes. */
+	} else if (!status.no_modseq_tracking) {
+		client_send_line(client,
+			t_strdup_printf("* OK [HIGHESTMODSEQ %"PRIu64"] Highest",
+					status.highest_modseq));
 		client->sync_last_full_modseq = status.highest_modseq;
 	}
 

@@ -1,14 +1,8 @@
 #ifndef UNICODE_NF_H
 #define UNICODE_NF_H
 
-#include "unicode-data-tables.h"
-
 #define UNICODE_NF_STREAM_SAFE_NON_STARTER_LEN 30
-/* Space for a starter, the non-starters after it, a CGJ and the longest
-   decomposition */
-#define UNICODE_NF_BUFFER_SIZE \
-	(1 + UNICODE_NF_STREAM_SAFE_NON_STARTER_LEN + 1 + \
-	 UNICODE_DECOMPOSITION_MAX_LENGTH)
+#define UNICODE_NF_BUFFER_SIZE (UNICODE_NF_STREAM_SAFE_NON_STARTER_LEN + 2)
 
 struct unicode_code_point_data;
 
@@ -153,29 +147,20 @@ struct unicode_nf_context {
 	struct unicode_transform transform;
 
 	size_t nonstarter_count;
-	size_t buffer_len;
-	/* Index after the last starter in the buffer. The non-starters after
-	   it may still be reordered. */
-	size_t run_pos;
-	/* NFC/NFKC: [0, composed_pos) has been composed */
-	size_t composed_pos;
-	/* NFC/NFKC: Index of the last starter in [0, composed_pos), if
-	   have_starter=TRUE. The following code points may compose with it. */
-	size_t starter_pos;
-	/* [0, buffer_output_max) is final and can be forwarded */
-	size_t buffer_output_max;
-	/* NFC/NFKC: Combining class of the last code point after starter_pos
-	   that didn't compose with it, or -1 if there is none. */
-	int last_ccc;
-
-	bool compose:1;
-	bool canonical:1;
-	bool have_starter:1;
-
-	/* These are last, so they don't need to be zeroed at init */
 	uint32_t cp_buffer[UNICODE_NF_BUFFER_SIZE];
 	const struct unicode_code_point_data *
 		cpd_buffer[UNICODE_NF_BUFFER_SIZE];
+	size_t buffer_len, buffer_processed, buffer_output_max;
+
+	size_t pending_decomp;
+	uint32_t pending_cp;
+	const struct unicode_code_point_data *pending_cpd;
+
+	uint8_t nf_qc_mask;
+
+	bool compose:1;
+	bool canonical:1;
+	bool finished:1;
 };
 
 void unicode_nf_init(struct unicode_nf_context *ctx_r,
@@ -188,27 +173,19 @@ void unicode_nf_reset(struct unicode_nf_context *ctx);
 
 struct unicode_nf_checker {
 	const struct unicode_code_point_data *cpd_last;
-	/* The last code point, if it's a starter with quick check Yes that
-	   wasn't given to the normalization transform (last_starter=TRUE) */
-	uint32_t last_cp;
 
 	uint8_t nf_qc_mask;
 	uint8_t nf_qc_yes;
 	uint8_t nf_qc_no;
 
-	/* Code points given to the normalization transform that haven't been
-	   compared to its output yet */
 	uint32_t cp_buffer[UNICODE_NF_BUFFER_SIZE];
 	size_t buffer_len;
 	struct unicode_nf_context nf;
 	struct unicode_transform sink;
 
+	bool not_first_cp;
 	bool compose:1;
 	bool canonical:1;
-	bool last_starter:1;
-	/* The normalization transform has been given input since it was
-	   reset */
-	bool nf_used:1;
 };
 
 void unicode_nf_checker_init(struct unicode_nf_checker *unc_r,
@@ -223,48 +200,21 @@ int unicode_nf_checker_finish(struct unicode_nf_checker *unc);
  * Casemap Transform
  */
 
-/* Maximum number of mapped code points buffered by the casemap transform.
-   Final_Sigma: If more case-ignorable code points follow a capital sigma
-   than fit into the buffer after it, it's lowercased as final sigma. */
-#define UNICODE_CASEMAP_BUFFER_SIZE 32
-
 struct unicode_casemap {
 	struct unicode_transform transform;
 
 	size_t (*map)(const struct unicode_code_point_data *cp_data,
 		      const uint32_t **map_r);
 
-	unsigned int buffer_len;
-	/* Final_Sigma: Position of the pending sigma in cp_buffer */
-	unsigned int sigma_pos;
+	uint32_t cp;
+	const struct unicode_code_point_data *cp_data;
+	unsigned int cp_map_pos;
 
-	/* Lowercase a capital sigma to final sigma when it's preceded by a
-	   cased letter and not followed by one (Final_Sigma condition in
-	   SpecialCasing.txt) */
-	bool final_sigma:1;
-	/* Final_Sigma: The last code point that isn't case-ignorable was
-	   cased */
-	bool preceded_by_cased:1;
-	/* Final_Sigma: It's still unknown whether a cased letter follows the
-	   sigma at sigma_pos. It and the code points after it aren't
-	   forwarded until it's known. */
-	bool sigma_pending:1;
-
-	/* Mapped code points that haven't been forwarded yet. These are last,
-	   so they don't need to be zeroed at init. */
-	uint32_t cp_buffer[UNICODE_CASEMAP_BUFFER_SIZE];
-	const struct unicode_code_point_data *
-		cpd_buffer[UNICODE_CASEMAP_BUFFER_SIZE];
+	bool cp_buffered:1;
 };
 
 void unicode_casemap_init_uppercase(struct unicode_casemap *map);
 void unicode_casemap_init_lowercase(struct unicode_casemap *map);
-/* Like unicode_casemap_init_lowercase(), but also handle the Final_Sigma
-   condition like libicu's Any-Lower transliterator. A case-ignorable code
-   point is skipped when checking the condition, even if it's also cased.
-   The condition is checked separately for each string, which ends when the
-   transform is flushed. */
-void unicode_casemap_init_lowercase_final_sigma(struct unicode_casemap *map);
 void unicode_casemap_init_casefold(struct unicode_casemap *map);
 
 /*

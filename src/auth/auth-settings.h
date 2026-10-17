@@ -1,8 +1,6 @@
 #ifndef AUTH_SETTINGS_H
 #define AUTH_SETTINGS_H
 
-#include "http-url.h"
-
 #define AUTH_CACHE_KEY_USER "%{user}"
 
 struct master_service;
@@ -74,7 +72,7 @@ struct auth_settings {
 	unsigned int failure_delay;
 	unsigned int internal_failure_delay;
 
-	struct http_url policy_server_url;
+	const char *policy_server_url;
 	const char *policy_server_api_header;
 	const char *policy_hash_mech;
 	const char *policy_hash_nonce;

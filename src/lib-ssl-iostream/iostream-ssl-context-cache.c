@@ -8,10 +8,6 @@
 struct ssl_iostream_context_cache {
 	bool server;
 	const struct ssl_iostream_settings *set;
-	/* ALPN protocols are a property of the SSL_CTX, so they must be part
-	   of the cache key. Otherwise whoever creates the context first would
-	   decide the ALPN for everybody else using the same settings. */
-	const char *const *application_protocols;
 };
 
 static pool_t ssl_iostream_contexts_pool;
@@ -42,9 +38,6 @@ ssl_iostream_context_cache_hash(const struct ssl_iostream_context_cache *cache)
 			}
 		}
 	}
-	for (n = 0; cache->application_protocols != NULL &&
-	     cache->application_protocols[n] != NULL; n++)
-		h ^= str_hash(cache->application_protocols[n]);
 	return h ^ (cache->server ? 1 : 0);
 }
 
@@ -54,15 +47,11 @@ ssl_iostream_context_cache_cmp(const struct ssl_iostream_context_cache *c1,
 {
 	if (c1->server != c2->server)
 		return -1;
-	if (!ssl_iostream_application_protocols_equals(c1->application_protocols,
-						       c2->application_protocols))
-		return -1;
 	return ssl_iostream_settings_equals(c1->set, c2->set) ? 0 : -1;
 }
 
 static int
 ssl_iostream_context_cache_get(const struct ssl_iostream_settings *set,
-			       const char *const *application_protocols,
 			       bool server,
 			       struct ssl_iostream_context **ctx_r,
 			       const char **error_r)
@@ -72,13 +61,7 @@ ssl_iostream_context_cache_get(const struct ssl_iostream_settings *set,
 	struct ssl_iostream_context_cache lookup = {
 		.server = server,
 		.set = set,
-		.application_protocols = application_protocols,
 	};
-
-	/* The application protocols can be given either via the settings or
-	   via the parameter, but not both. */
-	i_assert(application_protocols == NULL ||
-		 set->application_protocols == NULL);
 
 	if (ssl_iostream_contexts_pool == NULL) {
 		ssl_iostream_contexts_pool =
@@ -104,20 +87,11 @@ ssl_iostream_context_cache_get(const struct ssl_iostream_settings *set,
 		if (ssl_iostream_context_init_client(set, &ctx, error_r) < 0)
 			return -1;
 	}
-	if (application_protocols != NULL) {
-		ssl_iostream_context_set_application_protocols(
-			ctx, application_protocols);
-	}
 
 	cache = p_new(ssl_iostream_contexts_pool,
 		      struct ssl_iostream_context_cache, 1);
 	cache->server = server;
 	cache->set = set;
-	if (application_protocols != NULL) {
-		cache->application_protocols =
-			p_strarray_dup(ssl_iostream_contexts_pool,
-				       application_protocols);
-	}
 	pool_ref(cache->set->pool);
 	hash_table_insert(ssl_iostream_contexts, cache, ctx);
 
@@ -127,35 +101,31 @@ ssl_iostream_context_cache_get(const struct ssl_iostream_settings *set,
 }
 
 int ssl_iostream_client_context_cache_get(const struct ssl_iostream_settings *set,
-					  const char *const *application_protocols,
 					  struct ssl_iostream_context **ctx_r,
 					  const char **error_r)
 {
 	const char *error;
-
-	if (ssl_iostream_context_cache_get(set, application_protocols, FALSE,
-					   ctx_r, &error) < 0) {
+	int ret;
+	if ((ret = ssl_iostream_context_cache_get(set, FALSE, ctx_r, &error)) < 0) {
 		*error_r = t_strdup_printf(
 			"Couldn't initialize SSL client context: %s", error);
 		return -1;
 	}
-	return 0;
+	return ret;
 }
 
 int ssl_iostream_server_context_cache_get(const struct ssl_iostream_settings *set,
-					  const char *const *application_protocols,
 					  struct ssl_iostream_context **ctx_r,
 					  const char **error_r)
 {
 	const char *error;
-
-	if (ssl_iostream_context_cache_get(set, application_protocols, TRUE,
-					   ctx_r, &error) < 0) {
+	int ret;
+	if ((ret = ssl_iostream_context_cache_get(set, TRUE, ctx_r, &error)) < 0) {
 		*error_r = t_strdup_printf(
 			"Couldn't initialize SSL server context: %s", error);
 		return -1;
 	}
-	return 0;
+	return ret;
 }
 
 void ssl_iostream_context_cache_free(void)

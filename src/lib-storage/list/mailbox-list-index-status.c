@@ -690,12 +690,10 @@ static int index_list_update_mailbox(struct mailbox *box)
 		mailbox_set_index_error(box);
 		return -1;
 	}
-	ilist->index_locked = TRUE;
 	/* refresh to latest state of the mailbox now that we're locked */
 	if (mail_index_refresh(box->index) < 0) {
 		mailbox_set_index_error(box);
 		mail_index_sync_rollback(&list_sync_ctx);
-		ilist->index_locked = FALSE;
 		return -1;
 	}
 
@@ -715,9 +713,7 @@ static int index_list_update_mailbox(struct mailbox *box)
 
 	struct mail_index_sync_rec sync_rec;
 	while (mail_index_sync_next(list_sync_ctx, &sync_rec)) ;
-	ret = mail_index_sync_commit(&list_sync_ctx);
-	ilist->index_locked = FALSE;
-	if (ret < 0) {
+	if (mail_index_sync_commit(&list_sync_ctx) < 0) {
 		mailbox_set_index_error(box);
 		return -1;
 	}

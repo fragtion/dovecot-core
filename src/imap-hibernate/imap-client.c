@@ -15,7 +15,6 @@
 #include "base64.h"
 #include "str.h"
 #include "strescape.h"
-#include "str-table.h"
 #include "time-util.h"
 #include "var-expand.h"
 #include "master-service.h"
@@ -29,10 +28,7 @@
 
 #define IMAP_MASTER_SOCKET_NAME "imap-master"
 
-/* IDLE clients need only enough for "DONE\r\n<tag> IDLE\r\n". Non-IDLE
-   clients' input is read only to notice that there is some. Whatever is
-   read is passed to the new imap process, and the rest stays in the
-   socket. */
+/* we only need enough for "DONE\r\n<tag> IDLE\r\n" */
 #define IMAP_MAX_INBUF 12 + 1 + 128 /* DONE\r\nIDLE\r\n + ' ' + <tag> */
 #define IMAP_MAX_OUTBUF 1024
 
@@ -79,7 +75,6 @@ struct imap_client {
 	struct istream *input;
 	struct ostream *output;
 	struct timeout *to_keepalive;
-	struct timeout *to_inactivity;
 	struct imap_master_connection *master_conn;
 	struct ioloop_context *ioloop_ctx;
 	/* Points to imap_hibernate_client.imap_client. Set to NULL when this
@@ -94,8 +89,6 @@ struct imap_client {
 };
 
 static struct imap_client *imap_clients;
-/* The CAPABILITY strings are usually the same for most clients */
-static struct str_table *capability_table;
 static struct priorityq *unhibernate_queue;
 static struct timeout *to_unhibernate;
 static const char imap_still_here_text[] = "* OK Still here\r\n";
@@ -183,10 +176,6 @@ imap_client_move_back_send_callback(void *context, struct ostream *output)
 		str_printfa(str, "\tsession_created=%s",
 			    dec2str(state->session_created));
 	}
-	if (state->autoexpunge_next_check != 0) {
-		str_printfa(str, "\tautoexpunge_next_check=%"PRIdTIME_T,
-			    state->autoexpunge_next_check);
-	}
 	if (state->tag != NULL)
 		str_printfa(str, "\ttag=%s", client->state.tag);
 	if (state->local_ip.family != 0)
@@ -221,10 +210,6 @@ imap_client_move_back_send_callback(void *context, struct ostream *output)
 	if (state->session_pid != NULL) {
 		str_append(str, "\tsession_pid=");
 		str_append_tabescaped(str, state->session_pid);
-	}
-	if (state->capability != NULL) {
-		str_append(str, "\tcapability=");
-		str_append_tabescaped(str, state->capability);
 	}
 	input_data = i_stream_get_data(client->input, &input_size);
 	if (input_size > 0) {
@@ -509,41 +494,9 @@ static void imap_client_input_nonidle(struct imap_client *client)
 	if (i_stream_read(client->input) < 0)
 		imap_client_disconnected(&client);
 	else {
-		timeout_remove(&client->to_inactivity);
 		client->input_pending = TRUE;
 		imap_client_move_back(client);
 	}
-}
-
-static void imap_client_inactivity_timeout(struct imap_client *client)
-{
-	o_stream_nsend_str(client->output,
-			   "* BYE Disconnected for inactivity.\r\n");
-	imap_client_destroy(&client, t_strdup_printf(
-		"Inactivity - no input for %"PRIdTIME_T" secs",
-		ioloop_time - client->state.last_input));
-}
-
-static void imap_client_add_inactivity_timeout(struct imap_client *client)
-{
-	time_t last_input = client->state.last_input;
-	time_t timeout_secs;
-
-	/* last_input is the time of the client's last input in the imap
-	   process, sent in the hibernation state. The timeout counts from it,
-	   so the time the client was already inactive before hibernation is
-	   included. If it's missing (or in the future), the timeout starts
-	   from now. */
-	if (last_input == 0 || last_input > ioloop_time)
-		last_input = ioloop_time;
-	timeout_secs = last_input + IMAP_CLIENT_INACTIVITY_TIMEOUT_SECS -
-		ioloop_time;
-	if (timeout_secs < 0)
-		timeout_secs = 0;
-	client->state.last_input = last_input;
-	client->to_inactivity = timeout_add(timeout_secs * 1000,
-					    imap_client_inactivity_timeout,
-					    client);
 }
 
 static void imap_client_input_notify(struct imap_client *client)
@@ -682,8 +635,8 @@ userdb_fields_get_alt_usernames(const char *const *userdb_fields)
 	return array_front(&alt_usernames);
 }
 
-int imap_client_create(int fd, const struct imap_client_state *state,
-		       struct imap_client **client_r, const char **error_r)
+struct imap_client *
+imap_client_create(int fd, const struct imap_client_state *state)
 {
 	const struct var_expand_provider funcs[] = {
 		{ "userdb", imap_client_var_expand_func_userdb },
@@ -691,13 +644,28 @@ int imap_client_create(int fd, const struct imap_client_state *state,
 	};
 	struct imap_client *client;
 	pool_t pool = pool_alloconly_create("imap client", 256);
+	void *statebuf;
 	const char *error;
 
 	i_assert(state->username != NULL);
 	i_assert(state->mail_log_prefix != NULL);
 
+	fd_set_nonblock(fd, TRUE); /* it should already be, but be sure */
+
 	client = p_new(pool, struct imap_client, 1);
 	client->pool = pool;
+	client->fd = fd;
+	client->input = i_stream_create_fd(fd, IMAP_MAX_INBUF);
+	client->output = o_stream_create_fd(fd, IMAP_MAX_OUTBUF);
+	o_stream_set_no_error_handling(client->output, TRUE);
+	if (state->multiplex_ostream) {
+		struct ostream *output =
+			o_stream_create_multiplex(client->output,
+				IMAP_MAX_OUTBUF,
+				OSTREAM_MULTIPLEX_FORMAT_STREAM_CONTINUE);
+		o_stream_unref(&client->output);
+		client->output = output;
+	}
 	client->state.username = p_strdup(pool, state->username);
 	client->state.session_id = p_strdup(pool, state->session_id);
 	client->state.userdb_fields = p_strdup(pool, state->userdb_fields);
@@ -709,8 +677,6 @@ int imap_client_create(int fd, const struct imap_client_state *state,
 	client->state.local_port = state->local_port;
 	client->state.remote_port = state->remote_port;
 	client->state.session_created = state->session_created;
-	client->state.autoexpunge_next_check = state->autoexpunge_next_check;
-	client->state.last_input = state->last_input;
 
 	client->state.uid = state->uid;
 	client->state.gid = state->gid;
@@ -718,6 +684,7 @@ int imap_client_create(int fd, const struct imap_client_state *state,
 	client->state.peer_dev = state->peer_dev;
 	client->state.peer_ino = state->peer_ino;
 
+	client->state.tag = i_strdup(state->tag);
 	client->state.logout_stats = state->logout_stats;
 
 	guid_128_copy(client->state.anvil_conn_guid, state->anvil_conn_guid);
@@ -744,16 +711,9 @@ int imap_client_create(int fd, const struct imap_client_state *state,
 		event_add_int(client->event, "remote_port", state->remote_port);
 
 	if (state->state_size > 0) {
-		/* Allocate the state separately from the pool. It can be
-		   relatively large, and allocating it from the pool would
-		   often grow the pool to its next (doubled) block size,
-		   which wastes memory for each hibernated client. */
-		client->state.state = i_memdup(state->state, state->state_size);
+		client->state.state = statebuf = p_malloc(pool, state->state_size);
+		memcpy(statebuf, state->state, state->state_size);
 		client->state.state_size = state->state_size;
-	}
-	if (state->capability != NULL) {
-		client->state.capability =
-			str_table_ref(capability_table, state->capability);
 	}
 
 	struct master_service_anvil_session anvil_session = {
@@ -761,7 +721,6 @@ int imap_client_create(int fd, const struct imap_client_state *state,
 		.service_name = master_service_get_name(master_service),
 		.ip = client->state.remote_ip,
 	};
-	int ret = 0;
 	T_BEGIN {
 		/* the imap process sends userdb_fields only if it has any */
 		const char *const *fields = client->state.userdb_fields == NULL ?
@@ -777,56 +736,24 @@ int imap_client_create(int fd, const struct imap_client_state *state,
 
 		str = t_str_new(256);
 		if (var_expand(str, state->mail_log_prefix, &params, &error) < 0) {
-			*error_r = t_strdup_printf(
+			e_error(client->event,
 				"Failed to expand mail_log_prefix=%s: %s",
 				state->mail_log_prefix, error);
-			ret = -1;
-		} else {
-			client->log_prefix = p_strdup(pool, str_c(str));
-			/* the ioloop context isn't active for all of the
-			   logging, e.g. when the client is kicked before it's
-			   finished */
-			event_replace_log_prefix(client->event,
-						 client->log_prefix);
-			anvil_session.alt_usernames =
-				userdb_fields_get_alt_usernames(fields);
-			if (master_service_anvil_connect(master_service,
-					&anvil_session, TRUE,
-					client->state.anvil_conn_guid))
-				client->state.anvil_sent = TRUE;
 		}
-	} T_END_PASS_STR_IF(ret < 0, error_r);
-	if (ret < 0) {
-		e_error(client->event, "%s", *error_r);
-		event_unref(&client->event);
-		i_free(client->state.state);
-		if (client->state.capability != NULL) {
-			str_table_unref(capability_table,
-					&client->state.capability);
-		}
-		pool_unref(&pool);
-		return -1;
-	}
-
-	fd_set_nonblock(fd, TRUE); /* it should already be, but be sure */
-	client->fd = fd;
-	client->input = i_stream_create_fd(fd, IMAP_MAX_INBUF);
-	client->output = o_stream_create_fd(fd, IMAP_MAX_OUTBUF);
-	o_stream_set_no_error_handling(client->output, TRUE);
-	if (state->multiplex_ostream) {
-		struct ostream *output =
-			o_stream_create_multiplex(client->output,
-				IMAP_MAX_OUTBUF,
-				OSTREAM_MULTIPLEX_FORMAT_STREAM_CONTINUE);
-		o_stream_unref(&client->output);
-		client->output = output;
-	}
-	client->state.tag = i_strdup(state->tag);
+		client->log_prefix = p_strdup(pool, str_c(str));
+		/* the ioloop context isn't active for all of the logging,
+		   e.g. when the client is kicked before it's finished */
+		event_replace_log_prefix(client->event, client->log_prefix);
+		anvil_session.alt_usernames =
+			userdb_fields_get_alt_usernames(fields);
+		if (master_service_anvil_connect(master_service, &anvil_session,
+						 TRUE, client->state.anvil_conn_guid))
+			client->state.anvil_sent = TRUE;
+	} T_END;
 
 	p_array_init(&client->notifys, pool, 2);
 	DLLIST_PREPEND(&imap_clients, client);
-	*client_r = client;
-	return 0;
+	return client;
 }
 
 static void imap_client_stop_notify_listening(struct imap_client *client)
@@ -847,7 +774,6 @@ static void imap_client_stop(struct imap_client *client)
 	}
 	io_remove(&client->io);
 	timeout_remove(&client->to_keepalive);
-	timeout_remove(&client->to_inactivity);
 	imap_client_stop_notify_listening(client);
 }
 
@@ -888,9 +814,6 @@ void imap_client_destroy(struct imap_client **_client, const char *reason)
 
 	if (client->state.tag != NULL)
 		i_free(client->state.tag);
-	i_free(client->state.state);
-	if (client->state.capability != NULL)
-		str_table_unref(capability_table, &client->state.capability);
 
 	if (client->shutdown_fd_on_destroy) {
 		if (shutdown(client->fd, SHUT_RDWR) < 0)
@@ -935,14 +858,11 @@ void imap_client_create_finish(struct imap_client *client)
 	if (client->state.idle_cmd) {
 		client->io = io_add(client->fd, IO_READ,
 				    imap_client_input_idle_cmd, client);
-		imap_client_add_idle_keepalive_timeout(client);
 	} else {
-		/* No command is running, so the client isn't expecting any
-		   keepalives. The imap process doesn't send them either. */
 		client->io = io_add(client->fd, IO_READ,
 				    imap_client_input_nonidle, client);
-		imap_client_add_inactivity_timeout(client);
 	}
+	imap_client_add_idle_keepalive_timeout(client);
 
 	array_foreach_modifiable(&client->notifys, notify) {
 		notify->io = io_add(notify->fd, IO_READ,
@@ -1010,7 +930,6 @@ unsigned int imap_clients_kick(const char *user, const guid_128_t conn_guid)
 void imap_clients_init(void)
 {
 	unhibernate_queue = priorityq_init(client_unhibernate_cmp, 64);
-	capability_table = str_table_init();
 }
 
 void imap_clients_deinit(void)
@@ -1020,5 +939,4 @@ void imap_clients_deinit(void)
 
 	timeout_remove(&to_unhibernate);
 	priorityq_deinit(&unhibernate_queue);
-	str_table_deinit(&capability_table);
 }

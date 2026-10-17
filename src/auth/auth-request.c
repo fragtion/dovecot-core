@@ -8,7 +8,6 @@
 #include "hex-binary.h"
 #include "str.h"
 #include "array.h"
-#include "llist.h"
 #include "safe-memset.h"
 #include "str-sanitize.h"
 #include "strescape.h"
@@ -58,9 +57,6 @@ struct auth_policy_check_ctx {
 };
 
 unsigned int auth_request_state_count[AUTH_REQUEST_STATE_MAX];
-
-/* Requests waiting in auth_internal_failure_delay timeout */
-static struct auth_request *auth_requests_delayed_failures = NULL;
 
 static void
 auth_request_userdb_import(struct auth_request *request, const char *args);
@@ -775,43 +771,10 @@ auth_request_get_internal_failure_delay(struct auth_request *request)
 		(delay_msecs < 2 ? 0 : i_rand_limit(delay_msecs / 2));
 }
 
-static void auth_request_delayed_failure_finish(struct auth_request *request)
-{
-	auth_request_delayed_failure_callback_t *callback =
-		request->delayed_failure_callback;
-
-	timeout_remove(&request->to_penalty);
-	DLLIST_REMOVE_FULL(&auth_requests_delayed_failures, request,
-			   delayed_failure_prev, delayed_failure_next);
-	request->delayed_failure_callback = NULL;
-	callback(request);
-}
-
-static void
-auth_request_delay_failure(struct auth_request *request, unsigned int msecs,
-			   auth_request_delayed_failure_callback_t *callback)
-{
-	i_assert(request->to_penalty == NULL);
-	i_assert(request->delayed_failure_callback == NULL);
-
-	auth_request_ref(request);
-	request->delayed_failure_callback = callback;
-	request->to_penalty = timeout_add(msecs,
-		auth_request_delayed_failure_finish, request);
-	DLLIST_PREPEND_FULL(&auth_requests_delayed_failures, request,
-			    delayed_failure_prev, delayed_failure_next);
-}
-
-void auth_requests_flush_delayed_failures(void)
-{
-	while (auth_requests_delayed_failures != NULL) {
-		auth_request_delayed_failure_finish(
-			auth_requests_delayed_failures);
-	}
-}
-
 static void auth_request_passdb_internal_failure(struct auth_request *request)
 {
+	timeout_remove(&request->to_penalty);
+
 	request->passdb_result = PASSDB_RESULT_INTERNAL_FAILURE;
 	if (request->wanted_credentials_scheme != NULL) {
 		request->private_callback.lookup_credentials(
@@ -1087,9 +1050,9 @@ auth_request_finish_passdb_lookup(enum passdb_result *result,
 		unsigned int internal_failure_delay =
 			auth_request_get_internal_failure_delay(request);
 		if (internal_failure_delay > 0) {
-			auth_request_delay_failure(request,
-				internal_failure_delay,
-				auth_request_passdb_internal_failure);
+			auth_request_ref(request);
+			request->to_penalty = timeout_add(internal_failure_delay,
+				auth_request_passdb_internal_failure, request);
 			return -1;
 		}
 	}
@@ -1619,6 +1582,7 @@ auth_request_lookup_user_cache(struct auth_request *request, const char *key,
 
 static void auth_request_userdb_internal_failure(struct auth_request *request)
 {
+	timeout_remove(&request->to_penalty);
 	request->private_callback.userdb(USERDB_RESULT_INTERNAL_FAILURE,
 					 request);
 	auth_request_unref(&request);
@@ -1748,8 +1712,9 @@ void auth_request_userdb_callback(enum userdb_result result,
 
 	i_assert(request->to_penalty == NULL);
 	if (internal_failure_delay > 0) {
-		auth_request_delay_failure(request, internal_failure_delay,
-					   auth_request_userdb_internal_failure);
+		auth_request_ref(request);
+		request->to_penalty = timeout_add(internal_failure_delay,
+			auth_request_userdb_internal_failure, request);
 	} else {
 		request->private_callback.userdb(result, request);
 	}

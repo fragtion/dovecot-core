@@ -3,7 +3,6 @@
 #include "lib.h"
 #include "settings.h"
 #include "settings-parser.h"
-#include "settings-parser-http-url.h"
 #include "fts-solr-settings.h"
 
 #undef DEF
@@ -12,14 +11,14 @@
 
 static const struct setting_define fts_solr_setting_defines[] = {
 	{ .type = SET_FILTER_NAME, .key = FTS_SOLR_FILTER },
-	DEF(HTTP_URL_AUTH, url),
+	DEF(STR,  url),
 	DEF(UINT, batch_size),
 	DEF(BOOL, soft_commit),
 	SETTING_DEFINE_LIST_END
 };
 
 static const struct fts_solr_settings fts_solr_default_settings = {
-	.url               = HTTP_URL_INIT_EMPTY,
+	.url               = "",
 	.batch_size        = 1000,
 	.soft_commit       = TRUE,
 };
@@ -55,7 +54,8 @@ int fts_solr_settings_get(struct event *event,
 	if (settings_get(event, info, 0, set_r, error_r) < 0)
 		return -1;
 
-	if (http_url_is_empty(&(*set_r)->url)) {
+	const char *url = (*set_r)->url;
+	if (*url == '\0') {
 		*error_r = "fts_solr_url is required";
 		settings_free(*set_r);
 		return -1;
