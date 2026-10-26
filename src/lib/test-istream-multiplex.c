@@ -430,6 +430,163 @@ static void test_istream_multiplex_close_channel(void)
 	test_end();
 }
 
+struct test_multiplex_wakeup_ctx;
+
+struct test_multiplex_wakeup_channel {
+	struct test_multiplex_wakeup_ctx *ctx;
+	struct istream *input;
+	struct io *io;
+	string_t *expected, *received;
+};
+
+struct test_multiplex_wakeup_ctx {
+	struct test_multiplex_wakeup_channel channels[2];
+};
+
+static bool
+test_istream_multiplex_wakeup_finished(struct test_multiplex_wakeup_ctx *ctx)
+{
+	for (unsigned int i = 0; i < N_ELEMENTS(ctx->channels); i++) {
+		if (!str_equals(ctx->channels[i].received,
+				ctx->channels[i].expected))
+			return FALSE;
+	}
+	return TRUE;
+}
+
+static void
+test_istream_multiplex_wakeup_input(struct test_multiplex_wakeup_channel *chan)
+{
+	const unsigned char *data;
+	size_t size;
+
+	/* Read only once per IO callback, like doveadm's reader for the
+	   remote's log channel. If data is left behind, the multiplex istream
+	   must make some channel's IO pending again. */
+	(void)i_stream_read(chan->input);
+	data = i_stream_get_data(chan->input, &size);
+	str_append_data(chan->received, data, size);
+	i_stream_skip(chan->input, size);
+
+	if (test_istream_multiplex_wakeup_finished(chan->ctx))
+		io_loop_stop(current_ioloop);
+}
+
+static void
+test_istream_multiplex_wakeup_stalled(struct test_multiplex_wakeup_ctx *ctx)
+{
+	/* The timeouts run before the pending IOs in each ioloop iteration,
+	   and IOs set pending by the IO callbacks are called within the same
+	   iteration. So if no IO is pending here, the channels were left
+	   waiting: the input has no fd that could wake them up anymore. */
+	for (unsigned int i = 0; i < N_ELEMENTS(ctx->channels); i++) {
+		if (io_is_pending(ctx->channels[i].io))
+			return;
+	}
+	io_loop_stop(current_ioloop);
+}
+
+static void
+test_istream_multiplex_wakeup_append(buffer_t *buf, bool packet, uint8_t cid,
+				     const char *data)
+{
+	size_t len = strlen(data);
+
+	if (packet) {
+		uint32_t len_be = cpu32_to_be(len);
+
+		buffer_append_c(buf, cid);
+		buffer_append(buf, &len_be, sizeof(len_be));
+	} else {
+		buffer_append(buf, "\x03\xFE\x00", 3);
+		buffer_append_c(buf, cid);
+	}
+	buffer_append(buf, data, len);
+}
+
+static void test_istream_multiplex_wakeup(bool packet, uint8_t first_cid)
+{
+	/* Log lines in channel 1 interleaved with the end of the main
+	   protocol in channel 0, similar to what a doveadm server sends at the
+	   end of a dsync session. */
+	static const struct {
+		uint8_t cid;
+		const char *data;
+	} input_data[] = {
+		{ 1, "log: Syncing mailbox INBOX\n"
+		     "log: Duplicate file entry\n"
+		     "log: Mail changes sent\n" },
+		{ 0, "mail changes EOL\n" },
+		{ 1, "log: Mail requests sent\n" },
+		{ 0, "mail requests EOL\nmails EOL\n" },
+	};
+	static const size_t bufsizes[] = { 1, 2, 3, 7, 16, 64, SIZE_MAX };
+
+	test_begin(t_strdup_printf("istream multiplex (wakeup, %s, "
+				   "channel %u read first)",
+				   packet ? "packet" : "stream", first_cid));
+
+	struct ioloop *ioloop = io_loop_create();
+	struct test_multiplex_wakeup_ctx ctx;
+	buffer_t *buf = t_buffer_create(256);
+
+	i_zero(&ctx);
+	for (unsigned int i = 0; i < N_ELEMENTS(ctx.channels); i++) {
+		ctx.channels[i].ctx = &ctx;
+		ctx.channels[i].expected = t_str_new(128);
+		ctx.channels[i].received = t_str_new(128);
+	}
+	if (!packet)
+		buffer_append(buf, stream_header, sizeof(stream_header)-1);
+	for (unsigned int i = 0; i < N_ELEMENTS(input_data); i++) {
+		test_istream_multiplex_wakeup_append(buf, packet,
+			input_data[i].cid, input_data[i].data);
+		str_append(ctx.channels[input_data[i].cid].expected,
+			   input_data[i].data);
+	}
+
+	for (unsigned int i = 0; i < N_ELEMENTS(bufsizes); i++) {
+		/* All the data for both channels is read from the parent at
+		   once, and the parent has no fd. After the first channel's
+		   IO is called, only the multiplex istream can wake up the
+		   channels anymore. */
+		struct istream *input =
+			test_istream_create_data(buf->data, buf->used);
+		test_istream_set_allow_eof(input, FALSE);
+		struct istream *chan0 =
+			i_stream_create_multiplex(input, bufsizes[i]);
+		struct istream *chan1 =
+			i_stream_multiplex_add_channel(chan0, 1);
+		ctx.channels[0].input = chan0;
+		ctx.channels[1].input = chan1;
+
+		for (unsigned int j = 0; j < N_ELEMENTS(ctx.channels); j++) {
+			str_truncate(ctx.channels[j].received, 0);
+			ctx.channels[j].io = io_add_istream(
+				ctx.channels[j].input,
+				test_istream_multiplex_wakeup_input,
+				&ctx.channels[j]);
+		}
+		struct timeout *to = timeout_add_short(0,
+			test_istream_multiplex_wakeup_stalled, &ctx);
+		io_set_pending(ctx.channels[first_cid].io);
+		io_loop_run(ioloop);
+		timeout_remove(&to);
+
+		for (unsigned int j = 0; j < N_ELEMENTS(ctx.channels); j++) {
+			test_assert_idx(str_equals(ctx.channels[j].received,
+						   ctx.channels[j].expected),
+					i);
+			io_remove(&ctx.channels[j].io);
+		}
+		i_stream_unref(&chan1);
+		i_stream_unref(&chan0);
+		i_stream_unref(&input);
+	}
+	io_loop_destroy(&ioloop);
+	test_end();
+}
+
 void test_istream_multiplex(void)
 {
 	test_istream_multiplex_packet_simple();
@@ -442,4 +599,8 @@ void test_istream_multiplex(void)
 	test_istream_multiplex_ioloop(FALSE);
 	test_istream_multiplex_ioloop(TRUE);
 	test_istream_multiplex_close_channel();
+	test_istream_multiplex_wakeup(FALSE, 0);
+	test_istream_multiplex_wakeup(FALSE, 1);
+	test_istream_multiplex_wakeup(TRUE, 0);
+	test_istream_multiplex_wakeup(TRUE, 1);
 }

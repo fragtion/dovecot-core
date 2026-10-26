@@ -152,6 +152,12 @@ i_stream_multiplex_add(struct multiplex_ichannel *req_channel,
 		memcpy(stream->w_buffer + stream->pos, data, used);
 		stream->pos += used;
 		*got += used;
+		if (used < wanted) {
+			/* The rest stays in the parent, which the fd won't
+			   notify about anymore. Make sure the reader reads
+			   again, even if it reads only once per IO call. */
+			i_stream_set_input_pending(&stream->istream, TRUE);
+		}
 	}
 	return used;
 }
@@ -413,6 +419,14 @@ static ssize_t i_stream_multiplex_ichannel_read(struct istream_private *stream)
 		ssize_t ret = channel->pending_count;
 		stream->pos += channel->pending_count;
 		channel->pending_count = 0;
+		if (i_stream_get_data_size(mstream->parent) > 0) {
+			/* The parent still has unprocessed data, e.g. because
+			   this channel's buffer got full while another channel
+			   was reading. The fd won't notify about it, and the
+			   other channels may not read again, so this channel's
+			   next read must process it. */
+			i_stream_set_input_pending(&stream->istream, TRUE);
+		}
 		return ret;
 	}
 	switch (mstream->type) {
