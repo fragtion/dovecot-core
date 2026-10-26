@@ -698,11 +698,16 @@ static unsigned int test_maildir_sync_messages(struct mail_user *user)
 	return status.messages;
 }
 
-static void test_maildir_sync_quick_check_run(bool new_symlink)
+static void test_maildir_sync_quick_check_run(bool ignore_new,
+					      bool new_symlink)
 {
 	struct test_mail_storage_ctx *ctx = test_mail_storage_init();
+	const char *const ignore_new_input[] = {
+		"maildir_ignore_new_dir=yes", NULL
+	};
 	struct test_mail_storage_settings set = {
 		.driver = "maildir",
+		.extra_input = ignore_new ? ignore_new_input : NULL,
 	};
 	struct mailbox *box;
 	struct mailbox_status status;
@@ -729,6 +734,8 @@ static void test_maildir_sync_quick_check_run(bool new_symlink)
 	}
 	test_maildir_add_mail(cur_dir, "1000000001.M1P1.test:2,");
 	test_maildir_set_mtime(cur_dir, mtime);
+	if (!new_symlink)
+		test_maildir_set_mtime(new_dir, mtime);
 	mailbox_free(&box);
 
 	/* the first sync scans cur/ */
@@ -760,11 +767,16 @@ static void test_maildir_sync_quick_check_run(bool new_symlink)
 static void test_maildir_sync_quick_check(void)
 {
 	test_begin("maildir sync quick check");
-	test_maildir_sync_quick_check_run(FALSE);
+	test_maildir_sync_quick_check_run(FALSE, FALSE);
 	test_end();
 
-	test_begin("maildir sync quick check (new/ symlinked to cur/)");
-	test_maildir_sync_quick_check_run(TRUE);
+	test_begin("maildir sync quick check (maildir_ignore_new_dir)");
+	test_maildir_sync_quick_check_run(TRUE, FALSE);
+	test_end();
+
+	test_begin("maildir sync quick check "
+		   "(maildir_ignore_new_dir, new/ symlinked to cur/)");
+	test_maildir_sync_quick_check_run(TRUE, TRUE);
 	test_end();
 }
 

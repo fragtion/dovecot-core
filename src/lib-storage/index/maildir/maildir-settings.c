@@ -15,6 +15,7 @@ static const struct setting_define maildir_setting_defines[] = {
 	DEF(BOOL, maildir_very_dirty_syncs),
 	DEF(BOOL, maildir_broken_filename_sizes),
 	DEF(BOOL, maildir_empty_new),
+	DEF(BOOL, maildir_ignore_new_dir),
 
 	SETTING_DEFINE_LIST_END
 };
@@ -23,7 +24,8 @@ static const struct maildir_settings maildir_default_settings = {
 	.maildir_copy_with_hardlinks = TRUE,
 	.maildir_very_dirty_syncs = FALSE,
 	.maildir_broken_filename_sizes = FALSE,
-	.maildir_empty_new = FALSE
+	.maildir_empty_new = FALSE,
+	.maildir_ignore_new_dir = FALSE,
 };
 
 static const struct setting_keyvalue maildir_default_settings_keyvalue[] = {

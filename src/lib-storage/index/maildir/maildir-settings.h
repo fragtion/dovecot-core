@@ -7,6 +7,7 @@ struct maildir_settings {
 	bool maildir_very_dirty_syncs;
 	bool maildir_broken_filename_sizes;
 	bool maildir_empty_new;
+	bool maildir_ignore_new_dir;
 };
 
 extern const struct setting_parser_info maildir_setting_parser_info;

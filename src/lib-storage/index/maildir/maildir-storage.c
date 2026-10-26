@@ -648,6 +648,10 @@ static void maildir_notify_changes(struct mailbox *box)
 	if (box->notify_callback == NULL)
 		mailbox_watch_remove_all(&mbox->box);
 	else {
+		if (!mbox->storage->set->maildir_ignore_new_dir) {
+			mailbox_watch_add(&mbox->box,
+				t_strconcat(box_path, "/new", NULL));
+		}
 		mailbox_watch_add(&mbox->box,
 			t_strconcat(box_path, "/cur", NULL));
 	}
