@@ -30,7 +30,10 @@ changes, moves, copies, expunges, appends, on random nodes at the same
 time), node crash and restart mid-run, `full` topology, delivery
 affinity, and TLS between nodes. After the load stops, all nodes are
 identical within about 3 seconds. Delivery confirmation adds about 80 ms
-per recipient.
+per recipient. Repeated runs of the heaviest scenario (5 nodes, 3 users,
+3 IMAP clients each) found two rare problems, both in section 7: a flag
+mismatch on one mail (about 1 run in 16) and a dsync session stalling
+for 10 minutes (seen only with dsync debug logging).
 
 **Not yet tested anywhere:** separate machines/containers, real network
 latency or loss, network partitions, large mailboxes (10k+ mails, many
@@ -368,6 +371,8 @@ Report:
 - `Expunging failed` or `Couldn't open for expunging` from dsync: a
   deferred expunge couldn't be applied, so the session asked for a full
   resync (deleted mails may come back)
+- a user's syncs failing with `dsync lock failed` for about 10 minutes:
+  a stuck session (see the limitations)
 - `Delivered mail isn't on another node yet` while all peers are up
 - mails missing on some node, duplicated, or coming back after deletion
   (from `doveadm mesh verify` or client observation)
@@ -382,6 +387,19 @@ See also "Limitations and known issues" in the README.
 - Moving a few mails (fewer than 8 and under 512 kB) can still transfer
   them once to each node, when the destination folder is synced before
   the source folder in that session. Larger moves are copied locally.
+- A dsync session over the doveadm TCP connection can stall until dsync's
+  10 minute timeout, holding the user's lock on that node (other syncs
+  of the user fail, deliveries wait `mesh_save_lock_timeout`): dsync data
+  stays buffered in the multiplexed stream that also carries the peer's
+  log lines (`src/lib/istream-multiplex.c`). Seen in about 1 of 25 harness
+  runs with `mesh_dsync_debug = yes`, not yet without it. Everything
+  converges after the timeout. Not fixed yet.
+- In about 1 of 16 harness runs (5 nodes, 3 users, 3 IMAP clients per
+  user moving the same mails around on different nodes) one mail ends up
+  with different flags on two nodes; never a lost or duplicated mail.
+  Same rate with and without `reuse-local-mails`. Keep
+  `mesh_verify_interval` on: the verifier's full sync repairs it. Not
+  fixed yet.
 - Pausing a peer doesn't survive a restart.
 - meson build files don't include the mesh; use autotools.
 - No migration tooling beyond the README's steps (from the Syncthing

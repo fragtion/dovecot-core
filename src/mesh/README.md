@@ -419,6 +419,18 @@ service mesh {
 - With `reuse-local-mails`, moving a few mails (fewer than 8 and under
   512 kB) still transfers them once to each node when the destination
   folder happens to be synced before the source folder in that session.
+- A dsync session over the doveadm TCP connection can occasionally stall
+  until dsync's 10 minute timeout: dsync data stays buffered in the
+  multiplexed stream that also carries the peer's log lines. Meanwhile
+  the user's other syncs on that node fail, and saving mail for the user
+  there waits `mesh_save_lock_timeout` before saving anyway. Everything
+  converges after the timeout. It's more likely with
+  `mesh_dsync_debug = yes`.
+- In about 1 of 16 harness runs with 5 nodes and IMAP clients moving the
+  same mails around on several nodes, one mail ends up with different
+  flags on two nodes (with or without `reuse-local-mails`). The periodic
+  verifier (`mesh_verify_interval`) notices it and starts a full sync,
+  which repairs it.
 - The `full` topology syncs mostly statelessly with more than two nodes.
 - Pausing a peer isn't persistent.
 - The mesh service runs as root (like doveadm), since it uses the
