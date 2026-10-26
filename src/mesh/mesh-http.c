@@ -40,6 +40,27 @@ static struct http_server_resource *mesh_http_resource, *mesh_root_resource;
 static bool mesh_http_no_key_logged = FALSE;
 
 static void mesh_http_conn_destroy(void *context, const char *reason);
+static void
+mesh_http_root_request(void *context, struct http_server_request *req,
+		       const char *sub_path);
+
+/* Browsers send Basic auth with any request to this site, even one that
+   another site made them send. They can't add custom headers to such
+   requests, so require one for changes made with Basic auth. */
+static bool
+mesh_http_csrf_ok(struct http_server_request *req)
+{
+	const struct http_request *hreq = http_server_request_get(req);
+
+	if (strcmp(hreq->method, "GET") == 0 ||
+	    strcmp(hreq->method, "HEAD") == 0)
+		return TRUE;
+	if (http_request_header_get(hreq, "X-Requested-With") != NULL)
+		return TRUE;
+	http_server_request_fail(req, 403,
+		"Forbidden (X-Requested-With header missing)");
+	return FALSE;
+}
 
 static bool mesh_http_authorized(struct http_server_request *req)
 {
@@ -66,7 +87,7 @@ static bool mesh_http_authorized(struct http_server_request *req)
 			p = strchr(data, ':');
 			if (p != NULL &&
 			    str_equals_timing_almost_safe(p + 1, key))
-				return TRUE;
+				return mesh_http_csrf_ok(req);
 		}
 	}
 	http_server_request_fail_auth_basic(req, "Unauthorized",
@@ -394,8 +415,11 @@ mesh_http_resource_request(void *context ATTR_UNUSED,
 		mesh_http_api(req, sub_path);
 		return;
 	}
-	if (strcmp(sub_path, "") == 0 || strcmp(sub_path, "ui") == 0)
-		sub_path = "ui/";
+	if (strcmp(sub_path, "") == 0 || strcmp(sub_path, "ui") == 0) {
+		/* the UI uses relative paths */
+		mesh_http_root_request(NULL, req, sub_path);
+		return;
+	}
 	if (str_begins(sub_path, "ui/", &sub_path)) {
 		if (sub_path[0] == '\0')
 			sub_path = "index.html";
