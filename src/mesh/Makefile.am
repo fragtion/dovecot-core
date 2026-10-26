@@ -55,6 +55,7 @@ noinst_HEADERS = \
 	mesh-ui.h
 
 EXTRA_DIST = \
+	HANDOFF.md \
 	README.md \
 	mesh-route.lua \
 	mesh-ui-gen.pl \
