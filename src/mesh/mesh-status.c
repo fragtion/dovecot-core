@@ -200,6 +200,10 @@ static void mesh_user_json(string_t *dest, const struct mesh_user *user)
 	str_append_c(dest, ',');
 	json_append_num(dest, "last_change", user->last_change);
 	str_append_c(dest, ',');
+	json_append_str(dest, "verify_result", user->verify_result);
+	str_append_c(dest, ',');
+	json_append_num(dest, "verify_time", user->verify_time);
+	str_append_c(dest, ',');
 	json_append_str(dest, "syncing_with",
 			user->running_peer != NULL ? user->running_peer->name :
 			mesh_user_is_leased(user) ? user->lease_peer->name : "");

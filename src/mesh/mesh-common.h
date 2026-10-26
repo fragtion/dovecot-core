@@ -97,6 +97,12 @@ struct mesh_user {
 	/* node the user was anchored to when last checked */
 	const char *anchor;
 	time_t last_change;
+
+	/* last verification: ok, mismatch or error (NULL = never) */
+	time_t verify_time;
+	const char *verify_result;
+	/* consecutive mismatches */
+	unsigned int verify_mismatches;
 };
 HASH_TABLE_DEFINE_TYPE(mesh_user, char *, struct mesh_user *);
 
@@ -111,6 +117,15 @@ extern time_t mesh_start_time;
 void mesh_peers_init(void);
 void mesh_peers_deinit(void);
 struct mesh_peer *mesh_peer_find(const char *name);
+/* GET a path from the peer's mesh service and read the whole body. body is
+   NULL on failure. */
+typedef void mesh_peer_http_get_callback_t(const buffer_t *body,
+					   const char *error, void *context);
+struct mesh_peer_http_get *
+mesh_peer_http_get(struct mesh_peer *peer, const char *path,
+		   unsigned int timeout_msecs,
+		   mesh_peer_http_get_callback_t *callback, void *context);
+void mesh_peer_http_get_abort(struct mesh_peer_http_get **get);
 bool mesh_peer_usable(const struct mesh_peer *peer);
 unsigned int mesh_peers_up_count(void);
 /* Returns the node name of the user's anchor (may be mesh_node_name). */
@@ -164,9 +179,79 @@ unsigned int mesh_queue_pending_count(void);
 unsigned int mesh_queue_running_count(void);
 
 /* mesh-sync.c */
+struct doveadm_client;
 void mesh_sync_start(struct mesh_user *user, struct mesh_peer *peer,
 		     bool full);
 void mesh_sync_deinit(void);
+/* Append src %-encoded for a URL query parameter. */
+void mesh_url_encode(string_t *dest, const char *src);
+/* Connect to the local doveadm server. */
+int mesh_doveadm_client_create(struct doveadm_client **conn_r,
+			       const char **error_r);
+
+/* mesh-verify.c */
+struct mesh_fingerprint;
+struct mesh_fingerprint_request;
+struct mesh_verify;
+
+struct mesh_verify_result_node {
+	const char *name;
+	/* NULL if the node's fingerprint was received */
+	const char *error;
+};
+
+struct mesh_verify_mailbox_node {
+	bool present;
+	unsigned int messages;
+	const char *hash;
+};
+
+struct mesh_verify_mailbox {
+	const char *guid, *name;
+	/* TRUE if all nodes that answered have the same mails */
+	bool match;
+	/* indexed like mesh_verify_result.nodes */
+	struct mesh_verify_mailbox_node *nodes;
+};
+
+struct mesh_verify_result {
+	const char *username;
+	/* ok, mismatch, or error (no differences, but some node failed) */
+	const char *result;
+	/* this node first, then the peers that were up */
+	ARRAY(struct mesh_verify_result_node) nodes;
+	/* differing mailboxes first */
+	ARRAY(struct mesh_verify_mailbox *) mailboxes;
+};
+
+/* fp is NULL on failure. The callback owns fp. */
+typedef void mesh_fingerprint_callback_t(struct mesh_fingerprint *fp,
+					 const char *error, void *context);
+/* result is valid only during the callback */
+typedef void mesh_verify_callback_t(const struct mesh_verify_result *result,
+				    void *context);
+
+/* Compute the user's fingerprint on this node. */
+struct mesh_fingerprint_request *
+mesh_fingerprint_local(const char *username,
+		       mesh_fingerprint_callback_t *callback, void *context);
+void mesh_fingerprint_request_abort(struct mesh_fingerprint_request **req);
+void mesh_fingerprint_export(const struct mesh_fingerprint *fp,
+			     string_t *dest);
+void mesh_fingerprint_free(struct mesh_fingerprint **fp);
+
+/* Compare the user's fingerprints on all nodes that are up. */
+struct mesh_verify *
+mesh_verify_start(const char *username, mesh_verify_callback_t *callback,
+		  void *context);
+/* Don't call the callback anymore; the verification finishes on its own. */
+void mesh_verify_detach(struct mesh_verify **verify);
+void mesh_verify_result_rows(const struct mesh_verify_result *result,
+			     string_t *dest);
+void mesh_verify_result_json(const struct mesh_verify_result *result,
+			     string_t *dest);
+void mesh_verify_init(void);
+void mesh_verify_deinit(void);
 
 /* mesh-state.c */
 void mesh_state_init(void);

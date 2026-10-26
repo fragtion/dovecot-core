@@ -21,6 +21,10 @@
                                        per user and peer sync status, JSON
      GET  /mesh/v1/activity[?limit=<n>]  recent sessions, newest first
      POST /mesh/v1/sync?user=<u>[&full=1]
+     POST /mesh/v1/verify?user=<u>     compare the user's mailboxes on all
+                                       nodes, JSON
+     GET  /mesh/v1/fingerprint?user=<u>  (between nodes) this node's
+                                       fingerprint of the user's mailboxes
      POST /mesh/v1/pause?peer=<p>, /mesh/v1/resume?peer=<p>
      POST /mesh/v1/lease?user=<u>&node=<n>&secs=<s>&gen=<g>&exclusive=<0|1>
      POST /mesh/v1/release?user=<u>&node=<n>&gen=<g>   (between nodes,
@@ -249,6 +253,66 @@ mesh_http_lease(struct http_server_request *req,
 	http_server_response_submit(resp);
 }
 
+/* A request answered once a fingerprint or verification finishes. */
+struct mesh_http_async {
+	struct http_server_request *req;
+	struct mesh_fingerprint_request *fp_req;
+	struct mesh_verify *verify;
+};
+
+static void mesh_http_async_destroyed(struct mesh_http_async *ctx)
+{
+	/* the response was sent, or the client went away */
+	if (ctx->fp_req != NULL)
+		mesh_fingerprint_request_abort(&ctx->fp_req);
+	if (ctx->verify != NULL)
+		mesh_verify_detach(&ctx->verify);
+	http_server_request_unref(&ctx->req);
+	i_free(ctx);
+}
+
+static struct mesh_http_async *
+mesh_http_async_init(struct http_server_request *req)
+{
+	struct mesh_http_async *ctx = i_new(struct mesh_http_async, 1);
+
+	/* answered later, so keep the request */
+	http_server_request_ref(req);
+	ctx->req = req;
+	http_server_request_set_destroy_callback(req,
+		mesh_http_async_destroyed, ctx);
+	return ctx;
+}
+
+static void
+mesh_http_fingerprint_done(struct mesh_fingerprint *fp, const char *error,
+			   struct mesh_http_async *ctx)
+{
+	string_t *body = t_str_new(1024);
+
+	/* sending the response may free ctx */
+	ctx->fp_req = NULL;
+	if (fp == NULL) {
+		str_append(body, error);
+		mesh_http_send(ctx->req, 500, "text/plain", body);
+		return;
+	}
+	mesh_fingerprint_export(fp, body);
+	mesh_fingerprint_free(&fp);
+	mesh_http_send(ctx->req, 200, "text/plain", body);
+}
+
+static void
+mesh_http_verify_done(const struct mesh_verify_result *result,
+		      struct mesh_http_async *ctx)
+{
+	string_t *body = t_str_new(1024);
+
+	ctx->verify = NULL;
+	mesh_verify_result_json(result, body);
+	mesh_http_send_json(ctx->req, body);
+}
+
 struct mesh_http_release {
 	struct http_server_request *req;
 	char *username, *node;
@@ -354,6 +418,25 @@ mesh_http_api(struct http_server_request *req, const char *path)
 		}
 		mesh_users_json(body, &filter);
 		mesh_http_send_json(req, body);
+	} else if ((strcmp(path, "fingerprint") == 0 && is_get) ||
+		   (strcmp(path, "verify") == 0 && is_post)) {
+		struct mesh_http_async *ctx;
+
+		value = mesh_http_query_param(hreq, "user");
+		if (value == NULL || value[0] == '\0') {
+			http_server_request_fail(req, 400, "Missing user");
+			return;
+		}
+		ctx = mesh_http_async_init(req);
+		if (is_get) {
+			ctx->fp_req = mesh_fingerprint_local(value,
+				(mesh_fingerprint_callback_t *)
+				mesh_http_fingerprint_done, ctx);
+		} else {
+			ctx->verify = mesh_verify_start(value,
+				(mesh_verify_callback_t *)
+				mesh_http_verify_done, ctx);
+		}
 	} else if (strcmp(path, "activity") == 0 && is_get) {
 		unsigned int limit = 100;
 

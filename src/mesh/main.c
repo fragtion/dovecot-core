@@ -56,6 +56,7 @@ static void main_init(void)
 	mesh_queue_init();
 	mesh_state_init();
 	mesh_http_init();
+	mesh_verify_init();
 	mesh_queue_startup_sync();
 	i_info("Mesh node %s started: topology=%s, %u peers",
 	       mesh_node_name, mesh_set->mesh_topology,
@@ -64,6 +65,7 @@ static void main_init(void)
 
 static void main_deinit(void)
 {
+	mesh_verify_deinit();
 	mesh_sync_deinit();
 	mesh_state_deinit();
 	mesh_http_deinit();

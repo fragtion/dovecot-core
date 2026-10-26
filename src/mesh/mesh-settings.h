@@ -39,6 +39,7 @@ struct mesh_settings {
 	unsigned int mesh_full_sync_interval;
 	unsigned int mesh_sync_timeout;
 	unsigned int mesh_max_parallel_syncs;
+	unsigned int mesh_verify_interval;
 	bool mesh_dsync_debug;
 
 	/* generated: */

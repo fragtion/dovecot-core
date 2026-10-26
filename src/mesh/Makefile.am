@@ -29,7 +29,8 @@ mesh_SOURCES = \
 	mesh-state.c \
 	mesh-status.c \
 	mesh-sync.c \
-	mesh-ui.c
+	mesh-ui.c \
+	mesh-verify.c
 
 nodist_mesh_SOURCES = \
 	mesh-ui-data.c

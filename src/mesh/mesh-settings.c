@@ -112,6 +112,7 @@ static const struct setting_define mesh_setting_defines[] = {
 	DEF(TIME, mesh_full_sync_interval),
 	DEF(TIME, mesh_sync_timeout),
 	DEF(UINT, mesh_max_parallel_syncs),
+	DEF(TIME, mesh_verify_interval),
 	DEF(BOOL, mesh_dsync_debug),
 
 	SETTING_DEFINE_LIST_END
@@ -133,6 +134,7 @@ static const struct mesh_settings mesh_default_settings = {
 	.mesh_full_sync_interval = 24*60*60,
 	.mesh_sync_timeout = 10*60,
 	.mesh_max_parallel_syncs = 4,
+	.mesh_verify_interval = 0,
 	.mesh_dsync_debug = FALSE,
 };
 

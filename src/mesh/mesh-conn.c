@@ -20,11 +20,14 @@
      USERS [<user>]
      SYNC <user> [full]
      PAUSE <peer>
-     RESUME <peer> */
+     RESUME <peer>
+     VERIFY <user>   (rows as in mesh_verify_result_rows()) */
 
 struct mesh_conn {
 	struct connection conn;
 	bool admin;
+	/* VERIFY is running; input is halted until it finishes */
+	struct mesh_verify *verify;
 };
 
 static struct connection_list *mesh_notify_conns, *mesh_admin_conns;
@@ -131,6 +134,20 @@ static void mesh_admin_users(string_t *str, const char *username)
 	hash_table_iterate_deinit(&iter);
 }
 
+static void
+mesh_admin_verify_done(const struct mesh_verify_result *result,
+		       struct mesh_conn *mconn)
+{
+	string_t *str = t_str_new(1024);
+
+	mconn->verify = NULL;
+	str_append(str, "+OK\n");
+	mesh_verify_result_rows(result, str);
+	str_append_c(str, '\n');
+	o_stream_nsend(mconn->conn.output, str_data(str), str_len(str));
+	connection_input_resume(&mconn->conn);
+}
+
 static void mesh_admin_cmd(string_t *str, const char *const *args)
 {
 	struct mesh_peer *peer;
@@ -170,11 +187,20 @@ static void mesh_admin_cmd(string_t *str, const char *const *args)
 static int mesh_admin_input_args(struct connection *conn,
 				 const char *const *args)
 {
+	struct mesh_conn *mconn = container_of(conn, struct mesh_conn, conn);
 	string_t *str = t_str_new(1024);
 
 	if (args[0] == NULL) {
 		e_error(conn->event, "Empty command");
 		return -1;
+	}
+	if (strcmp(args[0], "VERIFY") == 0 && args[1] != NULL) {
+		/* answered when all nodes have replied */
+		connection_input_halt(conn);
+		mconn->verify = mesh_verify_start(args[1],
+			(mesh_verify_callback_t *)mesh_admin_verify_done,
+			mconn);
+		return 1;
 	}
 	mesh_admin_cmd(str, args);
 	str_append_c(str, '\n');
@@ -186,6 +212,8 @@ static void mesh_conn_destroy(struct connection *conn)
 {
 	struct mesh_conn *mconn = container_of(conn, struct mesh_conn, conn);
 
+	if (mconn->verify != NULL)
+		mesh_verify_detach(&mconn->verify);
 	connection_deinit(conn);
 	i_free(mconn);
 	master_service_client_connection_destroyed(master_service);

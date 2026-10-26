@@ -45,7 +45,7 @@ struct mesh_sync {
 
 static struct mesh_sync *mesh_syncs;
 
-static void mesh_url_encode(string_t *dest, const char *src)
+void mesh_url_encode(string_t *dest, const char *src)
 {
 	for (; *src != '\0'; src++) {
 		if (i_isalnum(*src) || strchr("-._~", *src) != NULL)
@@ -205,7 +205,7 @@ static void mesh_sync_timeout(struct mesh_sync *sync)
 			 "Timed out (mesh_sync_timeout)");
 }
 
-static const char *mesh_sync_get_socket_path(void)
+static const char *mesh_doveadm_get_socket_path(void)
 {
 	const char *path = mesh_set->mesh_doveadm_socket_path;
 
@@ -213,6 +213,20 @@ static const char *mesh_sync_get_socket_path(void)
 		return path;
 	return t_strconcat(master_service_get_service_settings(master_service)->base_dir,
 			   "/", path, NULL);
+}
+
+int mesh_doveadm_client_create(struct doveadm_client **conn_r,
+			       const char **error_r)
+{
+	/* The doveadm-server socket is mode 0600, which the doveadm server
+	   treats as preauthenticated, so no real credentials are needed. */
+	struct doveadm_client_settings set = {
+		.socket_path = mesh_doveadm_get_socket_path(),
+		.username = "doveadm",
+		.password = "",
+	};
+
+	return doveadm_client_create(&set, conn_r, error_r);
 }
 
 static const char *mesh_sync_build_cmd(struct mesh_sync *sync)
@@ -246,19 +260,12 @@ static const char *mesh_sync_build_cmd(struct mesh_sync *sync)
 
 static void mesh_sync_run_doveadm(struct mesh_sync *sync)
 {
-	/* The doveadm-server socket is mode 0600, which the doveadm server
-	   treats as preauthenticated, so no real credentials are needed. */
-	struct doveadm_client_settings set = {
-		.socket_path = mesh_sync_get_socket_path(),
-		.username = "doveadm",
-		.password = "",
-	};
 	struct doveadm_client_cmd_settings cmd_set = {
 		.proxy_ttl = DOVEADM_PROXY_TTL,
 	};
 	const char *error;
 
-	if (doveadm_client_create(&set, &sync->conn, &error) < 0) {
+	if (mesh_doveadm_client_create(&sync->conn, &error) < 0) {
 		mesh_sync_finish(sync, DOVEADM_EX_UNKNOWN, t_strdup_printf(
 			"Couldn't connect to doveadm server: %s", error));
 		return;

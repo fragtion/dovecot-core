@@ -5,6 +5,8 @@
 #include "str.h"
 #include "sha1.h"
 #include "time-util.h"
+#include "istream.h"
+#include "settings.h"
 #include "http-client.h"
 #include "http-response.h"
 #include "master-service.h"
@@ -154,6 +156,102 @@ mesh_peer_http_request(struct mesh_peer *peer, const char *method,
 	return req;
 }
 
+struct mesh_peer_http_get {
+	struct http_client_request *req;
+	struct istream *payload;
+	struct io *io;
+	buffer_t *body;
+	unsigned int status;
+
+	mesh_peer_http_get_callback_t *callback;
+	void *context;
+};
+
+static void mesh_peer_http_get_free(struct mesh_peer_http_get *get)
+{
+	io_remove(&get->io);
+	i_stream_unref(&get->payload);
+	buffer_free(&get->body);
+	i_free(get);
+}
+
+static void
+mesh_peer_http_get_finish(struct mesh_peer_http_get *get, const char *error)
+{
+	get->callback(error == NULL ? get->body : NULL, error, get->context);
+	mesh_peer_http_get_free(get);
+}
+
+static void mesh_peer_http_get_input(struct mesh_peer_http_get *get)
+{
+	const unsigned char *data;
+	size_t size;
+	int ret;
+
+	while ((ret = i_stream_read_more(get->payload, &data, &size)) > 0) {
+		buffer_append(get->body, data, size);
+		i_stream_skip(get->payload, size);
+	}
+	if (ret == 0)
+		return;
+	if (get->payload->stream_errno != 0) {
+		mesh_peer_http_get_finish(get, t_strdup_printf(
+			"read(%s) failed: %s", i_stream_get_name(get->payload),
+			i_stream_get_error(get->payload)));
+	} else {
+		mesh_peer_http_get_finish(get, NULL);
+	}
+}
+
+static void
+mesh_peer_http_get_response(const struct http_response *resp,
+			    struct mesh_peer_http_get *get)
+{
+	get->req = NULL;
+	if (resp->status / 100 != 2) {
+		mesh_peer_http_get_finish(get, t_strdup_printf(
+			"%u %s", resp->status, resp->reason));
+		return;
+	}
+	if (resp->payload == NULL) {
+		mesh_peer_http_get_finish(get, NULL);
+		return;
+	}
+	get->payload = resp->payload;
+	i_stream_ref(get->payload);
+	get->io = io_add_istream(get->payload, mesh_peer_http_get_input, get);
+	mesh_peer_http_get_input(get);
+}
+
+struct mesh_peer_http_get *
+mesh_peer_http_get(struct mesh_peer *peer, const char *path,
+		   unsigned int timeout_msecs,
+		   mesh_peer_http_get_callback_t *callback, void *context)
+{
+	struct mesh_peer_http_get *get;
+
+	get = i_new(struct mesh_peer_http_get, 1);
+	get->body = buffer_create_dynamic(default_pool, 1024);
+	get->callback = callback;
+	get->context = context;
+	get->req = mesh_peer_http_request(peer, "GET", path,
+		(void (*)(const struct http_response *, void *))
+		mesh_peer_http_get_response, get);
+	http_client_request_set_timeout_msecs(get->req, timeout_msecs);
+	http_client_request_submit(get->req);
+	return get;
+}
+
+void mesh_peer_http_get_abort(struct mesh_peer_http_get **_get)
+{
+	struct mesh_peer_http_get *get = *_get;
+
+	*_get = NULL;
+	if (get->req != NULL)
+		http_client_request_abort(&get->req);
+	mesh_peer_http_get_free(get);
+}
+
 struct mesh_peer *mesh_peer_find(const char *name)
 {
 	struct mesh_peer *peer;
@@ -229,6 +327,8 @@ struct mesh_peer *mesh_anchor_peer(const char *username)
 void mesh_peers_init(void)
 {
 	const struct mesh_peer_settings *peer_set;
+	const struct http_client_settings *http_set;
+	struct http_client_settings *set;
 	struct mesh_peer *peer;
 	const char *error;
 
@@ -247,9 +347,20 @@ void mesh_peers_init(void)
 	if (array_count(&mesh_peers) == 0)
 		i_info("No mesh_peer configured - nothing to replicate to");
 
-	if (http_client_init_auto(master_service_get_event(master_service),
-				  &mesh_http_client, &error) < 0)
-		i_fatal("http_client_init() failed: %s", error);
+	if (settings_get(master_service_get_event(master_service),
+			 &http_client_setting_parser_info, 0,
+			 &http_set, &error) < 0)
+		i_fatal("http_client settings: %s", error);
+	/* Requests to a peer shouldn't wait for each other: heartbeats must
+	   not be delayed by a slow fingerprint request, or the peer looks
+	   down. The client keeps a reference to the settings pool. */
+	set = p_new(http_set->pool, struct http_client_settings, 1);
+	*set = *http_set;
+	set->max_parallel_connections =
+		I_MAX(set->max_parallel_connections, 4);
+	mesh_http_client = http_client_init(set,
+		master_service_get_event(master_service));
+	settings_free(http_set);
 	mesh_heartbeat_to = timeout_add(mesh_set->mesh_heartbeat_interval,
 					mesh_heartbeat_timeout, NULL);
 	mesh_heartbeat_timeout(NULL);
