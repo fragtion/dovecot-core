@@ -36,6 +36,7 @@ static struct doveadm_cmd_ver2 *doveadm_commands_ver2[] = {
 	&doveadm_cmd_mesh_peers,
 	&doveadm_cmd_mesh_users,
 	&doveadm_cmd_mesh_sync,
+	&doveadm_cmd_mesh_verify,
 	&doveadm_cmd_mesh_pause,
 	&doveadm_cmd_mesh_resume,
 };

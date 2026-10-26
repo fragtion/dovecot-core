@@ -66,6 +66,7 @@ extern struct doveadm_cmd_ver2 doveadm_cmd_mesh_status;
 extern struct doveadm_cmd_ver2 doveadm_cmd_mesh_peers;
 extern struct doveadm_cmd_ver2 doveadm_cmd_mesh_users;
 extern struct doveadm_cmd_ver2 doveadm_cmd_mesh_sync;
+extern struct doveadm_cmd_ver2 doveadm_cmd_mesh_verify;
 extern struct doveadm_cmd_ver2 doveadm_cmd_mesh_pause;
 extern struct doveadm_cmd_ver2 doveadm_cmd_mesh_resume;
 

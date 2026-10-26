@@ -17,7 +17,8 @@
    "-ERR <error>", then zero or more tab-separated rows, then an empty
    line. */
 #define MESH_SOCKET_NAME "mesh"
-#define MESH_REPLY_TIMEOUT_SECS 30
+/* VERIFY waits for every node to fingerprint the user's mailboxes */
+#define MESH_REPLY_TIMEOUT_SECS (6*60)
 
 struct mesh_cmd_field {
 	const char *name;
@@ -219,6 +220,62 @@ static void cmd_mesh_sync(struct doveadm_cmd_context *cctx)
 	(void)mesh_cmd(cctx, args, &rows);
 }
 
+/* Rows: R <result> <user>, N <node> <error>, then
+   M <mailbox> <guid> <match|differs> <cell for each node>. */
+static void cmd_mesh_verify(struct doveadm_cmd_context *cctx)
+{
+	const char *user, *row, *const *args, *result = NULL;
+	ARRAY_TYPE(const_string) rows, nodes;
+	unsigned int i, node_count;
+
+	if (!doveadm_cmd_param_str(cctx, "user", &user))
+		help_ver2(&doveadm_cmd_mesh_verify);
+	const char *const cmd_args[] = { "VERIFY", user, NULL };
+	if (mesh_cmd(cctx, cmd_args, &rows) < 0)
+		return;
+
+	t_array_init(&nodes, 8);
+	array_foreach_elem(&rows, row) {
+		args = t_strsplit_tabescaped(row);
+		if (strcmp(args[0], "R") == 0)
+			result = t_strdup(args[1]);
+		else if (strcmp(args[0], "N") == 0 && args[1] != NULL) {
+			array_push_back(&nodes, &args[1]);
+			if (args[2] != NULL && args[2][0] != '\0') {
+				e_error(cctx->event, "%s: %s", args[1],
+					args[2]);
+			}
+		}
+	}
+	if (result == NULL)
+		i_fatal("mesh: Unexpected VERIFY reply");
+
+	node_count = array_count(&nodes);
+	doveadm_print_init(DOVEADM_PRINT_TYPE_TABLE);
+	doveadm_print_header_simple("mailbox");
+	doveadm_print_header_simple("status");
+	for (i = 0; i < node_count; i++) {
+		const char *name = array_idx_elem(&nodes, i);
+		doveadm_print_header(name, name, 0);
+	}
+	array_foreach_elem(&rows, row) {
+		args = t_strsplit_tabescaped(row);
+		if (strcmp(args[0], "M") != 0 ||
+		    str_array_length(args) < 4 + node_count)
+			continue;
+		doveadm_print(args[1]);
+		doveadm_print(args[3]);
+		for (i = 0; i < node_count; i++)
+			doveadm_print(args[4 + i]);
+	}
+
+	if (strcmp(result, "mismatch") == 0) {
+		e_error(cctx->event, "%s differs between nodes", user);
+		doveadm_exit_code = EX_DATAERR;
+	} else if (strcmp(result, "error") == 0)
+		doveadm_exit_code = EX_TEMPFAIL;
+}
+
 static void cmd_mesh_pause_resume(struct doveadm_cmd_context *cctx,
 				  const char *cmd,
 				  struct doveadm_cmd_ver2 *help_cmd)
@@ -273,6 +330,15 @@ struct doveadm_cmd_ver2 doveadm_cmd_mesh_sync = {
 	.usage = "[-f] <user>",
 DOVEADM_CMD_PARAMS_START
 DOVEADM_CMD_PARAM('f', "full", CMD_PARAM_BOOL, 0)
+DOVEADM_CMD_PARAM('\0', "user", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAMS_END
+};
+
+struct doveadm_cmd_ver2 doveadm_cmd_mesh_verify = {
+	.cmd = cmd_mesh_verify,
+	.name = "mesh verify",
+	.usage = "<user>",
+DOVEADM_CMD_PARAMS_START
 DOVEADM_CMD_PARAM('\0', "user", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
 DOVEADM_CMD_PARAMS_END
 };
