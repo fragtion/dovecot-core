@@ -4,6 +4,7 @@
 #include "net.h"
 #include "str.h"
 #include "strescape.h"
+#include "time-util.h"
 #include "ostream.h"
 #include "file-lock.h"
 #include "settings.h"
@@ -15,6 +16,8 @@
 #include "mesh-plugin.h"
 
 #include <fcntl.h>
+#include <unistd.h>
+#include <poll.h>
 
 #define MESH_USER_CONTEXT(obj) \
 	MODULE_CONTEXT(obj, mesh_user_module)
@@ -32,6 +35,7 @@ struct mesh_plugin_settings {
 	const char *mesh_notify_socket_path;
 	unsigned int mesh_save_lock_timeout;
 	unsigned int mesh_dsync_lock_timeout;
+	unsigned int mesh_delivery_sync_timeout;
 };
 
 enum mesh_priority {
@@ -51,6 +55,13 @@ struct mesh_user {
 	const char *dsync_lock_error;
 
 	struct ostream *notify_output;
+	/* replies to WAIT */
+	string_t *notify_input;
+	unsigned int last_wait_id;
+	/* number of transactions notified, see mesh_transaction_commit() */
+	unsigned int notified_count;
+	/* the next transaction was already notified */
+	bool skip_next_notify:1;
 	bool notify_connect_failed:1;
 };
 
@@ -77,6 +88,7 @@ static const struct setting_define mesh_plugin_setting_defines[] = {
 	DEF(STR, mesh_notify_socket_path),
 	DEF(TIME, mesh_save_lock_timeout),
 	DEF(TIME, mesh_dsync_lock_timeout),
+	DEF(TIME_MSECS, mesh_delivery_sync_timeout),
 
 	SETTING_DEFINE_LIST_END
 };
@@ -85,6 +97,7 @@ static const struct mesh_plugin_settings mesh_plugin_default_settings = {
 	.mesh_notify_socket_path = "mesh-notify",
 	.mesh_save_lock_timeout = 30,
 	.mesh_dsync_lock_timeout = 10,
+	.mesh_delivery_sync_timeout = 2*1000,
 };
 
 const struct setting_parser_info mesh_plugin_setting_parser_info = {
@@ -159,6 +172,111 @@ static void mesh_notify(struct mail_user *user, enum mesh_priority priority)
 	}
 }
 
+/* Read the mesh service's reply to WAIT <id>. Returns the result, or NULL
+   on timeout or error. */
+static const char *
+mesh_delivery_wait_reply(struct mail_user *user, struct mesh_user *muser,
+			 const char *id, unsigned int timeout_msecs)
+{
+	int fd = o_stream_get_fd(muser->notify_output);
+	struct pollfd pfd = { .fd = fd, .events = POLLIN };
+	const char *line, *p, *const *args;
+	struct timeval start, now;
+	char buf[256];
+	long long elapsed;
+	ssize_t ret;
+
+	i_gettimeofday(&start);
+	for (;;) {
+		/* complete lines: DONE <id> <result> */
+		while ((p = strchr(str_c(muser->notify_input), '\n')) != NULL) {
+			line = t_strdup_until(str_c(muser->notify_input), p);
+			str_delete(muser->notify_input, 0,
+				   p - str_c(muser->notify_input) + 1);
+			args = t_strsplit_tabescaped(line);
+			/* skip replies to earlier waits that timed out */
+			if (str_array_length(args) >= 3 &&
+			    strcmp(args[0], "DONE") == 0 &&
+			    strcmp(args[1], id) == 0)
+				return t_strdup(args[2]);
+		}
+
+		i_gettimeofday(&now);
+		elapsed = timeval_diff_msecs(&now, &start);
+		if (elapsed >= timeout_msecs)
+			return NULL;
+		ret = poll(&pfd, 1, timeout_msecs - elapsed);
+		if (ret < 0 && errno != EINTR) {
+			e_error(user->event, "mesh: poll() failed: %m");
+			return NULL;
+		}
+		if (ret <= 0)
+			continue;
+		ret = read(fd, buf, sizeof(buf));
+		if (ret > 0)
+			str_append_data(muser->notify_input, buf, ret);
+		else if (ret == 0 || (errno != EAGAIN && errno != EINTR)) {
+			e_debug(user->event, "mesh: read(%s) failed: %s",
+				o_stream_get_name(muser->notify_output),
+				ret == 0 ? "EOF" : strerror(errno));
+			o_stream_destroy(&muser->notify_output);
+			return NULL;
+		}
+	}
+}
+
+/* Mail was delivered: don't confirm it until it's on another node too, so
+   that losing this node right away doesn't lose the mail. The wait is
+   limited by mesh_delivery_sync_timeout, so a slow or broken mesh only
+   slows deliveries down. */
+static void mesh_delivery_wait(struct mail_user *user)
+{
+	struct mesh_user *muser = MESH_USER_CONTEXT(user);
+	unsigned int timeout_msecs;
+	const char *id, *result;
+	struct timeval start, end;
+	string_t *str;
+
+	if (muser == NULL || muser->notify_output == NULL)
+		return;
+	timeout_msecs = muser->set->mesh_delivery_sync_timeout;
+	if (timeout_msecs == 0)
+		return;
+
+	id = dec2str(++muser->last_wait_id);
+	str = t_str_new(128);
+	str_printfa(str, "WAIT\t%s\t", id);
+	str_append_tabescaped(str, user->username);
+	str_append_c(str, '\n');
+	o_stream_nsend(muser->notify_output, str_data(str), str_len(str));
+	if (o_stream_flush(muser->notify_output) < 0) {
+		o_stream_destroy(&muser->notify_output);
+		return;
+	}
+	if (muser->notify_input == NULL)
+		muser->notify_input = str_new(default_pool, 128);
+
+	i_gettimeofday(&start);
+	result = mesh_delivery_wait_reply(user, muser, id, timeout_msecs);
+	i_gettimeofday(&end);
+	if (result == NULL) {
+		e_warning(user->event, "mesh: Delivered mail isn't on another "
+			  "node yet after %u ms - not waiting longer",
+			  timeout_msecs);
+	} else {
+		e_debug(user->event, "mesh: Delivered mail replicated in "
+			"%lld ms (%s)", timeval_diff_msecs(&end, &start),
+			result);
+	}
+}
+
+static bool mesh_user_is_delivery(struct mail_user *user)
+{
+	return user->service != NULL &&
+		(strcmp(user->service, "lmtp") == 0 ||
+		 strcmp(user->service, "lda") == 0);
+}
+
 static void *mesh_mail_transaction_begin(struct mailbox_transaction_context *t)
 {
 	struct mesh_transaction *mt = i_new(struct mesh_transaction, 1);
@@ -209,8 +327,14 @@ mesh_mail_transaction_commit(void *txn,
 			     struct mail_transaction_commit_changes *changes ATTR_UNUSED)
 {
 	struct mesh_transaction *mt = txn;
+	struct mesh_user *muser = MESH_USER_CONTEXT(mt->user);
 
-	mesh_notify(mt->user, mt->priority);
+	if (muser != NULL && muser->skip_next_notify)
+		muser->skip_next_notify = FALSE;
+	else
+		mesh_notify(mt->user, mt->priority);
+	if (muser != NULL)
+		muser->notified_count++;
 	i_free(mt);
 }
 
@@ -366,11 +490,13 @@ mesh_transaction_commit(struct mailbox_transaction_context *t,
 	struct mail_user *user = box->storage->user;
 	struct mesh_user *muser = MESH_USER_CONTEXT(user);
 	struct file_lock *lock = NULL;
+	unsigned int notified_count;
 	const char *error;
 	int ret;
 
 	if (muser == NULL || user->dsyncing || t->save_count == 0)
 		return mbox->super.transaction_commit(t, changes_r);
+	notified_count = muser->notified_count;
 
 	/* New mails get their UIDs during commit. Wait until no dsync
 	   session is importing mails for this user. If the wait takes too
@@ -381,6 +507,18 @@ mesh_transaction_commit(struct mailbox_transaction_context *t,
 	ret = mbox->super.transaction_commit(t, changes_r);
 	if (lock != NULL)
 		file_unlock(&lock);
+	if (ret == 0 && mesh_user_is_delivery(user)) {
+		/* Wait only now that we've unlocked: the session we're
+		   waiting for needs the lock. The notify plugin's commit
+		   hook normally runs only after this function returns, so
+		   notify the mesh service already now, and skip the hook's
+		   notification. */
+		if (muser->notified_count == notified_count) {
+			mesh_notify(user, MESH_PRIORITY_HIGH);
+			muser->skip_next_notify = TRUE;
+		}
+		mesh_delivery_wait(user);
+	}
 	return ret;
 }
 
@@ -408,6 +546,7 @@ static void mesh_user_deinit(struct mail_user *user)
 		file_unlock(&muser->dsync_lock);
 	i_close_fd(&muser->lock_fd);
 	o_stream_destroy(&muser->notify_output);
+	str_free(&muser->notify_input);
 	settings_free(muser->set);
 
 	muser->module_ctx.super.deinit(user);
