@@ -128,7 +128,14 @@ def run(args):
     for p in problems[:40]:
         print("  PROBLEM:", p)
     if not args.keep:
+        # Crashes while shutting down show up only after stopping.
         cluster.teardown()
+        for node in cluster.nodes:
+            for line in node.log().splitlines():
+                if "Panic:" in line or "killed with signal" in line or \
+                   "double free" in line:
+                    problems.append("%s: %s" % (node.name, line))
+                    print("  PROBLEM: %s: %s" % (node.name, line))
     return 0 if not problems and quiet_secs is not None else 1
 
 
