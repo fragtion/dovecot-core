@@ -2338,6 +2338,17 @@ dsync_mailbox_import_handle_mail(struct dsync_mailbox_importer *importer,
 	if (!dsync_mailbox_import_try_local(importer, all_newmails,
 					    &local_uids, &wanted_uids) &&
 	    !dsync_mailbox_import_try_virtual_all(importer, all_newmails)) {
+		if (request_guid == NULL && request_uid == 0) {
+			/* All the instances were local, but they couldn't be
+			   kept or copied to their new UIDs, i.e. they were
+			   expunged meanwhile. The remote doesn't have the mail
+			   either, so there's nothing to request. */
+			e_warning(importer->event, "Local mail GUID=%s "
+				  "disappeared during sync - skipping it",
+				  all_newmails->guid);
+			importer->import_pos++;
+			return TRUE;
+		}
 		/* no local instance. request from remote */
 		IMPORTER_DEBUG_CHANGE(importer);
 		if (importer->want_mail_requests) {
