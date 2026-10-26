@@ -189,12 +189,12 @@ function renderUsers(s, u) {
   const peers = s.peers.map((p) => p.name);
   const head = `<tr><th>User</th><th>Anchor</th>` +
     peers.map((n) => `<th>${esc(n)}</th>`).join("") +
-    `<th>Last change</th><th></th></tr>`;
+    `<th>Last change</th><th>Verified</th><th></th></tr>`;
   const users = u.users.slice().sort((a, b) => a.user.localeCompare(b.user));
   if (users.length === 0) {
     const msg = state.userQuery || state.userProblems ?
       "No users match." : "No users yet. Users appear after their first change or sync.";
-    $("users").innerHTML = head + `<tr><td class="empty" colspan="${peers.length + 4}">${msg}</td></tr>`;
+    $("users").innerHTML = head + `<tr><td class="empty" colspan="${peers.length + 5}">${msg}</td></tr>`;
   } else {
     $("users").innerHTML = head + users.map((user) => {
       const byPeer = Object.fromEntries(user.peers.map((p) => [p.peer, p]));
@@ -203,7 +203,9 @@ function renderUsers(s, u) {
       return `<tr><td><b>${esc(user.user)}</b></td><td>${anchor}</td>` +
         peers.map((n) => `<td>${byPeer[n] ? userPeerPill(byPeer[n]) : ""}</td>`).join("") +
         `<td class="muted">${user.last_change ? ago(user.last_change) : "–"}</td>` +
-        `<td class="actions"><button data-act="sync" data-user="${esc(user.user)}">Sync now</button>` +
+        `<td>${verifyPill(user)}</td>` +
+        `<td class="actions"><button data-act="verify" data-user="${esc(user.user)}">Verify</button>` +
+        `<button data-act="sync" data-user="${esc(user.user)}">Sync now</button>` +
         `<button data-act="full" data-user="${esc(user.user)}">Full resync</button></td></tr>`;
     }).join("");
   }
@@ -212,6 +214,62 @@ function renderUsers(s, u) {
     (state.userQuery || state.userProblems) ?
     `${u.matched} of ${u.total} users match.` : "";
 }
+
+const VERIFY_PILL = {
+  ok: ["ok", "match"],
+  mismatch: ["bad", "differs"],
+  error: ["warn", "incomplete"],
+};
+
+function verifyPill(user) {
+  if (!user.verify_result) return `<span class="muted">–</span>`;
+  const [cls, text] = VERIFY_PILL[user.verify_result] || ["", user.verify_result];
+  return pill(cls, `${text} · ${ago(user.verify_time)}`, clock(user.verify_time));
+}
+
+function renderVerify(r) {
+  const nodes = r.nodes.map((n) => n.name);
+  const differing = r.mailboxes.filter((m) => !m.match).length;
+  const failed = r.nodes.filter((n) => n.error);
+  const [cls, text] = VERIFY_PILL[r.result] || ["", r.result];
+  let summary = `<div class="summary">${pill(cls, text)} ` +
+    `<p>${r.mailboxes.length} mailboxes compared on ${nodes.length - failed.length} of ${nodes.length} nodes` +
+    (differing ? `, ${differing} differ.` : ".") + ` Each cell shows the number of mails and the start of a ` +
+    `hash of their UIDs, GUIDs and flags.</p>`;
+  for (const n of failed)
+    summary += `<p class="err">${esc(n.name)}: ${esc(n.error)}</p>`;
+  summary += "</div>";
+  const head = `<tr><th>Mailbox</th><th>Status</th>` +
+    nodes.map((n) => `<th>${esc(n)}</th>`).join("") + `</tr>`;
+  const rows = r.mailboxes.map((m) => {
+    const first = m.nodes.find((c) => c);
+    const cells = m.nodes.map((c, i) => {
+      if (r.nodes[i].error) return `<td class="muted">?</td>`;
+      if (!c) return `<td class="diff">missing</td>`;
+      const same = first && c.messages === first.messages && c.hash === first.hash;
+      return `<td class="mono${m.match || same ? "" : " diff"}" title="${esc(c.hash)}">` +
+        `${c.messages} · ${esc(c.hash.slice(0, 8))}</td>`;
+    }).join("");
+    return `<tr><td>${esc(m.name)}</td><td>${m.match ? pill("ok", "match") : pill("bad", "differs")}</td>${cells}</tr>`;
+  }).join("");
+  return summary + `<div class="scroll"><table>${head}${rows}</table></div>`;
+}
+
+async function verify(user) {
+  const dialog = $("verify-dialog");
+  $("verify-title").textContent = `Verify ${user}`;
+  $("verify-body").innerHTML = `<div class="empty">Comparing mailboxes on all nodes…</div>`;
+  if (!dialog.open) dialog.showModal();
+  try {
+    const r = await api(`verify?user=${encodeURIComponent(user)}`, { method: "POST" });
+    $("verify-body").innerHTML = renderVerify(r);
+    refresh();
+  } catch (e) {
+    $("verify-body").innerHTML = `<div class="empty err">Failed: ${esc(e.message)}</div>`;
+  }
+}
+
+$("verify-close").addEventListener("click", () => $("verify-dialog").close());
 
 const RESULT_PILL = {
   ok: ["ok", "ok"],
@@ -296,7 +354,8 @@ document.addEventListener("click", (ev) => {
   const { act, user, peer } = btn.dataset;
   const u = encodeURIComponent(user || "");
   const p = encodeURIComponent(peer || "");
-  if (act === "sync") post(`sync?user=${u}`, `Sync of ${user} queued`);
+  if (act === "verify") verify(user);
+  else if (act === "sync") post(`sync?user=${u}`, `Sync of ${user} queued`);
   else if (act === "full") post(`sync?user=${u}&full=1`, `Full resync of ${user} queued`);
   else if (act === "pause") post(`pause?peer=${p}`, `${peer} paused`);
   else if (act === "resume") post(`resume?peer=${p}`, `${peer} resumed`);

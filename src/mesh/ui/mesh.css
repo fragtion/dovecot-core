@@ -121,6 +121,7 @@ th { font-size: 12px; font-weight: 600; color: var(--muted); background: color-m
 tr:last-child td { border-bottom: none; }
 td.num, th.num { text-align: right; }
 td.err { color: var(--bad); max-width: 380px; overflow: hidden; text-overflow: ellipsis; }
+.err { color: var(--bad); }
 td.muted, .muted { color: var(--muted); }
 tr.self td { background: color-mix(in srgb, var(--info-bg) 45%, transparent); }
 .empty { padding: 18px 16px; color: var(--muted); }
@@ -151,6 +152,23 @@ button:hover { border-color: var(--accent); color: var(--accent); }
 button:disabled { opacity: .5; cursor: default; }
 td.actions { text-align: right; }
 td.actions button + button { margin-left: 6px; }
+
+dialog {
+  border: 1px solid var(--border); border-radius: 10px; padding: 0;
+  background: var(--surface); color: var(--text);
+  width: min(900px, calc(100vw - 32px)); max-height: calc(100vh - 64px);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, .25);
+}
+dialog::backdrop { background: rgba(15, 18, 24, .45); }
+.dialog-head {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 16px; border-bottom: 1px solid var(--border);
+}
+.dialog-head h2 { font-size: 15px; margin: 0; flex: 1; font-weight: 650; }
+.dialog-body { overflow: auto; max-height: calc(100vh - 140px); }
+.dialog-body .summary { padding: 12px 16px; border-bottom: 1px solid var(--border); }
+.dialog-body .summary p { margin: 4px 0 0; color: var(--muted); }
+td.diff { color: var(--bad); font-weight: 600; }
 
 .toast {
   position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
