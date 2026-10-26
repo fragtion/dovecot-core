@@ -39,8 +39,11 @@ different UIDs (IMAP clients moved it into the same folder on both), and
 a pair's state could cover a node's flag change made during a session
 that the node hadn't sent. After the fixes 35 of 35 runs had no
 problems, and 16 of 16 with `dsync_features = relay-changes` only. The
-other, a dsync session stalling for 10 minutes (seen only with dsync
-debug logging), is in section 7.
+other, a dsync session stalling for 10 minutes while holding the user's
+lock (about 1 run in 25 with dsync debug logging), is fixed in
+`istream-multiplex`: data left in the doveadm connection's buffer behind
+the peer's log lines wasn't processed. After the fix 16 of 16 runs with
+dsync debug logging had no problems and no stalled sessions.
 
 **Not yet tested anywhere:** separate machines/containers, real network
 latency or loss, network partitions, large mailboxes (10k+ mails, many
@@ -378,8 +381,8 @@ Report:
 - `Expunging failed` or `Couldn't open for expunging` from dsync: a
   deferred expunge couldn't be applied, so the session asked for a full
   resync (deleted mails may come back)
-- a user's syncs failing with `dsync lock failed` for about 10 minutes:
-  a stuck session (see the limitations)
+- a user's syncs failing with `dsync lock failed` for minutes: a stuck
+  dsync session holding the user's lock
 - `Delivered mail isn't on another node yet` while all peers are up
 - mails missing on some node, duplicated, or coming back after deletion
   (from `doveadm mesh verify` or client observation)
@@ -394,13 +397,6 @@ See also "Limitations and known issues" in the README.
 - Moving a few mails (fewer than 8 and under 512 kB) can still transfer
   them once to each node, when the destination folder is synced before
   the source folder in that session. Larger moves are copied locally.
-- A dsync session over the doveadm TCP connection can stall until dsync's
-  10 minute timeout, holding the user's lock on that node (other syncs
-  of the user fail, deliveries wait `mesh_save_lock_timeout`): dsync data
-  stays buffered in the multiplexed stream that also carries the peer's
-  log lines (`src/lib/istream-multiplex.c`). Seen in about 1 of 25 harness
-  runs with `mesh_dsync_debug = yes`, not yet without it. Everything
-  converges after the timeout. Not fixed yet.
 - Pausing a peer doesn't survive a restart.
 - meson build files don't include the mesh; use autotools.
 - No migration tooling beyond the README's steps (from the Syncthing
