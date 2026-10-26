@@ -189,6 +189,37 @@ class Node:
                 res.stderr.strip()))
         return res
 
+    def mesh_admin(self, *cmd):
+        """Run a command on the mesh admin socket. Returns the rows as
+        lists of fields, or raises on -ERR."""
+        import socket
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(10)
+        sock.connect(os.path.join(self.dir, "run", "mesh"))
+        sock.sendall(("VERSION\tmesh-admin\t1\t0\n" +
+                      "\t".join(cmd) + "\n").encode())
+        data = b""
+        while True:
+            lines = data.decode(errors="replace").split("\n")
+            # VERSION line, +OK/-ERR, rows, empty line
+            if len(lines) >= 3 and "" in lines[2:-1]:
+                break
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+        sock.close()
+        lines = data.decode(errors="replace").split("\n")
+        reply = lines[1]
+        if not reply.startswith("+OK"):
+            raise RuntimeError("%s: mesh %s: %s" % (self.name, cmd, reply))
+        rows = []
+        for line in lines[2:]:
+            if line == "":
+                break
+            rows.append(line.split("\t"))
+        return rows
+
     def log(self):
         try:
             with open(os.path.join(self.dir, "log", "dovecot.log")) as f:
@@ -197,14 +228,53 @@ class Node:
             return ""
 
 
+MESH_API_KEY = "meshtest-key"
+
+
+def mesh_config(cluster, node, topology="anchor", extra=""):
+    """dovecot.conf lines that enable mesh replication on node."""
+    lines = [
+        "mail_plugins {",
+        "  notify = yes",
+        "  mesh = yes",
+        "}",
+        "dsync_features = relay-changes",
+        "mesh_node_name = %s" % node.name,
+        "mesh_topology = %s" % topology,
+        "mesh_api_key = %s" % MESH_API_KEY,
+        "mesh_heartbeat_interval = 500ms",
+        "mesh_peer_down_timeout = 2s",
+        "service mesh {",
+        "  inet_listener mesh-http {",
+        "    port = %d" % node.http_port,
+        "  }",
+        "}",
+    ]
+    for peer in cluster.nodes:
+        lines += [
+            "mesh_peer %s {" % peer.name,
+            "  mesh_peer_host = 127.0.0.1",
+            "  mesh_peer_doveadm_port = %d" % peer.doveadm_port,
+            "  mesh_peer_http_port = %d" % peer.http_port,
+            "}",
+        ]
+    return "\n".join(lines) + "\n" + extra
+
+
 class Cluster:
-    def __init__(self, n, root=ROOT, extra=None):
+    def __init__(self, n, root=ROOT, extra=None, mesh=False,
+                 topology="anchor"):
         self.root = root
         self.extra = extra or (lambda node: "")
+        self.mesh = mesh
+        self.topology = topology
         self.nodes = [Node(self, i + 1) for i in range(n)]
 
     def extra_config(self, node):
-        return self.extra(node)
+        conf = self.extra(node)
+        if self.mesh:
+            conf = mesh_config(self, node, self.topology) + conf
+        return conf
 
     def setup(self, clean=True):
         if clean:

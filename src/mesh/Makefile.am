@@ -55,4 +55,5 @@ EXTRA_DIST = \
 	$(UI_FILES) \
 	harness/cluster.py \
 	harness/phase0.py \
+	harness/phase1.py \
 	harness/workload.py
