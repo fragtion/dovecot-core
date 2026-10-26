@@ -938,6 +938,7 @@ src/plugins/lazy-expunge/Makefile
 src/plugins/mail-log/Makefile
 src/plugins/mail-lua/Makefile
 src/plugins/notify/Makefile
+src/plugins/mesh/Makefile
 src/plugins/notify-status/Makefile
 src/plugins/push-notification/Makefile
 src/plugins/pop3-migration/Makefile

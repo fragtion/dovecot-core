@@ -24,6 +24,7 @@ SUBDIRS = \
 	notify-status \
 	push-notification \
 	mail-log \
+	mesh \
 	$(MAIL_LUA) \
 	quota \
 	quota-clone \
