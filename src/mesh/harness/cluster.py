@@ -109,6 +109,8 @@ class Node:
         self.doveadm_port = base + 12
         self.mesh_port = base + 15
         self.http_port = base + 80
+        # plaintext mesh HTTP for local clients (mesh-route.lua) with --tls
+        self.http_local_port = base + 81
         self.conf = os.path.join(self.dir, "dovecot.conf")
         self.extra = ""
 
@@ -248,7 +250,8 @@ passdb mesh-route {
   }
 }
 """ % (os.path.join(PREFIX, "share/dovecot/mesh-route.lua"),
-       node.http_port, MESH_API_KEY)
+       node.http_local_port if node.cluster.tls else node.http_port,
+       MESH_API_KEY)
 
 
 def mesh_config(cluster, node, topology="anchor", extra=""):
@@ -269,6 +272,16 @@ def mesh_config(cluster, node, topology="anchor", extra=""):
         "    port = %d" % node.http_port,
         "    ssl = %s" % ("yes" if cluster.tls else "no"),
         "  }",
+    ]
+    if cluster.tls:
+        lines += [
+            "  inet_listener mesh-http-local {",
+            "    type = http",
+            "    listen = 127.0.0.1",
+            "    port = %d" % node.http_local_port,
+            "  }",
+        ]
+    lines += [
         "}",
     ]
     for peer in cluster.nodes:
