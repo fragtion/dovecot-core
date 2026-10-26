@@ -123,8 +123,10 @@ mail_plugins {
   mesh = yes
 }
 
-# Needed with more than two nodes: forward changes that dsync imported.
-dsync_features = relay-changes
+# relay-changes: needed with more than two nodes - forward changes that
+# dsync imported. reuse-local-mails: when mails are moved or copied to
+# another folder, copy them locally instead of transferring them again.
+dsync_features = relay-changes reuse-local-mails
 
 # dsync between nodes goes through the doveadm servers.
 doveadm_port = 12345
@@ -246,6 +248,21 @@ Mesh plugin (mail processes):
 dsync: `dsync_features = relay-changes` is needed with more than two
 nodes. Without it a node never forwards flag changes, keyword changes or
 expunges it received from one node to another.
+
+`dsync_features = reuse-local-mails` makes moving and copying mails
+between folders cheap to replicate. dsync syncs one folder at a time, so
+a moved mail shows up as an expunge in the old folder and a new mail in
+the new one, and without this feature the new one is downloaded from the
+peer again. With it, the receiving node copies the mail from its own copy
+in the old folder (a hardlink with Maildir), and the expunges a peer sent
+are applied only at the end of the session so that the old copy is still
+there when the new folder is synced. When the new folder is synced before
+the old one, the node looks the mails up in its other folders by GUID; it
+does that only if at least 8 mails or 512 kB would otherwise be
+transferred, since it reads the GUIDs of all the user's mails (about 0.3
+seconds for 100,000 mails). The node that starts a session turns it on
+for both sides. If a deferred expunge can't be applied at the end, the
+session asks for a full resync, so nothing is lost.
 
 ## Operating it
 
@@ -399,6 +416,9 @@ service mesh {
 - A node that writes mail into Maildirs behind Dovecot's back (another
   MDA, scripts) isn't noticed until the next periodic sync, and delivery
   waits don't apply.
+- With `reuse-local-mails`, moving a few mails (fewer than 8 and under
+  512 kB) still transfers them once to each node when the destination
+  folder happens to be synced before the source folder in that session.
 - The `full` topology syncs mostly statelessly with more than two nodes.
 - Pausing a peer isn't persistent.
 - The mesh service runs as root (like doveadm), since it uses the
@@ -420,7 +440,12 @@ python3 phase1.py --nodes 3 --users 3 --lmtp-route        # delivery affinity
 python3 phase1.py --nodes 3 --users 2 --tls               # TLS between nodes
 python3 phase1.py --nodes 3 --users 3 --topology full
 python3 phase1.py ... --keep   # leave the nodes running in /var/tmp/meshtest
+python3 moves.py --nodes 3 --mails 500   # moved mails aren't transferred
 ```
+
+`moves.py` seeds a user with mails, lets the mesh replicate them, moves
+them all to another folder on one node, and fails if any mail body was
+transferred over the network for the move (`--max-transferred`).
 
 `phase0.py` drives dsync directly instead of the mesh service; it was
 used to find out what dsync needs for multi-master replication.

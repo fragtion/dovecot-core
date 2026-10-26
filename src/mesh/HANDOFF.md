@@ -16,6 +16,7 @@ Branch: `claude/relaxed-ritchie-bjjfls` of `fragtion/dovecot-core`
 | Maildir `new/` handling restored; old Syncthing behaviour behind `maildir_ignore_new_dir` (default no) | `src/lib-storage/index/maildir/` | done, unit tests |
 | dsync `dsync_features = relay-changes` (forward changes dsync imported, needed with 3+ nodes) | `src/doveadm/dsync/` | done |
 | dsync merges flags of mails both sides already have | `src/doveadm/dsync/dsync-mailbox-import.c` | done |
+| dsync `dsync_features = reuse-local-mails` (mails moved or copied to another folder are copied locally, hardlinked with Maildir, instead of being transferred again) | `src/doveadm/dsync/dsync-local-mails.c` | done |
 | mesh mail plugin: change notifications, save/dsync locking, delivery wait | `src/plugins/mesh/` | done |
 | mesh service: anchor topology, leases, shared pair states, retries, periodic syncs, verifier, HTTP API, web UI, delivery route lookup, TLS | `src/mesh/` | done |
 | `doveadm mesh status/peers/users/sync/verify/pause/resume` | `src/doveadm/doveadm-mesh.c` | done |
@@ -198,7 +199,7 @@ mail_plugins {
   notify = yes
   mesh = yes
 }
-dsync_features = relay-changes
+dsync_features = relay-changes reuse-local-mails
 
 doveadm_port = 12345
 doveadm_password = CHANGE-ME-doveadm-secret
@@ -325,6 +326,16 @@ identical, and any warnings/errors in the logs.
     "differs" warnings and errors.
 11. **Restart everything**: stop and start all nodes; sessions afterwards
     should be incremental (web UI "Recent sessions" mode column).
+12. **Archiving**: give a user a few thousand mails (some MB each is
+    best), then move them all from INBOX to an Archive folder with an IMAP
+    client on one node, and also move a few hundred back. Measure the
+    traffic between the nodes meanwhile (e.g. container network
+    counters): it must stay far below the mails' size, since the other
+    nodes copy the mails locally. With Maildir the moved files on the
+    other nodes are hardlinks of the original ones (`stat` link count),
+    and `log_debug = category=dsync` (or `mesh_dsync_debug = yes`) logs
+    "Copied N mails from other local mailboxes instead of transferring
+    them". Verify the user afterwards.
 
 The harness can also run inside a single container as a regression test
 before deploying (`src/mesh/harness`, see the README; needs root, a
@@ -345,6 +356,8 @@ Expected, harmless:
 - An occasional single "Syncing <user> with <peer> failed" warning
   followed by a successful retry. (A peer that's busy with the user is
   retried silently.)
+- Rarely "Local mail GUID=... disappeared during sync - skipping it": a
+  mail was expunged locally while dsync was about to copy it.
 
 Report:
 
@@ -352,6 +365,9 @@ Report:
   nodes after a full sync`
 - any `Panic`, `Fatal`, or the `mesh` process restarting
 - repeated `Syncing <user> with <peer> failed` for the same user
+- `Expunging failed` or `Couldn't open for expunging` from dsync: a
+  deferred expunge couldn't be applied, so the session asked for a full
+  resync (deleted mails may come back)
 - `Delivered mail isn't on another node yet` while all peers are up
 - mails missing on some node, duplicated, or coming back after deletion
   (from `doveadm mesh verify` or client observation)
@@ -363,8 +379,9 @@ Report:
 See also "Limitations and known issues" in the README.
 
 - IMAP logins aren't routed to the anchor; only LMTP deliveries are.
-- A mail moved between folders may be transferred again instead of being
-  moved on the other nodes (dsync behaviour; correctness isn't affected).
+- Moving a few mails (fewer than 8 and under 512 kB) can still transfer
+  them once to each node, when the destination folder is synced before
+  the source folder in that session. Larger moves are copied locally.
 - Pausing a peer doesn't survive a restart.
 - meson build files don't include the mesh; use autotools.
 - No migration tooling beyond the README's steps (from the Syncthing
@@ -374,7 +391,8 @@ See also "Limitations and known issues" in the README.
 ## 8. Where things are
 
 - `src/mesh/README.md`: concepts, settings, operations, API.
-- `src/mesh/harness/`: `phase1.py` (mesh tests), `cluster.py` (node
+- `src/mesh/harness/`: `phase1.py` (mesh tests), `moves.py` (moved
+  mails mustn't be transferred again), `cluster.py` (node
   setup, shows a full working config), `workload.py` (load and
   convergence checks).
 - `src/mesh/*.c`: service. `mesh-queue.c` (scheduling, retries),
