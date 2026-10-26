@@ -6,6 +6,7 @@
 #include "dsync-mail.h"
 #include "dsync-mailbox-import.h"
 #include "dsync-mailbox-export.h"
+#include "dsync-transaction-log-scan.h"
 #include "dsync-brain-private.h"
 
 const char *dsync_box_state_names[] = {
@@ -281,6 +282,21 @@ static void dsync_brain_sync_half_finished(struct dsync_brain *brain)
 			state.changes_during_sync = TRUE;
 			dsync_brain_set_changes_during_sync(brain, changes_during_sync);
 		}
+	}
+	/* In the next session both sides look for their changes after the
+	   state's modseqs, and both use the lower of the two sides' states.
+	   Our changes are bounded only by the remote importer's state, which
+	   is normally our mailbox's highest modseq. That can be higher than
+	   what our transaction log scan saw: it may already include changes
+	   committed after our view of the mailbox was synced. And with
+	   changes during sync the remote importer uses its own highest modseq
+	   instead, which may be above ours. Our changes after the scan
+	   weren't exported, so don't let the state skip over them. (When
+	   receiving a backup we don't export anything.) */
+	if (!brain->backup_recv) {
+		dsync_transaction_log_scan_limit_modseqs(brain->log_scan,
+			&state.last_common_modseq,
+			&state.last_common_pvt_modseq);
 	}
 	if (brain->require_full_resync) {
 		state.last_uidvalidity = 0;

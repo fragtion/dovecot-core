@@ -19,9 +19,12 @@ struct dsync_transaction_log_scan {
 
 	uint32_t last_log_seq;
 	uoff_t last_log_offset;
+	/* modseqs up to which the logs were scanned */
+	uint64_t scanned_modseq, scanned_pvt_modseq;
 
 	bool returned_all_changes;
 	bool relay_changes;
+	bool pvt_scanned;
 };
 
 static bool ATTR_NOWARN_UNUSED_RESULT
@@ -417,7 +420,7 @@ dsync_log_scan(struct dsync_transaction_log_scan *ctx,
 	const void *data;
 	uint32_t file_seq, max_seq;
 	uoff_t file_offset, max_offset;
-	uint64_t cur_modseq;
+	uint64_t cur_modseq, scanned_modseq;
 	int ret;
 
 	log_view = mail_transaction_log_view_open(view->index->log);
@@ -432,12 +435,15 @@ dsync_log_scan(struct dsync_transaction_log_scan *ctx,
 
 	mail_transaction_log_view_get_prev_pos(log_view, &file_seq,
 					       &file_offset);
+	scanned_modseq = mail_transaction_log_view_get_prev_modseq(log_view);
 
 	while (mail_transaction_log_view_next(log_view, &hdr, &data) > 0) {
 		mail_transaction_log_view_get_prev_pos(log_view, &file_seq,
 						       &file_offset);
 		if (file_offset >= max_offset && file_seq == max_seq)
 			break;
+		scanned_modseq =
+			mail_transaction_log_view_get_prev_modseq(log_view);
 
 		if ((hdr->type & MAIL_TRANSACTION_SYNC) != 0 &&
 		    !ctx->relay_changes) {
@@ -481,6 +487,10 @@ dsync_log_scan(struct dsync_transaction_log_scan *ctx,
 	if (!pvt_scan) {
 		ctx->last_log_seq = file_seq;
 		ctx->last_log_offset = file_offset;
+		ctx->scanned_modseq = scanned_modseq;
+	} else {
+		ctx->scanned_pvt_modseq = scanned_modseq;
+		ctx->pvt_scanned = TRUE;
 	}
 	mail_transaction_log_view_close(&log_view);
 	return ret;
@@ -562,6 +572,18 @@ bool
 dsync_transaction_log_scan_has_all_changes(struct dsync_transaction_log_scan *scan)
 {
 	return scan->returned_all_changes;
+}
+
+void dsync_transaction_log_scan_limit_modseqs(struct dsync_transaction_log_scan *scan,
+					      uint64_t *modseq,
+					      uint64_t *pvt_modseq)
+{
+	/* 0 = modseqs aren't tracked */
+	if (scan->scanned_modseq != 0 && *modseq > scan->scanned_modseq)
+		*modseq = scan->scanned_modseq;
+	if (scan->pvt_scanned && scan->scanned_pvt_modseq != 0 &&
+	    *pvt_modseq > scan->scanned_pvt_modseq)
+		*pvt_modseq = scan->scanned_pvt_modseq;
 }
 
 struct dsync_mail_change *

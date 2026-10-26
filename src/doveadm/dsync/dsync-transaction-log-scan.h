@@ -21,6 +21,11 @@ HASH_TABLE_TYPE(dsync_attr_change)
 dsync_transaction_log_scan_get_attr_hash(struct dsync_transaction_log_scan *scan);
 /* Returns TRUE if the entire transaction log was scanned */
 bool dsync_transaction_log_scan_has_all_changes(struct dsync_transaction_log_scan *scan);
+/* Lower the modseqs to the ones up to which the transaction logs were
+   scanned, if they're higher. Changes after them weren't found. */
+void dsync_transaction_log_scan_limit_modseqs(struct dsync_transaction_log_scan *scan,
+					      uint64_t *modseq,
+					      uint64_t *pvt_modseq);
 /* If the given UID has been expunged after the initial log scan, create/update
    a change record for it and return it. */
 struct dsync_mail_change *
