@@ -77,6 +77,16 @@ def run(args):
 
     quiet_secs = wait_quiet(cluster, args.quiesce_timeout)
     problems = wl.check_convergence(cluster, users, history)
+    # The mesh's own verifier must agree that the nodes converged.
+    verifier = cluster.live_nodes()[0]
+    for user in users:
+        rows = verifier.mesh_admin("VERIFY", user)
+        result = rows[0][1] if rows and rows[0][0] == "R" else "?"
+        if result != "ok":
+            differing = [r[1] for r in rows
+                         if r[0] == "M" and r[3] != "match"]
+            problems.append("%s: mesh verify says %s (%s)" % (
+                user, result, ", ".join(differing)))
     errors = cluster.errors()
 
     print("topology=%s nodes=%d users=%d affinity=%s kill=%s" % (

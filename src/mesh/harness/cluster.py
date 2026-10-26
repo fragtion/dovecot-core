@@ -194,7 +194,7 @@ class Node:
         lists of fields, or raises on -ERR."""
         import socket
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(10)
+        sock.settimeout(120)
         sock.connect(os.path.join(self.dir, "run", "mesh"))
         sock.sendall(("VERSION\tmesh-admin\t1\t0\n" +
                       "\t".join(cmd) + "\n").encode())
