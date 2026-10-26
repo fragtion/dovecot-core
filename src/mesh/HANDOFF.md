@@ -410,7 +410,8 @@ See also "Limitations and known issues" in the README.
 
 - `src/mesh/README.md`: concepts, settings, operations, API.
 - `src/mesh/harness/`: `phase1.py` (mesh tests), `moves.py` (moved
-  mails mustn't be transferred again), `cluster.py` (node
+  mails mustn't be transferred again), `newmails.py` (a mail new on
+  two nodes under different UIDs gets the same flags), `cluster.py` (node
   setup, shows a full working config), `workload.py` (load and
   convergence checks).
 - `src/mesh/*.c`: service. `mesh-queue.c` (scheduling, retries),

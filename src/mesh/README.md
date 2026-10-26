@@ -453,11 +453,16 @@ python3 phase1.py --nodes 3 --users 2 --tls               # TLS between nodes
 python3 phase1.py --nodes 3 --users 3 --topology full
 python3 phase1.py ... --keep   # leave the nodes running in /var/tmp/meshtest
 python3 moves.py --nodes 3 --mails 500   # moved mails aren't transferred
+python3 newmails.py   # a mail new on two nodes gets the same flags
 ```
 
 `moves.py` seeds a user with mails, lets the mesh replicate them, moves
 them all to another folder on one node, and fails if any mail body was
 transferred over the network for the move (`--max-transferred`).
+
+`newmails.py` runs plain dsync between two nodes: a mail that is new on
+both under different UIDs (as after IMAP clients moved it into the same
+folder on both) must end up with the same flags on both.
 
 `phase0.py` drives dsync directly instead of the mesh service; it was
 used to find out what dsync needs for multi-master replication.
