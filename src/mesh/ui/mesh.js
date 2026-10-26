@@ -137,8 +137,9 @@ function renderNodes(s) {
     `<td class="num muted">–</td><td>${esc(s.version)}</td><td></td><td></td></tr>`;
   const rows = s.peers.map((p) => {
     const offset = Math.abs(p.clock_offset_ms) >= 1000 ?
-      pill("warn", p.clock_offset_ms + " ms", "Clocks differ, which " +
-        "makes flag conflict resolution less accurate") :
+      pill("warn", p.clock_offset_ms + " ms", "Clocks differ by a second " +
+        "or more. Keep the nodes' clocks in sync (NTP): times in logs, " +
+        "this UI and Maildir file names come from them.") :
       p.clock_offset_ms + " ms";
     const version = p.remote.version && p.remote.version !== s.version ?
       pill("warn", p.remote.version, "Differs from this node") :
