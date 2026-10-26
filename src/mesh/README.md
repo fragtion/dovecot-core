@@ -1,0 +1,407 @@
+# Dovecot Mesh
+
+Multi-master replication of mailboxes between any number of Dovecot
+servers ("nodes"). Every node accepts deliveries, IMAP changes and
+logins at the same time; the mesh keeps all of them in sync, normally
+within a fraction of a second.
+
+It replaces both what the replicator did for two servers (removed in
+Dovecot 2.4) and the Syncthing-based setup this fork was originally made
+for. The heavy lifting is done by dsync, Dovecot's own mailbox sync
+engine; the mesh decides who syncs which user with whom, when, and with
+which state, and shows what's going on.
+
+## Contents
+
+- [How it works](#how-it-works)
+- [Requirements](#requirements)
+- [Configuration](#configuration)
+- [Settings reference](#settings-reference)
+- [Operating it](#operating-it)
+- [Delivery affinity](#delivery-affinity)
+- [Monitoring](#monitoring)
+- [Migrating from the Syncthing setup](#migrating-from-the-syncthing-setup)
+- [Limitations and known issues](#limitations-and-known-issues)
+- [Test harness](#test-harness)
+
+## How it works
+
+```
+            node1                                 node2 (anchor of alice)
+  +----------------------------+          +----------------------------+
+  | imap / lmtp                |          | imap / lmtp                |
+  |   mesh plugin --notify--+  |          |  +--notify-- mesh plugin   |
+  |                         v  |  HTTP    |  v                         |
+  |   mesh service <-----------+----------+-> mesh service             |
+  |     | heartbeats, leases,  |          |   (relays alice's changes  |
+  |     | pair states          |          |    to node3, node4, ...)   |
+  |     v                      |  dsync   |                            |
+  |   doveadm-server ----------+----------+-> doveadm server           |
+  +----------------------------+          +----------------------------+
+```
+
+- **mesh plugin** (`lib25_mesh_plugin`, in mail processes): after every
+  committed change (new mail, flags, keywords, expunge, mailbox
+  create/delete/rename/subscribe) it tells the local mesh service which
+  user changed. It also serializes local saves with dsync sessions for the
+  same user (a lock file in the user's home), which avoids duplicate mails
+  when dsync renumbers UIDs, and it makes LMTP/LDA deliveries wait until
+  the mail is on another node.
+- **mesh service** (`mesh`, one process per node): queues a push for the
+  changed user, coalesces bursts, and runs `doveadm sync` (stateful dsync)
+  through the local doveadm server to the peer's doveadm port. It talks to
+  the other nodes' mesh services over HTTP: heartbeats, leases that keep a
+  user's sessions from overlapping, and the pair's dsync state. It also
+  serves the web UI, the HTTP API and the `doveadm mesh` commands.
+
+**Topology.** With the default `anchor` topology each user has one
+*anchor* node, chosen by rendezvous hashing over the nodes that are up.
+All nodes compute the same anchor, and a node going down moves only the
+users anchored to it. Other nodes (*spokes*) push a user's changes only
+to its anchor, which relays them to every other node. So each change
+crosses the network a minimal number of times, and every pair of nodes
+that syncs a user has a well defined history. With `full`, every node
+syncs every user with every other node; that's only sensible for two or
+three nodes.
+
+**Sessions and states.** A dsync session between two nodes is
+bidirectional: both send each other what changed. Sessions are stateful
+(only changes since the last session are compared), with one shared state
+per pair of nodes. Before a session, the initiating node *leases* the user
+from the peer; the peer refuses if it's syncing the user itself, and the
+initiator retries a moment later. The lease reply also tells whether the
+initiator's copy of the pair's state can be used: it must be the newest
+one, and at least one of the two nodes must have synced the user only
+with the other one since their last session. Otherwise mails could have
+reached both nodes some other way, which a state can't describe, and the
+session is *stateless*: dsync compares all mails. That is slower but
+always safe. With the anchor topology it happens only after the anchor
+moved, or if a node lost its state file.
+
+**Triggers.** Changes are pushed after `mesh_coalesce_delay`. In addition
+every user is pushed every `mesh_incremental_sync_interval` (catches
+changes nobody notified, e.g. a lost notification), fully every
+`mesh_full_sync_interval`, at startup, and when peers come up or the
+anchor moves. Failures are retried with backoff from 1s up to 60s; after
+three failures in a row the state is dropped and the next session is
+stateless.
+
+**Verification.** `doveadm mesh verify <user>` (or the web UI) compares
+a fingerprint of the user's mailboxes on all nodes that are up: per
+mailbox the number of mails and a hash of their UIDs, GUIDs and flags.
+With `mesh_verify_interval` set, each anchor also verifies its users one
+at a time in the background and repairs differences with a full sync.
+
+## Requirements
+
+- Dovecot built from this tree, on every node (same version on all).
+- Maildir (`mail_driver = maildir`) is what's tested. sdbox/mdbox should
+  work as dsync supports them, but haven't been tested.
+- Mail should arrive through LMTP or LDA (`dovecot-lda`), not by an MTA
+  writing into the Maildir itself: only Dovecot's own delivery notifies
+  the mesh right away and waits for replication.
+- Each node needs its own `hostname`: dsync and Maildir file names use it.
+- Clocks in sync (NTP).
+- For delivery affinity: Dovecot built with Lua (`--with-lua`).
+- Network between the nodes: each node's doveadm TCP port and mesh HTTP
+  port must be reachable from all other nodes. Use TLS for both if the
+  network isn't trusted (see below).
+
+## Configuration
+
+The same file can be used on every node; only `mesh_node_name` and
+`hostname` differ. A node skips the `mesh_peer` entry with its own name.
+
+```
+# --- per node ---
+hostname = node1.example.com
+mesh_node_name = node1
+
+# --- the same on all nodes ---
+mail_plugins {
+  notify = yes
+  mesh = yes
+}
+
+# Needed with more than two nodes: forward changes that dsync imported.
+dsync_features = relay-changes
+
+# dsync between nodes goes through the doveadm servers.
+doveadm_port = 12345
+doveadm_password = <shared secret, same on all nodes>
+service doveadm {
+  inet_listener doveadm {
+    port = 12345
+    #ssl = yes
+  }
+}
+
+# Shared secret for the mesh HTTP API between nodes, and the web UI
+# password.
+mesh_api_key = <shared secret, same on all nodes>
+
+service mesh {
+  inet_listener mesh-http {
+    port = 8090
+    #ssl = yes
+  }
+}
+
+mesh_peer node1 {
+  mesh_peer_host = 10.0.0.1
+  mesh_peer_doveadm_port = 12345
+  mesh_peer_http_port = 8090
+  #mesh_peer_lmtp_port = 24
+  #mesh_peer_doveadm_ssl = yes
+  #mesh_peer_http_ssl = yes
+}
+mesh_peer node2 {
+  mesh_peer_host = 10.0.0.2
+  mesh_peer_doveadm_port = 12345
+  mesh_peer_http_port = 8090
+}
+mesh_peer node3 {
+  mesh_peer_host = 10.0.0.3
+  mesh_peer_doveadm_port = 12345
+  mesh_peer_http_port = 8090
+}
+
+# Optional: check users' replicas in the background and repair
+# differences.
+#mesh_verify_interval = 1min
+```
+
+`maildir_ignore_new_dir` must stay `no` (the default) with the mesh. It
+exists only for the old Syncthing setup.
+
+### TLS between nodes
+
+```
+ssl = yes
+ssl_server_cert_file = /etc/dovecot/node.pem
+ssl_server_key_file = /etc/dovecot/node.key
+# CA that signed the other nodes' certificates
+ssl_client_ca_file = /etc/dovecot/mesh-ca.pem
+
+service doveadm {
+  inet_listener doveadm {
+    port = 12345
+    ssl = yes
+  }
+}
+service mesh {
+  inet_listener mesh-http {
+    port = 8090
+    ssl = yes
+  }
+}
+mesh_peer node2 {
+  mesh_peer_host = node2.example.com
+  ...
+  mesh_peer_doveadm_ssl = yes
+  mesh_peer_http_ssl = yes
+}
+```
+
+The certificates are verified against `mesh_peer_host`, so it must be a
+name (or IP address) in the peer's certificate.
+
+## Settings reference
+
+Mesh service:
+
+| Setting | Default | |
+|---|---|---|
+| `mesh_node_name` | hostname | This node's name, as the other nodes' `mesh_peer` calls it. |
+| `mesh_peer <name> { }` | | One per node; entries with this node's own name are ignored. |
+| `mesh_peer_host` | | Host name or IP of the peer. |
+| `mesh_peer_doveadm_port` | | The peer's doveadm TCP port. |
+| `mesh_peer_http_port` | | The peer's mesh HTTP port. |
+| `mesh_peer_lmtp_port` | 24 | The peer's LMTP port, for delivery affinity. |
+| `mesh_peer_doveadm_ssl` | no | dsync to the peer over TLS. |
+| `mesh_peer_http_ssl` | no | Mesh HTTP to the peer over TLS. |
+| `mesh_topology` | anchor | `anchor` or `full`. |
+| `mesh_api_key` | | Shared secret for the HTTP API and UI. Empty: HTTP requests are refused. |
+| `mesh_state_path` | mesh.db | State file, relative to `state_dir`. |
+| `mesh_doveadm_socket_path` | doveadm-server | Local doveadm server socket, relative to `base_dir`. |
+| `mesh_coalesce_delay` | 100ms | Wait this long after a change before pushing it. |
+| `mesh_heartbeat_interval` | 2s | Heartbeat to each peer. |
+| `mesh_peer_down_timeout` | 7s | A peer without heartbeat replies for this long is down. |
+| `mesh_incremental_sync_interval` | 10min | Push every user this often (0 = never). |
+| `mesh_full_sync_interval` | 1d | Fully sync every user this often (0 = never). |
+| `mesh_sync_timeout` | 10min | Give up a session after this long. |
+| `mesh_max_parallel_syncs` | 4 | Sessions this node runs at the same time. |
+| `mesh_verify_interval` | 0 | Verify one of this node's anchored users this often (0 = never). |
+| `mesh_dsync_debug` | no | Run dsync with debug logging. |
+
+Mesh plugin (mail processes):
+
+| Setting | Default | |
+|---|---|---|
+| `mesh_notify_socket_path` | mesh-notify | Mesh service socket, relative to `base_dir`. |
+| `mesh_delivery_sync_timeout` | 2s | LMTP/LDA wait at most this long for the mail to reach another node before confirming the delivery (0 = don't wait). |
+| `mesh_save_lock_timeout` | 30s | Saving waits at most this long for a running dsync session of the user; then it saves anyway, with a warning. |
+| `mesh_dsync_lock_timeout` | 10s | A dsync session waits at most this long for the user's lock, then fails (and is retried). |
+
+dsync: `dsync_features = relay-changes` is needed with more than two
+nodes. Without it a node never forwards flag changes, keyword changes or
+expunges it received from one node to another.
+
+## Operating it
+
+Web UI: `http://<node>:<mesh http port>/` (redirects to `/mesh/ui/`).
+Log in with any user name and `mesh_api_key` as the password. It shows
+this node's view: peers with heartbeat, RTT and clock offset; every user's
+status per peer; recent sessions; and has buttons for pause/resume, sync
+now, full resync and verify.
+
+Command line (on a node):
+
+```
+doveadm mesh status              # node, peers up, users, pending/running
+doveadm mesh peers               # per peer: up/down, RTT, last error, ...
+doveadm mesh users [<user>]      # per user and peer: status, last sync, ...
+doveadm mesh sync [-f] <user>    # push now (-f: full sync)
+doveadm mesh verify <user>       # compare the user's mailboxes on all nodes
+doveadm mesh pause|resume <peer> # stop/start syncing with a peer
+```
+
+User status per peer: `ok`; `via anchor` (relayed: this node syncs the
+user only with its anchor); `pending`; `syncing`; `error` (failing,
+retried with backoff); `never synced`.
+
+HTTP API (all under `/mesh/v1/`, `Authorization: Bearer <mesh_api_key>`
+or Basic auth; POST requests with Basic auth also need an
+`X-Requested-With` header):
+
+| Request | |
+|---|---|
+| `GET status` | Node and peers, JSON. |
+| `GET users[?user=u\|q=substring][&problems=1][&limit=n]` | Users' status per peer, JSON. |
+| `GET activity[?limit=n]` | Recent sessions of this node, newest first. |
+| `GET route?user=u` | Where to deliver the user's mail (see below). |
+| `POST sync?user=u[&full=1]` | Push the user now. |
+| `POST verify?user=u` | Compare the user's mailboxes on all nodes, JSON. |
+| `POST pause?peer=p`, `POST resume?peer=p` | |
+| `GET heartbeat`, `GET fingerprint?user=u`, `POST lease`, `POST release` | Between nodes. |
+
+Common tasks:
+
+- **Node down**: the others notice after `mesh_peer_down_timeout`; users
+  anchored to it get a new anchor. Changes made meanwhile are pushed when
+  it comes back (startup sync, and the other nodes see it come up).
+- **Adding a node**: add its `mesh_peer` to every node's configuration and
+  `doveadm reload`. An empty new node gets every user's mail with the
+  first (stateless) syncs; anchors of some users move to it.
+- **Removing a node**: remove its `mesh_peer` everywhere and reload.
+- **Something looks wrong with a user**: `doveadm mesh verify <user>`,
+  then `doveadm mesh sync -f <user>` to repair, and verify again.
+- **Maintenance on a node**: `doveadm mesh pause <node>` on the other
+  nodes stops syncing with it (pause isn't persistent across restarts).
+
+## Delivery affinity
+
+Mail delivered to several nodes at the same time gets the same UIDs on
+them, which dsync then has to renumber; IMAP clients see renumbered mails
+as expunged and new. Delivering each user's mail on its anchor avoids
+that. `mesh-route.lua` (installed into Dovecot's data directory, e.g.
+`/usr/share/dovecot/mesh-route.lua`) is a Lua passdb that makes LMTP
+proxy each recipient to its anchor:
+
+```
+lmtp_proxy = yes
+# must be the first passdb
+passdb mesh-route {
+  driver = lua
+  lua_file = /usr/share/dovecot/mesh-route.lua
+  lua_settings {
+    mesh_url = http://127.0.0.1:8090
+    mesh_api_key = <mesh_api_key>
+  }
+}
+passdb ... { (the real passdb) }
+```
+
+It only answers LMTP lookups and passes everything else on to the next
+passdb. If the anchor is the local node, isn't reachable, or the mesh
+service can't be asked, the mail is delivered locally. The peers'
+`mesh_peer_lmtp_port` must be right. IMAP logins aren't routed; clients
+may use any node.
+
+## Monitoring
+
+- Every session sends a `mesh_sync_finished` event with the fields
+  `user`, `peer`, `result` (ok, changed, busy, failed), `exit_code`,
+  `full`, `stateful`, `error` and the duration. Use it for metrics (e.g.
+  sessions per peer and result, duration histogram) or
+  `log_debug = event=mesh_sync_finished` to log them.
+- Warnings worth alerting on: `Syncing <user> with <peer> failed`,
+  `Peer <peer> is down`, `Verifying <user>: nodes differ` (with
+  `mesh_verify_interval`), `<user> still differs between nodes after a
+  full sync` (error), and from mail processes `mesh: Delivered mail isn't
+  on another node yet after N ms`.
+- `log_debug = category=mesh` logs every notification and session.
+
+## Migrating from the Syncthing setup
+
+1. Stop Syncthing on all nodes, and stop Dovecot.
+2. Install this build everywhere. Leave `maildir_ignore_new_dir` unset
+   (`no`).
+3. Replace the `new -> cur` symlinks with real directories, e.g.
+   `find /var/vmail -type l -name new -exec sh -c 'rm "$1" && mkdir -m 0700 "$1"' _ {} \;`
+   and fix their owner.
+4. Choose:
+   - keep all nodes' data: the first session of each user and pair is
+     stateless; mails that are on both nodes are matched by their GUID
+     (the Maildir file name) and not copied again, or
+   - keep one node's data, empty the others, and let the mesh copy
+     everything (simplest, costs bandwidth).
+5. Configure the mesh as above, start Dovecot everywhere, watch the web UI
+   until nothing is pending, and verify some users (or set
+   `mesh_verify_interval`).
+6. Point MX/MTA delivery at the nodes' LMTP, optionally with delivery
+   affinity.
+
+## Limitations and known issues
+
+- When the same folder is first created on several nodes independently
+  (e.g. INBOX of a new user on first login or delivery on two nodes), the
+  first sync makes the folders' UIDVALIDITY and GUID equal, which resets
+  the folder index on one node. IMAP clients connected to that folder at
+  that moment are disconnected once ("IMAP session state is inconsistent,
+  please relogin"), and the log shows "Log synchronization error ...
+  Extension record update for invalid uid" errors. Delivery affinity and
+  migrating existing data first make it rare.
+- "Duplicate file entry" warnings about `dovecot-uidlist` appear while
+  dsync renumbers mails; they're harmless.
+- If a session fails halfway, and a mail it already copied is expunged
+  before the next successful session, the mail can come back (a dsync
+  limitation with partially applied states).
+- A node that writes mail into Maildirs behind Dovecot's back (another
+  MDA, scripts) isn't noticed until the next periodic sync, and delivery
+  waits don't apply.
+- The `full` topology syncs mostly statelessly with more than two nodes.
+- Pausing a peer isn't persistent.
+- The mesh service runs as root (like doveadm), since it uses the
+  doveadm-server socket and writes `state_dir`.
+
+## Test harness
+
+`harness/` runs real Dovecot nodes on one machine (as root, needs a
+`vmail` user, Dovecot installed to `/opt/dovecot` or `DOVECOT_PREFIX`),
+drives a workload of LMTP deliveries and IMAP flag changes, moves,
+copies, expunges and appends on random nodes, and checks that all nodes
+end up identical with nothing lost, duplicated or brought back:
+
+```
+cd src/mesh/harness
+python3 phase1.py --nodes 5 --users 3 --duration 20
+python3 phase1.py --nodes 4 --users 2 --kill-node node3   # crash a node
+python3 phase1.py --nodes 3 --users 3 --lmtp-route        # delivery affinity
+python3 phase1.py --nodes 3 --users 2 --tls               # TLS between nodes
+python3 phase1.py --nodes 3 --users 3 --topology full
+python3 phase1.py ... --keep   # leave the nodes running in /var/tmp/meshtest
+```
+
+`phase0.py` drives dsync directly instead of the mesh service; it was
+used to find out what dsync needs for multi-master replication.
