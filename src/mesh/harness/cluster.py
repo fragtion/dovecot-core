@@ -60,7 +60,7 @@ namespace inbox {{
   }}
 }}
 
-passdb static {{
+{passdb_first}passdb static {{
   password = {user_password}
 }}
 userdb static {{
@@ -126,6 +126,8 @@ class Node:
                 doveadm_port=self.doveadm_port,
                 doveadm_password=DOVEADM_PASSWORD,
                 user_password=USER_PASSWORD,
+                passdb_first=(mesh_route_passdb(self)
+                              if self.cluster.lmtp_route else ""),
                 extra=self.cluster.extra_config(self)))
 
     def master_pid(self):
@@ -231,6 +233,21 @@ class Node:
 MESH_API_KEY = "meshtest-key"
 
 
+def mesh_route_passdb(node):
+    """A first passdb that proxies LMTP recipients to their anchor."""
+    return """lmtp_proxy = yes
+passdb mesh-route {
+  driver = lua
+  lua_file = %s
+  lua_settings {
+    mesh_url = http://127.0.0.1:%d
+    mesh_api_key = %s
+  }
+}
+""" % (os.path.join(PREFIX, "share/dovecot/mesh-route.lua"),
+       node.http_port, MESH_API_KEY)
+
+
 def mesh_config(cluster, node, topology="anchor", extra=""):
     """dovecot.conf lines that enable mesh replication on node."""
     lines = [
@@ -256,6 +273,7 @@ def mesh_config(cluster, node, topology="anchor", extra=""):
             "  mesh_peer_host = 127.0.0.1",
             "  mesh_peer_doveadm_port = %d" % peer.doveadm_port,
             "  mesh_peer_http_port = %d" % peer.http_port,
+            "  mesh_peer_lmtp_port = %d" % peer.lmtp_port,
             "}",
         ]
     return "\n".join(lines) + "\n" + extra
@@ -263,11 +281,13 @@ def mesh_config(cluster, node, topology="anchor", extra=""):
 
 class Cluster:
     def __init__(self, n, root=ROOT, extra=None, mesh=False,
-                 topology="anchor"):
+                 topology="anchor", lmtp_route=False):
         self.root = root
         self.extra = extra or (lambda node: "")
         self.mesh = mesh
         self.topology = topology
+        # proxy LMTP deliveries to the user's anchor (mesh-route.lua)
+        self.lmtp_route = lmtp_route
         self.nodes = [Node(self, i + 1) for i in range(n)]
 
     def extra_config(self, node):

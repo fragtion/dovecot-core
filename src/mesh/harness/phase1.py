@@ -4,6 +4,7 @@
 # check that every node converged.
 
 import argparse
+import re
 import sys
 import threading
 import time
@@ -40,7 +41,8 @@ def wait_quiet(cluster, timeout, stable_secs=2.0):
 def run(args):
     extra = "\n".join(args.set or [])
     cluster = cl.Cluster(args.nodes, extra=lambda node: extra, mesh=True,
-                         topology=args.topology)
+                         topology=args.topology,
+                         lmtp_route=args.lmtp_route)
     cluster.setup()
     cluster.start()
     time.sleep(2)
@@ -89,9 +91,21 @@ def run(args):
                 user, result, ", ".join(differing)))
     errors = cluster.errors()
 
-    print("topology=%s nodes=%d users=%d affinity=%s kill=%s" % (
+    print("topology=%s nodes=%d users=%d affinity=%s lmtp-route=%s kill=%s" % (
         args.topology, args.nodes, args.users, args.affinity,
-        args.kill_node))
+        args.lmtp_route, args.kill_node))
+    # where LMTP deliveries were saved: on the user's anchor or elsewhere
+    on_anchor = total = 0
+    for node in cluster.nodes:
+        for line in node.log().splitlines():
+            m = re.search(r"lmtp\(([^)]+)\)<.*: saved mail to", line)
+            if m is None:
+                continue
+            total += 1
+            if anchor_for(m.group(1), cluster.nodes).name == node.name:
+                on_anchor += 1
+    print("lmtp: %d of %d deliveries saved on the user's anchor" %
+          (on_anchor, total))
     print("work: %.1fs, ops=%d, delivered=%d appended=%d moved=%d "
           "copied=%d expunged=%d" % (
               work_secs, history.ops, len(history.delivered),
@@ -128,7 +142,11 @@ def main():
     p.add_argument("--deliverers", type=int, default=2)
     p.add_argument("--delivery-rate", type=float, default=10.0)
     p.add_argument("--actors-per-user", type=int, default=2)
-    p.add_argument("--affinity", action="store_true")
+    p.add_argument("--affinity", action="store_true",
+                   help="deliver to the user's anchor (harness picks it)")
+    p.add_argument("--lmtp-route", action="store_true",
+                   help="LMTP proxies recipients to their anchor "
+                   "(mesh-route.lua)")
     p.add_argument("--kill-node", help="crash and restart this node")
     p.add_argument("--quiesce-timeout", type=float, default=120)
     p.add_argument("--set", action="append",
