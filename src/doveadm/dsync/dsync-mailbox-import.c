@@ -164,6 +164,10 @@ static int dsync_mailbox_import_commit(struct dsync_mailbox_importer *importer,
 static void
 dsync_mailbox_import_flag_change(struct dsync_mailbox_importer *importer,
 				 const struct dsync_mail_change *change);
+static void
+dsync_mailbox_import_merge_flags(struct dsync_mailbox_importer *importer,
+				 struct mail *mail,
+				 const struct dsync_mail_change *change);
 
 static void
 dsync_import_unexpected_state(struct dsync_mailbox_importer *importer,
@@ -872,6 +876,35 @@ importer_mail_cmp(const struct importer_mail *m1,
 	return 0;
 }
 
+/* A local and a remote new mail with the same GUID got linked, so they become
+   one mail with the UID that is chosen for it later. Both sides link the
+   same pairs of instances, but each keeps its own instance's flags (the
+   local instance is kept or moved to the chosen UID). If those differ, e.g.
+   after the mail was moved to this mailbox on both servers, the state
+   written at the end treats them as synced and they stay different. So
+   merge the remote's flags into the local instance like for an existing
+   mail; both sides decide conflicts the same way. */
+static void
+newmail_merge_link_flags(struct dsync_mailbox_importer *importer,
+			 struct importer_new_mail *newmail)
+{
+	struct importer_new_mail *local, *remote;
+
+	if (newmail->uid_in_local) {
+		local = newmail;
+		remote = newmail->link;
+	} else {
+		local = newmail->link;
+		remote = newmail;
+	}
+	i_assert(local->uid_in_local && !remote->uid_in_local);
+	i_assert(remote->change != NULL);
+
+	if (mail_set_uid(importer->mail, local->local_uid))
+		dsync_mailbox_import_merge_flags(importer, importer->mail,
+						 remote->change);
+}
+
 static void newmail_link(struct dsync_mailbox_importer *importer,
 			 struct importer_new_mail *newmail, uint32_t remote_uid)
 {
@@ -920,6 +953,7 @@ static void newmail_link(struct dsync_mailbox_importer *importer,
 	if (link != NULL && newmail->link == NULL) {
 		link->link = newmail;
 		newmail->link = link;
+		newmail_merge_link_flags(importer, newmail);
 	}
 }
 
@@ -1418,7 +1452,9 @@ dsync_mailbox_import_replace_flags(struct mail *mail,
 		mail_update_pvt_modseq(mail, change->pvt_modseq);
 }
 
-/* Merge the remote's flags in change with the local mail's flags. */
+/* Merge the remote's flags in change with the local mail's flags. The mail
+   is usually the local instance with the same UID, but it can also be a
+   local instance with another UID that the remote mail was linked to. */
 static void
 dsync_mailbox_import_merge_flags(struct dsync_mailbox_importer *importer,
 				 struct mail *mail,
