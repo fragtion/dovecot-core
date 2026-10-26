@@ -58,6 +58,9 @@ Many unit tests exercise optional functionality; for full coverage, agents shoul
   - ICU
   - libsodium
   - libunwind
+  - Lua 5.4 (`--with-lua`): Lua passdb/userdb, including the mesh's
+    delivery affinity script `src/mesh/mesh-route.lua`. The lib-lua unit
+    tests also need the Lua `json` module.
 
 ### 1.4 Example package sets
 
@@ -78,7 +81,8 @@ apt-get install -y \
   libldap2-dev libpam0g-dev libsasl2-dev \
   libsystemd-dev libcap-dev \
   libicu-dev libcurl4-openssl-dev libunwind-dev \
-  liblz4-dev liblzma-dev libsodium-dev
+  liblz4-dev liblzma-dev libsodium-dev \
+  liblua5.4-dev lua-json
 ```
 
 #### RHEL / CentOS / Fedora
@@ -97,7 +101,8 @@ dnf install -y \
   openldap-devel pam-devel cyrus-sasl-devel \
   systemd-devel libcap-devel \
   libicu-devel libcurl-devel libunwind-devel \
-  lz4-devel xz-devel libsodium-devel
+  lz4-devel xz-devel libsodium-devel \
+  lua-devel
 ```
 
 ---
@@ -129,6 +134,12 @@ make -j$(nproc)
 ```
 
 NOTE: --enable-maintainer-mode allows rebuilding automake changes after Makefile.am changes in various directories.
+
+When building from **git**, `src/lib` downloads Unicode data files (UCD)
+from https://dovecot.org/res into `src/lib/ucd/`. If that host isn't
+reachable, put the same Unicode 16.0.0 files there yourself (e.g. from
+https://www.unicode.org/Public/16.0.0/ucd/; the file list is `UCD_FILES`
+in `src/lib/Makefile.am`).
 
 To see various available options, use
 
@@ -173,6 +184,29 @@ make -C src/lib-storage check
 
 To disable valgrind usage on agents, ensure `NOVALGRIND=1` environment variable
 is set when running make check.
+
+Some tests depend on the environment: `test-http-client-errors` expects a
+connection to 192.168.0.0 to time out (fails where such connections are
+refused right away), and `test-lua-http-client` needs the Lua `json`
+module.
+
+### 3.4 Mesh replication tests
+
+`src/mesh/harness/` runs several real Dovecot nodes on one machine and
+checks that mesh replication converges under a mixed workload. It needs
+root, a `vmail` user, Python 3, and this tree installed (default prefix
+`/opt/dovecot`, or set `DOVECOT_PREFIX`):
+
+```sh
+./configure --prefix=/opt/dovecot --with-lua=yes ... && make && make install
+cd src/mesh/harness
+python3 phase1.py --nodes 5 --users 3 --duration 20
+python3 phase1.py --nodes 4 --users 2 --kill-node node3
+python3 phase1.py --nodes 3 --users 3 --lmtp-route
+python3 phase1.py --nodes 3 --users 2 --tls
+```
+
+A run passes with `problems: 0`. See `src/mesh/README.md`.
 
 ---
 
