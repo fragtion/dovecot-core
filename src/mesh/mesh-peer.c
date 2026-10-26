@@ -148,6 +148,8 @@ mesh_peer_http_request(struct mesh_peer *peer, const char *method,
 				    (http_client_request_callback_t *)callback,
 				    context);
 	http_client_request_set_port(req, peer->set->mesh_peer_http_port);
+	/* the peer's certificate is checked with the ssl_client_* settings */
+	http_client_request_set_ssl(req, peer->set->mesh_peer_http_ssl);
 	http_client_request_set_timeout_msecs(req,
 		mesh_set->mesh_peer_down_timeout);
 	http_client_request_add_header(req, "Authorization",

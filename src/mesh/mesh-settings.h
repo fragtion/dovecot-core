@@ -20,6 +20,7 @@ struct mesh_peer_settings {
 	in_port_t mesh_peer_http_port;
 	in_port_t mesh_peer_lmtp_port;
 	bool mesh_peer_doveadm_ssl;
+	bool mesh_peer_http_ssl;
 };
 
 struct mesh_settings {

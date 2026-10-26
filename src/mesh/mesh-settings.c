@@ -69,6 +69,7 @@ static const struct setting_define mesh_peer_setting_defines[] = {
 	DEF(IN_PORT, mesh_peer_http_port),
 	DEF(IN_PORT, mesh_peer_lmtp_port),
 	DEF(BOOL, mesh_peer_doveadm_ssl),
+	DEF(BOOL, mesh_peer_http_ssl),
 
 	SETTING_DEFINE_LIST_END
 };
@@ -80,6 +81,7 @@ static const struct mesh_peer_settings mesh_peer_default_settings = {
 	.mesh_peer_http_port = 0,
 	.mesh_peer_lmtp_port = 24,
 	.mesh_peer_doveadm_ssl = FALSE,
+	.mesh_peer_http_ssl = FALSE,
 };
 
 const struct setting_parser_info mesh_peer_setting_parser_info = {
