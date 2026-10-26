@@ -2,10 +2,15 @@
 
 #include "lib.h"
 #include "ioloop.h"
+#include "write-full.h"
 #include "test-common.h"
 #include "test-dir.h"
 #include "master-service.h"
 #include "test-mail-storage-common.h"
+
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/time.h>
 
 static const struct test_globals {
 	const char *str;
@@ -657,6 +662,112 @@ static void test_mailbox_list_mbox(void)
 	test_end();
 }
 
+static void test_maildir_add_mail(const char *dir, const char *fname)
+{
+	static const char msg[] = "Subject: test\n\nbody\n";
+	const char *path = t_strdup_printf("%s/%s", dir, fname);
+	int fd;
+
+	fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	if (fd == -1)
+		i_fatal("open(%s) failed: %m", path);
+	if (write_full(fd, msg, sizeof(msg)-1) < 0)
+		i_fatal("write(%s) failed: %m", path);
+	i_close_fd(&fd);
+}
+
+static void test_maildir_set_mtime(const char *path, time_t mtime)
+{
+	struct timeval tv[2];
+
+	i_zero(&tv);
+	tv[0].tv_sec = tv[1].tv_sec = mtime;
+	if (utimes(path, tv) < 0)
+		i_fatal("utimes(%s) failed: %m", path);
+}
+
+static unsigned int test_maildir_sync_messages(struct mail_user *user)
+{
+	struct mailbox *box;
+	struct mailbox_status status;
+
+	box = mailbox_alloc(user->namespaces->list, "testbox", 0);
+	test_assert(mailbox_sync(box, 0) == 0);
+	mailbox_get_open_status(box, STATUS_MESSAGES, &status);
+	mailbox_free(&box);
+	return status.messages;
+}
+
+static void test_maildir_sync_quick_check_run(bool new_symlink)
+{
+	struct test_mail_storage_ctx *ctx = test_mail_storage_init();
+	struct test_mail_storage_settings set = {
+		.driver = "maildir",
+	};
+	struct mailbox *box;
+	struct mailbox_status status;
+	const char *path, *cur_dir, *new_dir;
+	/* keep cur/ mtime far enough in the past that the sync doesn't
+	   consider it dirty (MAILDIR_SYNC_SECS) */
+	time_t mtime = time(NULL) - 100;
+
+	test_mail_storage_init_user(ctx, &set);
+
+	/* not INBOX, since it's not in the mailbox list index by default */
+	box = mailbox_alloc(ctx->user->namespaces->list, "testbox", 0);
+	test_assert(mailbox_create(box, NULL, FALSE) == 0);
+	test_assert(mailbox_open(box) == 0);
+	test_assert(mailbox_get_path_to(box, MAILBOX_LIST_PATH_TYPE_MAILBOX,
+					&path) > 0);
+	cur_dir = t_strconcat(path, "/cur", NULL);
+	new_dir = t_strconcat(path, "/new", NULL);
+	if (new_symlink) {
+		if (rmdir(new_dir) < 0)
+			i_fatal("rmdir(%s) failed: %m", new_dir);
+		if (symlink("cur", new_dir) < 0)
+			i_fatal("symlink(%s) failed: %m", new_dir);
+	}
+	test_maildir_add_mail(cur_dir, "1000000001.M1P1.test:2,");
+	test_maildir_set_mtime(cur_dir, mtime);
+	mailbox_free(&box);
+
+	/* the first sync scans cur/ */
+	test_assert(test_maildir_sync_messages(ctx->user) == 1);
+
+	/* Add a mail without changing cur/ mtime. The quick check must
+	   decide that nothing changed and not rescan cur/, so the mail
+	   isn't seen yet. */
+	test_maildir_add_mail(cur_dir, "1000000002.M2P2.test:2,");
+	test_maildir_set_mtime(cur_dir, mtime);
+	test_assert(test_maildir_sync_messages(ctx->user) == 1);
+
+	/* STATUS is answered from the mailbox list index without opening
+	   the mailbox */
+	box = mailbox_alloc(ctx->user->namespaces->list, "testbox", 0);
+	test_assert(mailbox_get_status(box, STATUS_MESSAGES, &status) == 0);
+	test_assert(status.messages == 1);
+	test_assert(!box->opened);
+	mailbox_free(&box);
+
+	/* cur/ mtime change is noticed */
+	test_maildir_set_mtime(cur_dir, mtime + 1);
+	test_assert(test_maildir_sync_messages(ctx->user) == 2);
+
+	test_mail_storage_deinit_user(ctx);
+	test_mail_storage_deinit(&ctx);
+}
+
+static void test_maildir_sync_quick_check(void)
+{
+	test_begin("maildir sync quick check");
+	test_maildir_sync_quick_check_run(FALSE);
+	test_end();
+
+	test_begin("maildir sync quick check (new/ symlinked to cur/)");
+	test_maildir_sync_quick_check_run(TRUE);
+	test_end();
+}
+
 static void test_mail_parse_human_timestamp(void)
 {
 	int ret;
@@ -737,6 +848,7 @@ int main(int argc, char **argv)
 		test_mailbox_verify_name,
 		test_mailbox_list_maildir,
 		test_mailbox_list_mbox,
+		test_maildir_sync_quick_check,
 		test_mail_parse_human_timestamp,
 		test_mail_parse_human_timestamp_time_interval,
 		test_mail_parse_human_timestamp_fail,
