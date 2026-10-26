@@ -333,6 +333,7 @@ void mesh_peers_init(void)
 	struct http_client_settings *set;
 	struct mesh_peer *peer;
 	const char *error;
+	pool_t pool;
 
 	i_array_init(&mesh_peers, 8);
 	array_foreach_elem(&mesh_set->parsed_peers, peer_set) {
@@ -355,14 +356,20 @@ void mesh_peers_init(void)
 		i_fatal("http_client settings: %s", error);
 	/* Requests to a peer shouldn't wait for each other: heartbeats must
 	   not be delayed by a slow fingerprint request, or the peer looks
-	   down. The client keeps a reference to the settings pool. */
-	set = p_new(http_set->pool, struct http_client_settings, 1);
+	   down. The copy's pool keeps the original settings (and their
+	   strings) referenced. Like settings from settings_get(), the copy's
+	   reference is given to the client, which frees it in
+	   http_client_deinit(). */
+	pool = pool_alloconly_create("mesh http client settings", 256);
+	set = p_new(pool, struct http_client_settings, 1);
 	*set = *http_set;
+	set->pool = pool;
 	set->max_parallel_connections =
 		I_MAX(set->max_parallel_connections, 4);
+	pool_add_external_ref(pool, http_set->pool);
+	settings_free(http_set);
 	mesh_http_client = http_client_init(set,
 		master_service_get_event(master_service));
-	settings_free(http_set);
 	mesh_heartbeat_to = timeout_add(mesh_set->mesh_heartbeat_interval,
 					mesh_heartbeat_timeout, NULL);
 	mesh_heartbeat_timeout(NULL);
