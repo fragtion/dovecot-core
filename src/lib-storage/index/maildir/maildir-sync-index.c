@@ -700,7 +700,7 @@ int maildir_list_index_has_changed(struct mailbox *box,
 	struct maildir_mailbox *mbox = MAILDIR_MAILBOX(box);
 	const struct maildir_list_index_record *rec;
 	const void *data;
-	const char *root_dir, *new_dir, *cur_dir;
+	const char *root_dir, *cur_dir;
 	struct stat st;
 	uint32_t ext_id;
 	bool expunged;
@@ -741,20 +741,7 @@ int maildir_list_index_has_changed(struct mailbox *box,
 		return ret;
 	i_assert(ret > 0);
 
-	/* check if new/ changed */
-	new_dir = t_strconcat(root_dir, "/new", NULL);
-	if (stat(new_dir, &st) < 0) {
-		mailbox_set_critical(box, "stat(%s) failed: %m", new_dir);
-		return -1;
-	}
-	if ((time_t)rec->new_mtime != st.st_mtime) {
-		*reason_r = t_strdup_printf(
-			"Maildir new_mtime changed %u != %"PRIdTIME_T,
-			rec->new_mtime, st.st_mtime);
-		return 1;
-	}
-
-	/* check if cur/ changed */
+	/* new/ is ignored, so only check if cur/ changed */
 	cur_dir = t_strconcat(root_dir, "/cur", NULL);
 	if (stat(cur_dir, &st) < 0) {
 		mailbox_set_critical(box, "stat(%s) failed: %m", cur_dir);
@@ -797,8 +784,7 @@ void maildir_list_index_update_sync(struct mailbox *box,
 	old_rec = data;
 
 	i_zero(&new_rec);
-	if (mhdr->new_check_time <= mhdr->new_mtime + MAILDIR_SYNC_SECS ||
-	    mhdr->cur_check_time <= mhdr->cur_mtime + MAILDIR_SYNC_SECS) {
+	if (mhdr->cur_check_time <= mhdr->cur_mtime + MAILDIR_SYNC_SECS) {
 		/* dirty, we need a refresh next time */
 	} else {
 		new_rec.new_mtime = mhdr->new_mtime;
