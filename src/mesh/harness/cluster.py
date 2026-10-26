@@ -261,7 +261,7 @@ def mesh_config(cluster, node, topology="anchor", extra=""):
         "  notify = yes",
         "  mesh = yes",
         "}",
-        "dsync_features = relay-changes",
+        "dsync_features = relay-changes reuse-local-mails",
         "mesh_node_name = %s" % node.name,
         "mesh_topology = %s" % topology,
         "mesh_api_key = %s" % MESH_API_KEY,
