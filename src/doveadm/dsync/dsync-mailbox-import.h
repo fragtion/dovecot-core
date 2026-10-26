@@ -18,6 +18,7 @@ enum dsync_mailbox_import_flags {
 };
 
 struct mailbox;
+struct dsync_local_mails;
 struct dsync_mailbox_attribute;
 struct dsync_mail;
 struct dsync_mail_change;
@@ -25,6 +26,9 @@ struct dsync_transaction_log_scan;
 
 struct dsync_mailbox_import_settings {
 	struct mailbox *virtual_all_box;
+	/* If set, expunges are deferred to the end of the session, and mails
+	   are copied from other local mailboxes when possible. */
+	struct dsync_local_mails *local_mails;
 	uint32_t last_common_uid;
 	uint64_t last_common_modseq;
 	uint64_t last_common_pvt_modseq;

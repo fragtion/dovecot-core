@@ -34,6 +34,7 @@ libdsync_la_SOURCES = \
 	dsync-ibc.c \
 	dsync-ibc-stream.c \
 	dsync-ibc-pipe.c \
+	dsync-local-mails.c \
 	dsync-transaction-log-scan.c
 
 libdovecot_dsync_la_SOURCES =
@@ -48,6 +49,7 @@ pkginc_lib_HEADERS = \
 
 noinst_HEADERS = \
 	dsync-brain-private.h \
+	dsync-local-mails.h \
 	dsync-mail.h \
 	dsync-mailbox.h \
 	dsync-mailbox-import.h \

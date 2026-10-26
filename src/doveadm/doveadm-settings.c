@@ -141,6 +141,7 @@ static const struct dsync_feature_list dsync_feature_list[] = {
 	{ "empty-header-workaround", DSYNC_FEATURE_EMPTY_HDR_WORKAROUND },
 	{ "no-header-hashes", DSYNC_FEATURE_NO_HEADER_HASHES },
 	{ "relay-changes", DSYNC_FEATURE_RELAY_CHANGES },
+	{ "reuse-local-mails", DSYNC_FEATURE_REUSE_LOCAL_MAILS },
 	{ NULL, 0 }
 };
 

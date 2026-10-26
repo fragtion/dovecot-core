@@ -12,6 +12,7 @@
 #include "dsync-mailbox-export.h"
 #include "dsync-transaction-log-scan.h"
 #include "dsync-brain-private.h"
+#include "dsync-local-mails.h"
 
 static int
 ns_mailbox_try_alloc(struct dsync_brain *brain, struct mail_namespace *ns,
@@ -225,8 +226,20 @@ dsync_brain_sync_mailbox_init_remote(struct dsync_brain *brain,
 	if (brain->no_header_hashes)
 		import_flags |= DSYNC_MAILBOX_IMPORT_FLAG_NO_HEADER_HASHES;
 
+	if (brain->reuse_local_mails && brain->local_mails == NULL &&
+	    !brain->backup_send && !brain->backup_recv) {
+		enum mailbox_transaction_flags trans_flags =
+			MAILBOX_TRANSACTION_FLAG_SYNC;
+
+		if (brain->no_notify)
+			trans_flags |= MAILBOX_TRANSACTION_FLAG_NO_NOTIFY;
+		brain->local_mails = dsync_local_mails_init(brain->user,
+			trans_flags, brain->event);
+	}
+
 	const struct dsync_mailbox_import_settings import_set = {
 		.virtual_all_box = brain->virtual_all_box,
+		.local_mails = brain->local_mails,
 		.last_common_uid = last_common_uid,
 		.last_common_modseq = last_common_modseq,
 		.last_common_pvt_modseq = last_common_pvt_modseq,
@@ -346,8 +359,11 @@ int dsync_brain_sync_mailbox_open(struct dsync_brain *brain,
 	if (brain->sync_since_timestamp > 0 ||
 	    brain->sync_until_timestamp > 0)
 		exporter_flags |= DSYNC_MAILBOX_EXPORTER_FLAG_TIMESTAMPS;
-	if (brain->sync_max_size > 0)
+	if (brain->sync_max_size > 0 || brain->reuse_local_mails) {
+		/* with reuse_local_mails the remote uses sizes to decide
+		   whether looking for local copies is worth it */
 		exporter_flags |= DSYNC_MAILBOX_EXPORTER_FLAG_VSIZES;
+	}
 	if (brain->backup_send && !brain->no_backup_overwrite) {
 		/* The destination reverts its local changes, so it needs to
 		   see also the attributes that we haven't changed. */

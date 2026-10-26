@@ -14,6 +14,7 @@
 #include "dsync-mailbox-tree.h"
 #include "dsync-ibc.h"
 #include "dsync-brain-private.h"
+#include "dsync-local-mails.h"
 #include "dsync-mailbox-import.h"
 #include "dsync-mailbox-export.h"
 
@@ -177,6 +178,8 @@ dsync_brain_set_flags(struct dsync_brain *brain, enum dsync_brain_flags flags)
 	brain->empty_hdr_workaround = (flags & DSYNC_BRAIN_FLAG_EMPTY_HDR_WORKAROUND) != 0;
 	brain->no_header_hashes = (flags & DSYNC_BRAIN_FLAG_NO_HEADER_HASHES) != 0;
 	brain->relay_changes = (flags & DSYNC_BRAIN_FLAG_RELAY_CHANGES) != 0;
+	brain->reuse_local_mails =
+		(flags & DSYNC_BRAIN_FLAG_REUSE_LOCAL_MAILS) != 0;
 
 	event_set_forced_debug(brain->event, brain->debug);
 }
@@ -379,6 +382,11 @@ int dsync_brain_deinit(struct dsync_brain **_brain, enum mail_error *error_r)
 		dsync_brain_sync_mailbox_deinit(brain);
 	if (brain->virtual_all_box != NULL)
 		mailbox_free(&brain->virtual_all_box);
+	if (brain->local_mails != NULL) {
+		/* The session failed before finishing. Its imports were
+		   committed, so apply their expunges anyway. */
+		(void)dsync_local_mails_finish(&brain->local_mails);
+	}
 	if (brain->local_tree_iter != NULL)
 		dsync_mailbox_tree_iter_deinit(&brain->local_tree_iter);
 	if (brain->local_mailbox_tree != NULL)
@@ -643,6 +651,18 @@ static bool dsync_brain_slave_recv_last_common(struct dsync_brain *brain)
 	return changed;
 }
 
+static void dsync_brain_finish_local_mails(struct dsync_brain *brain)
+{
+	if (brain->local_mails == NULL)
+		return;
+	if (dsync_local_mails_finish(&brain->local_mails) < 0) {
+		/* The mailbox states already say that the remote's expunges
+		   were done. Only a full resync can fix that, and it won't
+		   lose mails. */
+		brain->require_full_resync = TRUE;
+	}
+}
+
 static bool dsync_brain_finish(struct dsync_brain *brain)
 {
 	const char *error;
@@ -650,6 +670,9 @@ static bool dsync_brain_finish(struct dsync_brain *brain)
 	bool require_full_resync;
 	enum dsync_ibc_recv_ret ret;
 
+	/* apply the deferred expunges before the slave reports its result
+	   and before the master exports the state */
+	dsync_brain_finish_local_mails(brain);
 	if (!brain->master_brain) {
 		dsync_ibc_send_finish(brain->ibc,
 				      brain->failed ? "dsync failed" : NULL,

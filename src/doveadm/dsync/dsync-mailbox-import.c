@@ -14,10 +14,16 @@
 #include "dsync-mail.h"
 #include "dsync-mailbox.h"
 #include "dsync-mailbox-import.h"
+#include "dsync-local-mails.h"
 
 struct importer_mail {
 	const char *guid;
 	uint32_t uid;
+};
+
+struct importer_deferred_expunge {
+	uint32_t uid;
+	const char *guid;
 };
 
 struct importer_new_mail {
@@ -83,6 +89,12 @@ struct dsync_mailbox_importer {
 	struct mailbox *virtual_all_box;
 	struct mailbox_transaction_context *virtual_trans;
 	struct mail *virtual_mail;
+
+	/* local copies of mails in other mailboxes, see
+	   dsync-local-mails.h */
+	struct dsync_local_mails *local_mails;
+	/* expunges deferred to the end of the session */
+	ARRAY(struct importer_deferred_expunge) deferred_expunges;
 
 	struct mail *cur_mail;
 	const char *cur_guid;
@@ -229,6 +241,7 @@ dsync_mailbox_import_init(struct mailbox *box,
 
 	importer->box = box;
 	importer->virtual_all_box = set->virtual_all_box;
+	importer->local_mails = set->local_mails;
 	importer->last_common_uid = set->last_common_uid;
 	importer->last_common_modseq = set->last_common_modseq;
 	importer->last_common_pvt_modseq = set->last_common_pvt_modseq;
@@ -262,6 +275,8 @@ dsync_mailbox_import_init(struct mailbox *box,
 	hash_table_create(&importer->import_guids, pool, 0, str_hash, strcmp);
 	hash_table_create_direct(&importer->import_uids, pool, 0);
 	i_array_init(&importer->maybe_expunge_uids, 16);
+	if (importer->local_mails != NULL)
+		p_array_init(&importer->deferred_expunges, pool, 16);
 	i_array_init(&importer->maybe_saves, 128);
 	i_array_init(&importer->newmails, 128);
 	i_array_init(&importer->wanted_uids, 128);
@@ -1611,6 +1626,28 @@ dsync_mailbox_import_save(struct dsync_mailbox_importer *importer,
 	}
 }
 
+/* Expunge a mail because the remote expunged it. With local_mails the
+   expunge is deferred to the end of the session: the mail may have been
+   moved to another mailbox that is synced later, and then it's copied from
+   here instead of being transferred again. */
+static void
+dsync_mailbox_import_remote_expunge(struct dsync_mailbox_importer *importer,
+				    struct mail *mail)
+{
+	struct importer_deferred_expunge *expunge;
+	const char *guid;
+
+	if (importer->local_mails == NULL || importer->revert_local_changes ||
+	    mail_get_special(mail, MAIL_FETCH_GUID, &guid) < 0 ||
+	    guid[0] == '\0') {
+		mail_expunge(mail);
+		return;
+	}
+	expunge = array_append_space(&importer->deferred_expunges);
+	expunge->uid = mail->uid;
+	expunge->guid = p_strdup(importer->pool, guid);
+}
+
 static void
 dsync_mailbox_import_expunge(struct dsync_mailbox_importer *importer,
 			     const struct dsync_mail_change *change)
@@ -1621,7 +1658,8 @@ dsync_mailbox_import_expunge(struct dsync_mailbox_importer *importer,
 		   match */
 		i_assert(change->uid <= importer->last_common_uid);
 		if (dsync_import_set_mail(importer, change))
-			mail_expunge(importer->mail);
+			dsync_mailbox_import_remote_expunge(importer,
+							    importer->mail);
 	} else if (importer->cur_mail == NULL ||
 		   change->uid < importer->cur_mail->uid) {
 		/* already expunged locally, we can ignore this.
@@ -1632,7 +1670,8 @@ dsync_mailbox_import_expunge(struct dsync_mailbox_importer *importer,
 		/* already verified that the GUID matches */
 		i_assert(importer->cur_mail->uid == change->uid);
 		if (dsync_check_cur_guid(importer, change))
-			mail_expunge(importer->cur_mail);
+			dsync_mailbox_import_remote_expunge(importer,
+							    importer->cur_mail);
 	} else {
 		/* we don't know yet if we should expunge this
 		   message or not. queue it until we do. */
@@ -1687,7 +1726,8 @@ dsync_mailbox_common_uid_found(struct dsync_mailbox_importer *importer)
 		}
 
 		if (mail_set_uid(importer->mail, uid))
-			mail_expunge(importer->mail);
+			dsync_mailbox_import_remote_expunge(importer,
+							    importer->mail);
 	}
 
 	/* handle pending saves */
@@ -2305,6 +2345,28 @@ dsync_mailbox_import_try_virtual_all(struct dsync_mailbox_importer *importer,
 }
 
 static bool
+dsync_mailbox_import_try_local_mails(struct dsync_mailbox_importer *importer,
+				     struct importer_new_mail *all_newmails)
+{
+	struct dsync_mail dmail;
+	struct mail *mail;
+
+	if (importer->local_mails == NULL || *all_newmails->guid == '\0')
+		return FALSE;
+	mail = dsync_local_mails_find(importer->local_mails,
+				      all_newmails->guid, importer->box);
+	if (mail == NULL)
+		return FALSE;
+	if (dsync_mailbox_import_local_uid(importer, mail, mail->uid,
+					   all_newmails->guid, &dmail) > 0) {
+		if (dsync_mailbox_save_newmails(importer, &dmail,
+						all_newmails, FALSE))
+			return TRUE;
+	}
+	return FALSE;
+}
+
+static bool
 dsync_mailbox_import_handle_mail(struct dsync_mailbox_importer *importer,
 				 struct importer_new_mail *all_newmails)
 {
@@ -2337,7 +2399,8 @@ dsync_mailbox_import_handle_mail(struct dsync_mailbox_importer *importer,
 
 	if (!dsync_mailbox_import_try_local(importer, all_newmails,
 					    &local_uids, &wanted_uids) &&
-	    !dsync_mailbox_import_try_virtual_all(importer, all_newmails)) {
+	    !dsync_mailbox_import_try_virtual_all(importer, all_newmails) &&
+	    !dsync_mailbox_import_try_local_mails(importer, all_newmails)) {
 		if (request_guid == NULL && request_uid == 0) {
 			/* All the instances were local, but they couldn't be
 			   kept or copied to their new UIDs, i.e. they were
@@ -2410,6 +2473,43 @@ dsync_mailbox_import_find_virtual_uids(struct dsync_mailbox_importer *importer)
 	importer->virtual_mail = mail_alloc(importer->virtual_trans, 0, NULL);
 }
 
+/* If many mails (or much mail) would have to be transferred from the
+   remote, look for them in the other local mailboxes first. */
+static void
+dsync_mailbox_import_scan_local_mails(struct dsync_mailbox_importer *importer)
+{
+	struct hash_iterate_context *iter;
+	struct importer_new_mail *first, *mail;
+	ARRAY_TYPE(const_string) guids;
+	const char *key;
+	uoff_t vsize, bytes = 0;
+	bool have_local;
+
+	t_array_init(&guids, 64);
+	iter = hash_table_iterate_init(importer->import_guids);
+	while (hash_table_iterate(iter, importer->import_guids, &key, &first)) {
+		have_local = FALSE;
+		vsize = 0;
+		for (mail = first; mail != NULL; mail = mail->next) {
+			if (mail->uid_in_local)
+				have_local = TRUE;
+			else if (mail->change != NULL &&
+				 mail->change->virtual_size != UOFF_T_MAX)
+				vsize = mail->change->virtual_size;
+		}
+		if (!have_local) {
+			array_push_back(&guids, &key);
+			bytes += vsize;
+		}
+	}
+	hash_table_iterate_deinit(&iter);
+
+	if (dsync_local_mails_want_scan(array_count(&guids), bytes)) {
+		dsync_local_mails_scan(importer->local_mails, importer->box,
+				       &guids);
+	}
+}
+
 static void
 dsync_mailbox_import_handle_local_mails(struct dsync_mailbox_importer *importer)
 {
@@ -2423,6 +2523,10 @@ dsync_mailbox_import_handle_local_mails(struct dsync_mailbox_importer *importer)
 		/* find UIDs in \All mailbox for all wanted GUIDs. */
 		dsync_mailbox_import_find_virtual_uids(importer);
 	}
+	if (importer->local_mails != NULL &&
+	    hash_table_count(importer->import_guids) > 0) T_BEGIN {
+		dsync_mailbox_import_scan_local_mails(importer);
+	} T_END;
 
 	iter = hash_table_iterate_init(importer->import_guids);
 	while (hash_table_iterate(iter, importer->import_guids, &key, &mail)) {
@@ -2447,6 +2551,8 @@ dsync_mailbox_import_handle_local_mails(struct dsync_mailbox_importer *importer)
 				(void)dsync_mailbox_import_handle_mail(importer, mail);
 		} T_END;
 	}
+	if (importer->local_mails != NULL)
+		dsync_local_mails_release(importer->local_mails);
 }
 
 int dsync_mailbox_import_changes_finish(struct dsync_mailbox_importer *importer)
@@ -3160,6 +3266,20 @@ int dsync_mailbox_import_deinit(struct dsync_mailbox_importer **_importer,
 
 	i_assert(importer->failed == (importer->mail_error != 0));
 	ret = importer->failed ? -1 : 0;
+	if (ret == 0 && importer->local_mails != NULL &&
+	    !importer->delete_mailbox) {
+		/* The import was committed. Its expunges are applied at the
+		   end of the session. (After a failure they're dropped: the
+		   remote sends them again next time.) */
+		const struct importer_deferred_expunge *expunge;
+		const char *vname = mailbox_get_vname(importer->box);
+
+		array_foreach(&importer->deferred_expunges, expunge) {
+			dsync_local_mails_add_expunge(importer->local_mails,
+						      vname, expunge->uid,
+						      expunge->guid);
+		}
+	}
 	*error_r = importer->mail_error;
 	event_unref(&importer->event);
 	pool_unref(&importer->pool);

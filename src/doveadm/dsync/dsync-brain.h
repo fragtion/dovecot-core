@@ -46,6 +46,12 @@ enum dsync_brain_flags {
 	   another one, which is only correct with two servers. Required when
 	   one server relays changes between more than two servers. */
 	DSYNC_BRAIN_FLAG_RELAY_CHANGES		= 0x2000,
+	/* Copy mails that are new in a mailbox from another local mailbox
+	   when possible, instead of transferring them. This makes moving
+	   and copying mails between mailboxes cheap to sync. Expunges are
+	   deferred to the end of the session for it, and if they can't be
+	   applied then, a full resync is required. */
+	DSYNC_BRAIN_FLAG_REUSE_LOCAL_MAILS	= 0x4000,
 };
 
 enum dsync_brain_sync_type {

@@ -57,6 +57,8 @@ struct dsync_brain {
 	ARRAY(struct mail_namespace *) sync_namespaces;
 	const char *sync_box;
 	struct mailbox *virtual_all_box;
+	/* with reuse_local_mails */
+	struct dsync_local_mails *local_mails;
 	guid_128_t sync_box_guid;
 	const char *const *exclude_mailboxes;
 	enum dsync_brain_sync_type sync_type;
@@ -129,6 +131,7 @@ struct dsync_brain {
 	bool empty_hdr_workaround:1;
 	bool no_header_hashes:1;
 	bool relay_changes:1;
+	bool reuse_local_mails:1;
 };
 
 extern const char *dsync_box_state_names[DSYNC_BOX_STATE_DONE+1];

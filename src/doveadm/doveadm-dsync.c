@@ -111,6 +111,7 @@ struct dsync_cmd_context {
 	bool empty_hdr_workaround:1;
 	bool no_header_hashes:1;
 	bool relay_changes:1;
+	bool reuse_local_mails:1;
 	bool err_line_continues:1;
 };
 
@@ -782,6 +783,8 @@ cmd_dsync_run(struct doveadm_mail_cmd_context *_ctx, struct mail_user *user)
 		brain_flags |= DSYNC_BRAIN_FLAG_NO_HEADER_HASHES;
 	if (ctx->relay_changes)
 		brain_flags |= DSYNC_BRAIN_FLAG_RELAY_CHANGES;
+	if (ctx->reuse_local_mails)
+		brain_flags |= DSYNC_BRAIN_FLAG_REUSE_LOCAL_MAILS;
 	if (doveadm_debug)
 		brain_flags |= DSYNC_BRAIN_FLAG_DEBUG;
 
@@ -1189,6 +1192,8 @@ static struct doveadm_mail_cmd_context *cmd_dsync_alloc(void)
                 ctx->no_header_hashes = TRUE;
 	if ((doveadm_settings->parsed_features & DSYNC_FEATURE_RELAY_CHANGES) != 0)
 		ctx->relay_changes = TRUE;
+	if ((doveadm_settings->parsed_features & DSYNC_FEATURE_REUSE_LOCAL_MAILS) != 0)
+		ctx->reuse_local_mails = TRUE;
 	ctx->import_commit_msgs_interval = doveadm_settings->dsync_commit_msgs_interval;
 	return &ctx->ctx;
 }
