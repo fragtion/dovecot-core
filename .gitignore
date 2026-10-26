@@ -121,6 +121,8 @@ src/lib-sql/sql-drivers-register.c
 src/log/log
 src/lmtp/lmtp
 src/master/dovecot
+src/mesh/mesh
+src/mesh/mesh-ui-data.c
 src/ssl-params/ssl-params
 src/stats/stats
 src/pop3-login/pop3-login

@@ -913,6 +913,7 @@ src/lmtp/Makefile
 src/dict/Makefile
 src/dns/Makefile
 src/indexer/Makefile
+src/mesh/Makefile
 src/imap/Makefile
 src/imap-hibernate/Makefile
 src/imap-login/Makefile

@@ -65,6 +65,7 @@ SUBDIRS = \
 	dict \
 	dns \
 	indexer \
+	mesh \
 	master \
 	login-common \
 	$(IMAP_HIBERNATE) \

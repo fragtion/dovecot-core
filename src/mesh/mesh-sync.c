@@ -1,0 +1,319 @@
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
+
+#include "mesh-common.h"
+#include "ioloop.h"
+#include "llist.h"
+#include "str.h"
+#include "strescape.h"
+#include "time-util.h"
+#include "master-service.h"
+#include "master-service-settings.h"
+#include "doveadm-protocol.h"
+#include "doveadm-client.h"
+#include "http-client.h"
+#include "http-response.h"
+
+#include <ctype.h>
+
+/* dsync's own per-user lock timeout (-l) */
+#define MESH_DSYNC_LOCK_TIMEOUT_SECS 30
+
+struct mesh_sync {
+	struct mesh_sync *prev, *next;
+
+	struct mesh_user *user;
+	struct mesh_peer *peer;
+	bool full;
+
+	/* the peer lent us the user for this session */
+	struct http_client_request *lease_req;
+	bool leased;
+	/* the newer of our and the peer's state_gen when the lease was
+	   granted */
+	unsigned int base_gen;
+
+	struct doveadm_client *conn;
+	string_t *output;
+	struct timeval start_time;
+	struct timeout *to;
+};
+
+static struct mesh_sync *mesh_syncs;
+
+static void mesh_url_encode(string_t *dest, const char *src)
+{
+	for (; *src != '\0'; src++) {
+		if (i_isalnum(*src) || strchr("-._~", *src) != NULL)
+			str_append_c(dest, *src);
+		else
+			str_printfa(dest, "%%%02X", (unsigned char)*src);
+	}
+}
+
+static string_t *
+mesh_lease_path(const char *action, const struct mesh_user *user)
+{
+	string_t *path = t_str_new(128);
+
+	str_printfa(path, "/mesh/v1/%s?user=", action);
+	mesh_url_encode(path, user->username);
+	str_append(path, "&node=");
+	mesh_url_encode(path, mesh_node_name);
+	return path;
+}
+
+static void
+mesh_lease_release_response(const struct http_response *resp,
+			    void *context ATTR_UNUSED)
+{
+	if (resp->status / 100 != 2) {
+		/* The peer keeps its older state copy, so the generations
+		   differ and the next session is a stateless one. */
+		e_debug(mesh_event, "Lease release failed: %u %s",
+			resp->status, resp->reason);
+	}
+}
+
+/* Give the user back to the peer, along with the pair's new state. */
+static void mesh_sync_release(struct mesh_user *user, struct mesh_peer *peer)
+{
+	const struct mesh_user_peer *up = &user->peers[peer->idx];
+	struct http_client_request *req;
+	string_t *path = mesh_lease_path("release", user);
+
+	str_printfa(path, "&gen=%u", up->state_gen);
+	req = mesh_peer_http_request(peer, "POST", str_c(path),
+				     mesh_lease_release_response, NULL);
+	if (up->dsync_state != NULL) {
+		http_client_request_set_payload_data(req,
+			(const unsigned char *)up->dsync_state,
+			strlen(up->dsync_state));
+	} else {
+		http_client_request_set_payload_empty(req);
+	}
+	http_client_request_submit(req);
+}
+
+static void mesh_sync_free(struct mesh_sync *sync)
+{
+	DLLIST_REMOVE(&mesh_syncs, sync);
+	if (sync->lease_req != NULL)
+		http_client_request_abort(&sync->lease_req);
+	timeout_remove(&sync->to);
+	if (sync->conn != NULL)
+		doveadm_client_unref(&sync->conn);
+	str_free(&sync->output);
+	i_free(sync);
+}
+
+static void mesh_sync_finish(struct mesh_sync *sync, int exit_code,
+			     const char *error)
+{
+	struct mesh_user *user = sync->user;
+	struct mesh_peer *peer = sync->peer;
+	bool full = sync->full, leased = sync->leased;
+	unsigned int base_gen = sync->base_gen;
+	unsigned int msecs =
+		timeval_diff_msecs(&ioloop_timeval, &sync->start_time);
+	const char *state = t_strdup(t_str_trim(str_c(sync->output), " \t\r\n"));
+
+	mesh_sync_free(sync);
+	mesh_queue_sync_finished(user, peer, exit_code, error, state, full,
+				 msecs);
+	if (leased) {
+		/* even an unchanged state gets a new generation, so that the
+		   copies are known to match only if this release arrives */
+		user->peers[peer->idx].state_gen = base_gen + 1;
+		mesh_state_changed();
+		mesh_sync_release(user, peer);
+	}
+}
+
+static void
+mesh_sync_print(const unsigned char *data, size_t size,
+		bool finished ATTR_UNUSED, struct mesh_sync *sync)
+{
+	/* the only printed field is the new dsync state */
+	str_append_data(sync->output, data, size);
+}
+
+static void
+mesh_sync_reply(const struct doveadm_server_reply *reply, void *context)
+{
+	struct mesh_sync *sync = context;
+	const char *error = NULL;
+
+	if (reply->exit_code != 0 &&
+	    reply->exit_code != DOVEADM_EX_CHANGED) {
+		error = t_strdup_printf("doveadm sync failed: %s%s%s",
+			doveadm_exit_code_to_str(reply->exit_code),
+			reply->error == NULL ? "" : ": ",
+			reply->error == NULL ? "" : reply->error);
+	}
+	mesh_sync_finish(sync, reply->exit_code, error);
+}
+
+static void mesh_sync_timeout(struct mesh_sync *sync)
+{
+	mesh_sync_finish(sync, DOVEADM_EX_UNKNOWN,
+			 "Timed out (mesh_sync_timeout)");
+}
+
+static const char *mesh_sync_get_socket_path(void)
+{
+	const char *path = mesh_set->mesh_doveadm_socket_path;
+
+	if (path[0] == '/')
+		return path;
+	return t_strconcat(master_service_get_service_settings(master_service)->base_dir,
+			   "/", path, NULL);
+}
+
+static const char *mesh_sync_build_cmd(struct mesh_sync *sync)
+{
+	const struct mesh_peer_settings *pset = sync->peer->set;
+	const struct mesh_user_peer *up = &sync->user->peers[sync->peer->idx];
+	string_t *cmd = t_str_new(512);
+
+	/* <flags> <username> <command> [<args>] */
+	if (mesh_set->mesh_dsync_debug)
+		str_append_c(cmd, DOVEADM_PROTOCOL_CMD_FLAG_DEBUG);
+	str_append_c(cmd, '\t');
+	str_append_tabescaped(cmd, sync->user->username);
+	str_append(cmd, "\tsync");
+	/* -s makes doveadm print the new state, so give it even for full
+	   syncs (as empty) */
+	str_append(cmd, "\t-s\t");
+	if (sync->full)
+		str_append(cmd, "\t-f");
+	else if (up->dsync_state != NULL)
+		str_append_tabescaped(cmd, up->dsync_state);
+	str_printfa(cmd, "\t-l\t%u", MESH_DSYNC_LOCK_TIMEOUT_SECS);
+	str_printfa(cmd, "\t-T\t%u", mesh_set->mesh_sync_timeout);
+	str_append_c(cmd, '\t');
+	str_append_tabescaped(cmd, t_strdup_printf("%s:%s:%u",
+		pset->mesh_peer_doveadm_ssl ? "tcps" : "tcp",
+		pset->mesh_peer_host, pset->mesh_peer_doveadm_port));
+	str_append_c(cmd, '\n');
+	return str_c(cmd);
+}
+
+static void mesh_sync_run_doveadm(struct mesh_sync *sync)
+{
+	/* The doveadm-server socket is mode 0600, which the doveadm server
+	   treats as preauthenticated, so no real credentials are needed. */
+	struct doveadm_client_settings set = {
+		.socket_path = mesh_sync_get_socket_path(),
+		.username = "doveadm",
+		.password = "",
+	};
+	struct doveadm_client_cmd_settings cmd_set = {
+		.proxy_ttl = DOVEADM_PROXY_TTL,
+	};
+	const char *error;
+
+	if (doveadm_client_create(&set, &sync->conn, &error) < 0) {
+		mesh_sync_finish(sync, DOVEADM_EX_UNKNOWN, t_strdup_printf(
+			"Couldn't connect to doveadm server: %s", error));
+		return;
+	}
+	/* a bit longer than dsync's own I/O timeout */
+	sync->to = timeout_add((mesh_set->mesh_sync_timeout + 30) * 1000,
+			       mesh_sync_timeout, sync);
+	doveadm_client_set_print(sync->conn, mesh_sync_print, sync);
+	doveadm_client_cmd(sync->conn, &cmd_set, mesh_sync_build_cmd(sync),
+			   NULL, mesh_sync_reply, sync);
+}
+
+/* The peer agreed to the session. It also told whether our copy of the
+   pair's dsync state can be used.
+
+   A stateful dsync session treats every mail above the state's last common
+   UID as new, and decides what to do with it from the mailboxes alone. That
+   only works if the mails that both nodes have were synced between them,
+   in sessions the state describes. Otherwise, for example after a mail
+   reached both nodes through the anchor, and was then expunged on one of
+   them, dsync can't tell that from a mail new on the other node, and
+   copies the mail back. So the state is used only if
+
+    - it's the newest one, i.e. our and the peer's copies have the same
+      generation (a lost release leaves the peer's older), and
+    - at least one of the nodes has had no session for the user with any
+      other node since their last session with each other. Then mails
+      can reach both nodes only through these sessions.
+
+   With the anchor topology a spoke syncs only with its anchor, so this
+   holds except after the anchor changed. Otherwise the session is
+   stateless: dsync compares the mailboxes, which is slower but safe. */
+static void
+mesh_sync_lease_response(const struct http_response *resp, void *context)
+{
+	struct mesh_sync *sync = context;
+	struct mesh_user_peer *up = &sync->user->peers[sync->peer->idx];
+	const char *value;
+	unsigned int remote_gen;
+
+	sync->lease_req = NULL;
+	if (resp->status == 409) {
+		mesh_sync_finish(sync, MESH_SYNC_EXIT_BUSY, "Peer is busy");
+		return;
+	}
+	if (resp->status / 100 != 2) {
+		mesh_sync_finish(sync, DOVEADM_EX_UNKNOWN, t_strdup_printf(
+			"Lease from peer failed: %u %s",
+			resp->status, resp->reason));
+		return;
+	}
+	sync->leased = TRUE;
+	value = http_response_header_get(resp, "X-Mesh-Gen");
+	if (value == NULL || str_to_uint(value, &remote_gen) < 0)
+		remote_gen = 0;
+	sync->base_gen = I_MAX(up->state_gen, remote_gen);
+	value = http_response_header_get(resp, "X-Mesh-State-Usable");
+	if ((value == NULL || strcmp(value, "1") != 0) &&
+	    up->dsync_state != NULL) {
+		e_debug(mesh_event, "Syncing %s with %s without state: %s",
+			sync->user->username, sync->peer->name,
+			value == NULL ? "peer didn't answer" :
+			up->state_gen != remote_gen ?
+			"state generation differs" :
+			"both nodes have synced with others since");
+		mesh_user_peer_set_state(up, NULL);
+	}
+	mesh_user_mark_session(sync->user, sync->peer);
+	mesh_sync_run_doveadm(sync);
+}
+
+void mesh_sync_start(struct mesh_user *user, struct mesh_peer *peer,
+		     bool full)
+{
+	const struct mesh_user_peer *up = &user->peers[peer->idx];
+	struct mesh_sync *sync;
+	string_t *path;
+
+	sync = i_new(struct mesh_sync, 1);
+	sync->user = user;
+	sync->peer = peer;
+	sync->full = full;
+	sync->output = str_new(default_pool, 128);
+	sync->start_time = ioloop_timeval;
+	DLLIST_PREPEND(&mesh_syncs, sync);
+
+	/* Ask the peer for a lease first. The peer refuses if it's syncing
+	   the user itself, so the user's sessions never overlap on either
+	   node. Otherwise they'd wait for each other's locks, and the pair's
+	   state would get two different successors. */
+	path = mesh_lease_path("lease", user);
+	str_printfa(path, "&secs=%u&gen=%u&exclusive=%d",
+		    mesh_set->mesh_sync_timeout + 60, up->state_gen,
+		    up->exclusive ? 1 : 0);
+	sync->lease_req = mesh_peer_http_request(peer, "POST", str_c(path),
+		mesh_sync_lease_response, sync);
+	http_client_request_submit(sync->lease_req);
+}
+
+void mesh_sync_deinit(void)
+{
+	while (mesh_syncs != NULL)
+		mesh_sync_finish(mesh_syncs, DOVEADM_EX_UNKNOWN, "Shutting down");
+}
