@@ -328,6 +328,24 @@ service can't be asked, the mail is delivered locally. The peers'
 `mesh_peer_lmtp_port` must be right. IMAP logins aren't routed; clients
 may use any node.
 
+If the mesh HTTP listener uses TLS, give the script a plaintext listener
+that only listens on localhost:
+
+```
+service mesh {
+  inet_listener mesh-http {
+    port = 8090
+    ssl = yes
+  }
+  inet_listener mesh-http-local {
+    type = http
+    listen = 127.0.0.1
+    port = 8091
+  }
+}
+# and in lua_settings: mesh_url = http://127.0.0.1:8091
+```
+
 ## Monitoring
 
 - Every session sends a `mesh_sync_finished` event with the fields
@@ -373,7 +391,8 @@ may use any node.
   Extension record update for invalid uid" errors. Delivery affinity and
   migrating existing data first make it rare.
 - "Duplicate file entry" warnings about `dovecot-uidlist` appear while
-  dsync renumbers mails; they're harmless.
+  dsync renumbers mails; they're harmless. Rarely, "Transaction log modseq
+  tracking is corrupted - fixing" appears; Dovecot repairs that itself.
 - If a session fails halfway, and a mail it already copied is expunged
   before the next successful session, the mail can come back (a dsync
   limitation with partially applied states).
