@@ -15,7 +15,8 @@ Branch: `claude/relaxed-ritchie-bjjfls` of `fragtion/dovecot-core`
 |---|---|---|
 | Maildir `new/` handling restored; old Syncthing behaviour behind `maildir_ignore_new_dir` (default no) | `src/lib-storage/index/maildir/` | done, unit tests |
 | dsync `dsync_features = relay-changes` (forward changes dsync imported, needed with 3+ nodes) | `src/doveadm/dsync/` | done |
-| dsync merges flags of mails both sides already have | `src/doveadm/dsync/dsync-mailbox-import.c` | done |
+| dsync merges flags of mails both sides already have, also when they're new on both sides under different UIDs | `src/doveadm/dsync/dsync-mailbox-import.c` | done, `harness/newmails.py` |
+| dsync states never claim changes that a side didn't export yet | `src/doveadm/dsync/dsync-brain-mails.c` | done |
 | dsync `dsync_features = reuse-local-mails` (mails moved or copied to another folder are copied locally, hardlinked with Maildir, instead of being transferred again) | `src/doveadm/dsync/dsync-local-mails.c` | done |
 | mesh mail plugin: change notifications, save/dsync locking, delivery wait | `src/plugins/mesh/` | done |
 | mesh service: anchor topology, leases, shared pair states, retries, periodic syncs, verifier, HTTP API, web UI, delivery route lookup, TLS | `src/mesh/` | done |
@@ -31,9 +32,15 @@ time), node crash and restart mid-run, `full` topology, delivery
 affinity, and TLS between nodes. After the load stops, all nodes are
 identical within about 3 seconds. Delivery confirmation adds about 80 ms
 per recipient. Repeated runs of the heaviest scenario (5 nodes, 3 users,
-3 IMAP clients each) found two rare problems, both in section 7: a flag
-mismatch on one mail (about 1 run in 16) and a dsync session stalling
-for 10 minutes (seen only with dsync debug logging).
+3 IMAP clients each) found two rare problems. One mail ending up with
+different flags on two nodes (about 1 run in 16) is fixed in dsync: it
+didn't merge the flags of a mail that was new on both nodes under
+different UIDs (IMAP clients moved it into the same folder on both), and
+a pair's state could cover a node's flag change made during a session
+that the node hadn't sent. After the fixes 35 of 35 runs had no
+problems, and 16 of 16 with `dsync_features = relay-changes` only. The
+other, a dsync session stalling for 10 minutes (seen only with dsync
+debug logging), is in section 7.
 
 **Not yet tested anywhere:** separate machines/containers, real network
 latency or loss, network partitions, large mailboxes (10k+ mails, many
@@ -394,12 +401,6 @@ See also "Limitations and known issues" in the README.
   log lines (`src/lib/istream-multiplex.c`). Seen in about 1 of 25 harness
   runs with `mesh_dsync_debug = yes`, not yet without it. Everything
   converges after the timeout. Not fixed yet.
-- In about 1 of 16 harness runs (5 nodes, 3 users, 3 IMAP clients per
-  user moving the same mails around on different nodes) one mail ends up
-  with different flags on two nodes; never a lost or duplicated mail.
-  Same rate with and without `reuse-local-mails`. Keep
-  `mesh_verify_interval` on: the verifier's full sync repairs it. Not
-  fixed yet.
 - Pausing a peer doesn't survive a restart.
 - meson build files don't include the mesh; use autotools.
 - No migration tooling beyond the README's steps (from the Syncthing
