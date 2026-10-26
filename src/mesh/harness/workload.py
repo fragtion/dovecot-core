@@ -31,6 +31,10 @@ class History:
         self.lock = threading.Lock()
         self.delivered = set()
         self.appended = set()
+        # Messages whose delivery or append failed on the client side.
+        # The server may still have saved them (e.g. a node killed after
+        # committing), so they may or may not exist.
+        self.attempted = set()
         self.copied = {}
         self.expunged = set()
         self.moved = set()
@@ -103,6 +107,8 @@ class Deliverer(threading.Thread):
                     self.history.delivered.add((user, msgid))
                     self.history.ops += 1
             except Exception as e:
+                with self.history.lock:
+                    self.history.attempted.add((user, msgid))
                 self.history.error("deliver %s to %s: %s" %
                                    (msgid, node.name, e))
             time.sleep(self.rnd.expovariate(self.rate))
@@ -183,6 +189,8 @@ class ImapActor(threading.Thread):
             self.appends += 1
             msgid = "%s-%d-%s@mesh" % (self.tag, self.appends, self.user)
             target = self.rnd.choice(["Sent", "Archive", "INBOX"])
+            with self.history.lock:
+                self.history.attempted.add((self.user, msgid))
             typ, _ = imap.append('"%s"' % target, "(\\Seen)", None,
                                  make_message(msgid, "append"))
             if typ == "OK":
@@ -290,6 +298,7 @@ def check_convergence(cluster, users, history, nodes=None):
                        if u == user}
             relocated = {m for u, m in history.moved if u == user} | \
                 {m for (u, m) in history.copied if u == user}
+            attempted = {m for u, m in history.attempted if u == user}
         counts = {}
         for mailbox, msgs in ref.items():
             seen = set()
@@ -306,7 +315,8 @@ def check_convergence(cluster, users, history, nodes=None):
             if n > 1 and msgid not in relocated:
                 problems.append("%s: message %s appears %d times" %
                                 (user, msgid, n))
-            if msgid not in created and not msgid.startswith("seed-"):
+            if msgid not in created and msgid not in attempted and \
+               not msgid.startswith("seed-"):
                 problems.append("%s: unknown message %s" % (user, msgid))
     for key, old, new in history.uid_reuse:
         problems.append("UID reused on %s %s/%s uidvalidity=%s uid=%s: "
