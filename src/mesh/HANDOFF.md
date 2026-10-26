@@ -6,7 +6,7 @@ explains how the mesh works and documents every setting. This file covers
 what you need beyond that: build, image, cluster layout, configuration,
 the test plan, and what to report.
 
-Branch: `claude/relaxed-ritchie-bjjfls` of `fragtion/dovecot-core`
+Branch: `dovecotmesh` of `fragtion/dovecot-core`
 (Dovecot 2.4 development tree, autotools build).
 
 ## 1. What was built and its state
