@@ -1418,8 +1418,10 @@ dsync_mailbox_import_replace_flags(struct mail *mail,
 		mail_update_pvt_modseq(mail, change->pvt_modseq);
 }
 
+/* Merge the remote's flags in change with the local mail's flags. */
 static void
-dsync_mailbox_import_flag_change(struct dsync_mailbox_importer *importer,
+dsync_mailbox_import_merge_flags(struct dsync_mailbox_importer *importer,
+				 struct mail *mail,
 				 const struct dsync_mail_change *change)
 {
 	const struct dsync_mail_change *local_change;
@@ -1427,22 +1429,10 @@ dsync_mailbox_import_flag_change(struct dsync_mailbox_importer *importer,
 	uint32_t change_add, change_remove;
 	uint64_t new_modseq;
 	ARRAY_TYPE(const_string) local_keyword_changes = ARRAY_INIT;
-	struct mail *mail;
 	bool prefer_remote, prefer_pvt_remote;
 	bool remote_changed = FALSE, remote_pvt_changed = FALSE;
 
 	i_assert((change->add_flags & change->remove_flags) == 0);
-
-	if (importer->cur_mail != NULL &&
-	    importer->cur_mail->uid == change->uid) {
-		if (!dsync_check_cur_guid(importer, change))
-			return;
-		mail = importer->cur_mail;
-	} else {
-		if (!dsync_import_set_mail(importer, change))
-			return;
-		mail = importer->mail;
-	}
 
 	if (importer->revert_local_changes) {
 		/* dsync backup: just make the local look like remote. */
@@ -1451,7 +1441,7 @@ dsync_mailbox_import_flag_change(struct dsync_mailbox_importer *importer,
 	}
 
 	local_change = hash_table_lookup(importer->local_changes,
-					 POINTER_CAST(change->uid));
+					 POINTER_CAST(mail->uid));
 	if (local_change == NULL) {
 		local_add = local_remove = 0;
 	} else {
@@ -1508,6 +1498,25 @@ dsync_mailbox_import_flag_change(struct dsync_mailbox_importer *importer,
 		new_modseq = importer->remote_highest_pvt_modseq+1;
 	if (mail_get_pvt_modseq(mail) < new_modseq)
 		mail_update_pvt_modseq(mail, new_modseq);
+}
+
+static void
+dsync_mailbox_import_flag_change(struct dsync_mailbox_importer *importer,
+				 const struct dsync_mail_change *change)
+{
+	struct mail *mail;
+
+	if (importer->cur_mail != NULL &&
+	    importer->cur_mail->uid == change->uid) {
+		if (!dsync_check_cur_guid(importer, change))
+			return;
+		mail = importer->cur_mail;
+	} else {
+		if (!dsync_import_set_mail(importer, change))
+			return;
+		mail = importer->mail;
+	}
+	dsync_mailbox_import_merge_flags(importer, mail, change);
 }
 
 static bool
