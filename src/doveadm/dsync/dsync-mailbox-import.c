@@ -149,6 +149,9 @@ static bool dsync_mailbox_save_newmails(struct dsync_mailbox_importer *importer,
 					bool remote_mail);
 static int dsync_mailbox_import_commit(struct dsync_mailbox_importer *importer,
 				       bool final);
+static void
+dsync_mailbox_import_flag_change(struct dsync_mailbox_importer *importer,
+				 const struct dsync_mail_change *change);
 
 static void
 dsync_import_unexpected_state(struct dsync_mailbox_importer *importer,
@@ -1005,6 +1008,15 @@ static bool dsync_mailbox_try_save_cur(struct dsync_mailbox_importer *importer,
 		/* identical */
 		i_assert(importer->cur_mail != NULL);
 		i_assert(save_change != NULL);
+		/* Both sides already have the mail, so it reached them some
+		   other way than this pair's syncs (another server, or a sync
+		   whose state got lost). Their flags may have changed since,
+		   so merge them like for an existing mail. Otherwise flags
+		   stay different, and the next state treats them as
+		   synced. (The header hash workarounds above may match mails
+		   with different UIDs, which aren't the same mail.) */
+		if (importer->cur_mail->uid == save_change->uid)
+			dsync_mailbox_import_flag_change(importer, save_change);
 		newmail = p_new(importer->pool, struct importer_new_mail, 1);
 		newmail->guid = save_change->guid;
 		newmail->final_uid = importer->cur_mail->uid;
