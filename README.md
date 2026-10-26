@@ -1,3 +1,16 @@
+> [!WARNING]
+> **This branch is legacy and no longer developed.** It holds the original
+> Syncthing-based setup, which needed the
+> [fragtion/syncthing](https://github.com/fragtion/syncthing) fork (now
+> archived as well).
+>
+> Its successor is **Dovecot Mesh**, on the
+> [`dovecotmesh`](https://github.com/fragtion/dovecot-core/tree/dovecotmesh)
+> branch of this repository: multi-master replication built into Dovecot
+> itself, for any number of servers, without Syncthing. To move an existing
+> cluster over, see
+> [Migrating from the Syncthing setup](https://github.com/fragtion/dovecot-core/blob/dovecotmesh/src/mesh/README.md#migrating-from-the-syncthing-setup).
+
 If you are looking for the original unmodified Dovecot mailserver instead, then please go to https://github.com/dovecot/core instead.
 
 ## Why the fork?
