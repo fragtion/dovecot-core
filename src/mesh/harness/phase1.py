@@ -42,7 +42,7 @@ def run(args):
     extra = "\n".join(args.set or [])
     cluster = cl.Cluster(args.nodes, extra=lambda node: extra, mesh=True,
                          topology=args.topology,
-                         lmtp_route=args.lmtp_route)
+                         lmtp_route=args.lmtp_route, tls=args.tls)
     cluster.setup()
     cluster.start()
     time.sleep(2)
@@ -91,9 +91,10 @@ def run(args):
                 user, result, ", ".join(differing)))
     errors = cluster.errors()
 
-    print("topology=%s nodes=%d users=%d affinity=%s lmtp-route=%s kill=%s" % (
-        args.topology, args.nodes, args.users, args.affinity,
-        args.lmtp_route, args.kill_node))
+    print("topology=%s nodes=%d users=%d affinity=%s lmtp-route=%s "
+          "tls=%s kill=%s" % (
+              args.topology, args.nodes, args.users, args.affinity,
+              args.lmtp_route, args.tls, args.kill_node))
     # where LMTP deliveries were saved: on the user's anchor or elsewhere
     on_anchor = total = 0
     for node in cluster.nodes:
@@ -148,6 +149,8 @@ def main():
                    help="LMTP proxies recipients to their anchor "
                    "(mesh-route.lua)")
     p.add_argument("--kill-node", help="crash and restart this node")
+    p.add_argument("--tls", action="store_true",
+                   help="TLS between the nodes (dsync and mesh HTTP)")
     p.add_argument("--quiesce-timeout", type=float, default=120)
     p.add_argument("--set", action="append",
                    help="extra dovecot.conf line for every node")

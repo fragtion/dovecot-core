@@ -33,7 +33,7 @@ protocols {{
   imap = yes
   lmtp = yes
 }}
-ssl = no
+{ssl_config}
 auth_allow_cleartext = yes
 auth_mechanisms = plain
 
@@ -87,6 +87,7 @@ service lmtp {{
 service doveadm {{
   inet_listener doveadm {{
     port = {doveadm_port}
+    ssl = {doveadm_ssl}
   }}
 }}
 doveadm_password = {doveadm_password}
@@ -128,6 +129,8 @@ class Node:
                 user_password=USER_PASSWORD,
                 passdb_first=(mesh_route_passdb(self)
                               if self.cluster.lmtp_route else ""),
+                ssl_config=self.cluster.ssl_config(),
+                doveadm_ssl="yes" if self.cluster.tls else "no",
                 extra=self.cluster.extra_config(self)))
 
     def master_pid(self):
@@ -264,6 +267,7 @@ def mesh_config(cluster, node, topology="anchor", extra=""):
         "service mesh {",
         "  inet_listener mesh-http {",
         "    port = %d" % node.http_port,
+        "    ssl = %s" % ("yes" if cluster.tls else "no"),
         "  }",
         "}",
     ]
@@ -274,6 +278,8 @@ def mesh_config(cluster, node, topology="anchor", extra=""):
             "  mesh_peer_doveadm_port = %d" % peer.doveadm_port,
             "  mesh_peer_http_port = %d" % peer.http_port,
             "  mesh_peer_lmtp_port = %d" % peer.lmtp_port,
+            "  mesh_peer_doveadm_ssl = %s" % ("yes" if cluster.tls else "no"),
+            "  mesh_peer_http_ssl = %s" % ("yes" if cluster.tls else "no"),
             "}",
         ]
     return "\n".join(lines) + "\n" + extra
@@ -281,14 +287,45 @@ def mesh_config(cluster, node, topology="anchor", extra=""):
 
 class Cluster:
     def __init__(self, n, root=ROOT, extra=None, mesh=False,
-                 topology="anchor", lmtp_route=False):
+                 topology="anchor", lmtp_route=False, tls=False):
         self.root = root
         self.extra = extra or (lambda node: "")
         self.mesh = mesh
         self.topology = topology
         # proxy LMTP deliveries to the user's anchor (mesh-route.lua)
         self.lmtp_route = lmtp_route
+        # TLS between the nodes, for both dsync and the mesh HTTP API
+        self.tls = tls
         self.nodes = [Node(self, i + 1) for i in range(n)]
+
+    def tls_dir(self):
+        return os.path.join(self.root, "tls")
+
+    def make_certs(self):
+        """A CA and one certificate for 127.0.0.1, shared by all nodes."""
+        d = self.tls_dir()
+        os.makedirs(d, exist_ok=True)
+        run = lambda *args: subprocess.run(
+            ["openssl"] + list(args), check=True, cwd=d,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        run("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2",
+            "-keyout", "ca.key", "-out", "ca.pem", "-subj", "/CN=mesh test CA")
+        run("req", "-newkey", "rsa:2048", "-nodes", "-keyout", "node.key",
+            "-out", "node.csr", "-subj", "/CN=127.0.0.1")
+        with open(os.path.join(d, "ext.cnf"), "w") as f:
+            f.write("subjectAltName = IP:127.0.0.1, DNS:localhost\n")
+        run("x509", "-req", "-in", "node.csr", "-CA", "ca.pem",
+            "-CAkey", "ca.key", "-CAcreateserial", "-days", "2",
+            "-extfile", "ext.cnf", "-out", "node.pem")
+
+    def ssl_config(self):
+        if not self.tls:
+            return "ssl = no"
+        d = self.tls_dir()
+        return ("ssl = yes\n"
+                "ssl_server_cert_file = %s/node.pem\n"
+                "ssl_server_key_file = %s/node.key\n"
+                "ssl_client_ca_file = %s/ca.pem" % (d, d, d))
 
     def extra_config(self, node):
         conf = self.extra(node)
@@ -311,6 +348,8 @@ class Cluster:
             shutil.rmtree(self.root, ignore_errors=True)
         os.makedirs(self.root, exist_ok=True)
         os.chmod(self.root, 0o755)
+        if self.tls:
+            self.make_certs()
         for node in self.nodes:
             node.write_config()
 
