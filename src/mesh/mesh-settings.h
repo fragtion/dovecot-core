@@ -18,6 +18,7 @@ struct mesh_peer_settings {
 	const char *mesh_peer_host;
 	in_port_t mesh_peer_doveadm_port;
 	in_port_t mesh_peer_http_port;
+	in_port_t mesh_peer_lmtp_port;
 	bool mesh_peer_doveadm_ssl;
 };
 

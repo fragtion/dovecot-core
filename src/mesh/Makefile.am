@@ -46,12 +46,16 @@ mesh-ui-data.c: $(UI_FILES) $(srcdir)/mesh-ui-gen.pl
 BUILT_SOURCES = mesh-ui-data.c
 CLEANFILES = mesh-ui-data.c
 
+# Lua passdb for LMTP delivery affinity, see the file
+pkgdata_DATA = mesh-route.lua
+
 noinst_HEADERS = \
 	mesh-common.h \
 	mesh-settings.h \
 	mesh-ui.h
 
 EXTRA_DIST = \
+	mesh-route.lua \
 	mesh-ui-gen.pl \
 	$(UI_FILES) \
 	harness/cluster.py \

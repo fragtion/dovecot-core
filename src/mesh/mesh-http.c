@@ -20,6 +20,9 @@
      GET  /mesh/v1/users[?user=<u>|q=<substring>][&problems=1][&limit=<n>]
                                        per user and peer sync status, JSON
      GET  /mesh/v1/activity[?limit=<n>]  recent sessions, newest first
+     GET  /mesh/v1/route?user=<u>      where to deliver the user's mail:
+                                       "<host> TAB <lmtp port>" of its
+                                       anchor, or empty for this node
      POST /mesh/v1/sync?user=<u>[&full=1]
      POST /mesh/v1/verify?user=<u>     compare the user's mailboxes on all
                                        nodes, JSON
@@ -395,6 +398,31 @@ mesh_http_release(struct http_server_request *req,
 		MESH_HTTP_MAX_STATE_SIZE, mesh_http_release_finished, ctx);
 }
 
+/* Deliver the user's mail on its anchor, so that new mails arrive on one
+   node and dsync doesn't need to resolve UID conflicts. Deliver locally if
+   this node is the anchor, or if we don't sync with the anchor right now
+   (paused): then the mail would be stuck there. */
+static void mesh_http_route(struct http_server_request *req,
+			    const char *username)
+{
+	struct http_server_response *resp;
+	struct mesh_peer *anchor = mesh_anchor_peer(username);
+	string_t *body = t_str_new(64);
+
+	resp = http_server_response_create(req, 200, "OK");
+	http_server_response_add_header(resp, "Content-Type", "text/plain");
+	http_server_response_add_header(resp, "Cache-Control", "no-store");
+	http_server_response_add_header(resp, "X-Mesh-Anchor",
+					mesh_anchor_name(username));
+	if (anchor != NULL && mesh_peer_usable(anchor)) {
+		str_printfa(body, "%s\t%u", anchor->set->mesh_peer_host,
+			    anchor->set->mesh_peer_lmtp_port);
+	}
+	http_server_response_set_payload_data(resp, str_data(body),
+					      str_len(body));
+	http_server_response_submit(resp);
+}
+
 static void
 mesh_http_api(struct http_server_request *req, const char *path)
 {
@@ -444,6 +472,13 @@ mesh_http_api(struct http_server_request *req, const char *path)
 				(mesh_verify_callback_t *)
 				mesh_http_verify_done, ctx);
 		}
+	} else if (strcmp(path, "route") == 0 && is_get) {
+		value = mesh_http_query_param(hreq, "user");
+		if (value == NULL || value[0] == '\0') {
+			http_server_request_fail(req, 400, "Missing user");
+			return;
+		}
+		mesh_http_route(req, value);
 	} else if (strcmp(path, "activity") == 0 && is_get) {
 		unsigned int limit = 100;
 
