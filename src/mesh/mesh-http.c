@@ -27,7 +27,7 @@
                                        fingerprint of the user's mailboxes
      POST /mesh/v1/pause?peer=<p>, /mesh/v1/resume?peer=<p>
      POST /mesh/v1/lease?user=<u>&node=<n>&secs=<s>&gen=<g>&exclusive=<0|1>
-     POST /mesh/v1/release?user=<u>&node=<n>&gen=<g>   (between nodes,
+     POST /mesh/v1/release?user=<u>&node=<n>&gen=<g>&ok=<0|1>  (between nodes,
                                        the payload is the pair's new state)
      GET  /mesh/ui/...                 the status web UI */
 
@@ -235,6 +235,7 @@ mesh_http_lease(struct http_server_request *req,
 	}
 	user->lease_peer = peer;
 	user->lease_expires = ioloop_time + secs;
+	user->lease_start = ioloop_timeval;
 
 	/* see mesh_sync_lease_response() */
 	up = &user->peers[peer->idx];
@@ -317,6 +318,7 @@ struct mesh_http_release {
 	struct http_server_request *req;
 	char *username, *node;
 	unsigned int gen;
+	bool ok;
 	buffer_t *state;
 };
 
@@ -335,6 +337,8 @@ static void mesh_http_release_finished(struct mesh_http_release *ctx)
 	struct mesh_user_peer *up = &user->peers[peer->idx];
 
 	if (user->lease_peer == peer) {
+		if (ctx->ok)
+			mesh_conn_user_replicated(user, &user->lease_start);
 		user->lease_peer = NULL;
 		user->lease_expires = 0;
 	}
@@ -355,6 +359,7 @@ mesh_http_release(struct http_server_request *req,
 	const char *username = mesh_http_query_param(hreq, "user");
 	const char *node = mesh_http_query_param(hreq, "node");
 	const char *gen_str = mesh_http_query_param(hreq, "gen");
+	const char *ok_str;
 	struct mesh_http_release *ctx;
 	unsigned int gen;
 	uoff_t size;
@@ -373,6 +378,8 @@ mesh_http_release(struct http_server_request *req,
 	ctx->username = i_strdup(username);
 	ctx->node = i_strdup(node);
 	ctx->gen = gen;
+	ok_str = mesh_http_query_param(hreq, "ok");
+	ctx->ok = ok_str != NULL && strcmp(ok_str, "1") == 0;
 	ctx->state = buffer_create_dynamic(default_pool, 256);
 	http_server_request_set_destroy_callback(req,
 		mesh_http_release_destroyed, ctx);

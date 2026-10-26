@@ -2,6 +2,8 @@
 
 #include "mesh-common.h"
 #include "ioloop.h"
+#include "llist.h"
+#include "time-util.h"
 #include "str.h"
 #include "strescape.h"
 #include "ostream.h"
@@ -10,8 +12,13 @@
 
 /* Two line-based protocols on UNIX sockets:
 
-   mesh-notify (mail processes, mode 0666), no replies:
+   mesh-notify (mail processes, mode 0666):
      NOTIFY <user> <high|normal> <dsync 0|1>
+     WAIT <id> <user>
+       Reply "DONE <id> ok" once a session that started after this
+       finished successfully, i.e. what the user's process committed
+       before is on another node, or right away "DONE <id> nopeers" if
+       no peer is usable. Used to confirm deliveries only after that.
 
    mesh (doveadm mesh, mode 0600). Each command's reply is "+OK" or
    "-ERR <error>", then zero or more tab-separated rows, then an empty line:
@@ -30,7 +37,72 @@ struct mesh_conn {
 	struct mesh_verify *verify;
 };
 
+/* forget a waiting delivery that's this old: its process gave up long
+   ago */
+#define MESH_WAITER_MAX_AGE_SECS 300
+
+struct mesh_waiter {
+	struct mesh_waiter *prev, *next;
+	struct mesh_conn *conn;
+	char *username, *id;
+	struct timeval since;
+};
+
 static struct connection_list *mesh_notify_conns, *mesh_admin_conns;
+static struct mesh_waiter *mesh_waiters;
+
+static void mesh_waiter_free(struct mesh_waiter *waiter)
+{
+	DLLIST_REMOVE(&mesh_waiters, waiter);
+	i_free(waiter->username);
+	i_free(waiter->id);
+	i_free(waiter);
+}
+
+static void mesh_waiter_reply(struct mesh_conn *mconn, const char *id,
+			      const char *result)
+{
+	string_t *str = t_str_new(64);
+
+	str_append(str, "DONE\t");
+	str_append_tabescaped(str, id);
+	str_printfa(str, "\t%s\n", result);
+	o_stream_nsend(mconn->conn.output, str_data(str), str_len(str));
+}
+
+static bool mesh_peers_usable(void)
+{
+	struct mesh_peer *peer;
+
+	array_foreach_elem(&mesh_peers, peer) {
+		if (mesh_peer_usable(peer))
+			return TRUE;
+	}
+	return FALSE;
+}
+
+void mesh_conn_user_replicated(const struct mesh_user *user,
+			       const struct timeval *start_time)
+{
+	struct mesh_waiter *waiter, *next;
+
+	for (waiter = mesh_waiters; waiter != NULL; waiter = next) {
+		next = waiter->next;
+		if (ioloop_time - waiter->since.tv_sec >
+		    MESH_WAITER_MAX_AGE_SECS) {
+			mesh_waiter_free(waiter);
+			continue;
+		}
+		if (strcmp(waiter->username, user->username) != 0 ||
+		    timeval_cmp(&waiter->since, start_time) > 0)
+			continue;
+		e_debug(mesh_event, "Delivery for %s replicated after %lld ms",
+			waiter->username,
+			timeval_diff_msecs(&ioloop_timeval, &waiter->since));
+		mesh_waiter_reply(waiter->conn, waiter->id, "ok");
+		mesh_waiter_free(waiter);
+	}
+}
 
 static enum mesh_priority mesh_priority_parse(const char *str)
 {
@@ -42,6 +114,23 @@ static enum mesh_priority mesh_priority_parse(const char *str)
 static int mesh_notify_input_args(struct connection *conn,
 				  const char *const *args)
 {
+	struct mesh_conn *mconn = container_of(conn, struct mesh_conn, conn);
+	struct mesh_waiter *waiter;
+
+	if (str_array_length(args) >= 3 && strcmp(args[0], "WAIT") == 0) {
+		if (!mesh_peers_usable()) {
+			mesh_waiter_reply(mconn, args[1], "nopeers");
+			return 1;
+		}
+		waiter = i_new(struct mesh_waiter, 1);
+		waiter->conn = mconn;
+		waiter->id = i_strdup(args[1]);
+		waiter->username = i_strdup(args[2]);
+		waiter->since = ioloop_timeval;
+		DLLIST_PREPEND(&mesh_waiters, waiter);
+		mesh_queue_expedite(mesh_user_lookup(args[2], TRUE));
+		return 1;
+	}
 	if (str_array_length(args) < 4 || strcmp(args[0], "NOTIFY") != 0) {
 		e_error(conn->event, "Invalid input: %s",
 			t_strarray_join(args, " "));
@@ -212,8 +301,15 @@ static void mesh_conn_destroy(struct connection *conn)
 {
 	struct mesh_conn *mconn = container_of(conn, struct mesh_conn, conn);
 
+	struct mesh_waiter *waiter, *next;
+
 	if (mconn->verify != NULL)
 		mesh_verify_detach(&mconn->verify);
+	for (waiter = mesh_waiters; waiter != NULL; waiter = next) {
+		next = waiter->next;
+		if (waiter->conn == mconn)
+			mesh_waiter_free(waiter);
+	}
 	connection_deinit(conn);
 	i_free(mconn);
 	master_service_client_connection_destroyed(master_service);
@@ -230,7 +326,7 @@ static const struct connection_settings mesh_notify_set = {
 	.major_version = 1,
 	.minor_version = 0,
 	.input_max_size = 1024*16,
-	.output_max_size = 1024,
+	.output_max_size = 1024*16,
 };
 
 static const struct connection_vfuncs mesh_admin_vfuncs = {
@@ -267,6 +363,8 @@ void mesh_conn_init(void)
 
 void mesh_conn_deinit(void)
 {
+	while (mesh_waiters != NULL)
+		mesh_waiter_free(mesh_waiters);
 	connection_list_deinit(&mesh_notify_conns);
 	connection_list_deinit(&mesh_admin_conns);
 }

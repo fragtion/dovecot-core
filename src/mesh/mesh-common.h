@@ -94,6 +94,7 @@ struct mesh_user {
 	/* this peer is running a sync for the user with us */
 	struct mesh_peer *lease_peer;
 	time_t lease_expires;
+	struct timeval lease_start;
 	/* node the user was anchored to when last checked */
 	const char *anchor;
 	time_t last_change;
@@ -160,6 +161,9 @@ void mesh_queue_sync_finished(struct mesh_user *user, struct mesh_peer *peer,
 			      const char *new_state, bool full,
 			      unsigned int msecs);
 void mesh_queue_schedule(void);
+/* Start the user's pending pushes now instead of waiting for more
+   changes to coalesce: a delivery is waiting for them. */
+void mesh_queue_expedite(struct mesh_user *user);
 /* TRUE if another peer currently holds the user's lease. */
 bool mesh_user_is_leased(const struct mesh_user *user);
 /* FALSE if the user's changes reach the peer through the anchor instead
@@ -262,6 +266,11 @@ void mesh_state_changed(void);
 void mesh_conn_init(void);
 void mesh_conn_deinit(void);
 void mesh_conn_create(int fd, bool admin);
+/* A session for the user that started at start_time finished
+   successfully, so everything committed before that is on another node
+   now. Answers the deliveries waiting for that. */
+void mesh_conn_user_replicated(const struct mesh_user *user,
+			       const struct timeval *start_time);
 
 /* mesh-http.c */
 void mesh_http_init(void);

@@ -79,14 +79,17 @@ mesh_lease_release_response(const struct http_response *resp,
 	}
 }
 
-/* Give the user back to the peer, along with the pair's new state. */
-static void mesh_sync_release(struct mesh_user *user, struct mesh_peer *peer)
+/* Give the user back to the peer, along with the pair's new state. ok
+   tells that the session succeeded, i.e. both nodes have everything that
+   was committed before the lease. */
+static void mesh_sync_release(struct mesh_user *user, struct mesh_peer *peer,
+			      bool ok)
 {
 	const struct mesh_user_peer *up = &user->peers[peer->idx];
 	struct http_client_request *req;
 	string_t *path = mesh_lease_path("release", user);
 
-	str_printfa(path, "&gen=%u", up->state_gen);
+	str_printfa(path, "&gen=%u&ok=%d", up->state_gen, ok ? 1 : 0);
 	req = mesh_peer_http_request(peer, "POST", str_c(path),
 				     mesh_lease_release_response, NULL);
 	if (up->dsync_state != NULL) {
@@ -157,6 +160,8 @@ static void mesh_sync_finish(struct mesh_sync *sync, int exit_code,
 	struct mesh_user *user = sync->user;
 	struct mesh_peer *peer = sync->peer;
 	bool full = sync->full, leased = sync->leased;
+	bool ok = exit_code == 0 || exit_code == DOVEADM_EX_CHANGED;
+	struct timeval start_time = sync->start_time;
 	unsigned int base_gen = sync->base_gen;
 	unsigned int msecs =
 		timeval_diff_msecs(&ioloop_timeval, &sync->start_time);
@@ -171,8 +176,10 @@ static void mesh_sync_finish(struct mesh_sync *sync, int exit_code,
 		   copies are known to match only if this release arrives */
 		user->peers[peer->idx].state_gen = base_gen + 1;
 		mesh_state_changed();
-		mesh_sync_release(user, peer);
+		mesh_sync_release(user, peer, ok);
 	}
+	if (ok)
+		mesh_conn_user_replicated(user, &start_time);
 }
 
 static void

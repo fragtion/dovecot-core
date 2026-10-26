@@ -202,6 +202,20 @@ bool mesh_user_is_leased(const struct mesh_user *user)
 	return user->lease_peer != NULL && user->lease_expires > ioloop_time;
 }
 
+void mesh_queue_expedite(struct mesh_user *user)
+{
+	struct mesh_peer *peer;
+	struct mesh_user_peer *up;
+
+	array_foreach_elem(&mesh_peers, peer) {
+		up = &user->peers[peer->idx];
+		if (up->pending != MESH_PRIORITY_NONE && up->failures == 0 &&
+		    timeval_cmp(&up->due, &ioloop_timeval) > 0)
+			up->due = ioloop_timeval;
+	}
+	mesh_queue_schedule_soon();
+}
+
 bool mesh_user_peer_is_direct(const struct mesh_user *user,
 			      const struct mesh_peer *peer)
 {
