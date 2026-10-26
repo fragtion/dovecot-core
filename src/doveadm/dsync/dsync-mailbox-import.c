@@ -2250,15 +2250,47 @@ dsync_msg_change_uid(struct dsync_mailbox_importer *importer,
 	return TRUE;
 }
 
+/* Returns the UID of the local instance that the mail getting final_uid was
+   linked to (or is), or 0 if there's none. */
+static uint32_t
+importer_new_mail_get_local_uid(struct importer_new_mail *all_newmails,
+				uint32_t final_uid)
+{
+	struct importer_new_mail *mail;
+
+	for (mail = all_newmails; mail != NULL; mail = mail->next) {
+		if (mail->skip || mail->final_uid != final_uid)
+			continue;
+		if (mail->uid_in_local)
+			return mail->local_uid;
+		if (mail->link != NULL && mail->link->uid_in_local)
+			return mail->link->local_uid;
+		break;
+	}
+	return 0;
+}
+
 static bool
 dsync_mailbox_import_change_uid(struct dsync_mailbox_importer *importer,
 				ARRAY_TYPE(seq_range) *unwanted_uids,
-				uint32_t wanted_uid)
+				uint32_t wanted_uid, uint32_t own_uid)
 {
 	const struct seq_range *range;
 	unsigned int count, n;
 	struct seq_range_iter iter;
 	uint32_t uid;
+
+	/* Prefer the mail's own local instance. With several instances of
+	   the same GUID they may have different flags, and the remote moves
+	   its own instance to wanted_uid. */
+	if (own_uid != 0 && seq_range_exists(unwanted_uids, own_uid)) {
+		if (dsync_msg_change_uid(importer, own_uid, wanted_uid)) {
+			seq_range_array_remove(unwanted_uids, own_uid);
+			return TRUE;
+		}
+		if (mailbox_get_last_mail_error(importer->box) == MAIL_ERROR_EXPUNGED)
+			seq_range_array_remove(unwanted_uids, own_uid);
+	}
 
 	/* optimize by first trying to use the latest UID */
 	range = array_get(unwanted_uids, &count);
@@ -2328,8 +2360,11 @@ dsync_mailbox_import_try_local(struct dsync_mailbox_importer *importer,
 
 	/* reuse as many existing messages as possible by changing their UIDs */
 	while (seq_range_array_iter_nth(&wanted_iter, wanted_n, &wanted_uid)) {
+		uint32_t own_uid =
+			importer_new_mail_get_local_uid(all_newmails, wanted_uid);
+
 		if (!dsync_mailbox_import_change_uid(importer, &unwanted_uids,
-						     wanted_uid))
+						     wanted_uid, own_uid))
 			break;
 		seq_range_array_add(&assigned_uids, wanted_uid);
 		wanted_n++;
