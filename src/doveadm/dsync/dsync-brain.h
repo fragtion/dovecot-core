@@ -40,6 +40,12 @@ enum dsync_brain_flags {
 	   less safe, but can have huge performance improvement with imapc
 	   if the remote server doesn't have a fast header cache. */
 	DSYNC_BRAIN_FLAG_NO_HEADER_HASHES	= 0x1000,
+	/* Export also the flag changes, expunges and attribute changes that
+	   dsync itself imported earlier from some other server. Without this
+	   a server never forwards changes it received from one server to
+	   another one, which is only correct with two servers. Required when
+	   one server relays changes between more than two servers. */
+	DSYNC_BRAIN_FLAG_RELAY_CHANGES		= 0x2000,
 };
 
 enum dsync_brain_sync_type {

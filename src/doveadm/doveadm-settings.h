@@ -9,6 +9,7 @@ struct ssl_iostream_settings;
 enum dsync_features {
 	DSYNC_FEATURE_EMPTY_HDR_WORKAROUND = 0x1,
 	DSYNC_FEATURE_NO_HEADER_HASHES = 0x2,
+	DSYNC_FEATURE_RELAY_CHANGES = 0x4,
 };
 
 #define DOVEADM_SERVER_FILTER "doveadm_server"

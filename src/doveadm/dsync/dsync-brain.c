@@ -176,6 +176,7 @@ dsync_brain_set_flags(struct dsync_brain *brain, enum dsync_brain_flags flags)
 	brain->no_notify = (flags & DSYNC_BRAIN_FLAG_NO_NOTIFY) != 0;
 	brain->empty_hdr_workaround = (flags & DSYNC_BRAIN_FLAG_EMPTY_HDR_WORKAROUND) != 0;
 	brain->no_header_hashes = (flags & DSYNC_BRAIN_FLAG_NO_HEADER_HASHES) != 0;
+	brain->relay_changes = (flags & DSYNC_BRAIN_FLAG_RELAY_CHANGES) != 0;
 
 	event_set_forced_debug(brain->event, brain->debug);
 }

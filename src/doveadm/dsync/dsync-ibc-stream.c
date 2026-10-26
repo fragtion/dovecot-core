@@ -80,7 +80,7 @@ static const struct {
 	  	"no_mail_sync no_backup_overwrite purge_remote "
 		"no_notify sync_since_timestamp sync_max_size sync_flags sync_until_timestamp "
 		"virtual_all_box empty_hdr_workaround "
-		"hashed_headers alt_char"
+		"hashed_headers alt_char relay_changes"
 	},
 	{ .name = "mailbox_state",
 	  .chr = 'S',
@@ -749,6 +749,8 @@ dsync_ibc_stream_send_handshake(struct dsync_ibc *_ibc,
 		dsync_serializer_encode_add(encoder, "no_notify", "");
 	if ((set->brain_flags & DSYNC_BRAIN_FLAG_EMPTY_HDR_WORKAROUND) != 0)
 		dsync_serializer_encode_add(encoder, "empty_hdr_workaround", "");
+	if ((set->brain_flags & DSYNC_BRAIN_FLAG_RELAY_CHANGES) != 0)
+		dsync_serializer_encode_add(encoder, "relay_changes", "");
 	/* this can be NULL in slave */
 	string_t *str2 = t_str_new(32);
 	if (set->hashed_headers != NULL) {
@@ -883,6 +885,8 @@ dsync_ibc_stream_recv_handshake(struct dsync_ibc *_ibc,
 		set->brain_flags |= DSYNC_BRAIN_FLAG_NO_NOTIFY;
 	if (dsync_deserializer_decode_try(decoder, "empty_hdr_workaround", &value))
 		set->brain_flags |= DSYNC_BRAIN_FLAG_EMPTY_HDR_WORKAROUND;
+	if (dsync_deserializer_decode_try(decoder, "relay_changes", &value))
+		set->brain_flags |= DSYNC_BRAIN_FLAG_RELAY_CHANGES;
 	if (dsync_deserializer_decode_try(decoder, "hashed_headers", &value))
 		set->hashed_headers = (const char*const*)p_strsplit_tabescaped(pool, value);
 	set->hdr_hash_v2 = ibc->minor_version >= DSYNC_PROTOCOL_MINOR_HAVE_HDR_HASH_V2;

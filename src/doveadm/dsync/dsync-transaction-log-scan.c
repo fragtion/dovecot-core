@@ -21,6 +21,7 @@ struct dsync_transaction_log_scan {
 	uoff_t last_log_offset;
 
 	bool returned_all_changes;
+	bool relay_changes;
 };
 
 static bool ATTR_NOWARN_UNUSED_RESULT
@@ -438,7 +439,8 @@ dsync_log_scan(struct dsync_transaction_log_scan *ctx,
 		if (file_offset >= max_offset && file_seq == max_seq)
 			break;
 
-		if ((hdr->type & MAIL_TRANSACTION_SYNC) != 0) {
+		if ((hdr->type & MAIL_TRANSACTION_SYNC) != 0 &&
+		    !ctx->relay_changes) {
 			/* ignore changes done by dsync, unless we can get
 			   expunged message's GUID from it */
 			if ((hdr->type & MAIL_TRANSACTION_TYPE_MASK) !=
@@ -527,6 +529,7 @@ int dsync_transaction_log_scan_init(struct dsync_brain *brain,
 			  dsync_mailbox_attribute_cmp);
 	ctx->view = view;
 	ctx->highest_wanted_uid = highest_wanted_uid;
+	ctx->relay_changes = brain->relay_changes;
 
 	if ((ret = dsync_log_scan(ctx, view, modseq, FALSE)) < 0)
 		return -1;
