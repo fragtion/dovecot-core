@@ -89,21 +89,6 @@ static void mesh_admin_peers(string_t *str)
 	}
 }
 
-static const char *
-mesh_user_peer_status(const struct mesh_user *user,
-		      const struct mesh_peer *peer)
-{
-	const struct mesh_user_peer *up = &user->peers[peer->idx];
-
-	if (user->running_peer == peer)
-		return "syncing";
-	if (up->pending != MESH_PRIORITY_NONE)
-		return up->failures > 0 ? "error" : "pending";
-	if (up->last_ok == 0)
-		return "never";
-	return "ok";
-}
-
 static void mesh_admin_user(string_t *str, struct mesh_user *user)
 {
 	struct mesh_peer *peer;

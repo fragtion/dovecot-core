@@ -157,6 +157,33 @@ bool mesh_user_is_leased(const struct mesh_user *user)
 	return user->lease_peer != NULL && user->lease_expires > ioloop_time;
 }
 
+bool mesh_user_peer_is_direct(const struct mesh_user *user,
+			      const struct mesh_peer *peer)
+{
+	const struct mesh_peer *anchor;
+
+	if (mesh_set->parsed_topology != MESH_TOPOLOGY_ANCHOR)
+		return TRUE;
+	anchor = mesh_anchor_peer(user->username);
+	return anchor == NULL || anchor == peer;
+}
+
+const char *mesh_user_peer_status(const struct mesh_user *user,
+				  const struct mesh_peer *peer)
+{
+	const struct mesh_user_peer *up = &user->peers[peer->idx];
+
+	if (user->running_peer == peer)
+		return "syncing";
+	if (up->pending != MESH_PRIORITY_NONE)
+		return up->failures > 0 ? "error" : "pending";
+	if (!mesh_user_peer_is_direct(user, peer))
+		return "relayed";
+	if (up->last_ok == 0)
+		return "never";
+	return "ok";
+}
+
 void mesh_user_mark_session(struct mesh_user *user, struct mesh_peer *peer)
 {
 	struct mesh_peer *p;
@@ -230,10 +257,6 @@ void mesh_queue_sync_finished(struct mesh_user *user, struct mesh_peer *peer,
 			up->last_full = ioloop_time;
 		peer->syncs_ok++;
 		peer->last_sync_ok = ioloop_time;
-		e_debug(mesh_event,
-			"Synced %s with %s in %u ms%s (exit code %d)",
-			user->username, peer->name, msecs,
-			full ? " (full)" : "", exit_code);
 		if (exit_code != DOVEADM_EX_CHANGED)
 			up->changed_count = 0;
 		else if (++up->changed_count >= 2) {

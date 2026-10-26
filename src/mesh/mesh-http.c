@@ -17,7 +17,9 @@
 
      GET  /mesh/v1/heartbeat           node status in X-Mesh-* headers
      GET  /mesh/v1/status              node and peers, JSON
-     GET  /mesh/v1/users[?user=<u>]    per user and peer sync status, JSON
+     GET  /mesh/v1/users[?user=<u>|q=<substring>][&problems=1][&limit=<n>]
+                                       per user and peer sync status, JSON
+     GET  /mesh/v1/activity[?limit=<n>]  recent sessions, newest first
      POST /mesh/v1/sync?user=<u>[&full=1]
      POST /mesh/v1/pause?peer=<p>, /mesh/v1/resume?peer=<p>
      POST /mesh/v1/lease?user=<u>&node=<n>&secs=<s>&gen=<g>&exclusive=<0|1>
@@ -318,7 +320,28 @@ mesh_http_api(struct http_server_request *req, const char *path)
 		mesh_status_json(body);
 		mesh_http_send_json(req, body);
 	} else if (strcmp(path, "users") == 0 && is_get) {
-		mesh_users_json(body, mesh_http_query_param(hreq, "user"));
+		struct mesh_users_filter filter = {
+			.user = mesh_http_query_param(hreq, "user"),
+			.query = mesh_http_query_param(hreq, "q"),
+		};
+		value = mesh_http_query_param(hreq, "problems");
+		filter.problems = value != NULL && strcmp(value, "1") == 0;
+		value = mesh_http_query_param(hreq, "limit");
+		if (value != NULL && str_to_uint(value, &filter.limit) < 0) {
+			http_server_request_fail(req, 400, "Invalid limit");
+			return;
+		}
+		mesh_users_json(body, &filter);
+		mesh_http_send_json(req, body);
+	} else if (strcmp(path, "activity") == 0 && is_get) {
+		unsigned int limit = 100;
+
+		value = mesh_http_query_param(hreq, "limit");
+		if (value != NULL && str_to_uint(value, &limit) < 0) {
+			http_server_request_fail(req, 400, "Invalid limit");
+			return;
+		}
+		mesh_activity_json(body, limit);
 		mesh_http_send_json(req, body);
 	} else if (strcmp(path, "sync") == 0 && is_post) {
 		value = mesh_http_query_param(hreq, "user");

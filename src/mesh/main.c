@@ -50,6 +50,7 @@ static void main_init(void)
 		mesh_set->mesh_node_name : my_hostdomain();
 	mesh_start_time = ioloop_time;
 
+	mesh_status_init();
 	mesh_conn_init();
 	mesh_peers_init();
 	mesh_queue_init();
@@ -69,6 +70,7 @@ static void main_deinit(void)
 	mesh_queue_deinit();
 	mesh_peers_deinit();
 	mesh_conn_deinit();
+	mesh_status_deinit();
 	settings_free(mesh_set);
 	event_unref(&mesh_event);
 }

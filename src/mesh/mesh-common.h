@@ -147,6 +147,13 @@ void mesh_queue_sync_finished(struct mesh_user *user, struct mesh_peer *peer,
 void mesh_queue_schedule(void);
 /* TRUE if another peer currently holds the user's lease. */
 bool mesh_user_is_leased(const struct mesh_user *user);
+/* FALSE if the user's changes reach the peer through the anchor instead
+   of syncs between this node and the peer. */
+bool mesh_user_peer_is_direct(const struct mesh_user *user,
+			      const struct mesh_peer *peer);
+/* syncing, pending, error, relayed, never or ok */
+const char *mesh_user_peer_status(const struct mesh_user *user,
+				  const struct mesh_peer *peer);
 /* A session for the user with the peer is starting. */
 void mesh_user_mark_session(struct mesh_user *user, struct mesh_peer *peer);
 /* Replace the pair's dsync state (NULL/"" = none). */
@@ -177,8 +184,27 @@ void mesh_http_deinit(void);
 void mesh_http_conn_create(struct master_service_connection *conn);
 
 /* mesh-status.c */
+void mesh_status_init(void);
+void mesh_status_deinit(void);
+/* Remember a finished session for the activity list. */
+void mesh_status_add_sync(const struct mesh_user *user,
+			  const struct mesh_peer *peer, const char *result,
+			  bool full, bool stateful, unsigned int msecs,
+			  const char *error);
 void mesh_status_json(string_t *dest);
-void mesh_users_json(string_t *dest, const char *only_user);
+void mesh_activity_json(string_t *dest, unsigned int limit);
+struct mesh_users_filter {
+	/* only this user */
+	const char *user;
+	/* user name contains this */
+	const char *query;
+	/* only users with a peer that's pending, syncing or failing, or
+	   never synced with */
+	bool problems;
+	/* 0 = unlimited */
+	unsigned int limit;
+};
+void mesh_users_json(string_t *dest, const struct mesh_users_filter *filter);
 void mesh_heartbeat_headers(ARRAY_TYPE(const_string) *headers);
 
 #endif

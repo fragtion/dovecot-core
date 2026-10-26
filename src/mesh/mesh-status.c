@@ -24,6 +24,86 @@ static void json_append_bool(string_t *dest, const char *key, bool value)
 	str_printfa(dest, "\"%s\":%s", key, value ? "true" : "false");
 }
 
+/* recent sessions for the activity list */
+#define MESH_ACTIVITY_MAX 200
+
+struct mesh_activity {
+	time_t time;
+	char *username, *peer, *error;
+	const char *result;
+	unsigned int msecs;
+	bool full, stateful;
+};
+
+static struct mesh_activity mesh_activity[MESH_ACTIVITY_MAX];
+/* index of the next slot to write, and how many are used */
+static unsigned int mesh_activity_next, mesh_activity_count;
+
+static void mesh_activity_free(struct mesh_activity *act)
+{
+	i_free(act->username);
+	i_free(act->peer);
+	i_free(act->error);
+}
+
+void mesh_status_add_sync(const struct mesh_user *user,
+			  const struct mesh_peer *peer, const char *result,
+			  bool full, bool stateful, unsigned int msecs,
+			  const char *error)
+{
+	struct mesh_activity *act = &mesh_activity[mesh_activity_next];
+
+	mesh_activity_free(act);
+	act->time = ioloop_time;
+	act->username = i_strdup(user->username);
+	act->peer = i_strdup(peer->name);
+	act->error = i_strdup(error);
+	/* result is a static string */
+	act->result = result;
+	act->msecs = msecs;
+	act->full = full;
+	act->stateful = stateful;
+	mesh_activity_next = (mesh_activity_next + 1) % MESH_ACTIVITY_MAX;
+	if (mesh_activity_count < MESH_ACTIVITY_MAX)
+		mesh_activity_count++;
+}
+
+void mesh_activity_json(string_t *dest, unsigned int limit)
+{
+	const struct mesh_activity *act;
+	unsigned int i, idx;
+
+	str_append_c(dest, '{');
+	json_append_str(dest, "node", mesh_node_name);
+	str_append(dest, ",\"activity\":[");
+	/* newest first */
+	for (i = 0; i < mesh_activity_count && i < limit; i++) {
+		idx = (mesh_activity_next + MESH_ACTIVITY_MAX - 1 - i) %
+			MESH_ACTIVITY_MAX;
+		act = &mesh_activity[idx];
+		if (i > 0)
+			str_append_c(dest, ',');
+		str_append_c(dest, '{');
+		json_append_num(dest, "time", act->time);
+		str_append_c(dest, ',');
+		json_append_str(dest, "user", act->username);
+		str_append_c(dest, ',');
+		json_append_str(dest, "peer", act->peer);
+		str_append_c(dest, ',');
+		json_append_str(dest, "result", act->result);
+		str_append_c(dest, ',');
+		json_append_num(dest, "ms", act->msecs);
+		str_append_c(dest, ',');
+		json_append_bool(dest, "full", act->full);
+		str_append_c(dest, ',');
+		json_append_bool(dest, "stateful", act->stateful);
+		str_append_c(dest, ',');
+		json_append_str(dest, "error", act->error);
+		str_append_c(dest, '}');
+	}
+	str_append(dest, "]}");
+}
+
 static long long mesh_now_msecs(void)
 {
 	return (long long)ioloop_timeval.tv_sec * 1000 +
@@ -107,21 +187,6 @@ void mesh_status_json(string_t *dest)
 	str_append(dest, "]}");
 }
 
-static const char *
-mesh_user_peer_status_str(const struct mesh_user *user,
-			  const struct mesh_peer *peer)
-{
-	const struct mesh_user_peer *up = &user->peers[peer->idx];
-
-	if (user->running_peer == peer)
-		return "syncing";
-	if (up->pending != MESH_PRIORITY_NONE)
-		return up->failures > 0 ? "error" : "pending";
-	if (up->last_ok == 0)
-		return "never";
-	return "ok";
-}
-
 static void mesh_user_json(string_t *dest, const struct mesh_user *user)
 {
 	const struct mesh_user_peer *up;
@@ -134,6 +199,10 @@ static void mesh_user_json(string_t *dest, const struct mesh_user *user)
 	json_append_str(dest, "anchor", mesh_anchor_name(user->username));
 	str_append_c(dest, ',');
 	json_append_num(dest, "last_change", user->last_change);
+	str_append_c(dest, ',');
+	json_append_str(dest, "syncing_with",
+			user->running_peer != NULL ? user->running_peer->name :
+			mesh_user_is_leased(user) ? user->lease_peer->name : "");
 	str_append(dest, ",\"peers\":[");
 	array_foreach_elem(&mesh_peers, peer) {
 		up = &user->peers[peer->idx];
@@ -144,7 +213,10 @@ static void mesh_user_json(string_t *dest, const struct mesh_user *user)
 		json_append_str(dest, "peer", peer->name);
 		str_append_c(dest, ',');
 		json_append_str(dest, "status",
-				mesh_user_peer_status_str(user, peer));
+				mesh_user_peer_status(user, peer));
+		str_append_c(dest, ',');
+		json_append_bool(dest, "direct",
+				 mesh_user_peer_is_direct(user, peer));
 		str_append_c(dest, ',');
 		json_append_num(dest, "last_ok", up->last_ok);
 		str_append_c(dest, ',');
@@ -176,31 +248,65 @@ static void mesh_user_json(string_t *dest, const struct mesh_user *user)
 	str_append(dest, "]}");
 }
 
-void mesh_users_json(string_t *dest, const char *only_user)
+static bool mesh_user_has_problem(const struct mesh_user *user)
+{
+	struct mesh_peer *peer;
+	const char *status;
+
+	array_foreach_elem(&mesh_peers, peer) {
+		status = mesh_user_peer_status(user, peer);
+		if (strcmp(status, "ok") != 0 && strcmp(status, "relayed") != 0)
+			return TRUE;
+	}
+	return FALSE;
+}
+
+static bool mesh_user_matches(const struct mesh_user *user,
+			      const struct mesh_users_filter *filter)
+{
+	if (filter->query != NULL && filter->query[0] != '\0' &&
+	    strstr(user->username, filter->query) == NULL)
+		return FALSE;
+	if (filter->problems && !mesh_user_has_problem(user))
+		return FALSE;
+	return TRUE;
+}
+
+void mesh_users_json(string_t *dest, const struct mesh_users_filter *filter)
 {
 	struct hash_iterate_context *iter;
 	struct mesh_user *user;
 	char *username;
-	bool first = TRUE;
+	unsigned int matched = 0;
 
 	str_append_c(dest, '{');
 	json_append_str(dest, "node", mesh_node_name);
 	str_append(dest, ",\"users\":[");
-	if (only_user != NULL) {
-		user = mesh_user_lookup(only_user, FALSE);
-		if (user != NULL)
+	if (filter->user != NULL) {
+		user = mesh_user_lookup(filter->user, FALSE);
+		if (user != NULL) {
 			mesh_user_json(dest, user);
+			matched++;
+		}
 	} else {
 		iter = hash_table_iterate_init(mesh_users);
 		while (hash_table_iterate(iter, mesh_users, &username, &user)) {
-			if (!first)
-				str_append_c(dest, ',');
-			first = FALSE;
-			mesh_user_json(dest, user);
+			if (!mesh_user_matches(user, filter))
+				continue;
+			if (filter->limit == 0 || matched < filter->limit) {
+				if (matched > 0)
+					str_append_c(dest, ',');
+				mesh_user_json(dest, user);
+			}
+			matched++;
 		}
 		hash_table_iterate_deinit(&iter);
 	}
-	str_append(dest, "]}");
+	str_append(dest, "],");
+	json_append_num(dest, "matched", matched);
+	str_append_c(dest, ',');
+	json_append_num(dest, "total", hash_table_count(mesh_users));
+	str_append_c(dest, '}');
 }
 
 void mesh_heartbeat_headers(ARRAY_TYPE(const_string) *headers)
@@ -229,4 +335,16 @@ void mesh_heartbeat_headers(ARRAY_TYPE(const_string) *headers)
 	ADD("X-Mesh-Users", dec2str(hash_table_count(mesh_users)));
 	ADD("X-Mesh-Peers-Up", str_c(peers_up));
 #undef ADD
+}
+
+void mesh_status_init(void)
+{
+}
+
+void mesh_status_deinit(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < MESH_ACTIVITY_MAX; i++)
+		mesh_activity_free(&mesh_activity[i]);
 }

@@ -36,6 +36,11 @@ struct mesh_sync {
 	string_t *output;
 	struct timeval start_time;
 	struct timeout *to;
+	/* mesh_sync_finished event, created when the session starts so that
+	   it gets the duration */
+	struct event *event;
+	/* the session used a dsync state */
+	bool stateful;
 };
 
 static struct mesh_sync *mesh_syncs;
@@ -103,7 +108,46 @@ static void mesh_sync_free(struct mesh_sync *sync)
 	if (sync->conn != NULL)
 		doveadm_client_unref(&sync->conn);
 	str_free(&sync->output);
+	event_unref(&sync->event);
 	i_free(sync);
+}
+
+static const char *mesh_sync_result(int exit_code)
+{
+	switch (exit_code) {
+	case 0:
+		return "ok";
+	case DOVEADM_EX_CHANGED:
+		return "changed";
+	case MESH_SYNC_EXIT_BUSY:
+		return "busy";
+	default:
+		return "failed";
+	}
+}
+
+static void mesh_sync_send_event(struct mesh_sync *sync, int exit_code,
+				 const char *error, unsigned int msecs)
+{
+	const char *result = mesh_sync_result(exit_code);
+	struct event_passthrough *e =
+		event_create_passthrough(sync->event)->
+		set_name("mesh_sync_finished")->
+		add_str("result", result)->
+		add_int("exit_code", exit_code)->
+		add_int("full", sync->full ? 1 : 0)->
+		add_int("stateful", sync->stateful ? 1 : 0);
+
+	if (error != NULL)
+		e->add_str("error", error);
+	if (exit_code != MESH_SYNC_EXIT_BUSY) {
+		mesh_status_add_sync(sync->user, sync->peer, result,
+				     sync->full, sync->stateful, msecs, error);
+	}
+	e_debug(e->event(), "Synced %s with %s in %u ms: %s%s%s%s",
+		sync->user->username, sync->peer->name, msecs, result,
+		sync->full ? " (full)" : sync->stateful ? "" : " (stateless)",
+		error == NULL ? "" : ": ", error == NULL ? "" : error);
 }
 
 static void mesh_sync_finish(struct mesh_sync *sync, int exit_code,
@@ -117,6 +161,7 @@ static void mesh_sync_finish(struct mesh_sync *sync, int exit_code,
 		timeval_diff_msecs(&ioloop_timeval, &sync->start_time);
 	const char *state = t_strdup(t_str_trim(str_c(sync->output), " \t\r\n"));
 
+	mesh_sync_send_event(sync, exit_code, error, msecs);
 	mesh_sync_free(sync);
 	mesh_queue_sync_finished(user, peer, exit_code, error, state, full,
 				 msecs);
@@ -281,6 +326,7 @@ mesh_sync_lease_response(const struct http_response *resp, void *context)
 		mesh_user_peer_set_state(up, NULL);
 	}
 	mesh_user_mark_session(sync->user, sync->peer);
+	sync->stateful = !sync->full && up->dsync_state != NULL;
 	mesh_sync_run_doveadm(sync);
 }
 
@@ -297,6 +343,9 @@ void mesh_sync_start(struct mesh_user *user, struct mesh_peer *peer,
 	sync->full = full;
 	sync->output = str_new(default_pool, 128);
 	sync->start_time = ioloop_timeval;
+	sync->event = event_create(mesh_event);
+	event_add_str(sync->event, "user", user->username);
+	event_add_str(sync->event, "peer", peer->name);
 	DLLIST_PREPEND(&mesh_syncs, sync);
 
 	/* Ask the peer for a lease first. The peer refuses if it's syncing
