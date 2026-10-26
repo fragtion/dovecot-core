@@ -95,6 +95,7 @@ doveadm_common_cmds = \
 	doveadm-kick.c \
 	doveadm-log.c \
 	doveadm-master.c \
+	doveadm-mesh.c \
 	doveadm-mutf7.c \
 	doveadm-penalty.c \
 	doveadm-sis.c \

@@ -32,6 +32,12 @@ static struct doveadm_cmd_ver2 *doveadm_commands_ver2[] = {
 	&doveadm_cmd_indexer_add,
 	&doveadm_cmd_indexer_remove,
 	&doveadm_cmd_indexer_list,
+	&doveadm_cmd_mesh_status,
+	&doveadm_cmd_mesh_peers,
+	&doveadm_cmd_mesh_users,
+	&doveadm_cmd_mesh_sync,
+	&doveadm_cmd_mesh_pause,
+	&doveadm_cmd_mesh_resume,
 };
 
 ARRAY_TYPE(doveadm_cmd_ver2) doveadm_cmds_ver2;
