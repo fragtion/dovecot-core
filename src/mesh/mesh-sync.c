@@ -146,7 +146,8 @@ static void mesh_sync_send_event(struct mesh_sync *sync, int exit_code,
 	}
 	e_debug(e->event(), "Synced %s with %s in %u ms: %s%s%s%s",
 		sync->user->username, sync->peer->name, msecs, result,
-		sync->full ? " (full)" : sync->stateful ? "" : " (stateless)",
+		exit_code == MESH_SYNC_EXIT_BUSY || sync->stateful ? "" :
+		sync->full ? " (full)" : " (stateless)",
 		error == NULL ? "" : ": ", error == NULL ? "" : error);
 }
 

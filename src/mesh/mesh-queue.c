@@ -17,7 +17,7 @@ HASH_TABLE_TYPE(mesh_user) mesh_users;
 
 /* users that have at least one pending push */
 static HASH_TABLE(char *, struct mesh_user *) mesh_pending_users;
-static struct timeout *mesh_queue_to, *mesh_periodic_to;
+static struct timeout *mesh_queue_to, *mesh_periodic_to, *mesh_startup_to;
 static unsigned int mesh_running_count;
 static time_t mesh_last_incremental, mesh_last_full;
 
@@ -128,10 +128,40 @@ void mesh_queue_notify(const char *username, enum mesh_priority priority,
 	}
 }
 
+/* With the anchor topology, move pushes queued for a peer that's no
+   longer a direct partner of the user (the anchor moved) to the anchor.
+   Otherwise e.g. pushes queued at startup, before any peer was known to
+   be up, would sync spokes with each other. */
+static void mesh_queue_redirect_pending(struct mesh_user *user)
+{
+	struct mesh_peer *peer, *anchor = mesh_anchor_peer(user->username);
+	struct mesh_user_peer *up;
+	enum mesh_priority priority = MESH_PRIORITY_NONE;
+	bool full = FALSE;
+
+	array_foreach_elem(&mesh_peers, peer) {
+		up = &user->peers[peer->idx];
+		if (up->pending == MESH_PRIORITY_NONE ||
+		    mesh_user_peer_is_direct(user, peer))
+			continue;
+		if (priority < up->pending)
+			priority = up->pending;
+		full = full || up->pending_full;
+		up->pending = MESH_PRIORITY_NONE;
+		up->pending_full = FALSE;
+		up->failures = 0;
+	}
+	if (priority != MESH_PRIORITY_NONE && anchor != NULL)
+		mesh_queue_push(user, anchor, priority, full);
+}
+
+static bool mesh_user_has_pending(const struct mesh_user *user);
+
 void mesh_queue_peers_changed(void)
 {
 	struct hash_iterate_context *iter;
 	struct mesh_user *user;
+	ARRAY(struct mesh_user *) redirect;
 	const char *anchor;
 	char *username;
 
@@ -148,6 +178,21 @@ void mesh_queue_peers_changed(void)
 			}
 		}
 		hash_table_iterate_deinit(&iter);
+
+		i_array_init(&redirect, 16);
+		iter = hash_table_iterate_init(mesh_pending_users);
+		while (hash_table_iterate(iter, mesh_pending_users,
+					  &username, &user))
+			array_push_back(&redirect, &user);
+		hash_table_iterate_deinit(&iter);
+		array_foreach_elem(&redirect, user) {
+			mesh_queue_redirect_pending(user);
+			if (!mesh_user_has_pending(user)) {
+				hash_table_remove(mesh_pending_users,
+						  user->username);
+			}
+		}
+		array_free(&redirect);
 	}
 	mesh_queue_schedule_soon();
 }
@@ -468,12 +513,20 @@ void mesh_queue_init(void)
 				       mesh_periodic_timeout, NULL);
 }
 
+static void mesh_queue_startup_timeout(void *context ATTR_UNUSED)
+{
+	timeout_remove(&mesh_startup_to);
+	mesh_queue_push_everyone(FALSE);
+}
+
 void mesh_queue_startup_sync(void)
 {
 	/* Push everyone once at startup, in case changes were made while
 	   this service wasn't running. Unchanged users cost only a quick
-	   state comparison. */
-	mesh_queue_push_everyone(FALSE);
+	   state comparison. Wait until the peers have had time to answer
+	   heartbeats, so that the anchors are known. */
+	mesh_startup_to = timeout_add(mesh_set->mesh_peer_down_timeout,
+				      mesh_queue_startup_timeout, NULL);
 }
 
 void mesh_queue_deinit(void)
@@ -484,6 +537,7 @@ void mesh_queue_deinit(void)
 
 	timeout_remove(&mesh_queue_to);
 	timeout_remove(&mesh_periodic_to);
+	timeout_remove(&mesh_startup_to);
 	hash_table_destroy(&mesh_pending_users);
 	iter = hash_table_iterate_init(mesh_users);
 	while (hash_table_iterate(iter, mesh_users, &username, &user))
