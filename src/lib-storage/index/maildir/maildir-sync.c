@@ -377,7 +377,6 @@ maildir_scan_dir(struct maildir_sync_context *ctx, bool final,
 	unsigned int time_diff, i, readdir_count = 0, move_count = 0;
 	time_t start_time;
 	int ret = 1;
-	bool dir_changed = FALSE;
 
 	path = ctx->cur_dir;
 	for (i = 0;; i++) {
@@ -478,15 +477,6 @@ maildir_scan_dir(struct maildir_sync_context *ctx, bool final,
 		ret = -1;
 	}
 
-	if (dir_changed) {
-		if (stat(ctx->cur_dir, &st) == 0) {
-			ctx->mbox->maildir_hdr.new_check_time =
-				I_MAX(st.st_mtime, start_time);
-			ctx->mbox->maildir_hdr.cur_mtime = st.st_mtime;
-			ctx->mbox->maildir_hdr.cur_mtime_nsecs =
-				ST_MTIME_NSEC(st);
-		}
-	}
 	time_diff = time(NULL) - start_time;
 	if (time_diff >= MAILDIR_SYNC_TIME_WARN_SECS) {
 		e_warning(event,
