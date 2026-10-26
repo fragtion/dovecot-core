@@ -1,55 +1,96 @@
-If you are looking for the original unmodified Dovecot mailserver instead, then please go to https://github.com/dovecot/core instead.
+# Dovecot Mesh
 
-## What is this fork?
+Multi-master mail clustering built into Dovecot: any number of servers
+accept deliveries and IMAP changes at the same time and replicate them to
+each other, normally within a fraction of a second.
 
-This fork turns Dovecot into a multi-master mail cluster: any number of servers accept deliveries and IMAP changes at the same time and replicate them to each other, normally within a fraction of a second. This is **Dovecot Mesh**:
+This is the `dovecotmesh` branch of
+[fragtion/dovecot-core](https://github.com/fragtion/dovecot-core), the
+project's main line. The repository keeps its old name so that existing
+links keep working.
 
-- built into Dovecot: a `mesh` service on each node plus a `mesh` mail plugin, driving Dovecot's own incremental sync engine (dsync), which transfers only what changed and recognizes renamed folders
-- any number of nodes; each user has an *anchor* node that relays its changes to the others, and the anchor moves automatically when a node goes down
-- deliveries are confirmed only once the mail is on a second node; optionally each user's mail is delivered on its anchor
-- a web UI and `doveadm mesh` commands showing nodes, per-user sync status and recent sessions, with sync, full resync, pause and verify actions
-- a verifier that compares users' mailboxes across all nodes, and can repair differences in the background
-- TLS between nodes
+> **Coming from the Syncthing setup?** That approach is legacy: the
+> [`main`](https://github.com/fragtion/dovecot-core/tree/main) branch of
+> this repository and [fragtion/syncthing](https://github.com/fragtion/syncthing)
+> are no longer developed. See
+> [Migrating from the Syncthing setup](src/mesh/README.md#migrating-from-the-syncthing-setup).
+>
+> **Looking for unmodified Dovecot?** Go to
+> [dovecot/core](https://github.com/dovecot/core).
 
-See **[src/mesh/README.md](src/mesh/README.md)** for how it works, configuration, operation and migration from the Syncthing setup described below.
+## What it does
 
-## Why the fork?
+- **Built into Dovecot.** A `mesh` service on each node and a `mesh` mail
+  plugin drive dsync, Dovecot's own incremental mailbox sync. Only what
+  changed is sent: renamed folders aren't copied again, and mails moved or
+  copied between folders are copied locally on the other nodes instead of
+  being transferred.
+- **Any number of nodes.** Each user has an *anchor* node that relays the
+  user's changes to the others. When a node goes down, its users get new
+  anchors automatically.
+- **Safe deliveries.** A delivery is confirmed once the mail is on a
+  second node, waiting up to `mesh_delivery_sync_timeout` (2 s). Optionally,
+  LMTP delivers each user's mail on their anchor (delivery affinity).
+- **Visible.** A web UI and `doveadm mesh` commands show the nodes, each
+  user's sync status and recent sessions, and can sync, resync, pause and
+  verify.
+- **Self-checking.** A verifier compares users' mailboxes across all nodes
+  and repairs differences in the background.
+- **TLS between nodes.**
 
-This is a modified version of dovecot, intended to work alongside https://github.com/fragtion/syncthing to allow for continuous, near-synchronous "multi-master" (Maildir-based) mail server deployments. In theory, other similar sync methods could also be used instead of Syncthing.
+| | Dovecot replicator | Syncthing setup (legacy) | Dovecot Mesh |
+|---|---|---|---|
+| Nodes | 2 (removed in Dovecot 2.4) | any | any |
+| Replicates | mailboxes, with dsync | Maildir files | mailboxes, with dsync |
+| Concurrent changes on two nodes | resolved by dsync | can create duplicates | resolved by dsync |
+| `\Recent` flag | works (per node) | lost (`new/` is ignored) | works (per node) |
+| Delivery waits for a second copy | optional | no | yes, up to 2 s |
 
-Dovecot's own built-in replication is limited to two nodes at max, and is not bandwidth efficient due to the lack of a delta syncing (any and all changes to the filesystem on one node must be fully re-transferred to the other node, including all contents of any renamed folders!)
+## Quick start
 
-Furthermore, while other third-party IMAP synchronization tools such as offlineimap, syncmaildir, etc do exist (and can also reliably keep pairs of maildirs in sync), these tools share all of the same constraints as detailed above
+Build from git (see [AGENTS.md](AGENTS.md) for the build dependencies):
 
-Syncthing is therefore used to ensure that the underlying maildir content (including dovecot-uuidlist) is kept efficiently in sync, in near-realtime
+```sh
+autoreconf -vif
+./configure --prefix=/opt/dovecot --with-lua=yes   # Lua: delivery affinity
+make -j$(nproc)
+sudo make install
+```
 
-While this implementation is obviously not perfect, the relative ease of deployment, high scalability in number of server nodes, and perceived immunity to latency bottlenecks otherwise introduced by dovecot's "Director" functionality or true-synchronous NAS/NFS-based storage schemes (both of which can often impact responsiveness of the user's IMAP experience considerably), do make it a compelling alternative choice for smaller & less critical deployments
+Then on every node:
 
-In conclusion, I determined that the current free version of dovecot simply lacks the ability to operate as an efficient and robust multi-master cluster when used standalone, and that no amount of pairing with other IMAP/Maildir synchronization utilities could reliably achieve the desired functionality either. The only solution was to modify dovecot's internal operation and maildir libraries.
+1. Use Maildir and deliver mail through Dovecot's LMTP or LDA.
+2. Add the mesh configuration from
+   [src/mesh/README.md](src/mesh/README.md#configuration): the `mesh`
+   plugin, `dsync_features = relay-changes reuse-local-mails`, the doveadm
+   and mesh HTTP listeners with shared secrets, and one `mesh_peer` block
+   per node. Only `hostname` and `mesh_node_name` differ between nodes.
+3. Start Dovecot, then check that every peer is up:
+   `doveadm mesh peers`, or the web UI at `http://<node>:8090/`.
 
-Dovecot Mesh is the result of taking that conclusion one step further: instead of replicating the Maildir files underneath Dovecot, Dovecot replicates the mailboxes itself, so it always knows what changed, can resolve conflicting changes, and can show what's going on.
+## Status
 
-## Legacy: the Syncthing setup
+Tested on one host with the included harness (`src/mesh/harness/`): 3 to
+5 nodes under mixed load (LMTP deliveries plus IMAP flag changes, moves,
+copies, expunges and appends on random nodes at once), node crashes, TLS
+and delivery affinity, each run ending with all nodes identical and
+nothing lost, duplicated or resurrected. Not yet tested on separate
+machines, over a real network, or at scale; that's next. Read the
+[limitations](src/mesh/README.md#limitations-and-known-issues) before
+using it in production.
 
-The fork's original approach is still available, but it's off by default now. Enable it with `maildir_ignore_new_dir = yes`. Don't use it together with Dovecot Mesh.
+## Documentation
 
-### How does it work?
+| Where | What |
+|---|---|
+| [src/mesh/README.md](src/mesh/README.md) | How it works, configuration, settings, operation, delivery affinity, monitoring, migration, limitations, test harness |
+| [src/mesh/HANDOFF.md](src/mesh/HANDOFF.md) | Deploying in containers and the live test plan |
+| [AGENTS.md](AGENTS.md) | Build environment and running the tests |
 
-As you may know, each folder of a Maildir is comprised of three core sub-folders: 'cur/', 'new/', and 'tmp/'. Newly delivered mails are typically delivered to the 'new/' folder. When an E-mail client first becomes aware of these new mails, they are moved to the 'cur/' folder while retaining their unread status. As far as I can tell, all this does is allow the E-mail client to differentiate between UNREAD and UNSEEN mails (yes, there's a difference!).
+## Based on
 
-In reality, such UNSEEN functionality is rarely needed. In our case, its presence causes serious problems when two or more IMAP clients are connected to different servers in the cluster concurrently, as each server will give that mail file a different name when it is moved from 'new/' to 'cur/', resulting in the formation of duplicates.
-
-A calculated choice must therefore be made to sacrifice this relatively unimportant UNSEEN flag, in favour of achieving the desired replication scalability instead. In my opinion, this is a very worthy trade-off as most E-mail reading clients don't care about the RECENT flag anyway. Yes, you might no longer hear that iconic voice say "You've got mail", but since the UNREAD flag remains untouched, the vast majority of end-users would never be able to tell the difference as all newly delivered mails will still retain their unread status.
-
-With `maildir_ignore_new_dir = yes`, dovecot will completely ignore any contents in the 'new/' folder for each Maildir folder respectively, effectively treating it as another 'tmp/' folder. This largely precludes the formation of duplicates otherwise caused by concurrent IMAP clients, but it does so at the total loss/expense of the RECENT flag, at least in the current implementation. Future revisions of this fork might re-intruduce the RECENT flag, but by means of a safer and non-conflicting workaround, such as including it in a given mail's own filename.
-
-### Prerequisites:
-
-All 'new/' folders should be replaced with symbolic links pointing to the 'cur/' folder for each and every Maildir folder respectively. While the 'new/' folder is no longer necessary for the operation of this dovecot fork, the symlink is necessary to retain some level of RFC complience, particularly to prevent other MTA's (such as postfix) from failing to deliver new mails.
-
-### DISCLAIMER:
-
-This project is still experimental, so reliability cannot be guaranteed, especially in production environments. Proceed at your own risk! This probably breaks RFC/spec, and might not scale so well! It works great for me... but YMMV - proceed at own risk.
+The Dovecot 2.4 development tree ([dovecot/core](https://github.com/dovecot/core)
+`main`), under Dovecot's licenses (see [COPYING](COPYING)).
 
 ## Coffee
 
