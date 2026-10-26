@@ -421,6 +421,11 @@ maildir_scan_dir(struct maildir_sync_context *ctx, bool final,
 	ctx->mbox->maildir_hdr.cur_check_time = start_time;
 	ctx->mbox->maildir_hdr.cur_mtime = st.st_mtime;
 	ctx->mbox->maildir_hdr.cur_mtime_nsecs = ST_MTIME_NSEC(st);
+	/* new/ is never scanned, but new_mtime=0 still means that the maildir
+	   hasn't been synced yet. Mirror the cur/ times to the new/ fields. */
+	ctx->mbox->maildir_hdr.new_check_time = start_time;
+	ctx->mbox->maildir_hdr.new_mtime = st.st_mtime;
+	ctx->mbox->maildir_hdr.new_mtime_nsecs = ST_MTIME_NSEC(st);
 
 	errno = 0;
 	for (; (dp = readdir(dirp)) != NULL; errno = 0) {
@@ -777,6 +782,7 @@ maildir_sync_context(struct maildir_sync_context *ctx, bool forced,
 
 	if (!ctx->locked) {
 		/* make sure we sync the maildir later */
+		ctx->mbox->maildir_hdr.new_mtime = 0;
 		ctx->mbox->maildir_hdr.cur_mtime = 0;
 	}
 
