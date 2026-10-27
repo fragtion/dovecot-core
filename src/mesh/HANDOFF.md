@@ -74,8 +74,9 @@ make install DESTDIR=/out   # for a multi-stage image
 
 - Building from git downloads Unicode data into `src/lib/ucd/` from
   `https://dovecot.org/res`. If the build host can't reach it, put the
-  Unicode 16.0.0 files listed as `UCD_FILES` in `src/lib/Makefile.am`
-  there yourself (from `https://www.unicode.org/Public/16.0.0/ucd/`).
+  Unicode 18.0.0 files listed as `UCD_FILES` in `src/lib/Makefile.am`
+  there yourself; AGENTS.md says where to get them (www.unicode.org, or
+  Unicode's repository on GitHub).
 - `--with-lua=yes` is needed only for delivery affinity, but build with
   it so that it can be tested.
 - Runtime libraries for the final image: `libssl3 zlib1g libpcre2-32-0
