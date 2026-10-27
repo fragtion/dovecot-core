@@ -43,6 +43,8 @@ struct mesh_settings {
 	unsigned int mesh_max_parallel_syncs;
 	unsigned int mesh_verify_interval;
 	bool mesh_dsync_debug;
+	/* learn all users from the userdb for the periodic syncs */
+	bool mesh_list_users;
 
 	/* generated: */
 	enum mesh_topology parsed_topology;

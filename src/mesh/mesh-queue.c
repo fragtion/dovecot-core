@@ -5,6 +5,8 @@
 #include "time-util.h"
 #include "doveadm-protocol.h"
 #include "master-service.h"
+#include "master-service-settings.h"
+#include "auth-master.h"
 
 /* how often to check whether a periodic sync is due */
 #define MESH_PERIODIC_CHECK_MSECS (30*1000)
@@ -469,6 +471,46 @@ void mesh_queue_schedule(void)
 	   reschedules */
 }
 
+/* Learn all users from the userdb. Otherwise only users who changed
+   something, or that a peer asked about, are known, and users who stay
+   idle would never be synced to a new or emptied node. */
+static void mesh_queue_discover_users(void)
+{
+	static bool warned = FALSE;
+	struct auth_master_connection *conn;
+	struct auth_master_user_list_ctx *ctx;
+	const char *socket_path, *username;
+	unsigned int count = 0, new_count = 0;
+
+	if (!mesh_set->mesh_list_users)
+		return;
+	socket_path = t_strconcat(master_service_get_service_settings(
+		master_service)->base_dir, "/auth-userdb", NULL);
+	conn = auth_master_init(socket_path, 0);
+	ctx = auth_master_user_list_init(conn, "*", NULL);
+	while ((username = auth_master_user_list_next(ctx)) != NULL) {
+		count++;
+		if (mesh_user_lookup(username, FALSE) == NULL) {
+			(void)mesh_user_lookup(username, TRUE);
+			new_count++;
+		}
+	}
+	if (auth_master_user_list_deinit(&ctx) < 0) {
+		/* e.g. a userdb that can't list its users */
+		if (!warned) {
+			i_warning("Couldn't list the users from the userdb: "
+				  "only users that change something are "
+				  "synced (set mesh_list_users=no if the "
+				  "userdb can't list users)");
+			warned = TRUE;
+		}
+	} else {
+		e_debug(mesh_event, "Listed %u users from the userdb, "
+			"%u of them new", count, new_count);
+	}
+	auth_master_deinit(&conn);
+}
+
 static void mesh_queue_push_everyone(bool full)
 {
 	struct hash_iterate_context *iter;
@@ -488,6 +530,7 @@ static void mesh_periodic_timeout(void *context ATTR_UNUSED)
 	    (time_t)mesh_set->mesh_full_sync_interval) {
 		mesh_last_full = ioloop_time;
 		mesh_last_incremental = ioloop_time;
+		mesh_queue_discover_users();
 		mesh_queue_push_everyone(TRUE);
 	} else if (mesh_set->mesh_incremental_sync_interval > 0 &&
 		   ioloop_time - mesh_last_incremental >=
@@ -534,6 +577,7 @@ void mesh_queue_init(void)
 static void mesh_queue_startup_timeout(void *context ATTR_UNUSED)
 {
 	timeout_remove(&mesh_startup_to);
+	mesh_queue_discover_users();
 	mesh_queue_push_everyone(FALSE);
 }
 
