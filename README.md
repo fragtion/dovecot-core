@@ -10,8 +10,8 @@ project's main line. The repository keeps its old name so that existing
 links keep working.
 
 > **Coming from the Syncthing setup?** That approach is legacy: the
-> [`main`](https://github.com/fragtion/dovecot-core/tree/main) branch of
-> this repository and [fragtion/syncthing](https://github.com/fragtion/syncthing)
+> [`legacy-syncthing`](https://github.com/fragtion/dovecot-core/tree/legacy-syncthing)
+> branch of this repository and [fragtion/syncthing](https://github.com/fragtion/syncthing)
 > are no longer developed. See
 > [Migrating from the Syncthing setup](src/mesh/README.md#migrating-from-the-syncthing-setup).
 >
@@ -86,6 +86,14 @@ using it in production.
 | [src/mesh/README.md](src/mesh/README.md) | How it works, configuration, settings, operation, delivery affinity, monitoring, migration, limitations, test harness |
 | [src/mesh/HANDOFF.md](src/mesh/HANDOFF.md) | Deploying in containers and the live test plan |
 | [AGENTS.md](AGENTS.md) | Build environment and running the tests |
+
+## Branches
+
+| Branch | What it is |
+|---|---|
+| `dovecotmesh` (default) | Dovecot Mesh. Upstream changes are merged in regularly. |
+| `main` | An unmodified mirror of [dovecot/core](https://github.com/dovecot/core) `main`, kept in sync with upstream. |
+| `legacy-syncthing` | The last state of the Syncthing-based fork. Frozen. |
 
 ## Based on
 
