@@ -918,6 +918,9 @@ static void dsync_server_run_command(struct dsync_cmd_context *ctx,
 	str_append_tabescaped(cmd, cctx->username);
 	str_append(cmd, "\tdsync-server\t-u");
 	str_append_tabescaped(cmd, cctx->username);
+	/* When the connection stalls, the server gives up as soon as we do,
+	   instead of keeping the user's mailboxes for its default timeout. */
+	str_printfa(cmd, "\t-T\t%u", ctx->io_timeout_secs);
 	str_append_c(cmd, '\n');
 
 	ctx->tcp_conn = conn;
