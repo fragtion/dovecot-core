@@ -3124,6 +3124,28 @@ dsync_mailbox_import_commit(struct dsync_mailbox_importer *importer, bool final)
 	mail_free(&importer->mail);
 	mail_free(&importer->ext_mail);
 
+	if (final && importer->failed &&
+	    importer->first_unsaved_idx != array_count(&importer->wanted_uids)) {
+		/* The session failed before all the mails were saved, and the
+		   saved ones aren't just the lowest of the planned UIDs: some
+		   mails were moved to new UIDs (conflicts), or saved out of
+		   order. Committing them would leave mails above UIDs that
+		   this mailbox is still missing. A later sync that finds the
+		   same mails at those higher UIDs on both sides takes the
+		   missing ones for expunges, and expunges them on the other
+		   side. Roll back what the import hasn't committed yet: the
+		   next session redoes it. (Intermediate commits are skipped
+		   for the same reason, see
+		   dsync_mailbox_import_saved_newmail().) */
+		e_debug(importer->event, "Rolling back the unfinished import: "
+			"%u of %u saved mails are in UID order",
+			importer->first_unsaved_idx,
+			array_count(&importer->wanted_uids));
+		mailbox_transaction_rollback(&importer->ext_trans);
+		mailbox_transaction_rollback(&importer->trans);
+		return -1;
+	}
+
 	/* commit saves */
 	if (mailbox_transaction_commit_get_changes(&importer->ext_trans,
 						   &changes) < 0) {
