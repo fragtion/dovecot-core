@@ -375,9 +375,19 @@ class SmokeTest:
         """Wait until doveadm mesh verify passes: right after the mails
         arrived, dsync may still be settling UIDs or flags."""
         node = node or self.node1
-        return wait_for("%s verifies" % user, lambda: node.doveadm(
-            "mesh", "verify", "%s@%s" % (user, DOMAIN),
-            check_rc=False).returncode == 0, 60, 2)
+        last = []
+
+        def verify():
+            res = node.doveadm("mesh", "verify", "%s@%s" % (user, DOMAIN),
+                               check_rc=False)
+            last[:] = [res]
+            return res.returncode == 0
+        if wait_for("%s verifies" % user, verify, 60, 2):
+            return True
+        print("     last verify (exit %d): %s %s" % (
+            last[0].returncode, last[0].stdout.strip(),
+            last[0].stderr.strip()))
+        return False
 
     def all_have(self, user, ids, mailbox="INBOX"):
         want = sorted(ids)
