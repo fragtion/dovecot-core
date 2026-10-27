@@ -299,10 +299,17 @@ static const char *mesh_sync_build_cmd(struct mesh_sync *sync)
 	/* -s makes doveadm print the new state, so give it even for full
 	   syncs (as empty) */
 	str_append(cmd, "\t-s\t");
-	if (sync->full)
+	if (sync->full || up->dsync_state == NULL) {
+		/* Without a state dsync skips mailboxes whose UIDVALIDITY,
+		   UIDNEXT, message count and modseqs are the same on both
+		   nodes. Copies that weren't made by dsync can have all of
+		   them in common and still contain different mails, e.g.
+		   Maildirs whose dovecot-uidlist was copied between nodes.
+		   A full sync compares the mails of every mailbox. */
 		str_append(cmd, "\t-f");
-	else if (up->dsync_state != NULL)
+	} else {
 		str_append_tabescaped(cmd, up->dsync_state);
+	}
 	str_printfa(cmd, "\t-l\t%u", MESH_DSYNC_LOCK_TIMEOUT_SECS);
 	str_printfa(cmd, "\t-T\t%u", mesh_set->mesh_sync_timeout);
 	str_append_c(cmd, '\t');

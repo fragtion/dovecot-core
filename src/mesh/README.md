@@ -74,9 +74,13 @@ initiator's copy of the pair's state can be used: it must be the newest
 one, and at least one of the two nodes must have synced the user only
 with the other one since their last session. Otherwise mails could have
 reached both nodes some other way, which a state can't describe, and the
-session is *stateless*: dsync compares all mails. That is slower but
-always safe. With the anchor topology it happens only after the anchor
-moved, or if a node lost its state file.
+session is *stateless*: a full sync, in which dsync compares all the
+mails of every mailbox. (Without a state, dsync would otherwise skip
+mailboxes whose UIDVALIDITY, UIDNEXT, message count and modseqs are the
+same on both nodes, which copies made by other tools can have in common
+while holding different mails.) That is slower but always safe. With the
+anchor topology it happens only after the anchor moved, or if a node lost
+its state file.
 
 **Triggers.** Changes are pushed after `mesh_coalesce_delay`. In addition
 every user is pushed every `mesh_incremental_sync_interval` (catches
