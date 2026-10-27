@@ -65,6 +65,8 @@ EXTRA_DIST = \
 	harness/idleusers.py \
 	harness/moves.py \
 	harness/newmails.py \
+	harness/overlap.py \
 	harness/phase0.py \
 	harness/phase1.py \
+	harness/stall.py \
 	harness/workload.py

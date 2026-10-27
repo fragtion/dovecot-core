@@ -212,6 +212,8 @@ python3 phase1.py --nodes 3 --users 3 --lmtp-route
 python3 phase1.py --nodes 3 --users 2 --tls
 python3 newmails.py
 python3 idleusers.py
+python3 overlap.py
+python3 stall.py
 ```
 
 A run passes with `problems: 0`. See `src/mesh/README.md`.
