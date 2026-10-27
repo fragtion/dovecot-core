@@ -235,7 +235,7 @@ Mesh service:
 | `mesh_peer_down_timeout` | 7s | A peer without heartbeat replies for this long is down. |
 | `mesh_incremental_sync_interval` | 10min | Push every user this often (0 = never). |
 | `mesh_full_sync_interval` | 1d | Fully sync every user this often (0 = never). |
-| `mesh_sync_timeout` | 10min | Give up a session after this long. |
+| `mesh_sync_timeout` | 2min | Give up a session when no data has moved for this long (dsync's I/O timeout, on both nodes). |
 | `mesh_max_parallel_syncs` | 4 | Sessions this node runs at the same time. |
 | `mesh_verify_interval` | 0 | Verify one of this node's anchored users this often (0 = never). |
 | `mesh_dsync_debug` | no | Run dsync with debug logging. |
@@ -323,6 +323,31 @@ Common tasks:
   then `doveadm mesh sync -f <user>` to repair, and verify again.
 - **Maintenance on a node**: `doveadm mesh pause <node>` on the other
   nodes stops syncing with it (pause isn't persistent across restarts).
+
+### When the network between nodes is slow or down
+
+IMAP and POP3 sessions work on the local copy; only these wait for the
+network:
+
+- **Saving mail** (deliveries, IMAP APPEND, COPY and MOVE) waits while a
+  session for the same user is running on this node, at most
+  `mesh_save_lock_timeout` (30 s); then it saves anyway. On a good link a
+  session takes milliseconds. On a slow one, an active user's saves can
+  wait for the session that replicates their previous change. Reading
+  mail, changing flags and deleting never wait.
+- **Deliveries** (LMTP, LDA) also wait up to `mesh_delivery_sync_timeout`
+  (2 s) for the mail to reach another node, but not when no peer is up.
+- **A node that stops answering** is marked down after
+  `mesh_peer_down_timeout` (7 s): no new sessions with it, and deliveries
+  stop waiting. A session that was running with it keeps that user's
+  mailboxes busy on both nodes until dsync gives up, after
+  `mesh_sync_timeout` (2 min) without data; that user's saves wait up to
+  `mesh_save_lock_timeout` each meanwhile. Lower both for links that
+  break often, at the cost of more failed (and retried) sessions on slow
+  ones.
+- **An interrupted session** keeps what it copied as long as that's
+  consistent; when it had moved mails to new UIDs (conflicts), it's rolled
+  back and redone by the next session.
 
 ## Delivery affinity
 

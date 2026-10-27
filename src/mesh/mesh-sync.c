@@ -17,6 +17,11 @@
 
 /* dsync's own per-user lock timeout (-l) */
 #define MESH_DSYNC_LOCK_TIMEOUT_SECS 30
+/* Give up waiting for the doveadm server's reply after this long. dsync
+   itself stops much earlier if data stops moving (mesh_sync_timeout), so
+   this is only a safety net: a session can take long when much has to be
+   copied over a slow link. */
+#define MESH_SYNC_MAX_SECS (2*60*60)
 
 struct mesh_sync {
 	struct mesh_sync *prev, *next;
@@ -28,6 +33,9 @@ struct mesh_sync {
 	/* the peer lent us the user for this session */
 	struct http_client_request *lease_req;
 	bool leased;
+	/* renews the lease while the session runs */
+	struct timeout *to_renew;
+	struct http_client_request *renew_req;
 	/* the newer of our and the peer's state_gen when the lease was
 	   granted */
 	unsigned int base_gen;
@@ -53,6 +61,12 @@ void mesh_url_encode(string_t *dest, const char *src)
 		else
 			str_printfa(dest, "%%%02X", (unsigned char)*src);
 	}
+}
+
+/* A lease outlives a session that stalled until dsync gave up on it. */
+static unsigned int mesh_lease_secs(void)
+{
+	return mesh_set->mesh_sync_timeout + 60;
 }
 
 static string_t *
@@ -107,6 +121,9 @@ static void mesh_sync_free(struct mesh_sync *sync)
 	DLLIST_REMOVE(&mesh_syncs, sync);
 	if (sync->lease_req != NULL)
 		http_client_request_abort(&sync->lease_req);
+	if (sync->renew_req != NULL)
+		http_client_request_abort(&sync->renew_req);
+	timeout_remove(&sync->to_renew);
 	timeout_remove(&sync->to);
 	if (sync->conn != NULL)
 		doveadm_client_unref(&sync->conn);
@@ -206,10 +223,41 @@ mesh_sync_reply(const struct doveadm_server_reply *reply, void *context)
 	mesh_sync_finish(sync, reply->exit_code, error);
 }
 
-static void mesh_sync_timeout(struct mesh_sync *sync)
+static void mesh_sync_no_reply(struct mesh_sync *sync)
 {
-	mesh_sync_finish(sync, DOVEADM_EX_UNKNOWN,
-			 "Timed out (mesh_sync_timeout)");
+	mesh_sync_finish(sync, DOVEADM_EX_UNKNOWN, t_strdup_printf(
+		"No reply from the doveadm server in %u seconds",
+		MESH_SYNC_MAX_SECS));
+}
+
+static void
+mesh_sync_lease_renew_response(const struct http_response *resp,
+			       void *context)
+{
+	struct mesh_sync *sync = context;
+
+	sync->renew_req = NULL;
+	if (resp->status / 100 != 2) {
+		e_debug(mesh_event, "Renewing the lease of %s from %s failed: "
+			"%u %s", sync->user->username, sync->peer->name,
+			resp->status, resp->reason);
+	}
+}
+
+/* A session can last longer than its lease, e.g. when much has to be
+   copied over a slow link. Keep the user leased while it runs, so that the
+   peer doesn't start sessions of its own for the user meanwhile. */
+static void mesh_sync_lease_renew(struct mesh_sync *sync)
+{
+	string_t *path;
+
+	if (sync->renew_req != NULL)
+		return;
+	path = mesh_lease_path("lease", sync->user);
+	str_printfa(path, "&secs=%u&renew=1", mesh_lease_secs());
+	sync->renew_req = mesh_peer_http_request(sync->peer, "POST",
+		str_c(path), mesh_sync_lease_renew_response, sync);
+	http_client_request_submit(sync->renew_req);
 }
 
 static const char *mesh_doveadm_get_socket_path(void)
@@ -277,9 +325,10 @@ static void mesh_sync_run_doveadm(struct mesh_sync *sync)
 			"Couldn't connect to doveadm server: %s", error));
 		return;
 	}
-	/* a bit longer than dsync's own I/O timeout */
-	sync->to = timeout_add((mesh_set->mesh_sync_timeout + 30) * 1000,
-			       mesh_sync_timeout, sync);
+	sync->to = timeout_add(MESH_SYNC_MAX_SECS * 1000,
+			       mesh_sync_no_reply, sync);
+	sync->to_renew = timeout_add(mesh_lease_secs() * 1000 / 2,
+				     mesh_sync_lease_renew, sync);
 	doveadm_client_set_print(sync->conn, mesh_sync_print, sync);
 	doveadm_client_cmd(sync->conn, &cmd_set, mesh_sync_build_cmd(sync),
 			   NULL, mesh_sync_reply, sync);
@@ -369,7 +418,7 @@ void mesh_sync_start(struct mesh_user *user, struct mesh_peer *peer,
 	   state would get two different successors. */
 	path = mesh_lease_path("lease", user);
 	str_printfa(path, "&secs=%u&gen=%u&exclusive=%d",
-		    mesh_set->mesh_sync_timeout + 60, up->state_gen,
+		    mesh_lease_secs(), up->state_gen,
 		    up->exclusive ? 1 : 0);
 	sync->lease_req = mesh_peer_http_request(peer, "POST", str_c(path),
 		mesh_sync_lease_response, sync);

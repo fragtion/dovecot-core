@@ -225,6 +225,23 @@ mesh_http_lease(struct http_server_request *req,
 	value = mesh_http_query_param(hreq, "secs");
 	if (value == NULL || str_to_uint(value, &secs) < 0)
 		secs = mesh_set->mesh_sync_timeout;
+	value = mesh_http_query_param(hreq, "renew");
+	if (value != NULL && strcmp(value, "1") == 0) {
+		/* The session is still running. Keep lease_start: deliveries
+		   from before it are what the session replicates. */
+		user = mesh_user_lookup(username, FALSE);
+		if (user == NULL || user->lease_peer != peer ||
+		    !mesh_user_is_leased(user)) {
+			http_server_request_fail(req, 409, "Not leased");
+			return;
+		}
+		user->lease_expires = ioloop_time + secs;
+		resp = http_server_response_create(req, 200, "OK");
+		http_server_response_set_payload_data(resp,
+			(const unsigned char *)"OK\n", 3);
+		http_server_response_submit(resp);
+		return;
+	}
 	value = mesh_http_query_param(hreq, "gen");
 	if (value == NULL || str_to_uint(value, &gen) < 0) {
 		http_server_request_fail(req, 400, "Missing gen");
