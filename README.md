@@ -84,7 +84,8 @@ using it in production.
 | Where | What |
 |---|---|
 | [src/mesh/README.md](src/mesh/README.md) | How it works, configuration, settings, operation, delivery affinity, monitoring, migration, limitations, test harness |
-| [src/mesh/HANDOFF.md](src/mesh/HANDOFF.md) | Deploying in containers and the live test plan |
+| [docker/README.md](docker/README.md) | Running it in Docker next to Postfix, migrating from the Syncthing setup |
+| [src/mesh/HANDOFF.md](src/mesh/HANDOFF.md) | The live test plan |
 | [AGENTS.md](AGENTS.md) | Build environment and running the tests |
 
 ## Branches

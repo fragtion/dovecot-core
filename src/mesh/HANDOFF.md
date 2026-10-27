@@ -9,6 +9,12 @@ the test plan, and what to report.
 Branch: `dovecotmesh` of `fragtion/dovecot-core`
 (Dovecot 2.4 development tree, autotools build).
 
+The image now exists: `docker/Dockerfile`, published as
+`ghcr.io/fragtion/dovecotmesh` by `.github/workflows/docker.yml`. See
+`docker/README.md` for running it next to a host's Postfix, and
+`docker/test/smoke-test.py` for a two-container test. The test plan below
+still applies.
+
 ## 1. What was built and its state
 
 | Part | Where | State |
