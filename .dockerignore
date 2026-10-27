@@ -1,0 +1,9 @@
+# docker build -f docker/Dockerfile . copies the source tree; keep build
+# output from a local build out of it.
+.git
+**/*.o
+**/*.lo
+**/*.la
+**/.libs
+**/.deps
+**/__pycache__
