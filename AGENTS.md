@@ -136,10 +136,16 @@ make -j$(nproc)
 NOTE: --enable-maintainer-mode allows rebuilding automake changes after Makefile.am changes in various directories.
 
 When building from **git**, `src/lib` downloads Unicode data files (UCD)
-from https://dovecot.org/res into `src/lib/ucd/`. If that host isn't
-reachable, put the same Unicode 16.0.0 files there yourself (e.g. from
-https://www.unicode.org/Public/16.0.0/ucd/; the file list is `UCD_FILES`
-in `src/lib/Makefile.am`).
+from https://dovecot.org/res into `src/lib/ucd/`, for the Unicode version
+in `UCD_VERSION` in `src/lib/Makefile.am` (18.0.0 now; files of another
+version are deleted and downloaded again). If that host isn't reachable,
+put the same files there yourself, e.g. from
+https://www.unicode.org/Public/18.0.0/ucd/ or from Unicode's GitHub
+repository, `https://raw.githubusercontent.com/unicode-org/unicodetools/main/unicodetools/data/ucd/18.0.0/`
+(some files are in its `extracted/`, `emoji/` and `auxiliary/`
+subdirectories; `IdnaMappingTable.txt` and `IdnaTestV2.txt` are in
+`.../data/idna/18.0.0/`). The file list is `UCD_FILES` in
+`src/lib/Makefile.am`; they all go directly into `src/lib/ucd/`.
 
 To see various available options, use
 
