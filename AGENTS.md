@@ -70,7 +70,7 @@ Many unit tests exercise optional functionality; for full coverage, agents shoul
 apt-get update
 apt-get install -y \
   build-essential \
-  autoconf automake libtool pkg-config \
+  autoconf automake libtool pkg-config gettext \
   flex bison \
   git wget \
   perl python3 \
