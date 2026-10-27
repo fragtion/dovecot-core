@@ -3,6 +3,11 @@
 # independently, e.g. after a partial copy (an old sync, an interrupted
 # first session, files copied by another tool). The first session must
 # match the shared mails and end up with every mail on both nodes.
+#
+# --same-uidlist: the nodes have different mails, but the same
+# dovecot-uidlist header (UIDVALIDITY, mailbox GUID, next UID) and as many
+# mails, as when a tool copied dovecot-uidlist between them. Their
+# mailboxes then look unchanged to a stateless dsync session.
 
 import argparse
 import os
@@ -37,13 +42,37 @@ def seed(node, user, prefix, count, start=0):
     return names
 
 
+def write_uidlist(node, user, names):
+    with open(os.path.join(maildir(node, user), "dovecot-uidlist"), "w") as f:
+        f.write("3 V1700000000 N%d G%s\n" % (len(names) + 1, "ab" * 16))
+        for uid, name in enumerate(names, 1):
+            f.write("%d :%s\n" % (uid, name.split(":")[0]))
+
+
+def run_same_uidlist(args, node1, node2):
+    names1 = seed(node1, "user1", "a", args.mails)
+    names2 = seed(node2, "user1", "b", args.mails)
+    write_uidlist(node1, "user1", names1)
+    write_uidlist(node2, "user1", names2)
+    return 2 * args.mails
+
+
 def run(args):
     users = ["user1"]
     settings = list(args.set or [])
+    if args.same_uidlist:
+        # one session from node1, as after "doveadm mesh sync"
+        settings.append("mesh_list_users = no")
     cluster = cl.Cluster(2, mesh=True, userdb_users=users,
                          extra=lambda node: "\n".join(settings))
     cluster.setup()
     node1, node2 = cluster.node(1), cluster.node(2)
+    if args.same_uidlist:
+        want = run_same_uidlist(args, node1, node2)
+        for node in (node1, node2):
+            subprocess.run(["chown", "-R", "vmail:vmail",
+                            os.path.join(node.dir, "home")], check=True)
+        return check(args, cluster, node1, want)
     names = seed(node1, "user1", "a", args.mails)
     # node2 has every third of node1's mails, in a different order, so
     # their UIDs differ, and mails of its own
@@ -67,8 +96,16 @@ def run(args):
     for node in (node1, node2):
         subprocess.run(["chown", "-R", "vmail:vmail",
                         os.path.join(node.dir, "home")], check=True)
-    want = args.mails + args.extra
+    return check(args, cluster, node1, args.mails + args.extra)
+
+
+def check(args, cluster, node1, want):
     cluster.start()
+    if args.same_uidlist:
+        # after the startup push (mesh_peer_down_timeout), which would
+        # start a second session
+        time.sleep(5)
+        node1.doveadm("mesh", "sync", "user1")
     end = time.time() + args.timeout
     while time.time() < end:
         counts = [len(wl.node_state(n, "user1").get("INBOX", []))
@@ -103,6 +140,9 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--mails", type=int, default=300)
     p.add_argument("--extra", type=int, default=2)
+    p.add_argument("--same-uidlist", action="store_true",
+                   help="different mails behind the same dovecot-uidlist "
+                   "header")
     p.add_argument("--index-first", action="store_true",
                    help="index both nodes' copies before node2 gets its "
                    "own mails")

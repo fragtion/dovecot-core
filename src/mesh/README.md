@@ -493,6 +493,7 @@ python3 moves.py --nodes 3 --mails 500   # moved mails aren't transferred
 python3 newmails.py   # a mail new on two nodes gets the same flags
 python3 idleusers.py  # idle users reach every node, differing copies merge
 python3 overlap.py    # copies sharing some mails under other UIDs merge
+python3 overlap.py --same-uidlist  # different mails, copied dovecot-uidlist
 python3 stall.py      # a stalled session times out on both nodes, loses nothing
 ```
 
