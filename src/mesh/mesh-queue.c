@@ -187,7 +187,11 @@ void mesh_queue_peers_changed(void)
 		hash_table_iterate_deinit(&iter);
 		array_foreach_elem(&redirect, user) {
 			mesh_queue_redirect_pending(user);
-			if (!mesh_user_has_pending(user)) {
+			/* A user whose sync is running stays, even without
+			   pending syncs: mesh_queue_sync_finished() removes
+			   it. */
+			if (!mesh_user_has_pending(user) &&
+			    user->running_peer == NULL) {
 				hash_table_remove(mesh_pending_users,
 						  user->username);
 			}
