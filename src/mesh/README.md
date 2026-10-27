@@ -419,11 +419,16 @@ service mesh {
    `find /var/vmail -type l -name new -exec sh -c 'rm "$1" && mkdir -m 0700 "$1"' _ {} \;`
    and fix their owner.
 4. Choose:
-   - keep all nodes' data: the first session of each user and pair is
-     stateless; mails that are on both nodes are matched by their GUID
-     (the Maildir file name) and not copied again, or
-   - keep one node's data, empty the others, and let the mesh copy
-     everything (simplest, costs bandwidth).
+   - keep one node's data: move the other nodes' mail aside (keep it as a
+     backup) and let the mesh copy everything. The safest choice; it
+     costs bandwidth.
+   - keep all nodes' data, but only if every node has every file: Syncthing
+     showed all folders as up to date before you stopped it, and the
+     number of mail files per user is the same on all nodes. The first
+     session of each user and pair is stateless; mails on both nodes are
+     matched by their GUID (the Maildir file name) and not copied again.
+     A node that lacks some files would make that session delete them on
+     the other nodes (see the limitations).
 5. Configure the mesh as above, start Dovecot everywhere, watch the web UI
    until nothing is pending, and verify some users (or set
    `mesh_verify_interval`).
@@ -446,6 +451,13 @@ service mesh {
 - If a session fails halfway, and a mail it already copied is expunged
   before the next successful session, the mail can come back (a dsync
   limitation with partially applied states).
+- A session without a state (the first one between two nodes, after an
+  anchor moved, a full sync) takes mails that one node lacks *below* UIDs
+  where both nodes have the same mails for deletions, and deletes them on
+  the other node. That's right for mail deleted through Dovecot, but not
+  for copies made by other means that are missing files: e.g. a node of
+  the Syncthing setup that hadn't received every file yet, or a partial
+  restore. Start such nodes empty instead (see the migration steps).
 - A node that writes mail into Maildirs behind Dovecot's back (another
   MDA, scripts) isn't noticed until the next periodic sync, and delivery
   waits don't apply.
