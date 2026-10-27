@@ -124,19 +124,31 @@ def run(args):
         print("  client error:", e)
     for e in errors[:20]:
         print("  log:", e)
+    # A crashed process is restarted and the nodes may still converge,
+    # but a crash is always a problem.
+    crashes = crash_lines(cluster)
+    problems.extend(crashes)
     print("problems: %d" % len(problems))
     for p in problems[:40]:
         print("  PROBLEM:", p)
     if not args.keep:
         # Crashes while shutting down show up only after stopping.
         cluster.teardown()
-        for node in cluster.nodes:
-            for line in node.log().splitlines():
-                if "Panic:" in line or "killed with signal" in line or \
-                   "double free" in line:
-                    problems.append("%s: %s" % (node.name, line))
-                    print("  PROBLEM: %s: %s" % (node.name, line))
+        for line in crash_lines(cluster):
+            if line not in crashes:
+                problems.append(line)
+                print("  PROBLEM:", line)
     return 0 if not problems and quiet_secs is not None else 1
+
+
+def crash_lines(cluster):
+    lines = []
+    for node in cluster.nodes:
+        for line in node.log().splitlines():
+            if "Panic:" in line or "killed with signal" in line or \
+               "double free" in line:
+                lines.append("%s: %s" % (node.name, line))
+    return lines
 
 
 def main():
