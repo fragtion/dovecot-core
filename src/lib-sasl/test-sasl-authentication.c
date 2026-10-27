@@ -6,7 +6,9 @@
 #include "base64.h"
 #include "randgen.h"
 #include "ioloop.h"
+#include "settings.h"
 #include "test-common.h"
+#include "client-auth-settings.h"
 #include "password-scheme.h"
 #include "gssapi-dummy.h"
 #include "sasl-server.h"
@@ -31,6 +33,9 @@ struct test_sasl {
 	unsigned int repeat;
 
 	bool failure:1;
+	bool no_cbind:1;
+	bool server_no_plus:1;
+	bool expect_cbind:1;
 };
 
 struct test_sasl_context {
@@ -40,6 +45,7 @@ struct test_sasl_context {
 	const struct test_sasl *test;
 
 	struct dsasl_client *client;
+	struct dsasl_client_session *session;
 
 	const char *authid;
 	const char *authzid;
@@ -275,9 +281,8 @@ test_server_request_output(struct sasl_server_req_ctx *rctx,
 		enum dsasl_client_result result;
 		const char *error = NULL;
 
-		result = dsasl_client_input(tctx->client,
-					    output->data, output->data_size,
-					    &error);
+		result = dsasl_client_session_input(
+			tctx->session, output->data, output->data_size, &error);
 		test_out_reason_quiet("client input",
 				      result == DSASL_CLIENT_RESULT_OK, error);
 	}
@@ -352,9 +357,8 @@ static void test_sasl_interact(struct test_sasl_context *tctx)
 	enum dsasl_client_result result;
 
 	if (tctx->auth_initial) {
-		result = dsasl_client_output(tctx->client,
-					     &sasl_data, &sasl_data_size,
-					     &error);
+		result = dsasl_client_session_output(
+			tctx->session, &sasl_data, &sasl_data_size, &error);
 		test_out_reason_quiet("client initial",
 				      result == DSASL_CLIENT_RESULT_OK, error);
 		if (test_has_failed())
@@ -368,12 +372,14 @@ static void test_sasl_interact(struct test_sasl_context *tctx)
 		sasl_data_size = 0;
 
 		if (!tctx->out_of_band_cycle) {
-			result = dsasl_client_output(tctx->client,
-						     &sasl_data, &sasl_data_size,
-						     &error);
+			result = dsasl_client_session_output(
+				tctx->session, &sasl_data, &sasl_data_size,
+				&error);
 			test_out_reason_quiet("client output",
 					      result == DSASL_CLIENT_RESULT_OK,
 					      error);
+			i_assert(sasl_data != NULL ||
+				 result != DSASL_CLIENT_RESULT_OK);
 		}
 
 		sasl_server_request_input(&tctx->ssrctx,
@@ -383,10 +389,10 @@ static void test_sasl_interact(struct test_sasl_context *tctx)
 
 static void
 test_sasl_run_once(const struct test_sasl *test,
+		   struct sasl_server_instance *server_inst,
 		   const struct sasl_server_mech *server_mech,
 		   bool auth_initial)
 {
-	const struct dsasl_client_mech *client_mech;
 	struct test_sasl_context tctx;
 
 	i_zero(&tctx);
@@ -394,7 +400,19 @@ test_sasl_run_once(const struct test_sasl *test,
 	tctx.test = test;
 	tctx.auth_initial = auth_initial;
 
-	sasl_server_request_create(&tctx.ssrctx, server_mech, "imap", NULL);
+	tctx.client = dsasl_client_create(test_event);
+	dsasl_client_init_ntlm_dummy(tctx.client);
+#ifdef HAVE_GSSAPI
+	dsasl_client_init_gssapi(tctx.client);
+#endif
+	i_assert(tctx.client != NULL);
+
+	enum sasl_server_request_flags sreq_flags = 0;
+
+	if (!test->no_cbind)
+		sreq_flags |= SASL_SERVER_REQUEST_FLAG_CBIND_AVAILABLE;
+	sasl_server_request_create(&tctx.ssrctx, server_mech, "imap",
+				   sreq_flags, NULL);
 
 	const char *authid = (test->client.authid != NULL ?
 			      test->client.authid : test->server.authid);
@@ -406,28 +424,60 @@ test_sasl_run_once(const struct test_sasl *test,
 				test->client.password :
 				test->server.password);
 
-	struct dsasl_client_settings client_set = {
-		.event_parent = test_event,
-		.authid = (realm == NULL ? authid :
-			   t_strconcat(authid, "@", realm, NULL)),
-		.authzid = authzid,
-		.password = password,
+	struct settings_root *set_root;
+	struct event *event;
+	const char *error;
+
+	set_root = settings_root_init();
+	if (authid != NULL) {
+		const char *full_auth_id = (realm == NULL ?
+			authid : t_strconcat(authid, "@", realm, NULL));
+		settings_root_override(set_root, "client_auth_authid",
+				       full_auth_id, SETTINGS_OVERRIDE_TYPE_CODE);
+	}
+	if (authzid != NULL) {
+		settings_root_override(set_root, "client_auth_authzid",
+				       authzid, SETTINGS_OVERRIDE_TYPE_CODE);
+	}
+	if (password != NULL) {
+		settings_root_override(set_root, "client_auth_password",
+				       password, SETTINGS_OVERRIDE_TYPE_CODE);
+	}
+	settings_root_override(set_root, "client_auth",
+			       test->mech, SETTINGS_OVERRIDE_TYPE_CODE);
+	settings_root_override(set_root,
+		t_strdup_printf("client_auth/%s/mechanism", test->mech),
+		test->mech, SETTINGS_OVERRIDE_TYPE_CODE);
+	event = event_create(test_event);
+	event_set_ptr(event, SETTINGS_EVENT_ROOT, set_root);
+
+	struct dsasl_client_parameters client_params = {
 		.protocol = "imap",
 		.host = "example.com",
+		.server_mechanisms =
+			sasl_server_instance_mech_get_list(server_inst),
 	};
-	client_mech = dsasl_client_mech_find(test->mech);
-	i_assert(client_mech != NULL);
-	tctx.client = dsasl_client_new(client_mech, &client_set);
-	i_assert(tctx.client != NULL);
+	if (dsasl_client_session_create_auto(tctx.client, event,
+					     &client_params, &tctx.session,
+					     &error) < 0)
+		i_fatal("Failed to create SASL session: %s", error);
+	i_assert(tctx.session != NULL);
 
-	dsasl_client_enable_channel_binding(
-		tctx.client, SSL_IOSTREAM_PROTOCOL_VERSION_TLS1_3,
-		test_client_channel_binding_callback, &tctx);
+	if (!test->no_cbind) {
+		dsasl_client_session_enable_channel_binding(
+			tctx.session, SSL_IOSTREAM_PROTOCOL_VERSION_TLS1_3,
+			test_client_channel_binding_callback, &tctx);
+	}
 
 	test_sasl_interact(&tctx);
 
-	dsasl_client_free(&tctx.client);
+	dsasl_client_session_destroy(&tctx.session);
+	event_unref(&event);
+	settings_root_deinit(&set_root);
+	dsasl_client_unref(&tctx.client);
 	sasl_server_request_destroy(&tctx.ssrctx);
+
+	test_assert(test->expect_cbind == tctx.server_cbinding);
 
 	pool_unref(&tctx.pool);
 }
@@ -467,9 +517,11 @@ test_sasl_run(const struct test_sasl *test, const char *label,
 	sasl_server_mech_register_login(server_inst);
 	sasl_server_mech_register_plain(server_inst);
 	sasl_server_mech_register_scram_sha1(server_inst);
-	sasl_server_mech_register_scram_sha1_plus(server_inst);
 	sasl_server_mech_register_scram_sha256(server_inst);
-	sasl_server_mech_register_scram_sha256_plus(server_inst);
+	if (!test->server_no_plus) {
+		sasl_server_mech_register_scram_sha1_plus(server_inst);
+		sasl_server_mech_register_scram_sha256_plus(server_inst);
+	}
 
 	sasl_server_mech_register_oauthbearer(server_inst, &server_oauth2_funcs,
 					      NULL);
@@ -496,8 +548,8 @@ test_sasl_run(const struct test_sasl *test, const char *label,
 	i_assert(server_mech != NULL);
 
 #ifdef HAVE_GSSAPI
-	if (strcmp(test->mech, SASL_MECH_NAME_GSSAPI) == 0 ||
-	    strcmp(test->mech, SASL_MECH_NAME_GSS_SPNEGO) == 0) {
+	if (strcasecmp(test->mech, SASL_MECH_NAME_GSSAPI) == 0 ||
+	    strcasecmp(test->mech, SASL_MECH_NAME_GSS_SPNEGO) == 0) {
 		gss_dummy_add_principal(test->server.authid);
 		gss_dummy_kinit(test->client.authid != NULL ?
 				test->client.authid : test->server.authid);
@@ -507,10 +559,14 @@ test_sasl_run(const struct test_sasl *test, const char *label,
 	unsigned int repeat = (test->repeat > 0 ? test->repeat : 1);
 
 	for (i = 0; i < repeat && !test_has_failed(); i++)
-		test_sasl_run_once(test, server_mech, auth_initial);
+		test_sasl_run_once(test, server_inst, server_mech,
+				   auth_initial);
 
 	sasl_server_instance_unref(&server_inst);
 	sasl_server_deinit(&server);
+#ifdef HAVE_GSSAPI
+	gss_dummy_deinit();
+#endif
 	test_end();
 }
 
@@ -600,6 +656,7 @@ static const struct test_sasl success_tests[] = {
 			.authid = "user",
 			.password = "pass",
 		},
+		.expect_cbind = TRUE,
 	},
 	{
 		.mech = "SCRAM-SHA-1",
@@ -609,6 +666,7 @@ static const struct test_sasl success_tests[] = {
 			.authzid = "user",
 			.password = "pass",
 		},
+		.expect_cbind = TRUE,
 	},
 	/* SCRAM-SHA-256 */
 	{
@@ -618,6 +676,7 @@ static const struct test_sasl success_tests[] = {
 			.authid = "user",
 			.password = "pass",
 		},
+		.expect_cbind = TRUE,
 	},
 	{
 		.mech = "SCRAM-SHA-256",
@@ -627,6 +686,87 @@ static const struct test_sasl success_tests[] = {
 			.authzid = "user",
 			.password = "pass",
 		},
+		.expect_cbind = TRUE,
+	},
+	/* SCRAM-SHA-1 */
+	{
+		.mech = "SCRAM-SHA-1",
+		.authid_type = SASL_SERVER_AUTHID_TYPE_USERNAME,
+		.server = {
+			.authid = "user",
+			.password = "pass",
+		},
+		.server_no_plus = TRUE,
+	},
+	{
+		.mech = "SCRAM-SHA-1",
+		.authid_type = SASL_SERVER_AUTHID_TYPE_USERNAME,
+		.server = {
+			.authid = "master",
+			.authzid = "user",
+			.password = "pass",
+		},
+		.server_no_plus = TRUE,
+	},
+	/* SCRAM-SHA-256 */
+	{
+		.mech = "SCRAM-SHA-256",
+		.authid_type = SASL_SERVER_AUTHID_TYPE_USERNAME,
+		.server = {
+			.authid = "user",
+			.password = "pass",
+		},
+		.server_no_plus = TRUE,
+	},
+	{
+		.mech = "SCRAM-SHA-256",
+		.authid_type = SASL_SERVER_AUTHID_TYPE_USERNAME,
+		.server = {
+			.authid = "master",
+			.authzid = "user",
+			.password = "pass",
+		},
+		.server_no_plus = TRUE,
+	},
+	/* SCRAM-SHA-1 */
+	{
+		.mech = "SCRAM-SHA-1",
+		.authid_type = SASL_SERVER_AUTHID_TYPE_USERNAME,
+		.server = {
+			.authid = "user",
+			.password = "pass",
+		},
+		.no_cbind = TRUE,
+	},
+	{
+		.mech = "SCRAM-SHA-1",
+		.authid_type = SASL_SERVER_AUTHID_TYPE_USERNAME,
+		.server = {
+			.authid = "master",
+			.authzid = "user",
+			.password = "pass",
+		},
+		.no_cbind = TRUE,
+	},
+	/* SCRAM-SHA-256 */
+	{
+		.mech = "SCRAM-SHA-256",
+		.authid_type = SASL_SERVER_AUTHID_TYPE_USERNAME,
+		.server = {
+			.authid = "user",
+			.password = "pass",
+		},
+		.no_cbind = TRUE,
+	},
+	{
+		.mech = "SCRAM-SHA-256",
+		.authid_type = SASL_SERVER_AUTHID_TYPE_USERNAME,
+		.server = {
+			.authid = "master",
+			.authzid = "user",
+			.password = "pass",
+		},
+		.no_cbind = TRUE,
 	},
 	/* SCRAM-SHA-1-PLUS */
 	{
@@ -636,6 +776,7 @@ static const struct test_sasl success_tests[] = {
 			.authid = "user",
 			.password = "pass",
 		},
+		.expect_cbind = TRUE,
 	},
 	{
 		.mech = "SCRAM-SHA-1-PLUS",
@@ -645,6 +786,7 @@ static const struct test_sasl success_tests[] = {
 			.authzid = "user",
 			.password = "pass",
 		},
+		.expect_cbind = TRUE,
 	},
 	/* SCRAM-SHA-256-PLUS */
 	{
@@ -654,6 +796,7 @@ static const struct test_sasl success_tests[] = {
 			.authid = "user",
 			.password = "pass",
 		},
+		.expect_cbind = TRUE,
 	},
 	{
 		.mech = "SCRAM-SHA-256-PLUS",
@@ -663,6 +806,7 @@ static const struct test_sasl success_tests[] = {
 			.authzid = "user",
 			.password = "pass",
 		},
+		.expect_cbind = TRUE,
 	},
 	/* OAUTHBEARER */
 	{
@@ -719,7 +863,7 @@ static const struct test_sasl success_tests[] = {
 		.server = {
 			.authid = "user@EXAMPLE.COM",
 			.authzid = "",
-			.password = "",
+			.password = "frop",
 		},
 	},
 	/* XOAUTH2 */
@@ -1077,6 +1221,7 @@ static const struct test_sasl bad_creds_tests[] = {
 			.authid = "userb",
 		},
 		.failure = TRUE,
+		.server_no_plus = TRUE,
 	},
 	{
 		.mech = "SCRAM-SHA-1",
@@ -1089,6 +1234,7 @@ static const struct test_sasl bad_creds_tests[] = {
 			.password = "florp",
 		},
 		.failure = TRUE,
+		.server_no_plus = TRUE,
 	},
 	{
 		.mech = "SCRAM-SHA-1",
@@ -1102,6 +1248,7 @@ static const struct test_sasl bad_creds_tests[] = {
 			.authzid = "user",
 		},
 		.failure = TRUE,
+		.server_no_plus = TRUE,
 	},
 	{
 		.mech = "SCRAM-SHA-1",
@@ -1115,6 +1262,7 @@ static const struct test_sasl bad_creds_tests[] = {
 			.authid = "commander",
 		},
 		.failure = TRUE,
+		.server_no_plus = TRUE,
 	},
 	{
 		.mech = "SCRAM-SHA-1",
@@ -1128,6 +1276,7 @@ static const struct test_sasl bad_creds_tests[] = {
 			.authzid = "userb",
 		},
 		.failure = TRUE,
+		.server_no_plus = TRUE,
 	},
 	{
 		.mech = "SCRAM-SHA-1",
@@ -1141,6 +1290,7 @@ static const struct test_sasl bad_creds_tests[] = {
 			.password = "florp",
 		},
 		.failure = TRUE,
+		.server_no_plus = TRUE,
 	},
 	/* SCRAM-SHA-256 */
 	{
@@ -1154,6 +1304,7 @@ static const struct test_sasl bad_creds_tests[] = {
 			.authid = "userb",
 		},
 		.failure = TRUE,
+		.server_no_plus = TRUE,
 	},
 	{
 		.mech = "SCRAM-SHA-256",
@@ -1166,6 +1317,7 @@ static const struct test_sasl bad_creds_tests[] = {
 			.password = "florp",
 		},
 		.failure = TRUE,
+		.server_no_plus = TRUE,
 	},
 	{
 		.mech = "SCRAM-SHA-256",
@@ -1179,6 +1331,7 @@ static const struct test_sasl bad_creds_tests[] = {
 			.authzid = "user",
 		},
 		.failure = TRUE,
+		.server_no_plus = TRUE,
 	},
 	{
 		.mech = "SCRAM-SHA-256",
@@ -1192,6 +1345,7 @@ static const struct test_sasl bad_creds_tests[] = {
 			.authid = "commander",
 		},
 		.failure = TRUE,
+		.server_no_plus = TRUE,
 	},
 	{
 		.mech = "SCRAM-SHA-256",
@@ -1205,6 +1359,7 @@ static const struct test_sasl bad_creds_tests[] = {
 			.authzid = "userb",
 		},
 		.failure = TRUE,
+		.server_no_plus = TRUE,
 	},
 	{
 		.mech = "SCRAM-SHA-256",
@@ -1218,6 +1373,7 @@ static const struct test_sasl bad_creds_tests[] = {
 			.password = "florp",
 		},
 		.failure = TRUE,
+		.server_no_plus = TRUE,
 	},
 	/* SCRAM-SHA-1-PLUS */
 	{
@@ -1231,6 +1387,7 @@ static const struct test_sasl bad_creds_tests[] = {
 			.authid = "userb",
 		},
 		.failure = TRUE,
+		.expect_cbind = TRUE,
 	},
 	{
 		.mech = "SCRAM-SHA-1-PLUS",
@@ -1243,6 +1400,7 @@ static const struct test_sasl bad_creds_tests[] = {
 			.password = "florp",
 		},
 		.failure = TRUE,
+		.expect_cbind = TRUE,
 	},
 	{
 		.mech = "SCRAM-SHA-1-PLUS",
@@ -1256,6 +1414,7 @@ static const struct test_sasl bad_creds_tests[] = {
 			.authzid = "user",
 		},
 		.failure = TRUE,
+		.expect_cbind = TRUE,
 	},
 	{
 		.mech = "SCRAM-SHA-1-PLUS",
@@ -1269,6 +1428,7 @@ static const struct test_sasl bad_creds_tests[] = {
 			.authid = "commander",
 		},
 		.failure = TRUE,
+		.expect_cbind = TRUE,
 	},
 	{
 		.mech = "SCRAM-SHA-1-PLUS",
@@ -1282,6 +1442,7 @@ static const struct test_sasl bad_creds_tests[] = {
 			.authzid = "userb",
 		},
 		.failure = TRUE,
+		.expect_cbind = TRUE,
 	},
 	{
 		.mech = "SCRAM-SHA-1-PLUS",
@@ -1295,6 +1456,7 @@ static const struct test_sasl bad_creds_tests[] = {
 			.password = "florp",
 		},
 		.failure = TRUE,
+		.expect_cbind = TRUE,
 	},
 	/* SCRAM-SHA-256-PLUS */
 	{
@@ -1308,6 +1470,7 @@ static const struct test_sasl bad_creds_tests[] = {
 			.authid = "userb",
 		},
 		.failure = TRUE,
+		.expect_cbind = TRUE,
 	},
 	{
 		.mech = "SCRAM-SHA-256-PLUS",
@@ -1320,6 +1483,7 @@ static const struct test_sasl bad_creds_tests[] = {
 			.password = "florp",
 		},
 		.failure = TRUE,
+		.expect_cbind = TRUE,
 	},
 	{
 		.mech = "SCRAM-SHA-256-PLUS",
@@ -1333,6 +1497,7 @@ static const struct test_sasl bad_creds_tests[] = {
 			.authzid = "user",
 		},
 		.failure = TRUE,
+		.expect_cbind = TRUE,
 	},
 	{
 		.mech = "SCRAM-SHA-256-PLUS",
@@ -1346,6 +1511,7 @@ static const struct test_sasl bad_creds_tests[] = {
 			.authid = "commander",
 		},
 		.failure = TRUE,
+		.expect_cbind = TRUE,
 	},
 	{
 		.mech = "SCRAM-SHA-256-PLUS",
@@ -1359,6 +1525,7 @@ static const struct test_sasl bad_creds_tests[] = {
 			.authzid = "userb",
 		},
 		.failure = TRUE,
+		.expect_cbind = TRUE,
 	},
 	{
 		.mech = "SCRAM-SHA-256-PLUS",
@@ -1372,6 +1539,7 @@ static const struct test_sasl bad_creds_tests[] = {
 			.password = "florp",
 		},
 		.failure = TRUE,
+		.expect_cbind = TRUE,
 	},
 	/* OAUTHBEARER */
 	{
@@ -1447,7 +1615,7 @@ static const struct test_sasl bad_creds_tests[] = {
 		.server = {
 			.authid = "user@EXAMPLE.COM",
 			.authzid = "",
-			.password = "",
+			.password = "frop",
 		},
 		.client = {
 			.authid = "userb@EXAMPLE.COM",
@@ -1607,7 +1775,7 @@ static void test_sasl_cram_md5_malformed_input(void)
 			MEMPOOL_GROWING"test_sasl", 1024);
 		tctx.test = &test;
 
-		sasl_server_request_create(&tctx.ssrctx, mech, "imap", NULL);
+		sasl_server_request_create(&tctx.ssrctx, mech, "imap", 0, NULL);
 		/* server sends challenge, no initial response from client */
 		sasl_server_request_initial(&tctx.ssrctx, NULL, 0);
 
@@ -1696,7 +1864,7 @@ static void test_sasl_oauthbearer_malformed_input(void)
 			MEMPOOL_GROWING"test_sasl", 1024);
 		tctx.test = &test;
 
-		sasl_server_request_create(&tctx.ssrctx, mech, "imap", NULL);
+		sasl_server_request_create(&tctx.ssrctx, mech, "imap", 0, NULL);
 		void *data_dup = i_memdup(cases[i].data, cases[i].data_size);
 		sasl_server_request_initial(&tctx.ssrctx,
 					    data_dup,
@@ -1743,17 +1911,11 @@ int main(int argc, char *argv[])
 	test_init();
 	event_set_forced_debug(test_event, debug);
 	password_schemes_init();
-	dsasl_clients_init();
-	dsasl_client_mech_ntlm_init_dummy();
-#ifdef HAVE_GSSAPI
-	dsasl_clients_init_gssapi();
-#endif
 
 	ioloop = io_loop_create();
 	ret = test_run(test_functions);
 	io_loop_destroy(&ioloop);
 
-	dsasl_clients_deinit();
 	password_schemes_deinit();
 	lib_signals_deinit();
 	lib_deinit();

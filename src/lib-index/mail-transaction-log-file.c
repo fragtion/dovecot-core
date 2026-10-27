@@ -439,7 +439,7 @@ int mail_transaction_log_file_lock(struct mail_transaction_log_file *file)
 		"Timeout (%us) while waiting for lock for "
 		"transaction log file %s%s",
 		lock_timeout_secs, file->filepath,
-		file_lock_find(file->fd, index->set.lock_method, F_WRLCK));
+		file_lock_find(file->fd, index->set.lock_method, F_WRLCK, 0, 0));
 	return -1;
 }
 
@@ -1137,10 +1137,15 @@ void mail_transaction_update_modseq(const struct mail_transaction_header *hdr,
 		break;
 	}
 	case MAIL_TRANSACTION_MODSEQ_UPDATE: {
-		const struct mail_transaction_modseq_update *rec, *end;
+		const struct mail_transaction_modseq_update *rec;
+		unsigned int i, count;
 
-		end = CONST_PTR_OFFSET(data, trans_size - sizeof(*hdr));
-		for (rec = data; rec < end; rec++) {
+		/* Only iterate over complete records. A non-multiple size is
+		   corrupted; ignore any trailing partial record rather than
+		   reading past the transaction data. */
+		count = (trans_size - sizeof(*hdr)) / sizeof(*rec);
+		rec = data;
+		for (i = 0; i < count; i++, rec++) {
 			uint64_t modseq = ((uint64_t)rec->modseq_high32 << 32) |
 				rec->modseq_low32;
 			if (*cur_modseq < modseq)

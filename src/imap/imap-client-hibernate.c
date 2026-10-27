@@ -12,7 +12,9 @@
 #include "strescape.h"
 #include "version.h"
 #include "compression.h"
+#include "master-service.h"
 #include "mailbox-watch.h"
+#include "mail-autoexpunge.h"
 #include "imap-state.h"
 #include "imap-client.h"
 
@@ -78,6 +80,10 @@ static void imap_hibernate_write_cmd(struct client *client, string_t *cmd,
 		str_printfa(cmd, "\tsession_created=%s",
 			    dec2str(user->session_create_time));
 	}
+	if (client->autoexpunge_next_check != 0) {
+		str_printfa(cmd, "\tautoexpunge_next_check=%"PRIdTIME_T,
+			    client->autoexpunge_next_check);
+	}
 	if (user->conn.local_ip != NULL)
 		str_printfa(cmd, "\tlip=%s", net_ip2addr(user->conn.local_ip));
 	if (user->conn.local_port != 0)
@@ -130,9 +136,16 @@ static void imap_hibernate_write_cmd(struct client *client, string_t *cmd,
 		    dec2str(user->auth_token_session_pid));
 	str_append(cmd, "\tstats=");
 	str_append_tabescaped(cmd, client_stats(client));
+	str_append(cmd, "\tcapability=");
+	if (client->capability_string != NULL)
+		str_append_tabescaped(cmd, str_c(client->capability_string));
 	if (client->command_queue != NULL &&
 	    strcasecmp(client->command_queue->name, "IDLE") == 0)
 		str_append(cmd, "\tidle-cmd");
+	else {
+		str_printfa(cmd, "\tlast_input=%"PRIdTIME_T,
+			    client->last_input);
+	}
 	if (fd_notify != -1)
 		str_append(cmd, "\tnotify_fd");
 	str_append(cmd, "\tstate=");
@@ -252,7 +265,48 @@ imap_hibernate_process_send(struct client *client, const buffer_t *state,
 }
 #endif
 
-bool imap_client_hibernate(struct client **_client, const char **reason_r)
+void imap_client_hibernate_autoexpunge(struct client *client)
+{
+	unsigned int count;
+
+	/* A next check time further away than the maximum interval means
+	   that the clock moved backwards. This can happen while the client
+	   is hibernated, because imap-hibernate doesn't die or wait like imap
+	   does. Check it now rather than delaying it by the time jump. */
+	if (client->autoexpunge_next_check > ioloop_time &&
+	    client->autoexpunge_next_check <=
+	    ioloop_time + MAIL_AUTOEXPUNGE_CHECK_MAX_INTERVAL_SECS)
+		return;
+	/* Same as with logout: Don't autoexpunge during shutdown to avoid
+	   load spikes. */
+	if (master_service_is_killed(master_service) ||
+	    master_service_is_master_stopped(master_service))
+		return;
+
+	count = mail_user_autoexpunge(client->user,
+				      &client->autoexpunge_next_check);
+	client->logout_stats.autoexpunged_count += count;
+	e_debug(client->event, "Autoexpunge check before hibernation: "
+		"%u mails expunged, next check in %"PRIdTIME_T" secs", count,
+		client->autoexpunge_next_check == 0 ? 0 :
+		client->autoexpunge_next_check - ioloop_time);
+}
+
+struct event_passthrough *imap_client_hibernated_event(struct client *client)
+{
+	struct event_passthrough *e =
+		event_create_passthrough(client->event)->
+		set_name("imap_client_hibernated")->
+		add_str("reason", client->command_queue != NULL ?
+			"idle" : "inactivity");
+	if (client->mailbox != NULL)
+		e->add_str("mailbox", mailbox_get_vname(client->mailbox));
+	return e;
+}
+
+static bool
+imap_client_hibernate_int(struct client **_client, int *fd_notify,
+			  const char **reason_r)
 {
 	struct client *client = *_client;
 	*reason_r = NULL;
@@ -270,19 +324,20 @@ bool imap_client_hibernate(struct client **_client, const char **reason_r)
 #ifdef BUILD_IMAP_HIBERNATE
 	buffer_t *state;
 	const char *error;
-	int ret, fd_notify = -1, fd_hibernate = -1;
+	int ret, fd_hibernate = -1;
 
 	if (o_stream_get_buffer_used_size(client->output) > 0) {
 		/* wait until we've sent the pending output to client */
 		*reason_r = "output pending to client";
 		return FALSE;
 	}
+	if (i_stream_get_data_size(client->input) > 0) {
+		/* a partially received command line would be lost */
+		*reason_r = "input pending from client";
+		return FALSE;
+	}
 
-	struct event_passthrough *e =
-		event_create_passthrough(client->event)->
-		set_name("imap_client_hibernated");
-	if (client->mailbox != NULL)
-		e->add_str("mailbox", mailbox_get_vname(client->mailbox));
+	struct event_passthrough *e = imap_client_hibernated_event(client);
 
 	state = buffer_create_dynamic(default_pool, 1024);
 	ret = imap_state_export_internal(client, state, &error);
@@ -301,10 +356,13 @@ bool imap_client_hibernate(struct client **_client, const char **reason_r)
 			mailbox_get_vname(client->mailbox));
 		*reason_r = error;
 	}
-	if (ret > 0 && client->mailbox != NULL) {
-		fd_notify = mailbox_watch_extract_notify_fd(client->mailbox,
-							    &error);
-		if (fd_notify == -1) {
+	/* the export allows only IDLE as the running command */
+	bool idle_cmd = client->command_queue != NULL;
+	if (ret > 0 && idle_cmd && client->mailbox != NULL &&
+	    *fd_notify == -1) {
+		*fd_notify = mailbox_watch_extract_notify_fd(client->mailbox,
+							     &error);
+		if (*fd_notify == -1) {
 			e->add_str("error", error);
 			e_debug(e->event(), "Couldn't hibernate imap client: "
 				"Couldn't extract notifications fd: %s",
@@ -314,7 +372,7 @@ bool imap_client_hibernate(struct client **_client, const char **reason_r)
 		}
 	}
 	if (ret > 0) {
-		if (imap_hibernate_process_send(client, state, fd_notify,
+		if (imap_hibernate_process_send(client, state, *fd_notify,
 						&fd_hibernate, &error) < 0) {
 			e->add_str("error", error);
 			e_error(e->event(),
@@ -323,7 +381,6 @@ bool imap_client_hibernate(struct client **_client, const char **reason_r)
 			ret = -1;
 		}
 	}
-	i_close_fd(&fd_notify);
 	if (ret > 0) {
 		/* hide the disconnect log message, because the client didn't
 		   actually log out */
@@ -351,4 +408,12 @@ bool imap_client_hibernate(struct client **_client, const char **reason_r)
 	*reason_r = "imap hibernation is not enabled";
 	return FALSE;
 #endif
+}
+
+bool imap_client_hibernate(struct client **_client, int fd_notify,
+			   const char **reason_r)
+{
+	bool ret = imap_client_hibernate_int(_client, &fd_notify, reason_r);
+	i_close_fd(&fd_notify);
+	return ret;
 }

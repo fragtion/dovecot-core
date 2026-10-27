@@ -1,0 +1,33 @@
+#ifndef POP3C_CLIENT_SETTINGS_H
+#define POP3C_CLIENT_SETTINGS_H
+
+#include "net.h"
+
+/* <settings checks> */
+#define POP3C_SETTINGS_FILTER "pop3c"
+
+enum pop3c_client_features {
+	POP3C_FEATURE_NO_PIPELINING = 0x1,
+};
+/* </settings checks> */
+
+
+struct pop3c_client_settings {
+	pool_t pool;
+	const char *pop3c_host;
+	in_port_t pop3c_port;
+	const char *pop3c_ssl;
+
+	const char *pop3c_rawlog_dir;
+
+	unsigned int pop3c_connect_timeout_msecs;
+	unsigned int pop3c_cmd_timeout_msecs;
+
+	ARRAY_TYPE(const_string) pop3c_features;
+
+	enum pop3c_client_features parsed_features;
+};
+
+extern const struct setting_parser_info pop3c_client_setting_parser_info;
+
+#endif

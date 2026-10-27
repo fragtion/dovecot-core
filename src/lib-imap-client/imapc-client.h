@@ -3,7 +3,9 @@
 
 #include "net.h"
 #include "iostream-ssl.h"
-#include "imapc-settings.h"
+#include "imapc-client-settings.h"
+
+struct imapc_client;
 
 enum imapc_command_state {
 	IMAPC_COMMAND_STATE_OK = 0,
@@ -87,12 +89,6 @@ struct imapc_parameters {
 	const char *session_id_prefix;
 	const char *temp_path_prefix;
 
-	/* imapc-storage creates custom paths based on the namespace user,
-	   this cannot be read from the config directly. */
-	const char *override_dns_client_socket_path;
-	const char *override_rawlog_dir;
-	const char *override_password;
-
 	enum imapc_parameter_flags flags;
 };
 
@@ -111,11 +107,15 @@ typedef void imapc_state_change_callback_t(void *context,
 					   enum imapc_state_change_event event,
 					   const char *error);
 
-struct imapc_client *
-imapc_client_init(const struct imapc_parameters *params,
-		  struct event *event_parent);
+int imapc_client_init(const struct imapc_parameters *params,
+		      struct event *event_parent,
+		      struct imapc_client **client_r, const char **error_r);
 void imapc_client_disconnect(struct imapc_client *client);
 void imapc_client_deinit(struct imapc_client **client);
+
+int imapc_client_settings_match(struct imapc_client *client,
+				struct event *event_other,
+				const char **error_r);
 
 /* Set login callback, must be set before calling other commands.
    This is called only for the first login, not for any reconnects or if there
@@ -173,6 +173,7 @@ imapc_client_mailbox_get_msgmap(struct imapc_client_mailbox *box);
 void imapc_client_mailbox_idle(struct imapc_client_mailbox *box);
 bool imapc_client_mailbox_is_opened(struct imapc_client_mailbox *box);
 
+const char *imapc_client_get_host(struct imapc_client *client);
 /* Get the server capabilities. If it fails, the error is seen and handled by
    the login callback. */
 int imapc_client_get_capabilities(struct imapc_client *client,

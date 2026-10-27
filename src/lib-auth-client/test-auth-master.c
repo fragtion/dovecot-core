@@ -159,6 +159,124 @@ static void test_auth_user_info_export(void)
 	test_end();
 }
 
+static void test_auth_forward_field_is_valid(void)
+{
+	static const struct {
+		const char *key;
+		const char *value;
+		bool valid;
+	} tests[] = {
+		{ "key", "value", TRUE },
+		{ "key", "", TRUE },
+		{ "key", NULL, TRUE },
+		{ "key", "k=\303\244", TRUE },
+		/* TAB, CR and LF are plausible in real passdb values, so they
+		   are legitimate in values */
+		{ "key", "a\tb", TRUE },
+		{ "key", "a\rb", TRUE },
+		{ "key", "a\nb", TRUE },
+		/* ... but no other control character is, not even the
+		   tabescape byte itself */
+		{ "key", "a\001b", FALSE },
+		{ "key", "\033[2J\033[H", FALSE },
+		{ "key", "v\010\010", FALSE },
+		{ "key", "v\177", FALSE },
+		{ "key", "\013v", FALSE },
+		{ "key", "\002", FALSE },
+		/* keys must be non-empty and free of any control character */
+		{ "", "value", FALSE },
+		{ "", NULL, FALSE },
+		{ "k\033", "value", FALSE },
+		{ "\033k", NULL, FALSE },
+		{ "a\tb", "value", FALSE },
+		{ "a\rb", "value", FALSE },
+		{ "a\nb", "value", FALSE },
+		{ "a\001b", "value", FALSE },
+		{ "k\177", "value", FALSE },
+		/* '=' in a key would be re-parsed as a key/value separator */
+		{ "a=b", "value", FALSE },
+		{ "=", NULL, FALSE },
+	};
+
+	test_begin("auth_forward_field_is_valid()");
+	for (unsigned int i = 0; i < N_ELEMENTS(tests); i++) {
+		test_assert_idx(auth_forward_field_is_valid(
+			tests[i].key, tests[i].value) == tests[i].valid, i);
+	}
+	test_end();
+}
+
+static void test_auth_forward_field_line_is_valid(void)
+{
+	static const struct {
+		const char *line;
+		bool valid;
+	} tests[] = {
+		{ "key=value", TRUE },
+		{ "key=", TRUE },
+		{ "key", TRUE },
+		{ "key=a=b", TRUE },
+		{ "key=a\tb", TRUE },
+		{ "", FALSE },
+		{ "=value", FALSE },
+		{ "k\033=value", FALSE },
+		{ "k\t=value", FALSE },
+		{ "\033", FALSE },
+		{ "key=\033[2J", FALSE },
+		{ "key=v\177", FALSE },
+	};
+
+	test_begin("auth_forward_field_line_is_valid()");
+	for (unsigned int i = 0; i < N_ELEMENTS(tests); i++) {
+		test_assert_idx(auth_forward_field_line_is_valid(
+			tests[i].line) == tests[i].valid, i);
+	}
+	test_end();
+}
+
+static void test_auth_session_id_is_valid(void)
+{
+	static const struct {
+		const char *session_id;
+		bool chars_valid;
+		bool valid;
+	} tests[] = {
+		{ "abc", TRUE, TRUE },
+		{ "kLmN0pQr/sT+uVw=", TRUE, TRUE },
+		{ "!#$%&'()*+,-./:;<=>?@[]^_`{|}~", TRUE, TRUE },
+		/* exactly AUTH_MAX_SESSION_ID_LEN bytes */
+		{ "0123456789012345678901234567890123456789"
+		  "012345678901234567890123", TRUE, TRUE },
+		/* one byte too long: only the length-limited check fails */
+		{ "0123456789012345678901234567890123456789"
+		  "0123456789012345678901234", TRUE, FALSE },
+		/* a 64-byte ID after two LMTP proxy hops */
+		{ "0123456789012345678901234567890123456789"
+		  "012345678901234567890123:P1:P1", TRUE, FALSE },
+		{ "", FALSE, FALSE },
+		{ "a b", FALSE, FALSE },
+		{ "a\tb", FALSE, FALSE },
+		{ "a\rb", FALSE, FALSE },
+		{ "a\nb", FALSE, FALSE },
+		{ "\033[2J", FALSE, FALSE },
+		{ "a\177", FALSE, FALSE },
+		/* IMAP quoted-specials */
+		{ "a\"b", FALSE, FALSE },
+		{ "a\\b", FALSE, FALSE },
+		{ "\303\244", FALSE, FALSE },
+	};
+
+	test_begin("auth_session_id_is_valid()");
+	for (unsigned int i = 0; i < N_ELEMENTS(tests); i++) {
+		test_assert_idx(auth_session_id_chars_valid(
+					tests[i].session_id) ==
+				tests[i].chars_valid, i);
+		test_assert_idx(auth_session_id_is_valid(tests[i].session_id) ==
+				tests[i].valid, i);
+	}
+	test_end();
+}
+
 /*
  * Connection refused
  */
@@ -1402,6 +1520,9 @@ static void test_user_list_stall(void)
 
 static void (*const test_functions[])(void) = {
 	test_auth_user_info_export,
+	test_auth_forward_field_is_valid,
+	test_auth_forward_field_line_is_valid,
+	test_auth_session_id_is_valid,
 	test_connection_refused,
 	test_connection_timed_out,
 	test_bad_version,

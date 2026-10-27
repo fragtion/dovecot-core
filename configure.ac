@@ -169,7 +169,7 @@ AS_HELP_STRING([--with-textcat], [Build with libtextcat support (for lib-languag
   want_textcat=auto)
 
 AC_ARG_WITH(icu,
-AS_HELP_STRING([--with-icu], [Build with libicu support (for lib-language normalization) (auto)]),
+AS_HELP_STRING([--with-icu], [Build with libicu support (for lib-language custom normalizer IDs) (auto)]),
   want_icu=$withval,
   want_icu=auto)
 
@@ -352,7 +352,7 @@ AC_DEFINE(PACKAGE_WEBPAGE, "https://www.dovecot.org/", [Support URL])
 AC_CHECK_FUNCS(flock pread setproctitle setresgid \
 	       getmntinfo setpriority quotactl getmntent kqueue kevent \
 	       backtrace_symbols walkcontext dirfd clearenv \
-	       malloc_usable_size glob fallocate posix_fadvise \
+	       malloc_usable_size malloc_trim glob fallocate posix_fadvise \
 	       getpeereid getpeerucred inotify_init timegm memrchr)
 
 AC_CHECK_HEADERS([valgrind/valgrind.h])
@@ -608,6 +608,7 @@ LIBDOVECOT_LA_LIBS='\
 	$(top_builddir)/src/lib-dcrypt/libdcrypt.la \
 	$(top_builddir)/src/lib-json/libjson.la \
 	$(top_builddir)/src/lib-regex/libdregex.la \
+	$(top_builddir)/src/lib-url/liburl.la \
 	$(top_builddir)/src/lib-test/libtest.la \
 	$(top_builddir)/src/lib/liblib.la'
 # This is used in dovecot-config, which is grepped in dovecot.m4,
@@ -753,6 +754,14 @@ DOVECOT_WANT_STEMMER
 DOVECOT_WANT_TEXTCAT
 
 DOVECOT_WANT_ICU
+AS_IF([test "$have_icu" = "yes"], [
+  # The libicu helper functions are in a separate library. External plugins
+  # linking with lib-language get it too for backwards compatibility.
+  LIBDOVECOT_LIBLANG_ICU='$(top_builddir)/src/lib-language/libdovecot-language-icu.la'
+  LINKED_LIBLANG_LDADD="-ldovecot-language-icu"
+])
+AC_SUBST(LIBDOVECOT_LIBLANG_ICU)
+AC_SUBST(LINKED_LIBLANG_LDADD)
 DOVECOT_WANT_PCRE
 
 DOVECOT_WANT_APPARMOR
@@ -774,7 +783,6 @@ non_libdovecot_c_files=
 all_files=`find $srcdir/src -name '*.[[ch]]' | $GREP -v '/src/config/all-settings.c' | $GREP -v '/src/lib-settings/' | $GREP -v '/test-' | xargs $GREP -e 'struct setting_parser_info [[a-z]]' -e 'struct service_settings [[a-z]]' -e '<settings checks>' | $SED 's/:.*//' | sort | uniq`
 for file in $all_files; do
   dir=`echo "$file" | $SED 's:/[[^/]]*$::'`
-  basefile=`basename $file`
   if echo "$libdovecot_dirs" | $GREP "$dir" >/dev/null; then
     dnl lib-dovecot
     if echo "$file" | $GREP '\.h$' >/dev/null; then
@@ -784,11 +792,7 @@ for file in $all_files; do
     fi
   else
     dnl not lib-dovecot
-    dnl ignore hibernation if not being built
-
-    if test "$BUILD_IMAP_HIBERNATE" = 0 && test "$basefile" = "imap-hibernate-settings.c"; then
-      continue
-    elif echo "$file" | $GREP '\.h$' >/dev/null; then
+    if echo "$file" | $GREP '\.h$' >/dev/null; then
       non_libdovecot_headers="$non_libdovecot_headers $file"
     else
       non_libdovecot_c_files="$non_libdovecot_c_files $file"
@@ -848,6 +852,7 @@ doc/index.html
 doc/dovecot.conf
 src/Makefile
 src/lib/Makefile
+src/lib-url/Makefile
 src/lib-sql/Makefile
 src/lib-auth/Makefile
 src/lib-auth-client/Makefile
@@ -865,6 +870,7 @@ src/lib-language/Makefile
 src/lib-http/Makefile
 src/lib-oauth2/Makefile
 src/lib-pop3/Makefile
+src/lib-pop3-client/Makefile
 src/lib-imap/Makefile
 src/lib-imap-storage/Makefile
 src/lib-imap-client/Makefile

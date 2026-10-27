@@ -1,4 +1,4 @@
-deps = [dep_lib, dep_settings, dep_auth, dep_json, dep_ssl_iostream, dep_oauth2]
+deps = [dep_lib, dep_url, dep_settings, dep_auth, dep_json, dep_ssl_iostream, dep_oauth2]
 
 client_mechanisms = [
   'dsasl-client-mech-anonymous.c',
@@ -25,6 +25,7 @@ server_mechanisms = [
 
 lib_sasl = static_library(
   'sasl',
+  'sasl-common.c',
   'sasl-oauth2.c',
   client_mechanisms,
   'dsasl-client.c',
@@ -45,6 +46,7 @@ install_headers(
   'sasl-common.h',
   'sasl-oauth2.h',
   'dsasl-client.h',
+  'dsasl-client-protected.h',
   'dsasl-client-private.h',
   'sasl-server.h',
   'sasl-server-gssapi.h',
@@ -104,13 +106,15 @@ foreach test_name : tests
   )
 endforeach
 
-# test-sasl-authentication pulls in an extra NTLM client stub and runs it (its path is
-# passed via TEST_WINBIND_HELPER_PATH).
+# test-sasl-authentication and its fuzzer pull in an extra NTLM client stub and run it
+# (its path is passed via TEST_WINBIND_HELPER_PATH).
 ntlm_dummy = executable(
   'ntlm_dummy',
   'ntlm_dummy.c',
   dependencies: dep_lib,
 )
+
+ntlm_dummy_c_args = '-DTEST_WINBIND_HELPER_PATH="@0@"'.format(ntlm_dummy.full_path())
 
 test(
   'authentication',
@@ -119,7 +123,7 @@ test(
     'test-sasl-authentication.c',
     'dsasl-client-mech-ntlm-dummy.c',
     sasl_gssapi_test_sources,
-    c_args: '-DTEST_WINBIND_HELPER_PATH="@0@"'.format(ntlm_dummy.full_path()),
+    c_args: ntlm_dummy_c_args,
     dependencies: [test_deps, sasl_gssapi_test_deps],
   ),
   depends: ntlm_dummy,
@@ -132,6 +136,7 @@ if get_option('fuzzing')
     'fuzz-sasl-authentication.c',
     'dsasl-client-mech-ntlm-dummy.c',
     sasl_gssapi_test_sources,
+    c_args: ntlm_dummy_c_args,
     link_language: 'cpp',
     pie: true,
     dependencies: [test_deps, sasl_gssapi_test_deps, ext_fuzzer],
@@ -142,6 +147,7 @@ if get_option('fuzzing')
       'fuzz-sasl-authentication',
       fuzzer,
       args: fuzzer_test_args,
+      depends: ntlm_dummy,
       suite: 'sasl',
       timeout: fuzzer_test_timeout,
       workdir: meson.current_build_dir(),

@@ -7,8 +7,9 @@ struct module;
 #include "login-proxy.h"
 #include "sasl-proxy.h"
 #include "login-client.h"
+#include "auth-master.h"
 
-#define LOGIN_MAX_SESSION_ID_LEN 64
+#define LOGIN_MAX_SESSION_ID_LEN AUTH_MAX_SESSION_ID_LEN
 #define LOGIN_MAX_MASTER_PREFIX_LEN 128
 #define LOGIN_MAX_CLIENT_ID_LEN 256
 
@@ -205,6 +206,9 @@ struct client {
 	ARRAY_TYPE(const_string) forward_fields;
 
 	int fd;
+	/* TLS socketpair endpoint passed to the post-login process. macOS
+	   needs it kept open until the receiver has it. */
+	int pending_plaintext_fd;
 	struct istream *input;
 	struct ostream *output;
 	/* The rawlog streams don't hold any references */
@@ -225,9 +229,8 @@ struct client {
 	unsigned int master_data_prefix_len;
 
 	struct login_proxy *login_proxy;
-	char *proxy_user, *proxy_master_user, *proxy_password;
-	const struct dsasl_client_mech *proxy_mech;
-	struct dsasl_client *proxy_sasl_client;
+	char *proxy_mech_name, *proxy_user, *proxy_master_user, *proxy_password;
+	struct dsasl_client_session *proxy_sasl_session;
 	unsigned int proxy_ttl;
 
 	char *auth_mech_name;
@@ -334,6 +337,7 @@ struct client {
 	bool fd_proxying:1;
 	bool shutting_down:1;
 	bool resource_constraint:1;
+	bool unauthenticated_limit_reached:1;
 	/* Defer calling auth ready callback until TLS handshake has been
 	   finished. */
 	bool defer_auth_ready:1;
@@ -358,7 +362,7 @@ void login_client_hooks_add(struct module *module,
 void login_client_hooks_remove(const struct login_client_hooks *hooks);
 
 int client_alloc(int fd, const struct master_service_connection *conn,
-		 struct client **client_r);
+		 struct event *event_parent, struct client **client_r);
 int client_init(struct client *client);
 void client_disconnect(struct client *client, const char *reason);
 void client_destroy(struct client *client, const char *reason);
@@ -392,6 +396,8 @@ struct client *clients_get_first_fd_proxy(void);
 
 void client_add_forward_field(struct client *client, const char *key,
 			      const char *value);
+bool client_forward_field_check(struct client *client, const char *field)
+	ATTR_WARN_UNUSED_RESULT;
 bool client_forward_decode_base64(struct client *client, const char *value);
 void client_set_title(struct client *client);
 bool client_get_extra_disconnect_reason(struct client *client,
@@ -449,6 +455,9 @@ const char *client_proxy_get_state(struct client *client);
 
 void clients_notify_auth_connected(void);
 bool client_destroy_oldest(bool kill, struct timeval *created_r);
+/* Destroy the oldest unauthenticated clients until there are at most limit
+   clients left. */
+void clients_check_unauthenticated_limit(unsigned int limit);
 void clients_destroy_all(void);
 void clients_destroy_all_reason(const char *reason);
 

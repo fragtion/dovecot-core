@@ -14,6 +14,7 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-storage/index \
 	-I$(top_srcdir)/src/lib-doveadm \
 	-I$(top_srcdir)/src/lib-var-expand \
+	-I$(top_srcdir)/src/lib-url \
 	-I$(top_srcdir)/src/doveadm
 
 NOPLUGIN_LDFLAGS =
@@ -36,6 +37,7 @@ lib20_fts_plugin_la_SOURCES = \
 	fts-plugin.c \
 	fts-search.c \
 	fts-search-args.c \
+	fts-search-scores.c \
 	fts-search-serialize.c \
 	fts-settings.c \
 	fts-storage.c \
@@ -56,6 +58,7 @@ noinst_HEADERS = \
 	fts-build-mail.h \
 	fts-plugin.h \
 	fts-search-args.h \
+	fts-search-scores.h \
 	fts-search-serialize.h
 
 pkglibexec_PROGRAMS = xml2text
@@ -71,7 +74,7 @@ doveadm_module_LTLIBRARIES = \
 lib20_doveadm_fts_plugin_la_SOURCES = \
 	doveadm-fts.c
 
-test_programs = test-fts-search-args
+test_programs = test-fts-search-args test-fts-search
 
 test_fts_search_args_SOURCES = test-fts-search-args.c
 test_fts_search_args_CPPFLAGS = $(AM_CPPFLAGS) -I$(top_srcdir)/src/lib-test
@@ -80,5 +83,12 @@ test_fts_search_args_LDADD = \
 	$(LIBDOVECOT_STORAGE) \
 	$(LIBDOVECOT)
 test_fts_search_args_DEPENDENCIES = $(LIBDOVECOT_DEPS) $(LIBDOVECOT_STORAGE_DEPS) $(LIBDOVECOT_LIBLANG_DEPS)
+
+test_fts_search_SOURCES = \
+	test-fts-search.c \
+	fts-search-scores.c
+test_fts_search_CPPFLAGS = $(AM_CPPFLAGS) -I$(top_srcdir)/src/lib-test
+test_fts_search_LDADD = $(LIBDOVECOT)
+test_fts_search_DEPENDENCIES = $(LIBDOVECOT_DEPS)
 
 include $(top_srcdir)/Makefile.test.include

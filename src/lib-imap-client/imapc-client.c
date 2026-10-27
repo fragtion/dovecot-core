@@ -6,10 +6,11 @@
 #include "ioloop.h"
 #include "safe-mkstemp.h"
 #include "settings.h"
+#include "client-auth-settings.h"
+#include "dsasl-client.h"
 #include "imapc-msgmap.h"
 #include "imapc-connection.h"
 #include "imapc-client-private.h"
-#include "imapc-settings.h"
 
 #include <unistd.h>
 
@@ -25,48 +26,115 @@ default_untagged_callback(const struct imapc_untagged_reply *reply ATTR_UNUSED,
 {
 }
 
-struct imapc_client *
-imapc_client_init(const struct imapc_parameters *params,
-		  struct event *event_parent)
+static struct settings_instance *
+imapc_client_init_settings(struct event *event,
+			   struct settings_instance **set_instance)
 {
+	if (*set_instance != NULL)
+		return *set_instance;
+
+	*set_instance = settings_instance_new_from_event(event);
+	event_set_ptr(event, SETTINGS_EVENT_INSTANCE, *set_instance);
+	return *set_instance;
+}
+
+static void
+imapc_client_handle_deprecated_settings(
+	struct event *event, const struct imapc_client_settings *set,
+	struct settings_instance **set_instance)
+{
+	/* SASL */
+
+	const char *const *mech_p =
+		settings_boollist_get(&set->imapc_sasl_mechanisms);
+	while (*mech_p != NULL) {
+		struct settings_instance *instance =
+			imapc_client_init_settings(event, set_instance);
+
+		settings_override(instance, "client_auth+", *mech_p,
+				  SETTINGS_OVERRIDE_TYPE_CODE);
+		settings_override(instance,
+				  t_strdup_printf("client_auth/%s/mechanism",
+						  *mech_p),
+				  *mech_p, SETTINGS_OVERRIDE_TYPE_CODE);
+		mech_p++;
+	}
+}
+
+int imapc_client_init(const struct imapc_parameters *params,
+		      struct event *event_parent,
+		      struct imapc_client **client_r, const char **error_r)
+{
+	struct event *event;
+	struct imapc_client_settings *set;
+	const struct ssl_settings *ssl_set = NULL;
+	struct settings_instance *set_instance = NULL;
+	struct dsasl_client *sasl_client;
 	struct imapc_client *client;
 	pool_t pool;
+
+	*client_r = NULL;
+	*error_r = NULL;
+
+	i_assert(params->temp_path_prefix != NULL &&
+		*params->temp_path_prefix != '\0');
+
+	event = event_create(event_parent);
+	settings_event_add_filter_name(event, IMAPC_SETTINGS_FILTER);
+
+	if (settings_get(event, &imapc_client_setting_parser_info, 0,
+			 &set, error_r) < 0) {
+		event_unref(&event);
+		return -1;
+	}
+	if (strcmp(set->imapc_ssl, "no") != 0 &&
+	    ssl_client_settings_get(event, &ssl_set, error_r) < 0) {
+		settings_free(set);
+		event_unref(&event);
+		return -1;
+	}
+
+	imapc_client_handle_deprecated_settings(event, set,
+						&set_instance);
+
+	sasl_client = dsasl_client_create(event);
+	if (dsasl_client_check_settings(sasl_client, error_r) < 0) {
+		dsasl_client_unref(&sasl_client);
+		settings_instance_free(&set_instance);
+		settings_free(set);
+		event_unref(&event);
+		return -1;
+	}
 
 	pool = pool_alloconly_create("imapc client", 1024);
 	client = p_new(pool, struct imapc_client, 1);
 	client->pool = pool;
 	client->refcount = 1;
-	client->event = event_create(event_parent);
 	client->untagged_callback = default_untagged_callback;
+	client->event = event;
+	client->set = set;
+	client->ssl_set = ssl_set;
+	client->set_instance = set_instance;
+	client->sasl_client = sasl_client;
 
-	client->set = settings_get_or_fatal(client->event, &imapc_setting_parser_info);
 	client->params.session_id_prefix =
 		p_strdup(pool, params->session_id_prefix);
 	client->params.temp_path_prefix =
 		p_strdup(pool, params->temp_path_prefix);
 	client->params.flags = params->flags;
 
-	client->imapc_rawlog_dir =
-		(params->override_rawlog_dir != NULL) ?
-			p_strdup(pool, params->override_rawlog_dir) :
-			p_strdup(pool, client->set->imapc_rawlog_dir);
-	client->password =
-		(params->override_password != NULL) ?
-			p_strdup(pool, params->override_password) :
-			p_strdup(pool, client->set->imapc_password);
-
 	event_set_append_log_prefix(client->event, t_strdup_printf(
 		"imapc(%s:%u): ", client->set->imapc_host, client->set->imapc_port));
 
 	client->ssl_mode = IMAPC_CLIENT_SSL_MODE_NONE;
-	if (strcmp(client->set->imapc_ssl, "imaps") == 0) {
+	if (strcmp(client->set->imapc_ssl, "imaps") == 0)
 		client->ssl_mode = IMAPC_CLIENT_SSL_MODE_IMMEDIATE;
-	} else if (strcmp(client->set->imapc_ssl, "starttls") == 0) {
+	else if (strcmp(client->set->imapc_ssl, "starttls") == 0)
 		client->ssl_mode = IMAPC_CLIENT_SSL_MODE_STARTTLS;
-	}
 
 	p_array_init(&client->conns, pool, 8);
-	return client;
+	*client_r = client;
+	return 0;
 }
 
 void imapc_client_ref(struct imapc_client *client)
@@ -87,8 +155,11 @@ void imapc_client_unref(struct imapc_client **_client)
 		return;
 
 	settings_free(client->set);
+	settings_free(client->ssl_set);
 
+	dsasl_client_unref(&client->sasl_client);
 	event_unref(&client->event);
+	settings_instance_free(&client->set_instance);
 	pool_unref(&client->pool);
 }
 
@@ -114,6 +185,64 @@ void imapc_client_deinit(struct imapc_client **_client)
 
 	imapc_client_disconnect(client);
 	imapc_client_unref(_client);
+}
+
+int imapc_client_settings_match(struct imapc_client *client,
+				struct event *event_other,
+				const char **error_r)
+{
+	const struct imapc_client_settings *imapc_set;
+	const struct ssl_settings *ssl_set;
+	struct settings_instance *set_instance = NULL;
+	struct event *event;
+	int ret = 1;
+
+	/* Look up the settings exactly like imapc_client_init() does, so also
+	   the settings inside the imapc { } filter are seen. */
+	event = event_create(event_other);
+	settings_event_add_filter_name(event, IMAPC_SETTINGS_FILTER);
+
+	if (settings_get(event, &imapc_client_setting_parser_info, 0,
+			 &imapc_set, error_r) < 0) {
+		event_unref(&event);
+		return -1;
+	}
+	if (*client->set->imapc_host == '\0' ||
+	    *imapc_set->imapc_host == '\0') {
+		/* Never match a disabled client */
+		ret = 0;
+	} else if (!settings_equal(&imapc_client_setting_parser_info,
+				   client->set, imapc_set, NULL)) {
+		ret = 0;
+	} else {
+		/* The client translated its deprecated settings into
+		   client_auth settings, so the same must be done here before
+		   they are compared. */
+		imapc_client_handle_deprecated_settings(event, imapc_set,
+							&set_instance);
+	}
+	settings_free(imapc_set);
+
+	if (ret > 0 && client->ssl_set != NULL) {
+		/* imapc_ssl is not "no", so compare also the SSL settings. */
+		if (ssl_client_settings_get(event, &ssl_set, error_r) < 0)
+			ret = -1;
+		else {
+			if (!settings_equal(&ssl_setting_parser_info,
+					    client->ssl_set, ssl_set, NULL))
+				ret = 0;
+			settings_free(ssl_set);
+		}
+	}
+	if (ret > 0) {
+		/* The authentication settings are used only when the
+		   connection is created, so they must be compared here as
+		   well. */
+		ret = client_auth_settings_equal(client->event, event, error_r);
+	}
+	event_unref(&event);
+	settings_instance_free(&set_instance);
+	return ret;
 }
 
 void imapc_client_register_untagged(struct imapc_client *client,
@@ -467,6 +596,11 @@ bool imapc_client_mailbox_is_opened(struct imapc_client_mailbox *box)
 	return TRUE;
 }
 
+const char *imapc_client_get_host(struct imapc_client *client)
+{
+	return client->set->imapc_host;
+}
+
 static bool
 imapc_client_get_any_capabilities(struct imapc_client *client,
 				  enum imapc_capability *capabilities_r)
@@ -510,11 +644,8 @@ int imapc_client_create_temp_fd(struct imapc_client *client,
 	string_t *path;
 	int fd;
 
-	if (client->params.temp_path_prefix == NULL) {
-		e_error(client->event,
-			"temp_path_prefix not set, can't create temp file");
-		return -1;
-	}
+	i_assert(client->params.temp_path_prefix != NULL &&
+		 *client->params.temp_path_prefix != '\0');
 
 	path = t_str_new(128);
 	str_append(path, client->params.temp_path_prefix);

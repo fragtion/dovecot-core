@@ -304,9 +304,6 @@ int ssl_iostream_get_peer_cert_fingerprint(struct ssl_iostream *ssl_io,
 					   const char **pubkey_fp_r,
 					   const char **error_r);
 
-void ssl_iostream_context_set_application_protocols(struct ssl_iostream_context *ssl_ctx,
-						    const char *const *names);
-
 int ssl_iostream_context_init_client(const struct ssl_iostream_settings *set,
 				     struct ssl_iostream_context **ctx_r,
 				     const char **error_r);
@@ -320,13 +317,19 @@ void ssl_iostream_context_unref(struct ssl_iostream_context **ctx);
    until ssl_iostream_context_cache_free() is called. The returned context
    must be unreferenced by the caller.
 
-   Returns 1 if new context was created, 0 if existing was re-used, and
-   -1 on error.
+   application_protocols is the NULL-terminated list of ALPN protocol names to
+   use for the context, or NULL for none. The protocols are part of the cache
+   key, so contexts wanting different protocols are never shared. They must not
+   be set both here and via set->application_protocols.
+
+   Returns 0 on success and -1 on error.
 */
 int ssl_iostream_client_context_cache_get(const struct ssl_iostream_settings *set,
+					  const char *const *application_protocols,
 					  struct ssl_iostream_context **ctx_r,
 					  const char **error_r);
 int ssl_iostream_server_context_cache_get(const struct ssl_iostream_settings *set,
+					  const char *const *application_protocols,
 					  struct ssl_iostream_context **ctx_r,
 					  const char **error_r);
 void ssl_iostream_context_cache_free(void);

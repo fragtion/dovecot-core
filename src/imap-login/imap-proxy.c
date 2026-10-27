@@ -11,6 +11,7 @@
 #include "safe-memset.h"
 #include "compression.h"
 #include "ostream-zlib.h"
+#include "client-auth-settings.h"
 #include "dsasl-client.h"
 #include "imap-login-client.h"
 #include "client-authenticate.h"
@@ -46,14 +47,14 @@ static void proxy_write_id(struct imap_client *client, string_t *str)
 	}
 	if (!client->common.proxy_no_multiplex)
 		str_append(str, "\"x-multiplex\" \"0\" ");
-	str_printfa(str, "\"x-session-id\" \"%s\" "
-		    "\"x-originating-ip\" \"%s\" "
+	str_append(str, "\"x-session-id\" ");
+	imap_append_quoted(str, client_get_session_id(&client->common), 0);
+	str_printfa(str, " \"x-originating-ip\" \"%s\" "
 		    "\"x-originating-port\" \"%u\" "
 		    "\"x-connected-ip\" \"%s\" "
 		    "\"x-connected-port\" \"%u\" "
 		    "\"x-proxy-ttl\" \"%u\" "
 		    "\"x-client-transport\" \"%s\"",
-		    client_get_session_id(&client->common),
 		    net_ip2addr(&client->common.ip),
 		    client->common.remote_port,
 		    net_ip2addr(&client->common.local_ip),
@@ -71,6 +72,8 @@ static void proxy_write_id(struct imap_client *client, string_t *str)
 	for(const char *const *ptr = client->common.auth_passdb_args; *ptr != NULL; ptr++) {
 		const char *suffix;
 		if (str_begins_icase(*ptr, "forward_", &suffix)) {
+			if (!client_forward_field_check(&client->common, suffix))
+				continue;
 			const char *key = t_strconcat("x-forward-",
 						      t_strcut(suffix, '='),
 						      NULL);
@@ -107,10 +110,11 @@ static int proxy_write_starttls(struct imap_client *client, string_t *str)
 
 static int proxy_write_login(struct imap_client *client, string_t *str)
 {
-	struct dsasl_client_settings sasl_set;
-	const unsigned char *output;
-	size_t len;
+	struct client_auth_settings sasl_set;
+	const unsigned char *sasl_output;
+	size_t sasl_output_len;
 	const char *mech_name, *error;
+	int ret;
 
 	/* Send CAPABILITY command if we don't know the capabilities yet.
 	   Also as kind of a Dovecot-backend workaround if the client insisted
@@ -130,7 +134,7 @@ static int proxy_write_login(struct imap_client *client, string_t *str)
 		}
 	}
 
-	if (client->common.proxy_mech == NULL) {
+	if (client->common.proxy_mech_name == NULL) {
 		/* logging in normally - use LOGIN command */
 		if (client->proxy_logindisabled &&
 		    login_proxy_get_ssl_flags(client->common.login_proxy) == 0) {
@@ -150,26 +154,40 @@ static int proxy_write_login(struct imap_client *client, string_t *str)
 		return 0;
 	}
 
-	i_assert(client->common.proxy_sasl_client == NULL);
+	i_assert(client->common.proxy_sasl_session == NULL);
 	i_zero(&sasl_set);
-	sasl_set.event_parent = client->common.event;
+	sasl_set.mechanism = client->common.proxy_mech_name;
 	sasl_set.authid = client->common.proxy_master_user != NULL ?
 		client->common.proxy_master_user : client->common.proxy_user;
 	sasl_set.authzid = client->common.proxy_user;
 	sasl_set.password = client->common.proxy_password;
-	sasl_set.protocol = "imap";
-	sasl_set.host = login_proxy_get_host(client->common.login_proxy);
-	sasl_set.port = login_proxy_get_port(client->common.login_proxy);
-	client->common.proxy_sasl_client =
-		dsasl_client_new(client->common.proxy_mech, &sasl_set);
-	mech_name = dsasl_client_mech_get_name(client->common.proxy_mech);
+
+	struct dsasl_client_parameters sasl_params = {
+		.protocol = "imap",
+		.host = login_proxy_get_host(client->common.login_proxy),
+		.port = login_proxy_get_port(client->common.login_proxy),
+	};
+	ret = dsasl_client_session_create(sasl_client, client->common.event,
+					  &sasl_params, &sasl_set,
+					  &client->common.proxy_sasl_session,
+					  &error);
+	if (ret <= 0) {
+		const char *reason = t_strdup_printf(
+			"SASL client session init failed: %s", error);
+		login_proxy_failed(client->common.login_proxy,
+			login_proxy_get_event(client->common.login_proxy),
+			LOGIN_PROXY_FAILURE_TYPE_INTERNAL, reason);
+		return -1;
+	}
+	mech_name = dsasl_client_session_get_mech_name(
+		client->common.proxy_sasl_session);
 
 	str_append(str, "L AUTHENTICATE ");
 	str_append(str, mech_name);
 	if (client->proxy_sasl_ir) {
-		if (dsasl_client_output(client->common.proxy_sasl_client,
-					&output, &len,
-					&error) != DSASL_CLIENT_RESULT_OK) {
+		if (dsasl_client_session_output(client->common.proxy_sasl_session,
+						&sasl_output, &sasl_output_len,
+						&error) != DSASL_CLIENT_RESULT_OK) {
 			const char *reason = t_strdup_printf(
 				"SASL mechanism %s init failed: %s",
 				mech_name, error);
@@ -178,11 +196,13 @@ static int proxy_write_login(struct imap_client *client, string_t *str)
 				LOGIN_PROXY_FAILURE_TYPE_INTERNAL, reason);
 			return -1;
 		}
-		str_append_c(str, ' ');
-		if (len == 0)
-			str_append_c(str, '=');
-		else
-			base64_encode(output, len, str);
+		if (sasl_output != NULL) {
+			str_append_c(str, ' ');
+			if (sasl_output_len == 0)
+				str_append_c(str, '=');
+			else
+				base64_encode(sasl_output, sasl_output_len, str);
+		}
 	}
 	str_append(str, "\r\n");
 	client->proxy_sent_state |= IMAP_PROXY_SENT_STATE_AUTHENTICATE;
@@ -363,8 +383,14 @@ int imap_proxy_parse_line(struct client *client, const char *line)
 			return -1;
 		return 0;
 	} else if (*line == '+') {
+		if (HAS_ALL_BITS(imap_client->proxy_sent_state,
+				 IMAP_PROXY_SENT_STATE_ID)) {
+			/* literal continuation for the pipelined ID command;
+			   its tagged reply clears the flag */
+			return 0;
+		}
 		/* AUTHENTICATE started. finish it. */
-		if (client->proxy_sasl_client == NULL) {
+		if (client->proxy_sasl_session == NULL) {
 			/* used literals with LOGIN command, just ignore. */
 			return 0;
 		}

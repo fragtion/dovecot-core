@@ -4,6 +4,7 @@
 #include "istream.h"
 #include "lib-signals.h"
 #include "file-lock.h"
+#include "file-lock-proc.h"
 #include "file-dotlock.h"
 #include "time-util.h"
 
@@ -69,15 +70,15 @@ int file_try_lock(int fd, const char *path, int lock_type,
 }
 
 static const char *
-file_lock_find_fcntl(int lock_fd, int lock_type)
+file_lock_find_fcntl(int lock_fd, int lock_type, uoff_t start, uoff_t len)
 {
 	struct flock fl;
 
 	i_zero(&fl);
 	fl.l_type = lock_type;
 	fl.l_whence = SEEK_SET;
-	fl.l_start = 0;
-	fl.l_len = 0;
+	fl.l_start = start;
+	fl.l_len = len;
 
 	if (fcntl(lock_fd, F_GETLK, &fl) < 0 ||
 	    fl.l_type == F_UNLCK || fl.l_pid == -1 || fl.l_pid == 0)
@@ -86,72 +87,20 @@ file_lock_find_fcntl(int lock_fd, int lock_type)
 		fl.l_type == F_RDLCK ? "READ" : "WRITE", (long)fl.l_pid);
 }
 
-static const char *
-file_lock_find_proc_locks(int lock_fd ATTR_UNUSED)
-{
-	/* do anything except Linux support this? don't bother trying it for
-	   OSes we don't know about. */
-#ifdef __linux__
-	static bool have_proc_locks = TRUE;
-	struct stat st;
-	char node_buf[MAX_INT_STRLEN * 3 + 2];
-	struct istream *input;
-	const char *line, *lock_type = "";
-	pid_t pid = 0;
-	int fd;
-
-	if (!have_proc_locks)
-		return NULL;
-
-	if (fstat(lock_fd, &st) < 0)
-		return "";
-	i_snprintf(node_buf, sizeof(node_buf), "%02x:%02x:%llu",
-		   major(st.st_dev), minor(st.st_dev),
-		   (unsigned long long)st.st_ino);
-	fd = open("/proc/locks", O_RDONLY);
-	if (fd == -1) {
-		have_proc_locks = FALSE;
-		return "";
-	}
-	input = i_stream_create_fd_autoclose(&fd, 512);
-	while (pid == 0 && (line = i_stream_read_next_line(input)) != NULL) T_BEGIN {
-		const char *const *args = t_strsplit_spaces(line, " ");
-
-		/* number: FLOCK/POSIX ADVISORY READ/WRITE pid
-		   major:minor:inode region-start region-end */
-		if (str_array_length(args) < 8) {
-			; /* don't continue from within a T_BEGIN {...} T_END */
-		} else if (strcmp(args[5], node_buf) == 0) {
-			lock_type = strcmp(args[3], "READ") == 0 ?
-				"READ" : "WRITE";
-			if (str_to_pid(args[4], &pid) < 0)
-				pid = 0;
-		}
-	} T_END;
-	i_stream_destroy(&input);
-	if (pid == 0) {
-		/* not found */
-		return "";
-	}
-	if (pid == getpid())
-		return " (BUG: lock is held by our own process)";
-	return t_strdup_printf(" (%s lock held by pid %ld)", lock_type, (long)pid);
-#else
-	return "";
-#endif
-}
-
 const char *file_lock_find(int lock_fd, enum file_lock_method lock_method,
-			   int lock_type)
+			   int lock_type, uoff_t start, uoff_t len)
 {
 	const char *ret;
 
-	if (lock_method == FILE_LOCK_METHOD_FCNTL) {
-		ret = file_lock_find_fcntl(lock_fd, lock_type);
-		if (ret[0] != '\0')
-			return ret;
-	}
-	return file_lock_find_proc_locks(lock_fd);
+	/* Prefer /proc/locks, because it can describe the locks in more
+	   detail than F_GETLK. */
+	ret = file_lock_proc_find(lock_fd, lock_method, lock_type, start, len);
+	if (ret[0] != '\0')
+		return ret;
+
+	if (lock_method == FILE_LOCK_METHOD_FCNTL)
+		return file_lock_find_fcntl(lock_fd, lock_type, start, len);
+	return "";
 }
 
 static bool err_is_lock_timeout(time_t started, unsigned int timeout_secs)
@@ -251,7 +200,7 @@ static int file_lock_do(int fd, const char *path, int lock_type,
 				"Timed out after %u seconds%s",
 				path, lock_type_str, timeout_secs,
 				file_lock_find(fd, set->lock_method,
-					       lock_type));
+					       lock_type, 0, 0));
 			return 0;
 		}
 		if (errno == EINTR) {
@@ -267,7 +216,7 @@ static int file_lock_do(int fd, const char *path, int lock_type,
 		if (errno == EDEADLK && !set->allow_deadlock) {
 			i_panic("%s%s", *error_r,
 				file_lock_find(fd, set->lock_method,
-					       lock_type));
+					       lock_type, 0, 0));
 		}
 		return -1;
 	}
@@ -317,7 +266,7 @@ static int file_lock_do(int fd, const char *path, int lock_type,
 				"Timed out after %u seconds%s",
 				path, lock_type_str, timeout_secs,
 				file_lock_find(fd, set->lock_method,
-					       lock_type));
+					       lock_type, 0, 0));
 			return 0;
 		}
 		if (errno == EINTR) {
@@ -332,7 +281,7 @@ static int file_lock_do(int fd, const char *path, int lock_type,
 		if (errno == EDEADLK && !set->allow_deadlock) {
 			i_panic("%s%s", *error_r,
 				file_lock_find(fd, set->lock_method,
-					       lock_type));
+					       lock_type, 0, 0));
 		}
 		return -1;
 #endif

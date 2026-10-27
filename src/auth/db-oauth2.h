@@ -6,14 +6,16 @@ struct oauth2_request;
 struct db_oauth2_request;
 
 #include "passdb.h"
+#include "http-url.h"
 
 struct auth_oauth2_settings {
 	pool_t pool;
-	/* tokeninfo endpoint, format https://endpoint/somewhere?token= */
+	/* tokeninfo endpoint URL template, must contain %{access_token} */
 	const char *tokeninfo_url;
 	/* password grant endpoint, format https://endpoint/somewhere */
-	const char *grant_url;
-	/* introspection endpoint, format https://endpoint/somewhere */
+	struct http_url grant_url;
+	/* introspection endpoint URL template; with introspection_mode=get
+	   must contain %{access_token}, with auth/post must not */
 	const char *introspection_url;
 	/* expected scope(s), optional */
 	ARRAY_TYPE(const_string) scope;
@@ -45,7 +47,7 @@ struct auth_oauth2_settings {
 
 	   https://datatracker.ietf.org/doc/html/rfc7628#section-3.2.2
 	*/
-	const char *openid_configuration_url;
+	struct http_url openid_configuration_url;
 
 	/* How many seconds after token expiration is it still allowed to
 	   succeed the authentication. */

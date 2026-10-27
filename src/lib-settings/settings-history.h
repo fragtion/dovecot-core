@@ -20,22 +20,40 @@ struct setting_history_value {
 	const char *version;
 };
 
+/* A setting was deprecated. It will no longer work once the new version is hit.
+ */
+struct setting_history_deprecate {
+	const char *key;
+	const char *version;
+};
+
 struct settings_history {
 	ARRAY(struct setting_history_default) defaults;
 	ARRAY(struct setting_history_rename) renames;
 	ARRAY(struct setting_history_value) values;
+	ARRAY(struct setting_history_deprecate) deprecates;
 	bool sort_pending;
 };
 
 struct settings_history *settings_history_get(void);
 
-/* Register new defaults/renames. The strings are assumed to be statically
-   allocated, i.e. they are not duplicated. */
+/* Translate a renamed setting key to its current name. The key may have a
+   filter prefix path, which is preserved. Returns the translated key
+   (data stack allocated) or the key itself if it wasn't renamed. Version
+   checks are intentionally not done: renames are applied regardless of
+   dovecot_config_version, because the callers (userdb and command line
+   overrides) have no config version context. */
+const char *settings_history_translate_key(const char *key);
+
+/* Register new defaults/renames/values/deprecates. The strings are assumed to
+   be statically allocated, i.e. they are not duplicated. */
 void settings_history_register_defaults(
 	const struct setting_history_default *defaults, unsigned int count);
 void settings_history_register_renames(
 	const struct setting_history_rename *renames, unsigned int count);
 void settings_history_register_values(
 	const struct setting_history_value *values, unsigned int count);
+void settings_history_register_deprecates(
+	const struct setting_history_deprecate *deprecates, unsigned int count);
 
 #endif

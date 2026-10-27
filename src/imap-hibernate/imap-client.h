@@ -4,15 +4,24 @@
 #include "net.h"
 #include "imap-stats.h"
 
+struct imap_client;
+
 struct imap_client_state {
 	/* required: */
 	const char *username, *mail_log_prefix;
 	/* optional: */
 	const char *session_id, *mailbox_vname, *userdb_fields, *stats;
 	const char *auth_token, *session_pid;
+	/* CAPABILITY string. It's sent back to the imap process when
+	   unhibernating, so it can verify that it hasn't changed. */
+	const char *capability;
 	struct ip_addr local_ip, remote_ip;
 	in_port_t local_port, remote_port;
 	time_t session_created;
+	/* Passed back to the imap process at unhibernation */
+	time_t autoexpunge_next_check;
+	/* Time of the last client input. Used only for non-IDLE clients. */
+	time_t last_input;
 
 	uid_t uid;
 	gid_t gid;
@@ -21,7 +30,7 @@ struct imap_client_state {
 	ino_t peer_ino;
 
 	char *tag;
-	const unsigned char *state;
+	unsigned char *state;
 	size_t state_size;
 
 	struct imap_logout_stats logout_stats;
@@ -34,8 +43,8 @@ struct imap_client_state {
 	bool multiplex_ostream;
 };
 
-struct imap_client *
-imap_client_create(int fd, const struct imap_client_state *state);
+int imap_client_create(int fd, const struct imap_client_state *state,
+		       struct imap_client **client_r, const char **error_r);
 /* Set pointer that is set to NULL when the client is destroyed. */
 void imap_client_set_destroy_ref(struct imap_client *client,
 				 struct imap_client **ref);

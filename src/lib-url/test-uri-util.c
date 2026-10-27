@@ -97,7 +97,17 @@ const char *invalid_uri_tests[] = {
 	"frop://friep\"",
 	"http://example.com/settings/%00/",
 	"http://[]/index.html",
-	"http://example.com:65536/index.html"
+	"http://[2001:db8::7",
+	"http://example.com:65536/index.html",
+	/* schemes with ';'-separated parameters (e.g. aaa) have no "?query"
+	   part, so a bare '?' after the path or the authority must be
+	   rejected rather than silently left unconsumed, including when
+	   the path itself is empty */
+	"aaa:,?.:",
+	"aaa:foo?bar",
+	"aaa://host?x",
+	"aaa://host:6666?x",
+	"aaa:?x"
 };
 
 unsigned int invalid_uri_test_count = N_ELEMENTS(invalid_uri_tests);
@@ -901,13 +911,17 @@ static void test_uri_iax(void)
 }
 
 
-void test_uri(void)
+int main(void)
 {
-	test_uri_valid();
-	test_uri_bounded_buffer();
-	test_uri_invalid();
-	test_uri_rfc();
-	test_uri_escape();
-	test_uri_aaa();
-	test_uri_iax();
+	static void (*const test_functions[])(void) = {
+		test_uri_valid,
+		test_uri_bounded_buffer,
+		test_uri_invalid,
+		test_uri_rfc,
+		test_uri_escape,
+		test_uri_aaa,
+		test_uri_iax,
+		NULL
+	};
+	return test_run(test_functions);
 }

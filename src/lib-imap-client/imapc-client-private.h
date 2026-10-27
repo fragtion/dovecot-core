@@ -2,7 +2,7 @@
 #define IMAPC_CLIENT_PRIVATE_H
 
 #include "imapc-client.h"
-#include "imapc-settings.h"
+#include "imapc-client-settings.h"
 
 #define IMAPC_CLIENT_IDLE_SEND_DELAY_MSECS 100
 
@@ -23,9 +23,15 @@ struct imapc_client {
 	int refcount;
 
 	struct event *event;
-	const struct imapc_settings *set;
+	struct settings_instance *set_instance;
+	const struct imapc_client_settings *set;
 	struct imapc_parameters params;
 	enum imapc_client_ssl_mode ssl_mode;
+	/* Client SSL settings, or NULL if imapc_ssl=no. Used only for
+	   checking matching settings between clients, which is used in
+	   lib-storage to determine whether an existing imapc storage can be
+	   reused. */
+	const struct ssl_settings *ssl_set;
 
 	imapc_untagged_callback_t *untagged_callback;
 	void *untagged_context;
@@ -42,8 +48,7 @@ struct imapc_client {
 	struct ioloop *ioloop;
 	bool stop_on_state_finish;
 
-	const char *imapc_rawlog_dir;
-	const char *password;
+	struct dsasl_client *sasl_client;
 };
 
 struct imapc_client_mailbox {
@@ -71,5 +76,7 @@ void imapc_client_unref(struct imapc_client **client);
 void imapc_command_set_mailbox(struct imapc_command *cmd,
 			       struct imapc_client_mailbox *box);
 void imapc_client_try_stop(struct imapc_client *client);
+
+struct dsasl_client *imapc_client_get_sasl_client(struct imapc_client *client);
 
 #endif

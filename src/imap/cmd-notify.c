@@ -2,6 +2,7 @@
 
 #include "imap-common.h"
 #include "str.h"
+#include "imap-resp-code.h"
 #include "mailbox-list-iter.h"
 #include "imap-quote.h"
 #include "imap-utf7.h"
@@ -548,17 +549,11 @@ bool cmd_notify(struct client_command_context *cmd)
 	const struct imap_arg *args;
 	const char *str;
 	int ret = 0;
-	pool_t pool;
 
 	if (!client_read_args(cmd, 0, 0, &args))
 		return FALSE;
 
-	pool = pool_alloconly_create("imap notify context", 1024);
-	ctx = p_new(pool, struct imap_notify_context, 1);
-	ctx->pool = pool;
-	ctx->client = cmd->client;
-	ctx->utf8 = cmd->utf8;
-	p_array_init(&ctx->namespaces, pool, 4);
+	ctx = imap_notify_context_alloc(cmd->client, cmd->utf8);
 
 	if (!imap_arg_get_atom(&args[0], &str))
 		ret = -1;
@@ -572,7 +567,7 @@ bool cmd_notify(struct client_command_context *cmd)
 	if (ret < 0) {
 		client_send_command_error(cmd, ctx->error != NULL ? ctx->error :
 					  "Invalid arguments.");
-		pool_unref(&pool);
+		pool_unref(&ctx->pool);
 		return TRUE;
 	}
 
@@ -580,7 +575,7 @@ bool cmd_notify(struct client_command_context *cmd)
 		string_t *client_error = t_str_new(128);
 		unsigned int i;
 
-		str_append(client_error, "NO [BADEVENT");
+		str_append(client_error, "NO ["IMAP_RESP_CODE_BADEVENT);
 		for (i = 0; i < N_ELEMENTS(imap_notify_event_names); i++) {
 			if ((ctx->global_used_events & (1 << i)) != 0 &&
 			    ((1 << i) & UNSUPPORTED_EVENTS) != 0) {
@@ -590,7 +585,7 @@ bool cmd_notify(struct client_command_context *cmd)
 		}
 		str_append(client_error, "] Unsupported NOTIFY events.");
 		client_send_tagline(cmd, str_c(client_error));
-		pool_unref(&pool);
+		pool_unref(&ctx->pool);
 		return TRUE;
 	}
 
@@ -598,17 +593,19 @@ bool cmd_notify(struct client_command_context *cmd)
 		/* selected mailbox only */
 	} else if (ctx->global_max_mailbox_names > IMAP_NOTIFY_MAX_NAMES_PER_NS) {
 		client_send_tagline(cmd,
-			"NO [NOTIFICATIONOVERFLOW] Too many mailbox names");
-		pool_unref(&pool);
+			"NO ["IMAP_RESP_CODE_NOTIFICATIONOVERFLOW"] "
+			"Too many mailbox names");
+		pool_unref(&ctx->pool);
 		return TRUE;
 	} else if (imap_notify_refresh_subscriptions(cmd, ctx) < 0) {
 		/* tagline already sent */
-		pool_unref(&pool);
+		pool_unref(&ctx->pool);
 		return TRUE;
 	} else if (imap_notify_begin(ctx) < 0) {
 		client_send_tagline(cmd,
-			"NO [NOTIFICATIONOVERFLOW] NOTIFY not supported for these mailboxes.");
-		pool_unref(&pool);
+			"NO ["IMAP_RESP_CODE_NOTIFICATIONOVERFLOW"] "
+			"NOTIFY not supported for these mailboxes.");
+		pool_unref(&ctx->pool);
 		return TRUE;
 	}
 	if (cmd->client->notify_ctx != NULL)

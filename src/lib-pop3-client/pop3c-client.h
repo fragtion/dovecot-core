@@ -2,12 +2,16 @@
 #define POP3C_CLIENT_H
 
 #include "net.h"
-#include "pop3c-settings.h"
+#include "pop3c-client-settings.h"
+
+struct pop3c_client;
 
 enum pop3c_capability {
 	POP3C_CAPABILITY_PIPELINING	= 0x01,
 	POP3C_CAPABILITY_TOP		= 0x02,
-	POP3C_CAPABILITY_UIDL		= 0x04
+	POP3C_CAPABILITY_UIDL		= 0x04,
+	POP3C_CAPABILITY_STLS           = 0x08,
+	POP3C_CAPABILITY_SASL		= 0x10,
 };
 
 enum pop3c_command_state {
@@ -15,6 +19,7 @@ enum pop3c_command_state {
 	POP3C_COMMAND_STATE_ERR,
 	POP3C_COMMAND_STATE_DISCONNECTED
 };
+extern const char *pop3c_command_state_names[];
 
 enum pop3c_client_ssl_mode {
 	POP3C_CLIENT_SSL_MODE_NONE,
@@ -22,24 +27,14 @@ enum pop3c_client_ssl_mode {
 	POP3C_CLIENT_SSL_MODE_STARTTLS
 };
 
-struct pop3c_client_settings {
-	const char *host;
-	in_port_t port;
+enum pop3c_parameter_flags {
+	POP3C_PARAMETER_CLIENT_DISABLED = BIT(1),
+};
 
-	const char *master_user;
-	const char *username;
-	const char *password;
-
-	const char *dns_client_socket_path;
+struct pop3c_parameters {
 	const char *temp_path_prefix;
 
-	enum pop3c_client_ssl_mode ssl_mode;
-	bool ssl_allow_invalid_cert;
-
-	enum pop3c_features parsed_features;
-
-	const char *rawlog_dir;
-	bool debug;
+	enum pop3c_parameter_flags flags;
 };
 
 typedef void pop3c_login_callback_t(enum pop3c_command_state state,
@@ -47,10 +42,13 @@ typedef void pop3c_login_callback_t(enum pop3c_command_state state,
 typedef void pop3c_cmd_callback_t(enum pop3c_command_state state,
 				  const char *reply, void *context);
 
-struct pop3c_client *
-pop3c_client_init(const struct pop3c_client_settings *set,
-		  struct event *event_parent);
+int pop3c_client_init(const struct pop3c_parameters *params,
+		      struct event *event_parent,
+		      struct pop3c_client **client_r, const char **error_r);
 void pop3c_client_deinit(struct pop3c_client **client);
+
+int pop3c_client_settings_match(struct event *event1, struct event *event2,
+				const char **error_r);
 
 void pop3c_client_login(struct pop3c_client *client,
 			pop3c_login_callback_t *callback, void *context);

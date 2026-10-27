@@ -2,6 +2,9 @@
 
 #include "test-stats-common.h"
 #include "array.h"
+#include "ioloop.h"
+#include "net.h"
+#include "http-client.h"
 
 bool test_stats_callback(struct event *event,
 			 enum event_callback_type type ATTR_UNUSED,
@@ -579,12 +582,167 @@ static void test_stats_metrics_group_by_quantized(void)
 		test_stats_metrics_group_by_quantized_real(&quantized_tests[i], i);
 }
 
+static void test_stats_metrics_group_by_exponential_bounds(void)
+{
+	static const struct {
+		const char *min, *max, *base;
+		bool success;
+	} tests[] = {
+		{ "0", "62", "2", TRUE },
+		{ "0", "63", "2", FALSE },
+		{ "0", "18", "10", TRUE },
+		{ "0", "19", "10", FALSE },
+		{ "0", "62", "10", FALSE },
+		{ "5", "5", "10", FALSE },
+		{ "6", "5", "10", FALSE },
+	};
+	const char *error;
+
+	test_begin("stats metrics (exponential group by bounds)");
+	for (unsigned int i = 0; i < N_ELEMENTS(tests); i++) {
+		const char *const settings[] = {
+			"metric=test",
+			"metric/test/metric_name=test",
+			"metric/test/filter=event=test",
+			"metric/test/group_by=foobar",
+			"metric/test/group_by/foobar/field=foobar",
+			"metric/test/group_by/foobar/method=exponential",
+			"metric/test/group_by/foobar/method/exponential/method=exponential",
+			t_strconcat("metric/test/group_by/foobar/method/exponential/min_magnitude=",
+				    tests[i].min, NULL),
+			t_strconcat("metric/test/group_by/foobar/method/exponential/max_magnitude=",
+				    tests[i].max, NULL),
+			t_strconcat("metric/test/group_by/foobar/method/exponential/base=",
+				    tests[i].base, NULL),
+			NULL
+		};
+		int ret = test_stats_try_init(settings, &error);
+		test_assert_idx((ret == 0) == tests[i].success, i);
+		if (ret == 0)
+			test_stats_deinit();
+	}
+	test_end();
+}
+
+static void test_stats_metrics_group_by_legacy_exponential_bounds(void)
+{
+	static const struct {
+		const char *str;
+		bool success;
+	} tests[] = {
+		{ "x:exponential:0:62:2", TRUE },
+		{ "x:exponential:0:63:2", FALSE },
+		{ "x:exponential:0:18:10", TRUE },
+		{ "x:exponential:0:19:10", FALSE },
+		{ "x:exponential:0:4000000000:10", FALSE },
+		{ "x:exponential:0:4294967298:2", FALSE },
+		{ "x:exponential:5:5:10", FALSE },
+	};
+	ARRAY_TYPE(stats_metric_settings_group_by) group_by;
+	const char *error;
+
+	test_begin("stats metrics (legacy exponential group by bounds)");
+	pool_t pool = pool_alloconly_create("legacy group_by", 1024);
+	for (unsigned int i = 0; i < N_ELEMENTS(tests); i++) {
+		p_clear(pool);
+		bool success = parse_legacy_metric_group_by(pool, tests[i].str,
+							    &group_by, &error);
+		test_assert_idx(success == tests[i].success, i);
+	}
+	pool_unref(&pool);
+	test_end();
+}
+
+static void test_stats_metrics_exporter_init_failure(void)
+{
+	static const char *const bad_driver[] = {
+		"event_exporter=foo",
+		"event_exporter/foo/event_exporter_driver=bogus",
+		"event_exporter/foo/event_exporter_format=json",
+		NULL
+	};
+	const char *error;
+
+	test_begin("stats metrics (exporter init failure doesn't crash)");
+	test_assert(test_stats_try_init(bad_driver, &error) < 0);
+	test_end();
+}
+
+static void
+test_stats_export_http_post_timeout_run(const char *timeout_setting,
+					bool expect_timeout)
+{
+	struct ioloop *ioloop = io_loop_create();
+	struct ip_addr ip;
+	in_port_t port = 0;
+
+	/* The listener never accepts or answers: the kernel completes the
+	   TCP handshake and the request just waits for a response. */
+	test_assert(net_addr2ip("127.0.0.1", &ip) == 0);
+	int fd_listen = net_listen(&ip, &port, 128);
+	if (fd_listen == -1)
+		i_fatal("net_listen() failed: %m");
+
+	const char *const settings_blob[] = {
+		"metric=test",
+		"metric/test/metric_name=test",
+		"metric/test/metric_filter=event=test",
+		"metric/test/metric_exporter=http",
+		"event_exporter=http",
+		"event_exporter/http/event_exporter_name=http",
+		"event_exporter/http/event_exporter_driver=http-post",
+		"event_exporter/http/event_exporter_format=json",
+		t_strdup_printf("event_exporter/http/event_exporter_http_post_url="
+				"http://127.0.0.1:%u/", port),
+		timeout_setting,
+		NULL
+	};
+	test_stats_init(settings_blob);
+
+	struct event *event = event_create(NULL);
+	event_add_category(event, &test_category);
+	event_set_name(event, "test");
+	test_event_send(event);
+	event_unref(&event);
+
+	if (expect_timeout) {
+		test_expect_error_string(t_strdup_printf(
+			"Failed to export event via HTTP POST: %d",
+			HTTP_CLIENT_REQUEST_ERROR_TIMED_OUT));
+	}
+	struct timeout *to = timeout_add(1500, io_loop_stop, ioloop);
+	io_loop_run(ioloop);
+	timeout_remove(&to);
+	test_expect_no_more_errors();
+
+	test_stats_deinit();
+	i_close_fd(&fd_listen);
+	io_loop_destroy(&ioloop);
+}
+
+static void test_stats_export_http_post_timeout(void)
+{
+	test_begin("stats export http-post default request timeout");
+	test_stats_export_http_post_timeout_run(NULL, TRUE);
+	test_end();
+
+	test_begin("stats export http-post explicit request timeout");
+	test_stats_export_http_post_timeout_run(
+		"event_exporter/http/http_client_request_absolute_timeout=10s",
+		FALSE);
+	test_end();
+}
+
 int main(void) {
 	void (*const test_functions[])(void) = {
 		test_stats_metrics,
 		test_stats_metrics_filter,
 		test_stats_metrics_group_by_discrete,
 		test_stats_metrics_group_by_quantized,
+		test_stats_metrics_group_by_exponential_bounds,
+		test_stats_metrics_group_by_legacy_exponential_bounds,
+		test_stats_metrics_exporter_init_failure,
+		test_stats_export_http_post_timeout,
 		NULL
 	};
 

@@ -2,6 +2,7 @@
 
 #include "imap-common.h"
 #include "str.h"
+#include "imap-resp-code.h"
 #include "ostream.h"
 #include "imap-quote.h"
 #include "mailbox-list-iter.h"
@@ -95,9 +96,11 @@ static int imap_notify_status(struct imap_notify_namespace *notify_ns,
 	} else if (imap_status_get_result(client, box, &items, &result) < 0) {
 		/* hide permission errors from client. we don't want to leak
 		   information about existence of mailboxes where user doesn't
-		   have access to */
+		   have access to. also ignore mailboxes that were deleted
+		   after the change was noticed - the deletion is reported
+		   separately. */
 		(void)mailbox_get_last_error(box, &error);
-		if (error != MAIL_ERROR_PERM)
+		if (error != MAIL_ERROR_PERM && error != MAIL_ERROR_NOTFOUND)
 			ret = -1;
 	} else {
 		bool utf8 = client_has_enabled(client, imap_feature_utf8accept);
@@ -131,8 +134,15 @@ imap_notify_next(struct imap_notify_namespace *notify_ns,
 			mailbox_flags = 0;
 		} else if (mailbox_list_mailbox(notify_ns->ns->list,
 						rec->storage_name,
-						&mailbox_flags) < 0)
+						&mailbox_flags) < 0 ||
+			   (mailbox_flags & MAILBOX_NONEXISTENT) != 0) {
+			/* Lookup failed, or the mailbox was already deleted
+			   but the deletion hasn't yet been synced to the
+			   mailbox list index. Don't report the creation with
+			   \NonExistent - the delete event is sent separately
+			   once the deletion is noticed. */
 			mailbox_flags = 0;
+		}
 		if ((ret = imap_notify_list(notify_ns, rec, mailbox_flags)) <= 0)
 			return ret;
 	}
@@ -313,6 +323,45 @@ imap_client_notify_selected(struct client *client)
 	return ret;
 }
 
+static void imap_notify_overflow_finish(struct client *client)
+{
+	struct imap_notify_context *old_ctx = client->notify_ctx;
+
+	timeout_remove(&old_ctx->to_overflow);
+	if (old_ctx->notifying) {
+		/* FETCH notifications are still being sent. Finish after
+		   they're done. */
+		return;
+	}
+	if (old_ctx->watching_mailbox)
+		mailbox_notify_changes_stop(client->mailbox);
+
+	/* behave as if NOTIFY NONE was received */
+	client->notify_ctx = imap_notify_context_alloc(client, old_ctx->utf8);
+	imap_notify_deinit(&old_ctx);
+	client->notify_immediate_expunges = FALSE;
+	client->notify_count_changes = FALSE;
+	client->notify_flag_changes = FALSE;
+}
+
+static void imap_notify_failed(struct imap_notify_context *ctx)
+{
+	if (ctx->overflowed)
+		return;
+	ctx->overflowed = TRUE;
+
+	client_send_line(ctx->client,
+		"* OK ["IMAP_RESP_CODE_NOTIFICATIONOVERFLOW"] "
+		"Failed to send some NOTIFY events, notifications disabled");
+
+	/* The context can't be freed yet, because the caller may still be
+	   using it. Until then the overflowed flag makes it ignore all
+	   changes. */
+	timeout_remove(&ctx->to_watch);
+	ctx->to_overflow = timeout_add_short(0, imap_notify_overflow_finish,
+					     ctx->client);
+}
+
 static int imap_client_notify_more(struct client *client)
 {
 	struct imap_notify_namespace *notify_ns;
@@ -325,21 +374,20 @@ static int imap_client_notify_more(struct client *client)
 	if (client->notify_ctx->fetch_ctx != NULL) {
 		if ((ret = imap_client_notify_selected(client)) < 0) {
 			client->notify_ctx->fetch_ctx->state.failed = FALSE;
-			ret = -1;
+			imap_notify_failed(client->notify_ctx);
 		}
 	}
 
 	/* send notifications for non-selected mailboxes */
 	array_foreach_modifiable(&client->notify_ctx->namespaces, notify_ns) {
-		if (ret == 0)
+		if (ret <= 0 || client->notify_ctx->overflowed)
 			break;
-		if (imap_client_notify_ns(notify_ns) < 0)
-			ret = -1;
-	}
-
-	if (ret < 0) {
-		client_send_line(client,
-			"* NO NOTIFY error, some events may have got lost");
+		if (imap_client_notify_ns(notify_ns) < 0) {
+			/* NOTIFICATIONOVERFLOW already tells the client about
+			   this. Don't fail the selected mailbox sync, since its
+			   storage error wouldn't be related to this failure. */
+			imap_notify_failed(client->notify_ctx);
+		}
 	}
 	event_reason_end(&reason);
 	return ret;
@@ -360,6 +408,8 @@ int imap_client_notify_newmails(struct client *client)
 	}
 	if (client->notify_ctx->notifying)
 		return imap_client_notify_more(client);
+	if (client->notify_ctx->overflowed)
+		return 1;
 	client->notify_ctx->notifying = TRUE;
 
 	i_assert(!fetch_ctx->state.fetching);
@@ -381,16 +431,31 @@ int imap_client_notify_newmails(struct client *client)
 
 void imap_client_notify_finished(struct client *client)
 {
-	if (client->notify_ctx != NULL)
-		client->notify_ctx->notifying = FALSE;
+	struct imap_notify_context *ctx = client->notify_ctx;
+
+	if (ctx == NULL)
+		return;
+	ctx->notifying = FALSE;
+	if (ctx->overflowed && ctx->to_overflow == NULL) {
+		/* the overflow was waiting for FETCH notifications to
+		   finish */
+		ctx->to_overflow = timeout_add_short(0,
+			imap_notify_overflow_finish, client);
+	}
 }
 
 static void notify_callback(struct imap_notify_namespace *notify_ns)
 {
+	struct client *client = notify_ns->ctx->client;
+
+	if (notify_ns->ctx->overflowed)
+		return;
+
 	struct event_reason *reason = event_reason_begin("imap:notify_update");
-	o_stream_cork(notify_ns->ctx->client->output);
-	imap_client_notify_ns(notify_ns);
-	o_stream_uncork(notify_ns->ctx->client->output);
+	o_stream_cork(client->output);
+	if (imap_client_notify_ns(notify_ns) < 0)
+		imap_notify_failed(notify_ns->ctx);
+	o_stream_uncork(client->output);
 	event_reason_end(&reason);
 }
 
@@ -476,7 +541,7 @@ void imap_client_notify_command_freed(struct client *client)
 {
 	struct imap_notify_context *ctx = client->notify_ctx;
 
-	if (ctx == NULL)
+	if (ctx == NULL || ctx->overflowed)
 		return;
 
 	if (client->command_queue_size > 0) {
@@ -504,6 +569,21 @@ void imap_client_notify_command_allocated(struct client *client)
 		ctx->watching_mailbox = FALSE;
 	}
 	timeout_remove(&ctx->to_watch);
+}
+
+struct imap_notify_context *
+imap_notify_context_alloc(struct client *client, bool utf8)
+{
+	struct imap_notify_context *ctx;
+	pool_t pool;
+
+	pool = pool_alloconly_create("imap notify context", 1024);
+	ctx = p_new(pool, struct imap_notify_context, 1);
+	ctx->pool = pool;
+	ctx->client = client;
+	ctx->utf8 = utf8;
+	p_array_init(&ctx->namespaces, pool, 4);
+	return ctx;
 }
 
 int imap_notify_begin(struct imap_notify_context *ctx)
@@ -545,6 +625,7 @@ void imap_notify_deinit(struct imap_notify_context **_ctx)
 			mailbox_list_notify_deinit(&notify_ns->notify);
 	}
 	timeout_remove(&ctx->to_watch);
+	timeout_remove(&ctx->to_overflow);
 	if (ctx->fetch_ctx != NULL)
 		imap_fetch_free(&ctx->fetch_ctx);
 	pool_unref(&ctx->pool);
@@ -554,6 +635,8 @@ void imap_notify_flush(struct imap_notify_context *ctx)
 {
 	struct imap_notify_namespace *notify_ns;
 
+	if (ctx->overflowed)
+		return;
 	array_foreach_modifiable(&ctx->namespaces, notify_ns) {
 		if (notify_ns->notify != NULL)
 			mailbox_list_notify_flush(notify_ns->notify);

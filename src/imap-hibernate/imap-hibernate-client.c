@@ -142,6 +142,8 @@ imap_hibernate_client_parse_input(const char *const *args, pool_t pool,
 			state_r->auth_token = value;
 		} else if (strcmp(key, "session_pid") == 0) {
 			state_r->session_pid = value;
+		} else if (strcmp(key, "capability") == 0) {
+			state_r->capability = value;
 		} else if (strcmp(key, "idle-cmd") == 0) {
 			state_r->idle_cmd = TRUE;
 		} else if (strcmp(key, "session") == 0) {
@@ -152,6 +154,18 @@ imap_hibernate_client_parse_input(const char *const *args, pool_t pool,
 			if (str_to_time(value, &state_r->session_created) < 0) {
 				*error_r = t_strdup_printf(
 					"Invalid session_created value: %s", value);
+				return -1;
+			}
+		} else if (strcmp(key, "autoexpunge_next_check") == 0) {
+			if (str_to_time(value, &state_r->autoexpunge_next_check) < 0) {
+				*error_r = t_strdup_printf(
+					"Invalid autoexpunge_next_check value: %s", value);
+				return -1;
+			}
+		} else if (strcmp(key, "last_input") == 0) {
+			if (str_to_time(value, &state_r->last_input) < 0) {
+				*error_r = t_strdup_printf(
+					"Invalid last_input value: %s", value);
 				return -1;
 			}
 		} else if (strcmp(key, "userdb_fields") == 0) {
@@ -178,7 +192,8 @@ imap_hibernate_client_parse_input(const char *const *args, pool_t pool,
 					"Invalid state base64 value: %s", value);
 				return -1;
 			}
-			state_r->state = state_buf->data;
+			state_r->state =
+				buffer_get_modifiable_data(state_buf, NULL);
 			state_r->state_size = state_buf->used;
 		} else if (strcmp(key, "fetch_hdr_count") == 0) {
 			if (str_to_uint(value, &state_r->logout_stats.fetch_hdr_count) < 0) {
@@ -248,8 +263,8 @@ imap_hibernate_client_parse_input(const char *const *args, pool_t pool,
 			}
 		}
 	}
-	if (state_r->tag == NULL) {
-		*error_r = "Missing tag";
+	if (state_r->idle_cmd && state_r->tag == NULL) {
+		*error_r = "Missing tag for IDLE client";
 		return -1;
 	}
 	if (peer_dev_major != 0 || peer_dev_minor != 0)
@@ -272,7 +287,11 @@ imap_hibernate_client_input_args(struct connection *conn,
 			"-Failed to parse client input: %s\n", error));
 		return -1;
 	}
-	client->imap_client = imap_client_create(fd, &state);
+	if (imap_client_create(fd, &state, &client->imap_client, &error) < 0) {
+		o_stream_nsend_str(conn->output,
+				   t_strdup_printf("-%s\n", error));
+		return -1;
+	}
 	/* the client can be destroyed already before it's finished, e.g. if
 	   the user is kicked. make sure our pointer is set to NULL then. */
 	imap_client_set_destroy_ref(client->imap_client, &client->imap_client);

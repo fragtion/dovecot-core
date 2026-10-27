@@ -1,7 +1,8 @@
 /* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
-#include "dsasl-client-private.h"
+
+#include "dsasl-client-protected.h"
 #include "dsasl-client-mech-ntlm-dummy.h"
 
 /* Dummy NTLM mechanism
@@ -15,24 +16,43 @@ enum ntlm_state {
 	STATE_RESPONSE
 };
 
-struct ntlm_dsasl_client {
-	struct dsasl_client client;
+struct ntlm_sasl_session {
+	struct dsasl_client_mech_session session;
+
 	enum ntlm_state state;
 };
 
 void dasl_client_mech_ntlm_init_dummy(void);
 
+static struct dsasl_client_mech_session *mech_ntlm_auth_new(pool_t pool)
+{
+	struct ntlm_sasl_session *nsession =
+		p_new(pool, struct ntlm_sasl_session, 1);
+	return &nsession->session;
+}
+
+static int
+mech_ntlm_auth_check(struct dsasl_client_mech_session *msession,
+		     const char **error_r)
+{
+	if (dsasl_client_session_check_authid(msession, error_r) < 0)
+		return -1;
+	if (dsasl_client_session_check_password(msession, error_r) < 0)
+		return -1;
+	return 0;
+}
+
 static enum dsasl_client_result
-mech_ntlm_input(struct dsasl_client *_client,
-		const unsigned char *input, size_t input_len,
-		const char **error_r)
+mech_ntlm_auth_input(struct dsasl_client_mech_session *msession,
+		     const unsigned char *input, size_t input_len,
+		     const char **error_r)
 {
 	static const char *challenge = "Challenge";
-	struct ntlm_dsasl_client *client =
-		container_of(_client, struct ntlm_dsasl_client, client);
+	struct ntlm_sasl_session *nsession =
+		container_of(msession, struct ntlm_sasl_session, session);
 	size_t chal_size;
 
-	if (client->state == STATE_RESPONSE) {
+	if (nsession->state == STATE_RESPONSE) {
 		*error_r = "Server didn't finish authentication";
 		return DSASL_CLIENT_RESULT_ERR_PROTOCOL;
 	}
@@ -42,36 +62,27 @@ mech_ntlm_input(struct dsasl_client *_client,
 		*error_r = "Invalid challenge";
 		return DSASL_CLIENT_RESULT_ERR_PROTOCOL;
 	}
-	client->state++;
+	nsession->state++;
 	return DSASL_CLIENT_RESULT_OK;
 }
 
 static enum dsasl_client_result
-mech_ntlm_output(struct dsasl_client *_client,
-		  const unsigned char **output_r, size_t *output_len_r,
-		  const char **error_r)
+mech_ntlm_auth_output(struct dsasl_client_mech_session *msession,
+		      const unsigned char **output_r, size_t *output_len_r,
+		      const char **error_r ATTR_UNUSED)
 {
-	struct ntlm_dsasl_client *client =
-		container_of(_client, struct ntlm_dsasl_client, client);
-
-	if (_client->set.authid == NULL) {
-		*error_r = "authid not set";
-		return DSASL_CLIENT_RESULT_ERR_INTERNAL;
-	}
-	if (_client->password == NULL) {
-		*error_r = "password not set";
-		return DSASL_CLIENT_RESULT_ERR_INTERNAL;
-	}
-
+	struct ntlm_sasl_session *nsession =
+		container_of(msession, struct ntlm_sasl_session, session);
 	const char *response;
 
-	switch (client->state) {
+	switch (nsession->state) {
 	case STATE_INIT:
 		*output_r = uchar_empty_ptr;
 		*output_len_r = 0;
 		return DSASL_CLIENT_RESULT_OK;
 	case STATE_RESPONSE:
-		response = t_strconcat("Response: ", _client->set.authid, NULL);
+		response = t_strconcat("Response: ",
+				       msession->authid, NULL);
 		*output_r = (const unsigned char *)response;
 		*output_len_r = strlen(response);
 		return DSASL_CLIENT_RESULT_OK;
@@ -81,13 +92,14 @@ mech_ntlm_output(struct dsasl_client *_client,
 
 const struct dsasl_client_mech dsasl_client_mech_ntlm = {
 	.name = SASL_MECH_NAME_NTLM,
-	.struct_size = sizeof(struct ntlm_dsasl_client),
 
-	.input = mech_ntlm_input,
-	.output = mech_ntlm_output
+	.auth_new = mech_ntlm_auth_new,
+	.auth_check = mech_ntlm_auth_check,
+	.auth_input = mech_ntlm_auth_input,
+	.auth_output = mech_ntlm_auth_output,
 };
 
-void dsasl_client_mech_ntlm_init_dummy(void)
+void dsasl_client_init_ntlm_dummy(struct dsasl_client *client)
 {
-	dsasl_client_mech_register(&dsasl_client_mech_ntlm);
+	dsasl_client_mech_register(client, &dsasl_client_mech_ntlm);
 }

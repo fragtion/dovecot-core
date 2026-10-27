@@ -9,6 +9,7 @@
 #include "str.h"
 #include "str-sanitize.h"
 #include "strescape.h"
+#include "client-auth-settings.h"
 #include "dsasl-client.h"
 #include "client.h"
 #include "smtp-syntax.h"
@@ -70,6 +71,8 @@ proxy_compose_xclient_forward(struct submission_client *client)
 	str = t_str_new(128);
 	for (arg = client->common.auth_passdb_args; *arg != NULL; arg++) {
 		if (str_begins_icase(*arg, "forward_", &value)) {
+			if (!client_forward_field_check(&client->common, value))
+				continue;
 			if (str_len(str) > 0)
 				str_append_c(str, '\t');
 			str_append_tabescaped(str, value);
@@ -230,14 +233,36 @@ proxy_send_xclient(struct submission_client *client, struct ostream *output)
 	return 1;
 }
 
+static void
+proxy_send_auth_command(struct submission_client *client,
+			struct ostream *output, const char *mech_name,
+			const char *init_resp)
+{
+	string_t *str = t_str_new(128);
+
+	str_printfa(str, "AUTH %s", mech_name);
+	if (init_resp != NULL) {
+		if (*init_resp == '\0')
+			str_append(str, " =");
+		else {
+			str_append_c(str, ' ');
+			str_append(str, init_resp);
+		}
+	}
+	str_append(str, "\r\n");
+	o_stream_nsend(output, str_data(str), str_len(str));
+
+	client->proxy_state = SUBMISSION_PROXY_AUTHENTICATE;
+}
+
 static int
 proxy_send_login(struct submission_client *client, struct ostream *output)
 {
-	struct dsasl_client_settings sasl_set;
+	struct client_auth_settings sasl_set;
 	const unsigned char *sasl_output;
 	size_t sasl_output_len;
 	const char *mech_name, *error;
-	string_t *str;
+	int ret;
 
 	if ((client->proxy_capability & SMTP_CAPABILITY_AUTH) == 0) {
 		/* Prevent sending credentials to a server that has login
@@ -249,26 +274,36 @@ proxy_send_login(struct submission_client *client, struct ostream *output)
 		return -1;
 	}
 
-	str = t_str_new(128);
-
-	if (client->common.proxy_mech == NULL)
-		client->common.proxy_mech = &dsasl_client_mech_plain;
-
-	i_assert(client->common.proxy_sasl_client == NULL);
+	i_assert(client->common.proxy_sasl_session == NULL);
 	i_zero(&sasl_set);
-	sasl_set.event_parent = client->common.event;
+	sasl_set.mechanism = client->common.proxy_mech_name;
 	sasl_set.authid = client->common.proxy_master_user != NULL ?
 		client->common.proxy_master_user : client->common.proxy_user;
 	sasl_set.authzid = client->common.proxy_user;
 	sasl_set.password = client->common.proxy_password;
-	client->common.proxy_sasl_client =
-		dsasl_client_new(client->common.proxy_mech, &sasl_set);
-	mech_name = dsasl_client_mech_get_name(client->common.proxy_mech);
+	struct dsasl_client_parameters sasl_params = {
+		.protocol = "smtp",
+		.host = login_proxy_get_host(client->common.login_proxy),
+		.port = login_proxy_get_port(client->common.login_proxy),
+	};
+	ret = dsasl_client_session_create(sasl_client, client->common.event,
+					  &sasl_params, &sasl_set,
+					  &client->common.proxy_sasl_session,
+					  &error);
+	if (ret <= 0) {
+		const char *reason = t_strdup_printf(
+			"SASL client session init failed: %s", error);
+		login_proxy_failed(client->common.login_proxy,
+			login_proxy_get_event(client->common.login_proxy),
+			LOGIN_PROXY_FAILURE_TYPE_INTERNAL, reason);
+		return -1;
+	}
+	mech_name = dsasl_client_session_get_mech_name(
+		client->common.proxy_sasl_session);
 
-	str_printfa(str, "AUTH %s", mech_name);
-	if (dsasl_client_output(client->common.proxy_sasl_client,
-				&sasl_output, &sasl_output_len,
-				&error) != DSASL_CLIENT_RESULT_OK) {
+	if (dsasl_client_session_output(client->common.proxy_sasl_session,
+					&sasl_output, &sasl_output_len,
+					&error) != DSASL_CLIENT_RESULT_OK) {
 		const char *reason = t_strdup_printf(
 			"SASL mechanism %s init failed: %s",
 			mech_name, error);
@@ -276,6 +311,14 @@ proxy_send_login(struct submission_client *client, struct ostream *output)
 			login_proxy_get_event(client->common.login_proxy),
 			LOGIN_PROXY_FAILURE_TYPE_INTERNAL, reason);
 		return -1;
+	}
+	if (sasl_output == NULL) {
+		proxy_send_auth_command(client, output, mech_name, NULL);
+		return 0;
+	}
+	if (sasl_output_len == 0) {
+		proxy_send_auth_command(client, output, mech_name, "");
+		return 0;
 	}
 
 	string_t *sasl_output_base64 = t_str_new(
@@ -295,21 +338,16 @@ proxy_send_login(struct submission_client *client, struct ostream *output)
 	   This indicates that the response is present, but contains no data.
 	 */
 
+	const char *init_resp = NULL;
+
 	i_assert(client->proxy_sasl_ir == NULL);
-	if (str_len(sasl_output_base64) == 0)
-		str_append(str, " =");
-	else if ((5 + strlen(mech_name) + 1 + str_len(sasl_output_base64)) >
-		 SMTP_BASE_LINE_LENGTH_LIMIT)
+	if ((5 + strlen(mech_name) + 1 + str_len(sasl_output_base64)) >
+	    SMTP_BASE_LINE_LENGTH_LIMIT)
 		client->proxy_sasl_ir = i_strdup(str_c(sasl_output_base64));
-	else {
-		str_append_c(str, ' ');
-		str_append_str(str, sasl_output_base64);
-	}
+	else
+		init_resp = str_c(sasl_output_base64);
 
-	str_append(str, "\r\n");
-	o_stream_nsend(output, str_data(str), str_len(str));
-
-	client->proxy_state = SUBMISSION_PROXY_AUTHENTICATE;
+	proxy_send_auth_command(client, output, mech_name, init_resp);
 	return 0;
 }
 
@@ -659,7 +697,7 @@ int submission_proxy_parse_line(struct client *client, const char *line)
 				LOGIN_PROXY_FAILURE_TYPE_PROTOCOL, reason);
 			return -1;
 		}
-		if (status == 334 && client->proxy_sasl_client != NULL) {
+		if (status == 334 && client->proxy_sasl_session != NULL) {
 			/* continue SASL authentication */
 			if (submission_proxy_continue_sasl_auth(
 				client, output, text, last_line) < 0)

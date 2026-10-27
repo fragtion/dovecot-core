@@ -257,7 +257,7 @@ static int master_input_auth_request(struct auth_master_connection *conn,
 			arg++;
 		}
 
-		(void)auth_request_import_info(auth_request, name, arg);
+		(void)auth_request_import_auth(auth_request, name, arg);
 	}
 
 	if (auth_request->fields.protocol == NULL) {
@@ -331,8 +331,10 @@ static void user_callback(enum userdb_result result,
 		if (auth_request->userdb_lookup_tempfailed) {
 			value = auth_fields_find(
 				auth_request->fields.userdb_reply, "reason");
-			if (value != NULL)
-				str_printfa(str, "\treason=%s", value);
+			if (value != NULL) {
+				str_append(str, "\treason=");
+				str_append_tabescaped(str, value);
+			}
 		}
 		break;
 	case USERDB_RESULT_USER_UNKNOWN:

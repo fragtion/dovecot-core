@@ -104,6 +104,26 @@ struct auth_user_info {
 	bool debug;
 };
 
+/* Returns TRUE if a key=value pair is acceptable as a forward field: a
+   non-empty key without '=' or control characters, and a value (may be
+   NULL) whose only control characters are the ones tabescape round-trips. */
+bool auth_forward_field_is_valid(const char *key, const char *value);
+/* Same check for a "key=value" or "key" line as produced by
+   p_strsplit_tabescaped(). */
+bool auth_forward_field_line_is_valid(const char *line);
+
+#define AUTH_MAX_SESSION_ID_LEN 64
+
+/* Returns TRUE if a session ID received from a proxy (IMAP ID, XCLIENT
+   SESSION) consists of acceptable characters: non-empty visible ASCII
+   without DQUOTE or backslash, so it can be forwarded as-is by every
+   protocol and logged safely. The length is not limited: use this where
+   the ID legitimately grows by a suffix per hop (LMTP proxying). */
+bool auth_session_id_chars_valid(const char *session_id);
+/* Same, and at most AUTH_MAX_SESSION_ID_LEN bytes. This is the limit for a
+   session ID received by a login process. */
+bool auth_session_id_is_valid(const char *session_id);
+
 /*
  * PassDB
  */

@@ -342,6 +342,32 @@ bool event_filter_has_field_prefix(struct event_filter *filter,
 	return FALSE;
 }
 
+static bool
+event_filter_node_has_source_location(const struct event_filter_node *node)
+{
+	switch (node->op) {
+	case EVENT_FILTER_OP_AND:
+	case EVENT_FILTER_OP_OR:
+		return event_filter_node_has_source_location(node->children[0]) ||
+			event_filter_node_has_source_location(node->children[1]);
+	case EVENT_FILTER_OP_NOT:
+		return event_filter_node_has_source_location(node->children[0]);
+	default:
+		return node->type == EVENT_FILTER_NODE_TYPE_EVENT_SOURCE_LOCATION;
+	}
+}
+
+bool event_filter_has_source_location(struct event_filter *filter)
+{
+	const struct event_filter_query_internal *query;
+
+	array_foreach(&filter->queries, query) {
+		if (event_filter_node_has_source_location(query->expr))
+			return TRUE;
+	}
+	return FALSE;
+}
+
 bool event_filter_category_to_log_type(const char *name,
 				       enum event_filter_log_type *log_type_r)
 {
@@ -1001,6 +1027,41 @@ event_match_field(struct event_filter *filter, struct event *event,
 }
 
 static bool
+event_filter_source_filename_match(const char *wanted, size_t wanted_len,
+				   const char *source_filename)
+{
+	/* __FILE__ may contain a path (e.g. meson or VPATH builds), so match
+	   the wanted filename against the end of the path at a '/' boundary. */
+	size_t source_len = strlen(source_filename);
+	if (source_len < wanted_len)
+		return FALSE;
+
+	const char *suffix = source_filename + (source_len - wanted_len);
+	return memcmp(suffix, wanted, wanted_len) == 0 &&
+		(suffix == source_filename || suffix[-1] == '/');
+}
+
+static bool
+event_filter_source_location_match(const char *wanted,
+				   const char *source_filename,
+				   unsigned int source_linenum)
+{
+	const char *p = strrchr(wanted, ':');
+	unsigned int linenum;
+
+	if (p == NULL) {
+		return event_filter_source_filename_match(wanted,
+			strlen(wanted), source_filename);
+	}
+
+	/* filename:linenum */
+	return str_to_uint(p + 1, &linenum) == 0 &&
+		linenum == source_linenum &&
+		event_filter_source_filename_match(wanted, p - wanted,
+						   source_filename);
+}
+
+static bool
 event_filter_query_match_cmp(struct event_filter *filter,
 			     struct event_filter_node *node,
 			     struct event *event, const char *source_filename,
@@ -1023,17 +1084,10 @@ event_filter_query_match_cmp(struct event_filter *filter,
 			return (event->sending_name != NULL) &&
 				wildcard_match_escaped(event->sending_name,
 						       node->field.value.str);
-		case EVENT_FILTER_NODE_TYPE_EVENT_SOURCE_LOCATION: {
-			bool ret;
-			if (strchr(node->field.value.str, ':') == NULL)
-				ret = strcmp(node->field.value.str, source_filename) == 0;
-			else T_BEGIN {
-				const char *wanted_str =
-					t_strdup_printf("%s:%u", source_filename, source_linenum);
-				ret = strcmp(node->field.value.str, wanted_str) == 0;
-			} T_END;
-			return ret;
-		}
+		case EVENT_FILTER_NODE_TYPE_EVENT_SOURCE_LOCATION:
+			return event_filter_source_location_match(
+				node->field.value.str,
+				source_filename, source_linenum);
 		case EVENT_FILTER_NODE_TYPE_EVENT_CATEGORY:
 			return event_has_category(event, node, log_type);
 		case EVENT_FILTER_NODE_TYPE_EVENT_FIELD_EXACT:

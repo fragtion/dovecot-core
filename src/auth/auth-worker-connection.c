@@ -30,6 +30,7 @@
 #define AUTH_WORKER_DELAY_WARN_SECS 3
 #define AUTH_WORKER_DELAY_WARN_MIN_INTERVAL_SECS (5*60)
 #define AUTH_WORKER_CONNECT_RETRY_TIMEOUT_MSECS (5*1000)
+#define AUTH_WORKER_CREATE_RETRY_MSECS 1000
 
 struct auth_worker_request {
 	unsigned int id;
@@ -62,16 +63,19 @@ static unsigned int auth_workers_throttle_count;
 static unsigned int auth_worker_process_limit = 0;
 
 static const char *worker_socket_path;
+static struct timeout *to_worker_refill;
 
 static void auth_worker_deinit(struct auth_worker_connection **worker,
-			       const char *reason, bool restart) ATTR_NULL(2);
+			       const char *reason, bool restart);
+static void auth_worker_refill_workers(void);
+static void auth_worker_refill_timeout(void *context);
 
 static void auth_worker_idle_timeout(struct auth_worker_connection *worker)
 {
 	i_assert(worker->request == NULL);
 
 	if (idle_count > 1)
-		auth_worker_deinit(&worker, NULL, FALSE);
+		auth_worker_deinit(&worker, "Idle timeout", FALSE);
 	else
 		timeout_reset(worker->to_lookup);
 }
@@ -170,7 +174,13 @@ static int auth_worker_handshake_args(struct connection *conn,
 		}
 
 		e_debug(conn->event, "Worker sent process limit '%s'", args[1]);
-		auth_workers_throttle_count = auth_worker_process_limit;
+		/* Don't undo the throttling while workers are failing.
+		   auth_worker_success() grows it back once they recover. */
+		if (auth_workers_throttle_count == 0 ||
+		    auth_workers_with_errors == 0) {
+			auth_workers_throttle_count = auth_worker_process_limit;
+			auth_worker_refill_workers();
+		}
 	}
 
 	if (auth_workers_throttle_count == 0) {
@@ -225,6 +235,9 @@ static void auth_worker_destroy(struct connection *conn)
 
 static struct auth_worker_connection *auth_worker_create(void)
 {
+	if (shutting_down)
+		return NULL;
+
 	/* first connection will negotiate auth_worker_process_limit
 	   via handshake */
 	if (auth_worker_process_limit > 0 &&
@@ -242,6 +255,11 @@ static struct auth_worker_connection *auth_worker_create(void)
 			worker->conn.name);
 		connection_deinit(&worker->conn);
 		i_free(worker);
+		if (to_worker_refill == NULL) {
+			to_worker_refill =
+				timeout_add(AUTH_WORKER_CREATE_RETRY_MSECS,
+					    auth_worker_refill_timeout, NULL);
+		}
 		return NULL;
 	}
 
@@ -261,15 +279,19 @@ static void auth_worker_deinit(struct auth_worker_connection **_worker,
 
 	*_worker = NULL;
 
+	e_debug(worker->conn.event, "Disconnecting: %s (restart=%s)",
+		reason, restart ? "yes" : "no");
+
 	if (worker->received_error) {
 		i_assert(auth_workers_with_errors > 0);
 		i_assert(connections == NULL || auth_workers_with_errors <= connections->connections_count);
 		auth_workers_with_errors--;
 	}
 
-	if (worker->request == NULL)
+	if (worker->request == NULL) {
+		i_assert(idle_count > 0);
 		idle_count--;
-	else {
+	} else {
 		e_error(worker->conn.event, "Aborted %s request for %s: %s",
 			t_strcut(worker->request->data, '\t'),
 			worker->request->username, reason);
@@ -309,6 +331,27 @@ static struct auth_worker_connection *auth_worker_find_free(void)
 	}
 
 	i_unreached();
+}
+
+static void auth_worker_refill_timeout(void *context ATTR_UNUSED)
+{
+	timeout_remove(&to_worker_refill);
+	auth_worker_refill_workers();
+}
+
+static void auth_worker_refill_workers(void)
+{
+	struct auth_worker_connection *worker;
+
+	/* Called when auth_workers_throttle_count grows. */
+	while (aqueue_count(worker_request_queue) > 0) {
+		worker = auth_worker_find_free();
+		if (worker == NULL)
+			worker = auth_worker_create();
+		if (worker == NULL)
+			return;
+		auth_worker_request_send_next(worker);
+	}
 }
 
 static int auth_worker_request_handle(struct auth_worker_connection *worker,
@@ -389,6 +432,8 @@ static void auth_worker_success(struct auth_worker_connection *worker)
 	} else if (auth_workers_throttle_count < auth_worker_process_limit)
 		auth_workers_throttle_count++;
 	worker->received_error = FALSE;
+
+	auth_worker_refill_workers();
 }
 
 static int worker_input_args(struct connection *conn, const char *const *args)
@@ -405,6 +450,13 @@ static int worker_input_args(struct connection *conn, const char *const *args)
 		return 1;
 	} else if (strcmp(args[0], "SHUTDOWN") == 0) {
 		worker->shutdown = TRUE;
+		if (worker->request == NULL) {
+			/* Worker is idle and announced it wants to exit.
+			   Disconnect now so no further requests get dispatched
+			   to it. */
+			auth_worker_deinit(&worker, "Idle kill", FALSE);
+			return -1;
+		}
 		return 1;
 	} else if (strcmp(args[0],  "RESTART") == 0) {
 		worker->restart = TRUE;
@@ -441,7 +493,13 @@ static int worker_input_args(struct connection *conn, const char *const *args)
 		auth_worker_deinit(&worker, "Max requests limit", TRUE);
 		ret = 0;
 	} else if (worker->shutdown) {
-		auth_worker_deinit(&worker, "Idle kill", FALSE);
+		/* The worker wants to exit. If there are still queued requests,
+		   create a replacement worker for them. Otherwise they would
+		   stay in the queue forever once the last worker is gone,
+		   because new requests are only queued while the queue is
+		   non-empty. */
+		auth_worker_deinit(&worker, "Idle kill",
+				   aqueue_count(worker_request_queue) > 0);
 		ret = 0;
 	} else {
 		auth_worker_request_send_next(worker);
@@ -493,9 +551,11 @@ void auth_worker_call(pool_t pool, const char *username, const char *data,
 	request->callback = callback;
 	request->context = context;
 
-	if (aqueue_count(worker_request_queue) > 0) {
+	if (aqueue_count(worker_request_queue) > 0 ||
+	    shutting_down) {
 		/* requests are already being queued, no chance of
-		   finding/creating a worker */
+		   finding/creating a worker. While shutting down the
+		   request is queued so it gets failed at deinit. */
 		worker = NULL;
 	} else {
 		worker = auth_worker_find_free();
@@ -538,9 +598,36 @@ void auth_worker_connection_init(void)
 					   &auth_worker_connection_funcs);
 }
 
+static void auth_worker_request_queue_abort(void)
+{
+	struct auth_worker_request *request;
+	const char *const args[] = {
+		"FAIL",
+		t_strdup_printf("%d", PASSDB_RESULT_INTERNAL_FAILURE),
+		NULL,
+	};
+
+	while (aqueue_count(worker_request_queue) > 0) {
+		request = array_idx_elem(&worker_request_array,
+					 aqueue_idx(worker_request_queue, 0));
+		aqueue_delete_tail(worker_request_queue);
+		e_debug(auth_event, "auth-worker: Aborted queued %s request for %s: Shutting down",
+			t_strcut(request->data, '\t'), request->username);
+		request->callback(NULL, args, request->context);
+	}
+}
+
 void auth_worker_connection_deinit(void)
 {
+	/* Aborting a request may continue it to the next passdb or userdb,
+	   which sends a new request to a worker. auth_worker_call() queues
+	   such requests while shutting_down, so they get failed below. */
+	i_assert(shutting_down);
+	timeout_remove(&to_worker_refill);
 	connection_list_deinit(&connections);
+	/* Fail the requests that never got dispatched to a worker. Otherwise
+	   their auth requests would be leaked. */
+	auth_worker_request_queue_abort();
 
 	aqueue_deinit(&worker_request_queue);
 	array_free(&worker_request_array);

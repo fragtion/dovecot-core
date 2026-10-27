@@ -4,10 +4,18 @@
 #include "net.h"
 #include "uri-util.h"
 
-#include "http-common.h"
+#define HTTP_DEFAULT_PORT 80
+#define HTTPS_DEFAULT_PORT 443
 
-struct http_request_target;
+enum http_request_target_format {
+	HTTP_REQUEST_TARGET_FORMAT_ORIGIN = 0,
+	HTTP_REQUEST_TARGET_FORMAT_ABSOLUTE,
+	HTTP_REQUEST_TARGET_FORMAT_AUTHORITY,
+	HTTP_REQUEST_TARGET_FORMAT_ASTERISK
+};
 
+/* Adding a field here also means updating http_url_equals() and any
+   settings code that hashes this type. */
 struct http_url {
 	/* server */
 	struct uri_host host;
@@ -50,13 +58,6 @@ int http_url_parse(const char *url, struct http_url *base,
 		   enum http_url_parse_flags flags, pool_t pool,
 		   struct http_url **url_r, const char **error_r);
 
-int http_url_request_target_parse(const char *request_target,
-				  const char *host_header,
-				  const struct http_url *default_base,
-				  pool_t pool,
-				  struct http_request_target *target,
-				  const char **error_r) ATTR_NULL(3);
-
 /*
  * HTTP URL evaluation
  */
@@ -72,6 +73,19 @@ static inline in_port_t http_url_get_port(const struct http_url *url)
 	return http_url_get_port_default(
 		url, (url->have_ssl ? HTTPS_DEFAULT_PORT : HTTP_DEFAULT_PORT));
 }
+
+/* Initializer for an unset URL, e.g. a settings default. */
+#define HTTP_URL_INIT_EMPTY { .host = { .name = NULL } }
+
+/* TRUE if the URL is unset, i.e. all-zero. Only meaningful for URLs that
+   came from http_url_parse() with base == NULL, or that were
+   zero-initialised. Does not tolerate url == NULL. */
+static inline bool http_url_is_empty(const struct http_url *url)
+{
+	return url->host.name == NULL;
+}
+
+bool http_url_equals(const struct http_url *url1, const struct http_url *url2);
 
 /*
  * HTTP URL manipulation

@@ -342,6 +342,25 @@ static void service_log_drop_warning(struct service *service)
 	}
 }
 
+static void service_drop_warning_timeout(struct service *service)
+{
+	/* The warning is cancelled when a process reports that it became
+	   available again. The ioloop runs timeouts before I/Os, so such a
+	   status update may already be waiting to be read - especially if the
+	   ioloop was delayed past this timeout's deadline. Read the pending
+	   status updates first, so a client that just reconnects to a busy
+	   service doesn't cause a warning about a limit that isn't really
+	   being reached. */
+	if (service->status_fd[0] != -1)
+		service_status_input(service);
+	if (service->to_drop_warning == NULL) {
+		/* a process became available - this was a false alarm */
+		return;
+	}
+	timeout_remove(&service->to_drop_warning);
+	service_log_drop_warning(service);
+}
+
 static void service_monitor_throttle(struct service *service)
 {
 	if (service->to_throttle != NULL || service->list->destroying)
@@ -390,36 +409,59 @@ static void service_monitor_listen_pending(struct service *service)
 				       service_drop_timeout, service);
 }
 
+/* A new connection arrived to a listener, but process_limit is reached and
+   none of the processes can accept more clients. This is handled in two
+   stages:
+
+   1. Master stops listening and waits up to SERVICE_DROP_TIMEOUT_MSECS for
+      a process to become available. Meanwhile the new connections wait in
+      the listener's queue. This way temporary peaks don't cause connections
+      to be dropped.
+
+   2. If no process became available, the pending connections are dropped
+      and master starts listening again. Each new connection is now
+      immediately accepted and closed.
+
+   Once a process becomes available or exits, the limit is no longer reached
+   and the connections are handled normally again. If the limit is reached
+   again later, it starts from stage 1.
+
+   The "limit reached, client connections are being dropped" warning is
+   logged at most once per SERVICE_DROP_WARN_INTERVAL_SECS:
+
+   - In stage 1 it's logged SERVICE_LOG_DROP_WARNING_DELAY_MSECS after the
+     stage started, unless a process became available or exited in the
+     meantime. A process may already be available without master knowing
+     it yet, e.g. when a client disconnects and immediately reconnects.
+   - In stage 2 it's logged whenever a connection is dropped.
+
+   Login services are different: they log the warning immediately and notify
+   the login processes to start killing their existing connections when they
+   reach client_limit. Their pending connections are also dropped after
+   SERVICE_DROP_TIMEOUT_MSECS, but they never do stage 2's accept-and-close.
+   A new connection arriving after that starts stage 1 again. */
 static void service_drop_connections(struct service_listener *l)
 {
 	struct service *service = l->service;
 	int fd;
 
-	if (service->type != SERVICE_TYPE_WORKER)
-		service_log_drop_warning(service);
-
 	if (service->type == SERVICE_TYPE_LOGIN) {
-		/* reached process limit, notify processes that they
-		   need to start killing existing connections if they
-		   reach connection limit */
+		service_log_drop_warning(service);
 		service_login_notify(service, TRUE);
-
 		service_monitor_listen_pending(service);
 	} else if (!service->listen_pending) {
-		/* maybe this is a temporary peak, stop for a while and
-		   see if it goes away */
+		/* stage 1 */
 		service_monitor_listen_pending(service);
-		if (service->to_drop_warning == NULL &&
-		    service->type == SERVICE_TYPE_WORKER) {
-			service->to_drop_warning =
-				timeout_add_short(SERVICE_LOG_DROP_WARNING_DELAY_MSECS,
-						  service_log_drop_warning, service);
-		}
+		i_assert(service->to_drop_warning == NULL);
+		service->to_drop_warning =
+			timeout_add_short(SERVICE_LOG_DROP_WARNING_DELAY_MSECS,
+					  service_drop_warning_timeout, service);
 	} else {
-		/* this has been happening for a while now. just accept and
-		   close the connection, so it's clear that this is happening
-		   because of the limit, rather than because the service
-		   processes aren't answering fast enough */
+		/* stage 2: accept and close the connection, so it's clear
+		   that this is happening because of the limit, rather than
+		   because the service processes aren't answering fast
+		   enough */
+		service_log_drop_warning(service);
 		fd = net_accept(l->fd, NULL, NULL);
 		if (fd > 0)
 			net_disconnect(fd);

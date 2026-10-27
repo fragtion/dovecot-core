@@ -39,6 +39,8 @@ enum setting_type {
 	SET_ALIAS, /* alias name for above setting definition */
 	SET_FILTER_NAME,
 	SET_FILTER_ARRAY,
+	SET_HTTP_URL, /* struct http_url, userinfo not parsed */
+	SET_HTTP_URL_AUTH, /* struct http_url, userinfo parsed */
 };
 enum setting_flags {
 	SET_FLAG_HIDDEN = BIT(0),
@@ -192,7 +194,7 @@ struct setting_parser_info {
 	   inside "<name> { .. }", but never inside any other filter.
 
 	   The array must be named <prefix>_never_inherited_by[] so that
-	   settings-get.pl copies it into all-settings.c. */
+	   settings-get.py copies it into all-settings.c. */
 	const char *const *never_inherited_by;
 
 	const struct setting_define *defines;

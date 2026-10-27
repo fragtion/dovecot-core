@@ -2,10 +2,12 @@
 #define OAUTH2_H
 
 #include "net.h"
+#include "http-url.h"
 
 struct dict;
 struct oauth2_request;
 struct oauth2_validation_key_cache;
+struct var_expand_program;
 
 struct oauth2_field {
 	const char *name;
@@ -16,16 +18,23 @@ ARRAY_DEFINE_TYPE(oauth2_field, struct oauth2_field);
 
 struct oauth2_settings {
 	struct http_client *client;
-	/* GET tokeninfo from this URL, token is appended to URL
-	   http://some.host/path?access_token= */
-	const char *tokeninfo_url;
+	/* GET tokeninfo from this URL template, which must contain
+	   %{access_token}. NULL when unset. */
+	const struct var_expand_program *tokeninfo_url;
 	/* POST grant password here, needs user credentials and client_*
-	   settings */
-	const char *grant_url;
-	/* GET more information from this URL, uses Bearer authentication */
-	const char *introspection_url;
-	/* POST refresh here, needs refresh token and client_* settings */
-	const char *refresh_url;
+	   settings. Points into the settings struct that owns it and is
+	   never NULL; use http_url_is_empty() to test for unset. */
+	const struct http_url *grant_url;
+	/* GET or POST more information from this URL template. With
+	   introspection_mode get the template must contain %{access_token};
+	   with auth or post the token goes into the Authorization header or
+	   the POST body instead, and the template must not contain it.
+	   NULL when unset. */
+	const struct var_expand_program *introspection_url;
+	/* POST refresh here, needs refresh token and client_* settings.
+	   Never assigned by any caller today; oauth2_refresh_start() is
+	   unreachable. */
+	const struct http_url *refresh_url;
 	/* client identifier for oauth2 server */
 	const char *client_id;
 	/* client secret for oauth2 server */
@@ -77,6 +86,25 @@ typedef void
 oauth2_request_callback_t(struct oauth2_request_result*, void*);
 
 bool oauth2_valid_token(const char *token);
+
+/* Check where url_template places its variables, looking only at its literal
+   text: %{access_token} must be in the URL path or query, and a variable that
+   is part of the scheme, host or port must use the safe filter, because
+   oauth2_url_template_expand() escapes all other variables. A variable in the
+   userinfo (before "@") is escaped as usual. Returns 0 if fine, otherwise -1
+   with error_r set. */
+int oauth2_url_template_check(const struct var_expand_program *url_template,
+			      const char **error_r);
+/* Expand url_template with %{access_token} set to token, appending the
+   result to dest. Every variable except those with the safe filter is
+   percent-encoded, so filters see the raw token. Fails if a variable
+   expands to "." or ".." (a dot segment, which would escape the intended URL
+   path on a server that resolves them), if %{access_token} doesn't follow
+   scheme://authority/ (or ?) after expansion, or if the template's own
+   expansion fails. */
+int oauth2_url_template_expand(const struct var_expand_program *url_template,
+			       const char *token, string_t *dest,
+			       const char **error_r);
 
 struct oauth2_request*
 oauth2_passwd_grant_start(const struct oauth2_settings *set,
@@ -142,6 +170,24 @@ oauth2_client_secret_start(const struct oauth2_settings *set,
 		set, input, resource - CALLBACK_TYPECHECK( \
 			callback, void(*)(struct oauth2_request_result*, \
 					  typeof(context))), \
+		(oauth2_request_callback_t*)callback, (void*)context);
+
+/* RFC 7523 JWT bearer assertion grant: POST the signed assertion to
+   set->grant_url, along with client_id, client_secret and scope when set.
+   The caller builds and signs the assertion. */
+struct oauth2_request *
+oauth2_jwt_bearer_grant_start(const struct oauth2_settings *set,
+			      const struct oauth2_request_input *input,
+			      const char *assertion,
+			      oauth2_request_callback_t *callback,
+			      void *context);
+#define oauth2_jwt_bearer_grant_start(set, input, assertion, callback, \
+				      context) \
+	oauth2_jwt_bearer_grant_start( \
+		set, input - CALLBACK_TYPECHECK( \
+			callback, void(*)(struct oauth2_request_result*, \
+					  typeof(context))), \
+		assertion, \
 		(oauth2_request_callback_t*)callback, (void*)context);
 
 /* Abort without calling callback, use this to cancel the request */

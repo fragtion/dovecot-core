@@ -2,6 +2,9 @@ include $(top_srcdir)/Makefile.test.include
 
 noinst_LTLIBRARIES = liblanguage.la
 
+# automake seems to force making this unconditional..
+NOPLUGIN_LDFLAGS =
+
 AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib \
 	-I$(top_srcdir)/src/lib-settings \
@@ -12,10 +15,13 @@ AM_CPPFLAGS = \
 	$(LIBICU_CFLAGS) \
 	-DUDHRDIR=\""$(top_srcdir)/src/lib-language"\" \
 	-DDATADIR=\"$(pkgdatadir)\" \
-	-DTEST_STOPWORDS_DIR=\""$(top_srcdir)/src/lib-language/stopwords"\"
+	-DMODULE_DIR=\""$(moduledir)"\" \
+	-DTEST_STOPWORDS_DIR=\""$(top_srcdir)/src/lib-language/stopwords"\" \
+	-DTEST_MODULE_DIR=\""$(abs_builddir)/.libs"\"
 
 stopwordsdir = $(datadir)/${PACKAGE_TARNAME}/stopwords
 dist_stopwords_DATA = \
+	stopwords/stopwords_ca.txt \
 	stopwords/stopwords_da.txt \
 	stopwords/stopwords_de.txt \
 	stopwords/stopwords_en.txt \
@@ -48,22 +54,25 @@ endif
 endif
 
 if BUILD_LIBICU
-ICU_SOURCES = lang-icu.c
-NORMALIZER_LIBS = $(LIBICU_LIBS)
+module_LTLIBRARIES = liblang_filter_normalizer_icu.la
 ICU_TESTS = test-lang-icu
 endif
 
+liblang_filter_normalizer_icu_la_LDFLAGS = -module -avoid-version
+liblang_filter_normalizer_icu_la_LIBADD = libdovecot-language-icu.la
+liblang_filter_normalizer_icu_la_SOURCES = \
+	lang-filter-normalizer-icu.c
+
 liblanguage_la_LIBADD = \
 	$(STEMMER_LIBS) \
-	$(TEXTCAT_LIBS) \
-	$(NORMALIZER_LIBS)
+	$(TEXTCAT_LIBS)
 
 liblanguage_la_SOURCES = \
 	lang-filter.c \
 	lang-filter-contractions.c \
 	lang-filter-english-possessive.c \
 	lang-filter-lowercase.c \
-	lang-filter-normalizer-icu.c \
+	lang-filter-normalizer.c \
 	lang-filter-stopwords.c \
 	lang-filter-stemmer-snowball.c \
 	language.c \
@@ -72,8 +81,7 @@ liblanguage_la_SOURCES = \
 	lang-tokenizer-address.c \
 	lang-tokenizer-common.c \
 	lang-tokenizer-generic.c \
-	lang-settings.c \
-	$(ICU_SOURCES)
+	lang-settings.c
 
 headers = \
 	lang-common.h \
@@ -89,6 +97,9 @@ headers = \
 	lang-indexer-status.h \
 	lang-settings.h
 
+noinst_HEADERS = \
+	lang-filter-normalizer-icu.h
+
 pkginc_libdir=$(pkgincludedir)
 pkginc_lib_HEADERS = $(headers)
 
@@ -97,6 +108,16 @@ libdovecot_language_la_SOURCES =
 libdovecot_language_la_LIBADD = liblanguage.la $(LIBDOVECOT)
 libdovecot_language_la_DEPENDENCIES = liblanguage.la $(LIBDOVECOT_DEPS)
 libdovecot_language_la_LDFLAGS = -export-dynamic
+
+# libicu helper functions. These are in a separate library, so that linking
+# libdovecot-language doesn't load libicu.
+if BUILD_LIBICU
+pkglib_LTLIBRARIES += libdovecot-language-icu.la
+endif
+libdovecot_language_icu_la_SOURCES = lang-icu.c
+libdovecot_language_icu_la_LIBADD = $(LIBICU_LIBS) $(LIBDOVECOT)
+libdovecot_language_icu_la_DEPENDENCIES = $(LIBDOVECOT_DEPS)
+libdovecot_language_icu_la_LDFLAGS = -export-dynamic
 
 test_programs = \
 	$(ICU_TESTS) \
@@ -108,12 +129,12 @@ test_libs = ../lib-dovecot/libdovecot.la
 test_deps = $(noinst_LTLIBRARIES) $(test_libs)
 
 test_lang_icu_SOURCES = test-lang-icu.c
-test_lang_icu_LDADD = lang-icu.lo $(LIBICU_LIBS) $(test_libs) $(LIBDOVECOT_TEST_LIBS)
-test_lang_icu_DEPENDENCIES = lang-icu.lo $(test_deps)
+test_lang_icu_LDADD = lang-filter-normalizer-icu.lo libdovecot-language-icu.la liblanguage.la $(LIBICU_LIBS) $(test_libs) $(LIBDOVECOT_TEST_LIBS)
+test_lang_icu_DEPENDENCIES = lang-filter-normalizer-icu.lo libdovecot-language-icu.la liblanguage.la $(test_deps)
 
 test_lang_filter_SOURCES = test-lang-filter.c
 test_lang_filter_LDADD = liblanguage.la $(test_libs) $(LIBDOVECOT_TEST_LIBS)
-test_lang_filter_DEPENDENCIES = liblanguage.la $(test_deps)
+test_lang_filter_DEPENDENCIES = liblanguage.la $(module_LTLIBRARIES) $(test_deps)
 
 if BUILD_LANG_EXTTEXTCAT
 TEST_LANGUAGE = test-language

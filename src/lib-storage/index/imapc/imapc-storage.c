@@ -16,9 +16,7 @@
 #include "imapc-search.h"
 #include "imapc-sync.h"
 #include "imapc-attribute.h"
-#include "imapc-settings.h"
 #include "imapc-storage.h"
-#include "dsasl-client.h"
 
 #define DNS_CLIENT_SOCKET_NAME "dns-client"
 
@@ -35,7 +33,7 @@ struct imapc_resp_code_map {
 extern struct mail_storage imapc_storage;
 extern struct mailbox imapc_mailbox;
 
-static struct event_category event_category_imapc = {
+struct event_category event_category_imapc = {
 	.name = "imapc",
 	.parent = &event_category_storage,
 };
@@ -309,7 +307,7 @@ bool imapc_storage_client_handle_auth_failure(struct imapc_storage_client *clien
 }
 
 static void imapc_storage_client_login(struct imapc_storage_client *client,
-				       struct mail_user *user, const char *host)
+				       struct mail_user *user)
 {
 	imapc_client_login(client->client);
 	if (!user->namespaces_created) {
@@ -321,65 +319,35 @@ static void imapc_storage_client_login(struct imapc_storage_client *client,
 		if (imapc_storage_client_handle_auth_failure(client)) {
 			user->error = p_strdup_printf(user->pool,
 				"imapc: Login to %s failed: %s",
-				host, client->auth_failed_reason);
+				imapc_client_get_host(client->client),
+				client->auth_failed_reason);
 		}
 	}
 }
 
 int imapc_storage_client_create(struct mailbox_list *list,
+				struct event *list_event,
 				struct imapc_storage_client **client_r,
 				const char **error_r)
 {
 	struct mail_namespace *ns = list->ns;
 	const struct imapc_settings *imapc_set;
+	struct imapc_client *imap_client;
 	struct imapc_storage_client *client;
 	struct imapc_parameters params = {};
-	const struct ssl_settings *ssl_set = NULL;
 	string_t *str;
 
-	if (settings_get(list->event, &imapc_setting_parser_info, 0,
+	if (settings_get(list_event, &imapc_setting_parser_info, 0,
 			 &imapc_set, error_r) < 0)
 		return -1;
-	if (strcmp(imapc_set->imapc_ssl, "no") != 0 &&
-	    ssl_client_settings_get(list->event, &ssl_set, error_r) < 0) {
-		settings_free(imapc_set);
-		return -1;
-	}
 
-	if ((ns->flags & NAMESPACE_FLAG_UNUSABLE) != 0 ||
-	    *imapc_set->imapc_host == '\0')
+	if ((ns->flags & NAMESPACE_FLAG_UNUSABLE) != 0) {
 		/* Shared namespace user doesn't actually exist. Don't try to
 		   access the user via imapc, but also don't make this a
 		   visible error. If any code path tries to connect to imapc,
 		   it's a bug. */
 		params.flags |= IMAPC_PARAMETER_CLIENT_DISABLED;
-
-	if (!array_is_empty(&imapc_set->imapc_sasl_mechanisms)) {
-		const char *mech_name;
-		array_foreach_elem(&imapc_set->imapc_sasl_mechanisms, mech_name) {
-			const struct dsasl_client_mech *mech =
-				dsasl_client_mech_find(mech_name);
-			if (mech == NULL) {
-				*error_r =
-					t_strdup_printf("imapc_sasl_mechanism: "
-							"'%s' is not supported",
-							mech_name);
-				settings_free(imapc_set);
-				settings_free(ssl_set);
-				return -1;
-			} else if (dsasl_client_mech_uses_password(mech) &&
-				   *imapc_set->imapc_password == '\0') {
-				*error_r = "Missing imapc_password";
-				settings_free(imapc_set);
-				settings_free(ssl_set);
-				return -1;
-			}
-		}
 	}
-	params.override_dns_client_socket_path = *ns->user->set->base_dir == '\0' ? "" :
-		t_strconcat(ns->user->set->base_dir, "/",
-			    DNS_CLIENT_SOCKET_NAME, NULL);
-
 	if ((imapc_set->parsed_features & IMAPC_FEATURE_SEND_ID) != 0)
 		params.session_id_prefix = ns->user->session_id;
 
@@ -387,14 +355,16 @@ int imapc_storage_client_create(struct mailbox_list *list,
 	mail_user_set_get_temp_prefix(str, ns->user->set);
 	params.temp_path_prefix = str_c(str);
 
+	if (imapc_client_init(&params, list_event, &imap_client, error_r) < 0)
+		return -1;
+
 	client = i_new(struct imapc_storage_client, 1);
 	client->refcount = 1;
 	client->set = imapc_set;
-	client->ssl_set = ssl_set;
 	client->disabled =
 		HAS_ALL_BITS(params.flags, IMAPC_PARAMETER_CLIENT_DISABLED);
 	i_array_init(&client->untagged_callbacks, 16);
-	client->client = imapc_client_init(&params, list->event);
+	client->client = imap_client;
 	imapc_client_register_untagged(client->client,
 				       imapc_storage_client_untagged_cb, client);
 
@@ -403,7 +373,7 @@ int imapc_storage_client_create(struct mailbox_list *list,
 	if ((ns->flags & NAMESPACE_FLAG_LIST_PREFIX) != 0 &&
 	    (imapc_set->parsed_features & IMAPC_FEATURE_NO_DELAY_LOGIN) != 0) {
 		/* start logging in immediately */
-		imapc_storage_client_login(client, ns->user, imapc_set->imapc_host);
+		imapc_storage_client_login(client, ns->user);
 	}
 
 	*client_r = client;
@@ -422,7 +392,6 @@ void imapc_storage_client_unref(struct imapc_storage_client **_client)
 		return;
 	imapc_client_deinit(&client->client);
 	settings_free(client->set);
-	settings_free(client->ssl_set);
 	array_foreach_modifiable(&client->untagged_callbacks, cb)
 		i_free(cb->name);
 	array_free(&client->untagged_callbacks);
@@ -435,7 +404,6 @@ imapc_storage_match(struct mail_storage *_storage, struct mailbox_list *list)
 {
 	struct imapc_storage *storage = IMAPC_STORAGE(_storage);
 	const struct imapc_settings *imapc_set;
-	const struct ssl_settings *ssl_set;
 	const char *error;
 	bool match;
 
@@ -450,21 +418,17 @@ imapc_storage_match(struct mail_storage *_storage, struct mailbox_list *list)
 		/* The error is reported when the new storage is created. */
 		return FALSE;
 	}
-	match = settings_equal(&imapc_setting_parser_info, storage->client->set,
-			       imapc_set, NULL);
+	match = settings_equal(&imapc_setting_parser_info,
+			       storage->client->set, imapc_set, NULL);
 	settings_free(imapc_set);
-	if (!match || storage->client->ssl_set == NULL) {
-		/* Either the settings differ, or imapc_ssl=no in both of them
-		   and there are no SSL settings to compare. */
-		return match;
-	}
-
-	if (ssl_client_settings_get(list->event, &ssl_set, &error) < 0)
+	if (!match)
 		return FALSE;
-	match = settings_equal(&ssl_setting_parser_info,
-			       storage->client->ssl_set, ssl_set, NULL);
-	settings_free(ssl_set);
-	return match;
+	if (imapc_client_settings_match(storage->client->client, list->event,
+					&error) <= 0) {
+		/* Any error is reported when the new storage is created. */
+		return FALSE;
+	}
+	return TRUE;
 }
 
 static int
@@ -474,15 +438,25 @@ imapc_storage_create(struct mail_storage *_storage,
 {
 	struct imapc_storage *storage = IMAPC_STORAGE(_storage);
 	struct imapc_mailbox_list *imapc_list = NULL;
+	struct event *list_event;
+
+	list_event = event_create(ns->list->event);
+	event_add_category(list_event, &event_category_imapc);
 
 	if (strcmp(ns->list->name, MAILBOX_LIST_NAME_IMAPC) == 0) {
 		imapc_list = (struct imapc_mailbox_list *)ns->list;
 		storage->client = imapc_list->client;
 		storage->client->refcount++;
 	} else {
-		if (imapc_storage_client_create(ns->list, &storage->client, error_r) < 0)
+		if (imapc_storage_client_create(ns->list, list_event,
+						&storage->client,
+						error_r) < 0) {
+			event_unref(&list_event);
 			return -1;
+		}
 	}
+	event_unref(&list_event);
+
 	storage->client->_storage = storage;
 	storage->set = storage->client->set;
 	p_array_init(&storage->remote_namespaces, _storage->pool, 4);

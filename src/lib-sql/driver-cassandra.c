@@ -34,7 +34,7 @@
 
 #define CASSANDRA_FALLBACK_WARN_INTERVAL_SECS 60
 #define CASSANDRA_FALLBACK_FIRST_RETRY_MSECS 50
-#define CASSANDRA_FALLBACK_MAX_RETRY_MSECS (1000*60)
+#define CASSANDRA_FALLBACK_MAX_RETRY_MSECS (1000*10)
 
 #define CASS_QUERY_DEFAULT_WARN_TIMEOUT_MSECS (5*1000)
 
@@ -144,6 +144,10 @@ struct cassandra_settings {
 	unsigned int execution_retry_times;
 	unsigned int page_size;
 
+	unsigned int fallback_failure_threshold;
+	unsigned int fallback_window_msecs;
+	unsigned int primary_retry_count;
+
 	const char *ssl;
 
 	const char *reconnect_policy;
@@ -226,6 +230,10 @@ static const struct setting_define cassandra_setting_defines[] = {
 	DEF(UINT, execution_retry_times),
 	DEF(UINT, page_size),
 
+	DEF(UINT, fallback_failure_threshold),
+	DEF_MSECS(fallback_window),
+	DEF(UINT, primary_retry_count),
+
 	DEF(ENUM, ssl),
 
 	DEF(ENUM, reconnect_policy),
@@ -293,6 +301,10 @@ static struct cassandra_settings cassandra_default_settings = {
 	.execution_retry_interval_msecs = 0,
 	.execution_retry_times = 0,
 	.page_size = 0,
+
+	.fallback_failure_threshold = 3,
+	.fallback_window_msecs = 5000,
+	.primary_retry_count = 2,
 
 	.ssl = "no:cert-only:cert-ip",
 
@@ -376,7 +388,18 @@ struct cassandra_db {
 
 	struct timeval primary_query_last_sent[CASSANDRA_QUERY_TYPE_COUNT];
 	time_t last_fallback_warning[CASSANDRA_QUERY_TYPE_COUNT];
-	unsigned int fallback_failures[CASSANDRA_QUERY_TYPE_COUNT];
+	/* >0 means the fallback "circuit breaker" is open for this query type:
+	   queries are sent at fallback consistency, with periodic primary
+	   consistency probes. The value is 1 when the breaker opens, and it's
+	   incremented for each failed primary probe after that. It's also the
+	   exponential backoff counter for scheduling the primary probes. */
+	unsigned int primary_probe_failures[CASSANDRA_QUERY_TYPE_COUNT];
+	/* Number of consecutive primary-consistency queries that have
+	   definitively failed within the current window, while the breaker is
+	   still closed. A successful primary-consistency query resets it. Once
+	   this reaches fallback_failure_threshold, the breaker opens. */
+	unsigned int primary_window_failures[CASSANDRA_QUERY_TYPE_COUNT];
+	struct timeval primary_failure_window_start[CASSANDRA_QUERY_TYPE_COUNT];
 
 	/* for synchronous queries: */
 	struct ioloop *ioloop, *orig_ioloop;
@@ -409,10 +432,17 @@ struct cassandra_result {
 	char *log_query;
 	char *error;
 	CassConsistency consistency, fallback_consistency;
+	/* primary consistency configured for this query type. consistency
+	   above is what the current attempt actually used (== primary, or ==
+	   fallback once downgraded). */
+	CassConsistency primary_consistency;
 	CassConsistency error_result_consistency;
 	enum cassandra_query_type query_type;
 	struct timeval page0_start_time, start_time, finish_time;
 	unsigned int row_count, total_row_count, page_num;
+	/* number of times this query has been retried at primary consistency
+	   after a transient error */
+	unsigned int primary_retries;
 	cass_int64_t timestamp;
 
 	pool_t row_pool;
@@ -426,6 +456,12 @@ struct cassandra_result {
 	bool finished:1;
 	bool paging_continues:1;
 	bool batch_unlogged:1;
+	bool any_uncertain:1;
+	/* current attempt was sent at fallback consistency */
+	bool sent_at_fallback:1;
+	/* current attempt is a primary-consistency probe sent while the
+	   breaker was open */
+	bool primary_probe:1;
 };
 
 struct cassandra_transaction_context {
@@ -703,6 +739,14 @@ cassandra_settings_check(void *_set, pool_t pool ATTR_UNUSED,
 				consistencies[i].set_value);
 			return FALSE;
 		}
+	}
+	if (set->fallback_failure_threshold == 0) {
+		*error_r = "cassandra_fallback_failure_threshold must not be 0";
+		return FALSE;
+	}
+	if (set->fallback_window_msecs == 0) {
+		*error_r = "cassandra_fallback_window must not be 0";
+		return FALSE;
 	}
 	if (set->connections_per_host == 0) {
 		*error_r = "cassandra_connections_per_host must not be 0";
@@ -1929,11 +1973,80 @@ static void result_finish(struct cassandra_result *result)
 		sql_result_unref(&result->api);
 }
 
+static void
+cassandra_fallback_warn(struct cassandra_db *db, struct cassandra_result *result,
+			bool rate_limit, const char *reason)
+{
+	time_t last_warning =
+		ioloop_time - db->last_fallback_warning[result->query_type];
+
+	if (rate_limit && last_warning < CASSANDRA_FALLBACK_WARN_INTERVAL_SECS)
+		return;
+	e_warning(db->api.event, "%s - %s", result->error, reason);
+	db->last_fallback_warning[result->query_type] = ioloop_time;
+}
+
+/* A primary-consistency query has definitively failed while the breaker was
+   closed. Count it within the window and open the breaker once the threshold
+   of consecutive failures is reached. */
+static void
+cassandra_breaker_record_failure(struct cassandra_db *db,
+				 struct cassandra_result *result)
+{
+	enum cassandra_query_type query_type = result->query_type;
+	struct timeval *window_start =
+		&db->primary_failure_window_start[query_type];
+
+	if (window_start->tv_sec == 0 ||
+	    timeval_diff_msecs(&ioloop_timeval, window_start) >
+	    (long long)db->set->fallback_window_msecs) {
+		/* start a fresh window */
+		*window_start = ioloop_timeval;
+		db->primary_window_failures[query_type] = 0;
+	}
+	db->primary_window_failures[query_type]++;
+	if (db->primary_window_failures[query_type] <
+	    db->set->fallback_failure_threshold) {
+		cassandra_fallback_warn(db, result, TRUE, t_strdup_printf(
+			"retrying the query with consistency %s (instead of %s), "
+			"fallback breaker still closed (%u/%u failures)",
+			cass_consistency_string(result->fallback_consistency),
+			cass_consistency_string(result->primary_consistency),
+			db->primary_window_failures[query_type],
+			db->set->fallback_failure_threshold));
+		return;
+	}
+
+	/* open the breaker */
+	db->primary_probe_failures[query_type] = 1;
+	db->primary_window_failures[query_type] = 0;
+	window_start->tv_sec = 0;
+	cassandra_fallback_warn(db, result, FALSE, t_strdup_printf(
+		"fallback breaker opened, retrying future %s queries with "
+		"consistency %s (instead of %s)",
+		cassandra_query_type_names[query_type],
+		cass_consistency_string(result->fallback_consistency),
+		cass_consistency_string(result->primary_consistency)));
+}
+
+/* A primary-consistency probe failed while the breaker was already open. Grow
+   the exponential backoff so probes are attempted less frequently. */
+static void
+cassandra_breaker_probe_failed(struct cassandra_db *db,
+			       struct cassandra_result *result)
+{
+	db->primary_probe_failures[result->query_type]++;
+	cassandra_fallback_warn(db, result, TRUE, t_strdup_printf(
+		"fallback breaker still open, retrying future %s queries with "
+		"consistency %s (instead of %s)",
+		cassandra_query_type_names[result->query_type],
+		cass_consistency_string(result->fallback_consistency),
+		cass_consistency_string(result->primary_consistency)));
+}
+
 static void query_resend_with_fallback(struct cassandra_result *result)
 {
 	struct cassandra_db *db = container_of(result->api.db, struct cassandra_db, api);
-	time_t last_warning =
-		ioloop_time - db->last_fallback_warning[result->query_type];
 
 	if (db->closing) {
 		/* Don't resend onto a session that's closing - result->error
@@ -1945,18 +2058,9 @@ static void query_resend_with_fallback(struct cassandra_result *result)
 		return;
 	}
 
-	if (last_warning >= CASSANDRA_FALLBACK_WARN_INTERVAL_SECS) {
-		e_warning(db->api.event,
-			  "%s - retrying future %s queries with consistency %s (instead of %s)",
-			  result->error, cassandra_query_type_names[result->query_type],
-			  cass_consistency_string(result->fallback_consistency),
-			  cass_consistency_string(result->consistency));
-		db->last_fallback_warning[result->query_type] = ioloop_time;
-	}
 	i_free_and_null(result->error);
-	db->fallback_failures[result->query_type]++;
-
 	result->consistency = result->fallback_consistency;
+	result->sent_at_fallback = TRUE;
 	driver_cassandra_result_send_query(result);
 }
 
@@ -2023,7 +2127,44 @@ static bool query_error_want_fallback(CassError error)
 	}
 }
 
-static enum sql_result_error_type
+/* Returns TRUE if a fallback-eligible error is likely transient, so the query
+   could succeed by retrying it at primary consistency. */
+static bool query_error_want_primary_retry(CassError error)
+{
+	switch (error) {
+	case CASS_ERROR_SERVER_UNAVAILABLE:
+	case CASS_ERROR_LIB_NO_HOSTS_AVAILABLE:
+		/* Strong evidence that a datacenter (or enough replicas) is
+		   actually unreachable. The coordinator already knows the
+		   required replicas can't be reached. */
+		return FALSE;
+	case CASS_ERROR_LIB_REQUEST_TIMED_OUT:
+		/* The full cassandra_request_timeout was already spent waiting
+		   for this query. Retrying would most likely only delay the
+		   reply beyond the caller's own timeout. */
+		return FALSE;
+	default:
+		return TRUE;
+	}
+}
+
+static CassErrorSource driver_cassandra_error_source(CassError error)
+{
+	/* The public CASS_ERROR() macro defines the encoding as
+	   (source << 24) | code, but the driver exposes no accessor to get the
+	   source back out, so undo it here. */
+	return (CassErrorSource)((unsigned int)error >> 24);
+}
+
+/* Returns TRUE if the mutation may already have been applied despite the error.
+
+   Unrecognized server errors intentionally end up here as uncertain. The two
+   ways of being wrong are not symmetric: a wrong TRUE at worst makes the caller
+   keep data that turns out to be unreferenced, while a wrong FALSE lets the
+   caller undo or clean up after a write that did commit. So an error code
+   whose meaning we don't know, including any added by a future cpp-driver or
+   Cassandra release, has to be treated as uncertain. */
+static bool
 driver_cassandra_error_is_uncertain(CassError error)
 {
 	switch (error) {
@@ -2039,10 +2180,69 @@ driver_cassandra_error_is_uncertain(CassError error)
 		/* A request sent from the driver has timed out. */
 	case CASS_ERROR_LIB_WRITE_ERROR:
 		/* A write error occurred. */
-		return SQL_RESULT_ERROR_TYPE_WRITE_UNCERTAIN;
+	case CASS_ERROR_SERVER_SERVER_ERROR:
+		/* The coordinator accepted the request and then hit an internal
+		 * error. The mutation may already have been applied before the
+		 * error, so this is ambiguous rather than a definite failure.
+		 * Callers must not treat it as "the write did not happen". */
+	case CASS_ERROR_SERVER_OVERLOADED:
+		/* The coordinator can throw this while it is already sending
+		 * the mutations to the replicas (when there are too many
+		 * hints in progress). For a logged batch the batchlog has
+		 * already been written by then and will be replayed, and for
+		 * an unlogged batch the earlier mutations have already been
+		 * sent. */
+	case CASS_ERROR_LIB_UNEXPECTED_RESPONSE:
+	case CASS_ERROR_LIB_INVALID_DATA:
+	case CASS_ERROR_LIB_NOT_ENOUGH_DATA:
+	case CASS_ERROR_LIB_INVALID_ERROR_RESULT_TYPE:
+		/* The server replied, but the driver couldn't decode the
+		 * reply. The request reached the coordinator, so the
+		 * mutation may have been applied. */
+	case CASS_ERROR_LIB_NO_HOSTS_AVAILABLE:
+		/* The driver ran out of hosts in the query plan. The hosts
+		 * that were already tried count too: e.g. a coordinator may
+		 * have answered UNAVAILABLE, or the connection may have
+		 * dropped while the request was in flight, after which the
+		 * driver retried the next host. So the request may have
+		 * reached a coordinator and the mutation may have been
+		 * applied. */
+		return TRUE;
+
+	/* Server errors that the coordinator answered with before it could have
+	 * applied anything: rejected while parsing, authenticating or routing the
+	 * request, or refused outright. Also the read-side failures, which can't
+	 * be the result of a mutation at all. */
+	case CASS_ERROR_SERVER_PROTOCOL_ERROR:
+	case CASS_ERROR_SERVER_BAD_CREDENTIALS:
+	case CASS_ERROR_SERVER_IS_BOOTSTRAPPING:
+	case CASS_ERROR_SERVER_TRUNCATE_ERROR:
+	case CASS_ERROR_SERVER_READ_TIMEOUT:
+	case CASS_ERROR_SERVER_READ_FAILURE:
+	case CASS_ERROR_SERVER_FUNCTION_FAILURE:
+	case CASS_ERROR_SERVER_SYNTAX_ERROR:
+	case CASS_ERROR_SERVER_UNAUTHORIZED:
+	case CASS_ERROR_SERVER_INVALID_QUERY:
+	case CASS_ERROR_SERVER_CONFIG_ERROR:
+	case CASS_ERROR_SERVER_ALREADY_EXISTS:
+	case CASS_ERROR_SERVER_UNPREPARED:
+		return FALSE;
 	default:
-		return SQL_RESULT_ERROR_TYPE_UNKNOWN;
+		break;
 	}
+
+	/* Anything else that isn't a server error comes from the client library
+	   or the TLS layer. These are certain only because the client-library
+	   errors that mean the request was already in flight, or that the
+	   server's reply couldn't be decoded, are listed above. The rest mean
+	   the request was never built or never left the driver. Enumerating them
+	   would tie this to one cpp-driver version's error list. */
+	if (driver_cassandra_error_source(error) != CASS_ERROR_SOURCE_SERVER)
+		return FALSE;
+
+	/* An unrecognized server error: the coordinator saw the request, so we
+	   can't rule out that the mutation was applied. */
+	return TRUE;
 }
 
 static const char *
@@ -2101,6 +2301,7 @@ static void query_callback(CassFuture *future, void *context)
 		const char *errmsg;
 		size_t errsize;
 		long long msecs;
+		bool is_write;
 
 		cass_future_error_message(future, &errmsg, &errsize);
 		i_free(result->error);
@@ -2109,31 +2310,82 @@ static void query_callback(CassFuture *future, void *context)
 		counters_inc_error(db, error);
 		/* Timeouts bring uncertainty whether the query succeeded or
 		   not. Also _SERVER_UNAVAILABLE could have actually written
-		   enough copies of the data for the query to succeed. */
-		result->api.error_type = driver_cassandra_error_is_uncertain(error);
+		   enough copies of the data for the query to succeed. Once
+		   any attempt has been uncertain, the result stays uncertain
+		   even if a later fallback attempt fails with a non-uncertain
+		   error - the original write may have applied. */
+		if (driver_cassandra_error_is_uncertain(error))
+			result->any_uncertain = TRUE;
+		result->api.error_type = result->any_uncertain ?
+			SQL_RESULT_ERROR_TYPE_WRITE_UNCERTAIN :
+			SQL_RESULT_ERROR_TYPE_UNKNOWN;
+		/* Include the error code: several distinct errors share the
+		   same message text (e.g. LIB_NO_HOSTS_AVAILABLE and
+		   SERVER_UNAVAILABLE are both "All hosts in current policy
+		   attempted and were either unavailable or failed"), although
+		   they mean different things. Without the code a log can't tell
+		   afterwards which one happened. */
+		is_write = result->query_type == CASSANDRA_QUERY_TYPE_WRITE ||
+			result->query_type == CASSANDRA_QUERY_TYPE_DELETE;
 		result->error = i_strdup_printf(
-			"Query '%s' failed: %.*s (in %lld.%03lld secs%s%s)",
+			"Query '%s' failed: %.*s (in %lld.%03lld secs, code 0x%08x (%s)%s%s%s)",
 			result->log_query, (int)errsize, errmsg, msecs/1000, msecs%1000,
+			(unsigned int)error, cass_error_desc(error),
+			result->any_uncertain && is_write ? ", write uncertain" : "",
 			result->page_num == 0 ?
 				"" :
 				t_strdup_printf(", page %u", result->page_num),
 			get_consistency_error(result, future, error));
 
-		if (query_error_want_fallback(error) &&
-		    result->fallback_consistency != result->consistency) {
-			/* retry with fallback consistency */
-			query_resend_with_fallback(result);
+		if (!query_error_want_fallback(error) ||
+		    result->sent_at_fallback ||
+		    result->fallback_consistency == result->primary_consistency) {
+			/* Not a fallback-eligible error, the fallback attempt
+			   itself failed or there's no distinct fallback
+			   consistency configured. */
+			result_finish(result);
 			return;
 		}
-		result_finish(result);
+		/* a primary-consistency attempt failed */
+		if (!db->closing &&
+		    db->primary_probe_failures[result->query_type] == 0 &&
+		    query_error_want_primary_retry(error) &&
+		    result->primary_retries < db->set->primary_retry_count) {
+			/* Transient error while the breaker is closed - the
+			   primary consistency may well succeed on a retry, so
+			   don't degrade durability yet. When the breaker is
+			   already open, the query isn't retried: probes are
+			   kept cheap, and queries sent before the breaker
+			   opened are downgraded right away. */
+			result->primary_retries++;
+			i_free_and_null(result->error);
+			driver_cassandra_result_send_query(result);
+			return;
+		}
+		if (db->primary_probe_failures[result->query_type] == 0) {
+			/* breaker is closed: count this failure towards the
+			   threshold for opening it. */
+			cassandra_breaker_record_failure(db, result);
+		} else if (result->primary_probe) {
+			/* a primary probe failed while the breaker is open.
+			   Grow the backoff. A query that was sent at primary
+			   consistency before the breaker opened isn't a probe,
+			   so it doesn't affect the backoff. */
+			cassandra_breaker_probe_failed(db, result);
+		}
+		/* Either way, downgrade this individual query so it still has
+		   a chance to apply. */
+		query_resend_with_fallback(result);
 		return;
 	}
 	db->counters[CASSANDRA_COUNTER_TYPE_QUERY_RECV_OK]++;
 
-	if (result->fallback_consistency != result->consistency) {
-		/* non-fallback query finished successfully. if there had been
-		   any fallbacks, reset them. */
-		db->fallback_failures[result->query_type] = 0;
+	if (!result->sent_at_fallback) {
+		/* a primary-consistency query finished successfully. Close
+		   the breaker and reset the windowed failure counter. */
+		db->primary_probe_failures[result->query_type] = 0;
+		db->primary_window_failures[result->query_type] = 0;
+		db->primary_failure_window_start[result->query_type].tv_sec = 0;
 	}
 
 	result->result = cass_future_get_result(future);
@@ -2195,7 +2447,7 @@ static bool
 driver_cassandra_want_fallback_query(struct cassandra_result *result)
 {
 	struct cassandra_db *db = container_of(result->api.db, struct cassandra_db, api);
-	unsigned int failure_count = db->fallback_failures[result->query_type];
+	unsigned int failure_count = db->primary_probe_failures[result->query_type];
 	unsigned int i, msecs = CASSANDRA_FALLBACK_FIRST_RETRY_MSECS;
 	struct timeval tv;
 
@@ -2255,22 +2507,23 @@ cassandra_result_connect_and_send_query(struct cassandra_result *result)
 	result->row_pool = pool_alloconly_create("cassandra result", 512);
 	switch (result->query_type) {
 	case CASSANDRA_QUERY_TYPE_READ:
-		result->consistency = db->set->parsed_read_consistency;
+		result->primary_consistency = db->set->parsed_read_consistency;
 		result->fallback_consistency =
 			db->set->parsed_read_fallback_consistency;
 		break;
 	case CASSANDRA_QUERY_TYPE_READ_MORE:
 		/* consistency is already set and we don't want to fallback
 		   at this point anymore. */
+		result->primary_consistency = result->consistency;
 		result->fallback_consistency = result->consistency;
 		break;
 	case CASSANDRA_QUERY_TYPE_WRITE:
-		result->consistency = db->set->parsed_write_consistency;
+		result->primary_consistency = db->set->parsed_write_consistency;
 		result->fallback_consistency =
 			db->set->parsed_write_fallback_consistency;
 		break;
 	case CASSANDRA_QUERY_TYPE_DELETE:
-		result->consistency = db->set->parsed_delete_consistency;
+		result->primary_consistency = db->set->parsed_delete_consistency;
 		result->fallback_consistency =
 			db->set->parsed_delete_fallback_consistency;
 		break;
@@ -2278,10 +2531,17 @@ cassandra_result_connect_and_send_query(struct cassandra_result *result)
 		i_unreached();
 	}
 
-	if (driver_cassandra_want_fallback_query(result))
+	if (driver_cassandra_want_fallback_query(result)) {
 		result->consistency = result->fallback_consistency;
-	else
+		result->sent_at_fallback = TRUE;
+		result->primary_probe = FALSE;
+	} else {
+		result->consistency = result->primary_consistency;
+		result->sent_at_fallback = FALSE;
+		result->primary_probe =
+			db->primary_probe_failures[result->query_type] > 0;
 		db->primary_query_last_sent[result->query_type] = ioloop_timeval;
+	}
 
 	driver_cassandra_result_send_query(result);
 	result->query_sent = TRUE;

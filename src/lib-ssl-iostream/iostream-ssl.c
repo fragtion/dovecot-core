@@ -168,14 +168,11 @@ int io_stream_autocreate_ssl_client(
 	}
 	settings_free(ssl_set);
 
-	ret = ssl_iostream_client_context_cache_get(set, &ctx, error_r);
+	ret = ssl_iostream_client_context_cache_get(
+		set, parameters->application_protocols, &ctx, error_r);
 	settings_free(set);
 	if (ret < 0)
 		return -1;
-	if (ret > 0 && parameters->application_protocols != NULL) {
-		ssl_iostream_context_set_application_protocols(ctx,
-				parameters->application_protocols);
-	}
 	ret = io_stream_create_ssl_client(ctx, parameters->host,
 					  parameters->event_parent,
 					  parameters->flags, input,
@@ -204,14 +201,11 @@ int io_stream_autocreate_ssl_server(
 	settings_free(ssl_set);
 	settings_free(ssl_server_set);
 
-	ret = ssl_iostream_server_context_cache_get(set, &ctx, error_r);
+	ret = ssl_iostream_server_context_cache_get(
+		set, parameters->application_protocols, &ctx, error_r);
 	settings_free(set);
 	if (ret < 0)
 		return -1;
-	if (ret > 0 && parameters->application_protocols != NULL) {
-		ssl_iostream_context_set_application_protocols(ctx,
-				parameters->application_protocols);
-	}
 	ret = io_stream_create_ssl_server(ctx, parameters->event_parent, input,
 					  output, iostream_r, error_r);
 	ssl_iostream_context_unref(&ctx);
@@ -359,6 +353,22 @@ static bool quick_strcmp(const char *str1, const char *str2)
 	return null_strcmp(str1, str2) == 0;
 }
 
+bool ssl_iostream_application_protocols_equals(const char *const *protos1,
+					       const char *const *protos2)
+{
+	if (protos1 == protos2)
+		return TRUE;
+	if (protos1 == NULL || protos2 == NULL)
+		return FALSE;
+
+	unsigned int i;
+	for (i = 0; protos1[i] != NULL && protos2[i] != NULL; i++) {
+		if (strcmp(protos1[i], protos2[i]) != 0)
+			return FALSE;
+	}
+	return protos1[i] == NULL && protos2[i] == NULL;
+}
+
 bool ssl_iostream_settings_equals(const struct ssl_iostream_settings *set1,
 				  const struct ssl_iostream_settings *set2)
 {
@@ -390,6 +400,11 @@ bool ssl_iostream_settings_equals(const struct ssl_iostream_settings *set1,
 	    !quick_strcmp(set1->cert_username_field,
 			  set2->cert_username_field) ||
 	    !quick_strcmp(set1->crypto_device, set2->crypto_device))
+		return FALSE;
+
+	if (!ssl_iostream_application_protocols_equals(
+			set1->application_protocols,
+			set2->application_protocols))
 		return FALSE;
 
 	if (set1->skip_crl_check != set2->skip_crl_check ||

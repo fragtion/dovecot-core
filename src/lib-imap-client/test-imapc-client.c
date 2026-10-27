@@ -17,6 +17,7 @@
 
 #include <stdio.h>
 #include <unistd.h>
+#include <sys/signal.h>
 
 #define SERVER_KILL_TIMEOUT_SECS    20
 
@@ -34,12 +35,12 @@ struct test_server {
 	struct ostream *output;
 };
 
+static struct event *common_event, *client_event, *server_event;
 static struct ip_addr bind_ip;
 static struct test_server server;
 static struct imapc_client *imapc_client;
 static enum imapc_command_state imapc_login_last_reply;
 static ARRAY(enum imapc_command_state) imapc_cmd_last_replies;
-static bool debug = FALSE;
 
 static struct settings_simple test_set;
 
@@ -50,13 +51,16 @@ static void main_deinit(void);
  */
 
 static const char **
-test_generate_settings(const char *port, const char *connection_timeout_interval)
+test_generate_settings(const char *port, const char *sasl_mech,
+		       const char *connection_timeout_interval)
 {
 	static const char *settings[] = {
 		"imapc_host", "127.0.0.1",
 		"imapc_port", "",
-		"imapc_user", "testuser",
-		"imapc_password", "testpass",
+		"imapc/client_auth_mechanism", "",
+		"imapc/client_auth_authid", "",
+		"imapc/client_auth_authzid", "testuser",
+		"imapc/client_auth_password", "testpass",
 		"imapc_connection_timeout_interval", "5s",
 		"imapc_connection_retry_count", "3",
 		"imapc_connection_retry_interval", "10ms",
@@ -66,8 +70,12 @@ test_generate_settings(const char *port, const char *connection_timeout_interval
 	};
 	if (port != NULL)
 		settings[3] = port;
+	if (sasl_mech != NULL)
+		settings[5] = sasl_mech;
+	else
+		settings[5] = "";
 	if (connection_timeout_interval != NULL)
-		settings[9] = connection_timeout_interval;
+		settings[13] = connection_timeout_interval;
 
 	return settings;
 }
@@ -96,11 +104,8 @@ static bool test_imapc_cmd_last_reply_expect(enum imapc_command_state state)
 static void imapc_login_callback(const struct imapc_command_reply *reply,
 				 void *context ATTR_UNUSED)
 {
-	if (debug) {
-		i_debug("Login reply: %s %s",
-			imapc_command_state_names[reply->state],
-			reply->text_full);
-	}
+	e_debug(client_event, "Login reply: %s %s",
+		imapc_command_state_names[reply->state], reply->text_full);
 	imapc_login_last_reply = reply->state;
 	imapc_client_stop(imapc_client);
 }
@@ -108,11 +113,8 @@ static void imapc_login_callback(const struct imapc_command_reply *reply,
 static void imapc_command_callback(const struct imapc_command_reply *reply,
 				   void *context ATTR_UNUSED)
 {
-	if (debug) {
-		i_debug("Command reply: %s %s",
-			imapc_command_state_names[reply->state],
-			reply->text_full);
-	}
+	e_debug(client_event, "Command reply: %s %s",
+		imapc_command_state_names[reply->state], reply->text_full);
 	array_push_back(&imapc_cmd_last_replies, &reply->state);
 	imapc_client_stop(imapc_client);
 }
@@ -137,8 +139,7 @@ test_imapc_server_expect_full(struct test_server *server,
 {
 	const char *line = i_stream_read_next_line(server->input);
 
-	if (debug)
-		i_debug("Received: %s", (line == NULL ? "<EOF>" : line));
+	e_debug(server_event, "Received: %s", (line == NULL ? "<EOF>" : line));
 
 	if (line == NULL) {
 		printf("imapc client disconnected unexpectedly: %s\n",
@@ -161,14 +162,12 @@ static bool test_imapc_server_expect(const char *expected_line)
 static void
 test_server_wait_connection_common(struct test_server *server)
 {
-	if (debug)
-		i_debug("Waiting for connection");
+	e_debug(server_event, "Waiting for connection");
 
 	server->fd = net_accept(server->fd_listen, NULL, NULL);
 	i_assert(server->fd >= 0);
 
-	if (debug)
-		i_debug("Client connected");
+	e_debug(server_event, "Client connected");
 
 	fd_set_nonblock(server->fd, FALSE);
 	server->input = i_stream_create_fd(server->fd, SIZE_MAX);
@@ -201,8 +200,7 @@ test_server_wait_connection_imap4rev2(struct test_server *server, bool send_bann
 
 static void test_server_disconnect(struct test_server *server)
 {
-	if (debug)
-		i_debug("Disconnecting client");
+	e_debug(server_event, "Disconnecting client");
 
 	i_stream_unref(&server->input);
 	o_stream_unref(&server->output);
@@ -222,8 +220,7 @@ static void test_server_disconnect_and_wait(bool send_banner)
 static int test_open_server_fd(in_port_t *bind_port)
 {
 	int fd = net_listen(&bind_ip, bind_port, 128);
-	if (debug)
-		i_debug("server listening on %u", *bind_port);
+	e_debug(common_event, "server listening on %u", *bind_port);
 	if (fd == -1) {
 		i_fatal("listen(%s:%u) failed: %m",
 			net_ip2addr(&bind_ip), *bind_port);
@@ -238,17 +235,16 @@ static int test_run_server(test_server_init_t *server_test)
 
 	i_set_failure_prefix("SERVER: ");
 
-	if (debug)
-		i_debug("PID=%s", my_pid);
+	e_debug(server_event, "PID=%s", my_pid);
 
+	test_subprocess_notify_signal_send_parent(SIGHUP);
 	ioloop = io_loop_create();
 	if (server_test != NULL)
 		server_test();
 	test_server_disconnect(&server);
 	io_loop_destroy(&ioloop);
 
-	if (debug)
-		i_debug("Terminated");
+	e_debug(server_event, "Terminated");
 
 	i_close_fd(&server.fd_listen);
 	main_deinit();
@@ -264,19 +260,19 @@ static void
 test_run_client(test_client_init_t *client_test, const char *temp_path_prefix)
 {
 	struct ioloop *ioloop;
+	const char *error;
 
 	i_set_failure_prefix("CLIENT: ");
 
-	if (debug)
-		i_debug("PID=%s", my_pid);
-
-	i_sleep_msecs(100); /* wait a little for server setup */
+	e_debug(client_event, "PID=%s", my_pid);
 
 	struct imapc_parameters imapc_params = {
 		.temp_path_prefix = temp_path_prefix,
 	};
 	ioloop = io_loop_create();
-	imapc_client = imapc_client_init(&imapc_params, test_set.event);
+	if (imapc_client_init(&imapc_params, test_set.event,
+			      &imapc_client, &error) < 0)
+		i_fatal("Failed to initialize IMAP client: %s", error);
 	client_test();
 	imapc_client_logout(imapc_client);
 	test_assert(array_count(&imapc_cmd_last_replies) == 0);
@@ -284,14 +280,13 @@ test_run_client(test_client_init_t *client_test, const char *temp_path_prefix)
 		imapc_client_deinit(&imapc_client);
 	io_loop_destroy(&ioloop);
 
-	if (debug)
-		i_debug("Terminated");
+	e_debug(client_event, "Terminated");
 }
 
 static void
 test_run_client_server(test_client_init_t *client_test,
 		       test_server_init_t *server_test,
-		       bool reduce_timeout)
+		       const char *sasl_mech, bool reduce_timeout)
 {
 	static unsigned int run_id = 0;
 	const char *error;
@@ -305,9 +300,10 @@ test_run_client_server(test_client_init_t *client_test,
 	server.fd = -1;
 	server.fd_listen = test_open_server_fd(&server.port);
 
-	const char **settings = test_generate_settings(dec2str(server.port),
-						       reduce_timeout ? "500ms" : "5s");
-	settings_simple_init(&test_set, settings);
+	const char **settings = test_generate_settings(
+		dec2str(server.port), sasl_mech,
+		(reduce_timeout ? "500ms" : "5s"));
+	settings_simple_init_with_event(&test_set, client_event, settings);
 
 	const char *temp_path_prefix = t_strdup_printf(
 		"%s/client-run-%u/", test_dir_get(), run_id++);
@@ -316,7 +312,10 @@ test_run_client_server(test_client_init_t *client_test,
 
 	if (server_test != NULL) {
 		/* Fork server */
+		test_subprocess_notify_signal_reset(SIGHUP);
 		test_subprocess_fork(test_run_server, server_test, TRUE);
+		test_subprocess_notify_signal_wait(
+			SIGHUP, TEST_SIGNALS_DEFAULT_TIMEOUT_MS);
 	}
 	i_close_fd(&server.fd_listen);
 
@@ -356,7 +355,8 @@ static void test_imapc_connect_failed_client(void)
 static void test_imapc_connect_failed(void)
 {
 	test_begin("imapc connect failed");
-	test_run_client_server(test_imapc_connect_failed_client, NULL, FALSE);
+	test_run_client_server(test_imapc_connect_failed_client, NULL,
+			       NULL, FALSE);
 	test_end();
 }
 
@@ -390,7 +390,38 @@ static void test_imapc_banner_hangs(void)
 	test_begin("imapc banner hangs");
 	test_run_client_server(test_imapc_banner_hangs_client,
 			       test_imapc_banner_hangs_server,
-			       TRUE);
+			       NULL, TRUE);
+	test_end();
+}
+
+/*
+ * imapc short invalid banner
+ */
+
+static void test_imapc_banner_short_invalid_client(void)
+{
+	imapc_client_set_login_callback(imapc_client,
+					imapc_login_callback, NULL);
+	imapc_client_login(imapc_client);
+	test_expect_error_string("Banner doesn't begin with OK");
+	imapc_client_run(imapc_client);
+	test_expect_no_more_errors();
+	test_assert(imapc_login_last_reply == IMAPC_COMMAND_STATE_DISCONNECTED);
+}
+
+static void test_imapc_banner_short_invalid_server(void)
+{
+	test_server_wait_connection(&server, FALSE);
+	o_stream_nsend_str(server.output, "* \r\n");
+	test_assert(i_stream_read_next_line(server.input) == NULL);
+}
+
+static void test_imapc_banner_short_invalid(void)
+{
+	test_begin("imapc short invalid banner");
+	test_run_client_server(test_imapc_banner_short_invalid_client,
+			       test_imapc_banner_short_invalid_server,
+			       NULL, FALSE);
 	test_end();
 }
 
@@ -436,7 +467,7 @@ static void test_imapc_login_hangs(void)
 	test_begin("imapc login hangs");
 	test_run_client_server(test_imapc_login_hangs_client,
 			       test_imapc_login_hangs_server,
-			       TRUE);
+			       NULL, TRUE);
 	test_end();
 }
 
@@ -468,7 +499,148 @@ static void test_imapc_login_fails(void)
 	test_begin("imapc login fails");
 	test_run_client_server(test_imapc_login_fails_client,
 			       test_imapc_login_fails_server,
-			       FALSE);
+			       NULL, FALSE);
+	test_end();
+}
+
+/*
+ * imapc login success
+ */
+
+static void test_imapc_login_success_client(void)
+{
+	imapc_client_set_login_callback(imapc_client,
+					imapc_login_callback, NULL);
+	imapc_client_login(imapc_client);
+	imapc_client_run(imapc_client);
+	test_assert(imapc_login_last_reply == IMAPC_COMMAND_STATE_OK);
+
+	struct imapc_command *cmd;
+
+	cmd = imapc_client_cmd(imapc_client, imapc_command_callback, NULL);
+	imapc_command_send(cmd, "NOOP");
+	imapc_client_run(imapc_client);
+	test_assert(test_imapc_cmd_last_reply_expect(IMAPC_COMMAND_STATE_OK));
+}
+
+static void test_imapc_login_success_server(void)
+{
+	test_server_wait_connection(&server, TRUE);
+	test_assert(test_imapc_server_expect(
+		"1 LOGIN \"testuser\" \"testpass\""));
+	o_stream_nsend_str(server.output, "1 OK Logged in\r\n");
+	test_assert(test_imapc_server_expect(
+		"2 NOOP"));
+	o_stream_nsend_str(server.output, "2 OK Doing nothing\r\n");
+
+	test_assert(test_imapc_server_expect("3 LOGOUT"));
+	o_stream_nsend_str(server.output, "3 OK \r\n");
+
+	test_assert(i_stream_read_next_line(server.input) == NULL);
+}
+
+static void test_imapc_login_success(void)
+{
+	test_begin("imapc login success");
+	test_run_client_server(test_imapc_login_success_client,
+			       test_imapc_login_success_server,
+			       NULL, FALSE);
+	test_end();
+}
+
+/*
+ * imapc auth success
+ */
+
+static void test_imapc_auth_success_client(void)
+{
+	imapc_client_set_login_callback(imapc_client,
+					imapc_login_callback, NULL);
+	imapc_client_login(imapc_client);
+	imapc_client_run(imapc_client);
+	test_assert(imapc_login_last_reply == IMAPC_COMMAND_STATE_OK);
+
+	struct imapc_command *cmd;
+
+	cmd = imapc_client_cmd(imapc_client, imapc_command_callback, NULL);
+	imapc_command_send(cmd, "NOOP");
+	imapc_client_run(imapc_client);
+	test_assert(test_imapc_cmd_last_reply_expect(IMAPC_COMMAND_STATE_OK));
+}
+
+static void test_imapc_auth_success_server(void)
+{
+	test_server_wait_connection(&server, TRUE);
+	test_assert(test_imapc_server_expect(
+		"1 AUTHENTICATE PLAIN"));
+	o_stream_nsend_str(server.output, "+ \r\n");
+	test_assert(test_imapc_server_expect(
+		"AHRlc3R1c2VyAHRlc3RwYXNz"));
+	o_stream_nsend_str(server.output, "1 OK Logged in\r\n");
+	test_assert(test_imapc_server_expect(
+		"2 NOOP"));
+	o_stream_nsend_str(server.output, "2 OK Doing nothing\r\n");
+
+	test_assert(test_imapc_server_expect("3 LOGOUT"));
+	o_stream_nsend_str(server.output, "3 OK \r\n");
+
+	test_assert(i_stream_read_next_line(server.input) == NULL);
+}
+
+static void test_imapc_auth_success(void)
+{
+	test_begin("imapc auth success");
+	test_run_client_server(test_imapc_auth_success_client,
+			       test_imapc_auth_success_server,
+			       "PLAIN", FALSE);
+	test_end();
+}
+
+/*
+ * imapc auth SASL-IR success
+ */
+
+static void test_imapc_auth_ir_success_client(void)
+{
+	imapc_client_set_login_callback(imapc_client,
+					imapc_login_callback, NULL);
+	imapc_client_login(imapc_client);
+	imapc_client_run(imapc_client);
+	test_assert(imapc_login_last_reply == IMAPC_COMMAND_STATE_OK);
+
+	struct imapc_command *cmd;
+
+	cmd = imapc_client_cmd(imapc_client, imapc_command_callback, NULL);
+	imapc_command_send(cmd, "NOOP");
+	imapc_client_run(imapc_client);
+	test_assert(test_imapc_cmd_last_reply_expect(IMAPC_COMMAND_STATE_OK));
+}
+
+static void test_imapc_auth_ir_success_server(void)
+{
+	test_server_wait_connection(&server, FALSE);
+	o_stream_nsend_str(server.output, "* OK ["
+		"CAPABILITY IMAP4rev1 UNSELECT QUOTA SASL-IR AUTH=PLAIN"
+		"] ready\r\n");
+	test_assert(test_imapc_server_expect(
+		"1 AUTHENTICATE PLAIN AHRlc3R1c2VyAHRlc3RwYXNz"));
+	o_stream_nsend_str(server.output, "1 OK Logged in\r\n");
+	test_assert(test_imapc_server_expect(
+		"2 NOOP"));
+	o_stream_nsend_str(server.output, "2 OK Doing nothing\r\n");
+
+	test_assert(test_imapc_server_expect("3 LOGOUT"));
+	o_stream_nsend_str(server.output, "3 OK \r\n");
+
+	test_assert(i_stream_read_next_line(server.input) == NULL);
+}
+
+static void test_imapc_auth_ir_success(void)
+{
+	test_begin("imapc auth SASL-IR success");
+	test_run_client_server(test_imapc_auth_ir_success_client,
+			       test_imapc_auth_ir_success_server,
+			       "PLAIN", FALSE);
 	test_end();
 }
 
@@ -527,6 +699,15 @@ static void test_imapc_reconnect_server(void)
 	test_assert(i_stream_read_next_line(server.input) == NULL);
 }
 
+static void test_imapc_reconnect(void)
+{
+	test_begin("imapc reconnect");
+	test_run_client_server(test_imapc_reconnect_client,
+			       test_imapc_reconnect_server,
+			       NULL, FALSE);
+	test_end();
+}
+
 /*
  * imapc short tagged reply (IMAP4rev2)
  */
@@ -559,7 +740,7 @@ static void test_imapc_short_reply(void)
 	test_begin("imapc short tagged reply (IMAP4rev2)");
 	test_run_client_server(test_imapc_short_reply_client,
 			       test_imapc_short_reply_server,
-			       FALSE);
+			       NULL, FALSE);
 	test_end();
 }
 
@@ -591,7 +772,7 @@ static void test_imapc_short_reply_no(void)
 	test_begin("imapc short tagged NO reply (IMAP4rev2)");
 	test_run_client_server(test_imapc_short_reply_no_client,
 			       test_imapc_short_reply_no_server,
-			       FALSE);
+			       NULL, FALSE);
 	test_end();
 }
 
@@ -624,7 +805,7 @@ static void test_imapc_short_reply_bad(void)
 	test_begin("imapc short tagged BAD reply (IMAP4rev2)");
 	test_run_client_server(test_imapc_short_reply_bad_client,
 			       test_imapc_short_reply_bad_server,
-			       FALSE);
+			       NULL, FALSE);
 	test_end();
 }
 
@@ -663,16 +844,7 @@ static void test_imapc_short_banner(void)
 	test_begin("imapc banner with short resp-text (IMAP4rev2)");
 	test_run_client_server(test_imapc_short_banner_client,
 			       test_imapc_short_banner_server,
-			       FALSE);
-	test_end();
-}
-
-static void test_imapc_reconnect(void)
-{
-	test_begin("imapc reconnect");
-	test_run_client_server(test_imapc_reconnect_client,
-			       test_imapc_reconnect_server,
-			       FALSE);
+			       NULL, FALSE);
 	test_end();
 }
 
@@ -745,7 +917,7 @@ static void test_imapc_reconnect_resend_commands(void)
 	test_begin("imapc reconnect resend commands");
 	test_run_client_server(test_imapc_reconnect_resend_cmds_client,
 			       test_imapc_reconnect_resend_cmds_server,
-			       FALSE);
+			       NULL, FALSE);
 	test_end();
 }
 
@@ -809,7 +981,7 @@ static void test_imapc_reconnect_resend_commands_failed(void)
 	test_begin("imapc reconnect resend commands failed");
 	test_run_client_server(test_imapc_reconnect_resend_cmds_failed_client,
 			       test_imapc_reconnect_resend_cmds_failed_server,
-			       TRUE);
+			       NULL, TRUE);
 	test_end();
 }
 
@@ -894,7 +1066,7 @@ static void test_imapc_reconnect_mailbox(void)
 	test_begin("imapc reconnect mailbox");
 	test_run_client_server(test_imapc_reconnect_mailbox_client,
 			       test_imapc_reconnect_mailbox_server,
-			       FALSE);
+			       NULL, FALSE);
 	test_end();
 }
 
@@ -930,7 +1102,7 @@ static void test_imapc_client_get_capabilities(void)
 	test_begin("imapc_client_get_capabilities()");
 	test_run_client_server(test_imapc_client_get_capabilities_client,
 			       test_imapc_client_get_capabilities_server,
-			       FALSE);
+			       NULL, FALSE);
 	test_end();
 }
 
@@ -973,7 +1145,7 @@ static void test_imapc_client_get_capabilities_reconnected(void)
 	test_run_client_server(
 		test_imapc_client_get_capabilities_reconnected_client,
 		test_imapc_client_get_capabilities_reconnected_server,
-		FALSE);
+		NULL, FALSE);
 	test_end();
 }
 
@@ -1004,7 +1176,7 @@ static void test_imapc_client_get_capabilities_disconnected(void)
 	test_run_client_server(
 		test_imapc_client_get_capabilities_disconnected_client,
 		test_imapc_client_get_capabilities_disconnected_server,
-		FALSE);
+		NULL, FALSE);
 	test_end();
 }
 
@@ -1048,7 +1220,7 @@ static void test_imapc_client_get_capabilities_imap4rev2(void)
 	test_begin("imapc_client_get_capabilities_imap4rev2()");
 	test_run_client_server(test_imapc_client_get_capabilities_imap4rev2_client,
 			       test_imapc_client_get_capabilities_imap4rev2_server,
-			       FALSE);
+			       NULL, FALSE);
 	test_end();
 }
 #endif
@@ -1059,24 +1231,35 @@ static void test_imapc_client_get_capabilities_imap4rev2(void)
 
 static void main_init(void)
 {
-	/* nothing yet */
+	common_event = test_event;
+	client_event = event_create(common_event);
+	event_set_append_log_prefix(client_event, "test client: ");
+	server_event = event_create(common_event);
+	event_set_append_log_prefix(server_event, "test server: ");
 }
 
 static void main_deinit(void)
 {
-	/* nothing yet; also called from sub-processes */
+	event_unref(&client_event);
+	event_unref(&server_event);
+	common_event = NULL;
 }
 
 int main(int argc ATTR_UNUSED, char *argv[])
 {
 	int c;
+	bool debug = FALSE;
 	int ret;
 
 	static void (*const test_functions[])(void) = {
 		test_imapc_connect_failed,
 		test_imapc_banner_hangs,
+		test_imapc_banner_short_invalid,
 		test_imapc_login_hangs,
 		test_imapc_login_fails,
+		test_imapc_login_success,
+		test_imapc_auth_success,
+		test_imapc_auth_ir_success,
 		test_imapc_short_reply,
 		test_imapc_short_reply_no,
 		test_imapc_short_reply_bad,
@@ -1095,7 +1278,6 @@ int main(int argc ATTR_UNUSED, char *argv[])
 	};
 
 	lib_init();
-	main_init();
 
 	while ((c = getopt(argc, argv, "D")) > 0) {
 		switch (c) {
@@ -1111,6 +1293,7 @@ int main(int argc ATTR_UNUSED, char *argv[])
 	event_set_forced_debug(test_event, debug);
 	test_dir_init("test-imapc-client");
 	test_subprocesses_init();
+	main_init();
 
 	/* listen on localhost */
 	i_zero(&bind_ip);

@@ -192,7 +192,7 @@ struct smtp_client_connection {
 
 	struct dns_lookup *dns_lookup;
 
-	struct dsasl_client *sasl_client;
+	struct dsasl_client_session *sasl_session;
 	char *sasl_ir;
 	struct smtp_client_command *cmd_auth;
 
@@ -234,6 +234,7 @@ struct smtp_client_connection {
 	bool old_smtp:1;
 	bool authenticated:1;
 	bool xclient_sent:1;
+	bool xclient_rejected:1;
 	bool connect_failed:1;
 	bool connect_succeeded:1;
 	bool handshake_failed:1;
@@ -256,6 +257,8 @@ struct smtp_client {
 	struct ssl_iostream_context *ssl_ctx;
 
 	struct connection_list *conn_list;
+
+	struct dsasl_client *sasl_client;
 };
 
 extern struct event_category event_category_smtp_client;
@@ -335,5 +338,6 @@ void smtp_client_connection_next_transaction(
  */
 
 int smtp_client_init_ssl_ctx(struct smtp_client *client, const char **error_r);
+struct dsasl_client *smtp_client_get_sasl_client(struct smtp_client *client);
 
 #endif

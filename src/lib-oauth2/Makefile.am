@@ -8,7 +8,7 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-dcrypt \
 	-I$(top_srcdir)/src/lib-dict \
 	-I$(top_srcdir)/src/lib-settings \
-	-I$(top_srcdir)/src/lib-settings \
+	-I$(top_srcdir)/src/lib-url \
 	-I$(top_srcdir)/src/lib-var-expand
 
 noinst_LTLIBRARIES=liboauth2.la
@@ -30,7 +30,9 @@ liboauth2_la_DEPENDENCIES = \
 
 test_programs = \
 	test-oauth2-json \
-	test-oauth2-jwt
+	test-oauth2-jwt \
+	test-oauth2-url \
+	test-oauth2-request
 
 test_libs = \
 	$(noinst_LTLIBRARIES) \
@@ -49,6 +51,7 @@ test_libs = \
 	../lib-var-expand/libvar_expand.la \
 	../lib-regex/libdregex.la \
 	../lib-test/libtest.la \
+	../lib-url/liburl.la \
 	../lib/liblib.la
 test_deps = \
 	$(noinst_LTLIBRARIES) \
@@ -67,6 +70,7 @@ test_deps = \
 	../lib-var-expand/libvar_expand.la \
 	../lib-regex/libdregex.la \
 	../lib-test/libtest.la \
+	../lib-url/liburl.la \
 	../lib/liblib.la
 
 test_oauth2_json_SOURCES = test-oauth2-json.c
@@ -80,3 +84,11 @@ test_oauth2_jwt_LDFLAGS = \
 	-Wl,$(LD_WHOLE_ARCHIVE),../lib-json/.libs/libjson.a,../lib-ssl-iostream/.libs/libssl_iostream.a,$(LD_NO_WHOLE_ARCHIVE)
 endif
 test_oauth2_jwt_DEPENDENCIES = $(test_deps)
+
+test_oauth2_url_SOURCES = test-oauth2-url.c
+test_oauth2_url_LDADD = $(test_libs) $(SSL_LIBS) $(LIBDOVECOT_TEST_LIBS)
+test_oauth2_url_DEPENDENCIES = $(test_deps)
+
+test_oauth2_request_SOURCES = test-oauth2-request.c
+test_oauth2_request_LDADD = $(test_libs) $(SSL_LIBS) $(LIBDOVECOT_TEST_LIBS)
+test_oauth2_request_DEPENDENCIES = $(test_deps)

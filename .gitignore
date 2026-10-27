@@ -17,6 +17,7 @@ Makefile.in
 compile_commands.json
 *~
 vgcore.*
+test.out~*
 auth-token-secret.dat
 
 /configure
@@ -114,6 +115,7 @@ src/lib/unicode-data-tables.c
 src/lib/unicode-data-tables.h
 src/lib/unicode-data-types.c
 src/lib/unicode-data-types.h
+src/lib/ucd-*.stamp
 src/lib-compression/bench-compression
 src/lib-dict-backend/dict-drivers-register.c
 src/lib-json/json-format

@@ -16,7 +16,7 @@ static struct event_category event_category_dns = {
 };
 
 struct dns_cache_lookup {
-	struct dns_client *client;
+	struct event *event;
 	char *key;
 };
 
@@ -26,6 +26,12 @@ struct dns_lookup {
 	pool_t pool;
 	bool ptr_lookup;
 	bool cached;
+	/* dns_lookup_abort() was called. The callback and the finished
+	   event have already been dealt with. */
+	bool canceled;
+	/* The result is already known and lookup->to delivers it. Such
+	   lookups with a client are also in client->deferred_head list. */
+	bool deferred;
 
 	struct timeout *to;
 
@@ -44,6 +50,7 @@ struct dns_client {
 	struct connection conn;
 	struct connection_list *clist;
 	struct dns_lookup *head, *tail;
+	struct dns_lookup *deferred_head, *deferred_tail;
 	struct timeout *to_idle;
 	char *path;
 	struct dns_client_cache *cache;
@@ -60,6 +67,7 @@ static void dns_cache_lookup_free(struct dns_cache_lookup **_ctx)
 	struct dns_cache_lookup *ctx = *_ctx;
 	*_ctx = NULL;
 
+	event_unref(&ctx->event);
 	i_free(ctx->key);
 	i_free(ctx);
 }
@@ -68,7 +76,7 @@ static void dns_client_cache_callback(const struct dns_lookup_result *result,
 				      struct dns_cache_lookup *ctx)
 {
 	if (result->ret < 0)
-		e_debug(ctx->client->conn.event,
+		e_debug(ctx->event,
 			"Background entry refresh failed for %s '%s': %s",
 			*ctx->key == 'I' ? "IP" : "name",
 			ctx->key + 1, result->error);
@@ -87,13 +95,13 @@ static void dns_client_cache_refresh(const char *cache_key,
 			i_unreached();
 		ctx = i_new(struct dns_cache_lookup, 1);
 		ctx->key = i_strdup(cache_key);
-		ctx->client = client;
+		ctx->event = event_ref(client->conn.event);
 		dns_client_lookup_ptr(client, &ip, client->conn.event,
 				      dns_client_cache_callback, ctx, &lookup);
 	} else if (*cache_key == 'N') {
 		ctx = i_new(struct dns_cache_lookup, 1);
 		ctx->key = i_strdup(cache_key);
-		ctx->client = client;
+		ctx->event = event_ref(client->conn.event);
 		dns_client_lookup(client, cache_key + 1, client->conn.event,
 				  dns_client_cache_callback, ctx, &lookup);
 	} else {
@@ -110,18 +118,13 @@ static void dns_lookup_free(struct dns_lookup **_lookup);
 
 static void dns_lookup_save_msecs(struct dns_lookup *lookup);
 
-static void dns_lookup_callback(struct dns_lookup *lookup)
+static void dns_lookup_send_finished_event(struct dns_lookup *lookup)
 {
 	struct event_passthrough *e =
 		event_create_passthrough(lookup->event)->
 		set_name("dns_request_finished");
 
-	if (!lookup->cached && lookup->client != NULL) {
-		dns_client_cache_entry(lookup->client->cache, lookup->cache_key,
-				       &lookup->result);
-	}
 	dns_lookup_save_msecs(lookup);
-
 	if (lookup->result.ret != 0) {
 		i_assert(lookup->result.error != NULL);
 		e->add_int("error_code", lookup->result.ret);
@@ -134,6 +137,17 @@ static void dns_lookup_callback(struct dns_lookup *lookup)
 			lookup->result.msecs);
 		i_assert(lookup->ptr_lookup || lookup->result.ips_count > 0);
 	}
+}
+
+static void dns_lookup_callback(struct dns_lookup *lookup)
+{
+	if (!lookup->cached && lookup->client != NULL) {
+		dns_client_cache_entry(lookup->client->cache, lookup->cache_key,
+				       &lookup->result);
+	}
+	/* A canceled lookup has already sent its event. */
+	if (!lookup->canceled)
+		dns_lookup_send_finished_event(lookup);
 	if (lookup->callback != NULL)
 		lookup->callback(&lookup->result, lookup->context);
 }
@@ -160,6 +174,11 @@ dns_lookup_async_finish(struct dns_lookup *lookup,
 	*lookup_r = lookup;
 	lookup->to = timeout_add_short_to(ioloop, 0,
 					  dns_lookup_callback_deferred, lookup);
+	lookup->deferred = TRUE;
+	if (lookup->client != NULL) {
+		DLLIST2_APPEND(&lookup->client->deferred_head,
+			       &lookup->client->deferred_tail, lookup);
+	}
 }
 
 static void dns_client_disconnect(struct dns_client *client, const char *error)
@@ -202,7 +221,9 @@ static void dns_client_destroy(struct connection *conn)
 	dns_client_disconnect(client, connection_disconnect_reason(&client->conn));
 	client->connected = FALSE;
 	timeout_remove(&client->to_idle);
-	connection_deinit(conn);
+	/* Keep the connection initialized so that a shared client can
+	   reconnect on its next lookup. dns_client_deinit() frees it. */
+	connection_disconnect(conn);
 
 	if (deinit_client_at_free) {
 		client->deinit_client_at_free = TRUE;
@@ -215,6 +236,8 @@ static int dns_lookup_input_args(struct dns_lookup *lookup, const char *const *a
 	struct dns_lookup_result *result = &lookup->result;
 
 	if (str_to_int(args[0], &result->ret) < 0)
+		return -1;
+	if (args[1] == NULL)
 		return -1;
 	if (result->ret != 0) {
 		result->error = args[1];
@@ -403,6 +426,10 @@ static void dns_lookup_free(struct dns_lookup **_lookup)
 	*_lookup = NULL;
 
 	timeout_remove(&lookup->to);
+	if (lookup->deferred && client != NULL) {
+		DLLIST2_REMOVE(&client->deferred_head, &client->deferred_tail,
+			       lookup);
+	}
 	if (client != NULL) {
 		if (client->deinit_client_at_free)
 			dns_client_deinit(&client);
@@ -417,6 +444,21 @@ static void dns_lookup_free(struct dns_lookup **_lookup)
 	pool_unref(&lookup->pool);
 }
 
+static void dns_lookup_cancel(struct dns_lookup *lookup)
+{
+	dns_lookup_callback_t *callback = lookup->callback;
+
+	/* Clear the callback first, so it is never called again, e.g. by
+	   dns_client_disconnect(). */
+	lookup->callback = NULL;
+	lookup->canceled = TRUE;
+	lookup->result.ret = EAI_CANCELED;
+	lookup->result.error = "Lookup canceled";
+	dns_lookup_send_finished_event(lookup);
+	if (callback != NULL)
+		callback(&lookup->result, lookup->context);
+}
+
 void dns_lookup_abort(struct dns_lookup **_lookup)
 {
 	struct dns_lookup *lookup = *_lookup;
@@ -426,14 +468,17 @@ void dns_lookup_abort(struct dns_lookup **_lookup)
 	*_lookup = NULL;
 
 	struct dns_client *client = lookup->client;
-	if (client != NULL && client->deinit_client_at_free)
+	bool deinit_client = client != NULL && client->deinit_client_at_free;
+	bool deferred = lookup->deferred;
+
+	/* The callback may free a shared client and the lookup with it. */
+	dns_lookup_cancel(lookup);
+	if (deferred) {
+		/* Nothing else will complete the lookup. Free it now, so
+		   its timeout won't fire later. */
+		dns_lookup_free(&lookup);
+	} else if (deinit_client) {
 		dns_client_deinit(&client);
-	else if (lookup->callback != NULL) {
-		dns_lookup_save_msecs(lookup);
-		lookup->result.ret = EAI_CANCELED,
-		lookup->result.error = "Lookup canceled";
-		lookup->callback(&lookup->result, lookup->context);
-		lookup->callback = NULL;
 	}
 }
 
@@ -448,7 +493,7 @@ void dns_lookup_switch_ioloop_to(struct dns_lookup *lookup,
 				 struct ioloop *ioloop)
 {
 	/* dns client ioloop switch switches all lookups too */
-	if (lookup->client->deinit_client_at_free)
+	if (lookup->client != NULL && lookup->client->deinit_client_at_free)
 		dns_client_switch_ioloop_to(lookup->client, ioloop);
 	else
 		dns_lookup_switch_ioloop_real(lookup, ioloop);
@@ -523,6 +568,17 @@ void dns_client_deinit(struct dns_client **_client)
 
 	/* dns_client_disconnect() is supposed to clear out all queries */
 	i_assert(client->head == NULL);
+
+	/* Deferred lookups already have their result. Let them deliver it
+	   without the client. */
+	while (client->deferred_head != NULL) {
+		struct dns_lookup *lookup = client->deferred_head;
+
+		DLLIST2_REMOVE(&client->deferred_head, &client->deferred_tail,
+			       lookup);
+		lookup->client = NULL;
+	}
+	connection_deinit(&client->conn);
 	connection_list_deinit(&clist);
 
 	dns_client_cache_deinit(&client->cache);
@@ -696,9 +752,12 @@ void dns_client_switch_ioloop_to(struct dns_client *client,
 	struct dns_lookup *lookup;
 
 	connection_switch_ioloop_to(&client->conn, ioloop);
-	client->to_idle = io_loop_move_timeout(&client->to_idle);
+	client->to_idle = io_loop_move_timeout_to(ioloop, &client->to_idle);
 
 	for (lookup = client->head; lookup != NULL; lookup = lookup->next)
+		dns_lookup_switch_ioloop_real(lookup, ioloop);
+	for (lookup = client->deferred_head; lookup != NULL;
+	     lookup = lookup->next)
 		dns_lookup_switch_ioloop_real(lookup, ioloop);
 }
 

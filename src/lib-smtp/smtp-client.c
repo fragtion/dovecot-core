@@ -13,6 +13,7 @@
 #include "dns-lookup.h"
 #include "iostream-rawlog.h"
 #include "iostream-ssl.h"
+#include "dsasl-client.h"
 
 #include "smtp-client-private.h"
 
@@ -53,11 +54,7 @@ struct smtp_client *smtp_client_init(const struct smtp_client_settings *set)
 
 	client->set.master_user = p_strdup_empty(pool, set->master_user);
 	client->set.username = p_strdup_empty(pool, set->username);
-	client->set.sasl_mech = set->sasl_mech;
-	if (set->sasl_mech == NULL) {
-		client->set.sasl_mechanisms =
-			p_strdup(pool, set->sasl_mechanisms);
-	}
+	client->set.sasl_mechanisms = p_strdup(pool, set->sasl_mechanisms);
 
 	client->set.connect_timeout_msecs = set->connect_timeout_msecs != 0 ?
 		set->connect_timeout_msecs :
@@ -99,6 +96,7 @@ void smtp_client_deinit(struct smtp_client **_client)
 	settings_free(client->set.ssl);
 	if (client->ssl_ctx != NULL)
 		ssl_iostream_context_unref(&client->ssl_ctx);
+	dsasl_client_unref(&client->sasl_client);
 	event_unref(&client->event);
 	pool_unref(&client->pool);
 	*_client = NULL;
@@ -127,7 +125,7 @@ int smtp_client_init_ssl_ctx(struct smtp_client *client, const char **error_r)
 
 	if (client->set.ssl != NULL) {
 		return ssl_iostream_client_context_cache_get(client->set.ssl,
-			&client->ssl_ctx, error_r);
+			NULL, &client->ssl_ctx, error_r);
 	}
 	/* no ssl settings given via smtp_client_settings -
 	   look them up automatically */
@@ -135,11 +133,20 @@ int smtp_client_init_ssl_ctx(struct smtp_client *client, const char **error_r)
 		return -1;
 	ssl_client_settings_to_iostream_set(ssl_set, &set);
 
-	int ret = ssl_iostream_client_context_cache_get(set, &client->ssl_ctx,
-							error_r);
+	int ret = ssl_iostream_client_context_cache_get(set, NULL,
+						       &client->ssl_ctx,
+						       error_r);
 	settings_free(set);
 	settings_free(ssl_set);
 	return ret;
+}
+
+struct dsasl_client *smtp_client_get_sasl_client(struct smtp_client *client)
+{
+	if (client->sasl_client == NULL)
+		client->sasl_client = dsasl_client_create(client->event);
+
+	return client->sasl_client;
 }
 
 // FIXME: Implement smtp_client_run()

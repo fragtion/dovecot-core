@@ -3801,7 +3801,7 @@ dcrypt_openssl_sign_ecdsa(struct dcrypt_private_key *key, const char *algorithm,
 	EVP_PKEY *pkey = key->key;
 	EC_KEY *ec_key = EVP_PKEY_get0_EC_KEY(pkey);
 	bool ret;
-	int rs_len = EC_GROUP_order_bits(EC_KEY_get0_group(ec_key)) / 8;
+	int rs_len = (EC_GROUP_order_bits(EC_KEY_get0_group(ec_key)) + 7) / 8;
 
 	/* digest data */
 	buffer_t *digest = t_buffer_create(64);
@@ -3852,8 +3852,8 @@ dcrypt_openssl_sign(struct dcrypt_private_key *key, const char *algorithm,
 	case DCRYPT_SIGNATURE_FORMAT_DSS:
 		break;
 	case DCRYPT_SIGNATURE_FORMAT_X962:
-		if (EVP_PKEY_base_id(key->key) == EVP_PKEY_RSA) {
-			*error_r = "Format does not support RSA";
+		if (EVP_PKEY_base_id(key->key) != EVP_PKEY_EC) {
+			*error_r = "Format requires an EC key";
 			return FALSE;
 		}
 		return dcrypt_openssl_sign_ecdsa(key, algorithm,
@@ -3894,13 +3894,15 @@ dcrypt_openssl_sign(struct dcrypt_private_key *key, const char *algorithm,
 		ret = dcrypt_openssl_error(error_r);
 	} else {
 		i_assert(siglen > 0);
+		size_t offset = signature_r->used;
 		/* @UNSAFE */
 		unsigned char *buf =
 			buffer_append_space_unsafe(signature_r, siglen);
 		if (EVP_DigestSign(dctx, buf, &siglen, data, data_len) != 1) {
+			buffer_set_used_size(signature_r, offset);
 			ret = dcrypt_openssl_error(error_r);
 		} else {
-			buffer_set_used_size(signature_r, siglen);
+			buffer_set_used_size(signature_r, offset + siglen);
 			ret = TRUE;
 		}
 	}
@@ -3981,8 +3983,8 @@ dcrypt_openssl_verify(struct dcrypt_public_key *key, const char *algorithm,
 	case DCRYPT_SIGNATURE_FORMAT_DSS:
 		break;
 	case DCRYPT_SIGNATURE_FORMAT_X962:
-		if (EVP_PKEY_base_id(key->key) == EVP_PKEY_RSA) {
-			*error_r = "Format does not support RSA";
+		if (EVP_PKEY_base_id(key->key) != EVP_PKEY_EC) {
+			*error_r = "Format requires an EC key";
 			return FALSE;
 		}
 		return dcrypt_openssl_verify_ecdsa(key, algorithm,

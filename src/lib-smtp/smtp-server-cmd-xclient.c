@@ -1,11 +1,13 @@
 /* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
+#include "abnf.h"
 #include "array.h"
 #include "istream.h"
 #include "connection.h"
 #include "smtp-syntax.h"
 #include "smtp-reply.h"
+#include "auth-master.h"
 
 #include "smtp-server-private.h"
 
@@ -52,7 +54,12 @@ cmd_xclient_recheck(struct smtp_server_cmd_ctx *cmd,
 		    struct smtp_proxy_data *proxy_data ATTR_UNUSED)
 {
 	struct smtp_server_connection *conn = cmd->conn;
+	struct smtp_server_command *command = cmd->cmd;
 
+	/* the XCLIENT callback may already have rejected the command; don't
+	   overwrite its reply with the success greeting */
+	if (smtp_server_command_is_replied(command))
+		return;
 	/* all preceding commands have finished and now the transaction state is
 	   clear. This provides the opportunity to re-check the protocol state */
 	if (!cmd_xclient_check_state(cmd))
@@ -176,6 +183,11 @@ void smtp_server_cmd_xclient(struct smtp_server_cmd_ctx *cmd,
 		} else if (strcmp(param.keyword, "LOGIN") == 0) {
 			if (strcasecmp(param.value, "[UNAVAILABLE]") == 0)
 				continue;
+			if (abnf_contains_ascii_ctrl(param.value)) {
+				smtp_server_reply(cmd, 501, "5.5.4",
+						  "Invalid LOGIN parameter");
+				return;
+			}
 			proxy_data->login = p_strdup(cmd->pool, param.value);
 		} else if (strcmp(param.keyword, "PORT") == 0) {
 			if (strcasecmp(param.value, "[UNAVAILABLE]") == 0)
@@ -209,10 +221,24 @@ void smtp_server_cmd_xclient(struct smtp_server_cmd_ctx *cmd,
 		} else if (strcmp(param.keyword, "SESSION") == 0) {
 			if (strcasecmp(param.value, "[UNAVAILABLE]") == 0)
 				continue;
+			/* No length limit here: lmtp appends ":P<n>" per
+			   proxy hop and ":R<n>" per extra recipient, so a
+			   session ID that was accepted by the first hop
+			   must still be accepted by the next ones. */
+			if (!auth_session_id_chars_valid(param.value)) {
+				smtp_server_reply(cmd, 501, "5.5.4",
+						  "Invalid SESSION parameter");
+				return;
+			}
 			proxy_data->session = p_strdup(cmd->pool, param.value);
 		} else if (strcmp(param.keyword, "CLIENT-TRANSPORT") == 0) {
 			if (strcasecmp(param.value, "[UNAVAILABLE]") == 0)
 				continue;
+			if (abnf_contains_ascii_ctrl(param.value)) {
+				smtp_server_reply(cmd, 501, "5.5.4",
+					"Invalid CLIENT-TRANSPORT parameter");
+				return;
+			}
 			proxy_data->client_transport =
 				p_strdup(cmd->pool, param.value);
 		} else if (strcmp(param.keyword, "DESTNAME") == 0) {
@@ -248,7 +274,10 @@ void smtp_server_cmd_xclient(struct smtp_server_cmd_ctx *cmd,
 			&proxy_data->extra_fields_count);
 	}
 
-	smtp_server_command_input_lock(cmd);
+	/* The connection state is reset once this command completes, so
+	   commands pipelined behind it must not be handled before that:
+	   the reset would wipe the pending_*_cmds counters they increment. */
+	smtp_server_command_pipeline_block(cmd);
 
 	smtp_server_command_add_hook(command, SMTP_SERVER_COMMAND_HOOK_NEXT,
 				     cmd_xclient_recheck, proxy_data);

@@ -80,8 +80,8 @@ mech_gssapi_log_error(struct gssapi_auth_request *request,
 }
 
 static struct sasl_server_mech_request *
-mech_gssapi_auth_new(const struct sasl_server_mech *mech ATTR_UNUSED,
-		     pool_t pool)
+mech_gssapi_auth_alloc(const struct sasl_server_mech *mech ATTR_UNUSED,
+		       pool_t pool)
 {
 	struct gssapi_auth_request *request;
 
@@ -446,7 +446,8 @@ mech_gssapi_userok(struct gssapi_auth_request *request, const char *login_user)
 	if (!mech_gssapi_krb5_userok(request, request->authn_name,
 				     login_user, TRUE)) {
 		e_info(auth_request->event,
-		       "User not authorized to log in as %s", login_user);
+		       "User not authorized to log in as %s",
+		       str_sanitize(login_user, 128));
 		return -1;
 	}
 
@@ -651,7 +652,7 @@ static struct sasl_server_mech *mech_gssapi_mech_new(pool_t pool)
 }
 
 static const struct sasl_server_mech_funcs mech_gssapi_funcs = {
-	.auth_new = mech_gssapi_auth_new,
+	.auth_alloc = mech_gssapi_auth_alloc,
 	.auth_initial = mech_gssapi_auth_initial,
 	.auth_continue = mech_gssapi_auth_continue,
 	.auth_free = mech_gssapi_auth_free,

@@ -57,9 +57,6 @@ struct imapc_storage_client {
 
 	struct imapc_client *client;
 	const struct imapc_settings *set;
-	/* Client SSL settings, or NULL if imapc_ssl=no. Used only for
-	   checking whether an existing storage can be reused. */
-	const struct ssl_settings *ssl_set;
 
 	ARRAY(struct imapc_storage_event_callback) untagged_callbacks;
 
@@ -207,10 +204,13 @@ struct imapc_simple_context {
 	int ret;
 };
 
+extern struct event_category event_category_imapc;
+
 #define IMAPC_STORAGE(s)	container_of(s, struct imapc_storage, storage)
 #define IMAPC_MAILBOX(s)	container_of(s, struct imapc_mailbox, box)
 
 int imapc_storage_client_create(struct mailbox_list *list,
+				struct event *list_event,
 				struct imapc_storage_client **client_r,
 				const char **error_r);
 void imapc_storage_client_unref(struct imapc_storage_client **client);

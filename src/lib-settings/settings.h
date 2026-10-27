@@ -315,6 +315,11 @@ struct settings_root *settings_root_find(const struct event *event);
 /* Return SETTINGS_EVENT_INSTANCE from the event or its parents. */
 struct settings_instance *settings_instance_find(const struct event *event);
 
+/* Return a new instance based on an existing SETTINGS_EVENT_INSTANCE from the
+   event or its parents, or, if none exists, create a new one for the
+   SETTINGS_EVENT_ROOT of the event or its parents. */
+struct settings_instance *settings_instance_new_from_event(struct event *event);
+
 struct settings_simple {
 	struct settings_root *root;
 	struct settings_instance *instance;
@@ -323,6 +328,9 @@ struct settings_simple {
 
 void settings_simple_init(struct settings_simple *set_r,
 			  const char *const settings[]);
+void settings_simple_init_with_event(struct settings_simple *set_r,
+				     struct event *event_parent,
+				     const char *const settings[]);
 void settings_simple_deinit(struct settings_simple *set);
 void settings_simple_update(struct settings_simple *set,
 			    const char *const settings[]);

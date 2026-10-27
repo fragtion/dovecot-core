@@ -70,6 +70,12 @@ static int sql_query_save_results(struct sql_result *result,
 
 		if (*name == '\0')
 			continue;
+		if (!auth_fields_key_is_valid(name)) {
+			e_error(authdb_event(auth_request),
+				"Invalid column name in query result: %s",
+				name);
+			continue;
+		}
 
 		auth_fields_add(fields, name, value, 0);
 		if (!auth_request->passdb->set->fields_import_all)
@@ -281,7 +287,7 @@ static void passdb_sql_init(struct passdb_module *_module)
 		container_of(_module, struct sql_passdb_module, module);
 	enum sql_db_flags flags;
 
-	flags = sql_get_flags(module->db);
+	flags = sql_get_static_flags(module->db);
 	if (!module->module.blocking)
 		module->module.blocking = (flags & SQL_DB_FLAG_BLOCKING) != 0;
 

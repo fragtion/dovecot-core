@@ -88,7 +88,6 @@ void mail_storage_init(void)
 {
 	if (mail_storage_init_refcount++ > 0)
 		return;
-	dsasl_clients_init();
 	mailbox_attributes_init();
 	mailbox_lists_init();
 	mail_storage_hooks_init();
@@ -115,7 +114,6 @@ void mail_storage_deinit(void)
 	mail_storage_hooks_deinit();
 	mailbox_lists_deinit();
 	mailbox_attributes_deinit();
-	dsasl_clients_deinit();
 }
 
 void mail_storage_class_register(struct mail_storage *storage_class)
@@ -1214,6 +1212,8 @@ struct mailbox *mailbox_alloc(struct mailbox_list *list, const char *vname,
 			box->vname_raw = p_strdup(box->pool, vname_raw);
 		box->mailbox_not_original = mailbox_not_original;
 		box->mailbox_name_changed_by_nfc = mailbox_name_changed_by_nfc;
+		rate_limit_init(&box->notify_rate_limit,
+				&mailbox_notify_rate_limit_set);
 		hook_mailbox_allocated(box);
 	} T_END;
 

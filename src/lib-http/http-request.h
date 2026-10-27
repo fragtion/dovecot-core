@@ -2,8 +2,7 @@
 #define HTTP_REQUEST_H
 
 #include "http-header.h"
-
-struct http_url;
+#include "http-url.h"
 
 #define HTTP_REQUEST_DEFAULT_MAX_TARGET_LENGTH      (8 * 1024)
 #define HTTP_REQUEST_DEFAULT_MAX_HEADER_SIZE        (200 * 1024)
@@ -16,13 +15,6 @@ struct http_request_limits {
 	uoff_t max_payload_size;
 
 	struct http_header_limits header;
-};
-
-enum http_request_target_format {
-	HTTP_REQUEST_TARGET_FORMAT_ORIGIN = 0,
-	HTTP_REQUEST_TARGET_FORMAT_ABSOLUTE,
-	HTTP_REQUEST_TARGET_FORMAT_AUTHORITY,
-	HTTP_REQUEST_TARGET_FORMAT_ASTERISK
 };
 
 struct http_request_target {
@@ -80,5 +72,12 @@ bool http_request_has_connection_option(const struct http_request *req,
 	const char *option);
 int http_request_get_payload_size(const struct http_request *req,
 	uoff_t *size_r);
+
+int http_url_request_target_parse(const char *request_target,
+				  const char *host_header,
+				  const struct http_url *default_base,
+				  pool_t pool,
+				  struct http_request_target *target,
+				  const char **error_r) ATTR_NULL(3);
 
 #endif

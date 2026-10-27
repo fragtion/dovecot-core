@@ -69,11 +69,12 @@ meson.add_dist_script(
   settings_history_filenames,    # The generated source filenames.
 )
 
-deps = [dep_lib, dep_var_expand, dep_dns]
+deps = [dep_lib, dep_url, dep_var_expand, dep_dns]
 
 lib_settings = static_library(
   'settings',
   'settings.c',
+  'settings-bin-filter.c',
   'settings-history.c',
   'settings-parser.c',
   settings_history_files,
@@ -88,8 +89,10 @@ dep_settings = declare_dependency(
 
 install_headers(
   'settings.h',
+  'settings-bin-filter.h',
   'settings-history.h',
   'settings-parser.h',
+  'settings-parser-http-url.h',
   'settings-consts.h',
   install_dir: dovecot_includedir,
 )

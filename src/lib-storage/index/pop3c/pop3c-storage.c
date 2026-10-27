@@ -34,29 +34,63 @@ static struct mail_storage *pop3c_storage_alloc(void)
 	return &storage->storage;
 }
 
+static bool
+pop3c_storage_match(struct mail_storage *_storage, struct mailbox_list *list)
+{
+	struct pop3c_storage *storage = POP3C_STORAGE(_storage);
+	const struct pop3c_settings *pop3c_set;
+	const char *error;
+	bool match;
+
+	if (storage->disabled ||
+	    HAS_ANY_BITS(list->ns->flags, NAMESPACE_FLAG_UNUSABLE)) {
+		/* Never share a disabled client, or share a working client
+		   with a namespace that must not access the remote. */
+		return FALSE;
+	}
+	if (settings_get(list->event, &pop3c_setting_parser_info, 0,
+			 &pop3c_set, &error) < 0) {
+		/* The error is reported when the new storage is created. */
+		return FALSE;
+	}
+	match = settings_equal(&pop3c_setting_parser_info,
+			       storage->set, pop3c_set, NULL);
+	settings_free(pop3c_set);
+	if (!match)
+		return FALSE;
+	if (pop3c_client_settings_match(storage->list_event, list->event,
+					&error) <= 0) {
+		/* Any error is reported when the new storage is created. */
+		return FALSE;
+	}
+	return TRUE;
+}
+
 static int
 pop3c_storage_create(struct mail_storage *_storage,
-		     struct mail_namespace *ns ATTR_UNUSED,
+		     struct mail_namespace *ns,
 		     const char **error_r)
 {
 	struct pop3c_storage *storage = POP3C_STORAGE(_storage);
+	struct event *list_event;
 
-	if (settings_get(_storage->event, &pop3c_setting_parser_info, 0,
-			 &storage->set, error_r) < 0)
-		return -1;
+	list_event = event_create(ns->list->event);
+	event_add_category(list_event, &event_category_pop3c);
 
-	if (storage->set->pop3c_host[0] == '\0') {
-		*error_r = "missing pop3c_host";
-		return -1;
-	}
-	if (storage->set->pop3c_password[0] == '\0') {
-		*error_r = "missing pop3c_password";
+	if (settings_get(list_event, &pop3c_setting_parser_info, 0,
+			 &storage->set, error_r) < 0) {
+		event_unref(&list_event);
 		return -1;
 	}
-	event_set_append_log_prefix(_storage->event, t_strdup_printf(
-		"pop3c(%s:%u): ",
-		storage->set->pop3c_host, storage->set->pop3c_port));
 
+	storage->list_event = list_event;
+	if ((ns->flags & NAMESPACE_FLAG_UNUSABLE) != 0) {
+		/* Shared namespace user doesn't actually exist. Don't try to
+		   access the user via pop3c, but also don't make this a
+		   visible error. If any code path tries to connect to pop3c,
+		   it's a bug. */
+		storage->disabled = TRUE;
+	}
 	return 0;
 }
 
@@ -65,43 +99,27 @@ static void pop3c_storage_destroy(struct mail_storage *_storage)
 	struct pop3c_storage *storage = POP3C_STORAGE(_storage);
 
 	settings_free(storage->set);
+	event_unref(&storage->list_event);
 	index_storage_destroy(_storage);
 }
 
-static struct pop3c_client *
-pop3c_client_create_from_set(struct mail_storage *storage,
-			     const struct pop3c_settings *set)
+static int
+pop3c_client_create(struct mail_storage *_storage,
+		    struct pop3c_client **client_r, const char **error_r)
 {
-	struct pop3c_client_settings client_set;
+	struct pop3c_storage *storage = POP3C_STORAGE(_storage);
+	struct mail_user *user = _storage->user;
+	struct pop3c_parameters params = {};
 	string_t *str;
 
-	i_zero(&client_set);
-	client_set.host = set->pop3c_host;
-	client_set.port = set->pop3c_port;
-	client_set.username = set->pop3c_user;
-	client_set.master_user = set->pop3c_master_user;
-	client_set.password = set->pop3c_password;
-	client_set.dns_client_socket_path =
-		storage->user->set->base_dir[0] == '\0' ? "" :
-		t_strconcat(storage->user->set->base_dir, "/",
-			    DNS_CLIENT_SOCKET_NAME, NULL);
 	str = t_str_new(128);
-	mail_user_set_get_temp_prefix(str, storage->user->set);
-	client_set.temp_path_prefix = str_c(str);
+	mail_user_set_get_temp_prefix(str, user->set);
+	params.temp_path_prefix = str_c(str);
+	if (storage->disabled)
+		params.flags |= POP3C_PARAMETER_CLIENT_DISABLED;
 
-	client_set.debug = event_want_debug(storage->event);
-	client_set.rawlog_dir = set->pop3c_rawlog_dir;
-
-	if (!set->pop3c_ssl_verify)
-		client_set.ssl_allow_invalid_cert = TRUE;
-
-	if (strcmp(set->pop3c_ssl, "pop3s") == 0)
-		client_set.ssl_mode = POP3C_CLIENT_SSL_MODE_IMMEDIATE;
-	else if (strcmp(set->pop3c_ssl, "starttls") == 0)
-		client_set.ssl_mode = POP3C_CLIENT_SSL_MODE_STARTTLS;
-	else
-		client_set.ssl_mode = POP3C_CLIENT_SSL_MODE_NONE;
-	return pop3c_client_init(&client_set, storage->event);
+	return pop3c_client_init(&params, storage->list_event,
+				 client_r, error_r);
 }
 
 static struct mailbox *
@@ -166,6 +184,7 @@ static void pop3c_login_callback(enum pop3c_command_state state,
 static int pop3c_mailbox_open(struct mailbox *box)
 {
 	struct pop3c_mailbox *mbox = POP3C_MAILBOX(box);
+	const char *error;
 
 	if (strcmp(box->name, "INBOX") != 0) {
 		mail_storage_set_error(box->storage, MAIL_ERROR_NOTFOUND,
@@ -175,9 +194,12 @@ static int pop3c_mailbox_open(struct mailbox *box)
 
 	if (index_storage_mailbox_open(box, FALSE) < 0)
 		return -1;
-
-	mbox->client = pop3c_client_create_from_set(box->storage,
-						    mbox->storage->set);
+	if (pop3c_client_create(box->storage, &mbox->client, &error) < 0) {
+		mailbox_set_critical(box,
+			"Failed to initialize POP3 client: %s", error);
+		mailbox_close(box);
+		return -1;
+	}
 	pop3c_client_login(mbox->client, pop3c_login_callback, mbox);
 	pop3c_client_wait_one(mbox->client);
 	return mbox->logged_in ? 0 : -1;
@@ -309,6 +331,7 @@ struct mail_storage pop3c_storage = {
 		.create = pop3c_storage_create,
 		.destroy = pop3c_storage_destroy,
 		.mailbox_alloc = pop3c_mailbox_alloc,
+		.storage_match = pop3c_storage_match,
 	}
 };
 

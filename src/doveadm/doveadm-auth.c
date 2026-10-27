@@ -7,9 +7,11 @@
 #include "base64.h"
 #include "hex-binary.h"
 #include "str.h"
+#include "str-sanitize.h"
 #include "strescape.h"
 #include "var-expand.h"
 #include "randgen.h"
+#include "client-auth-settings.h"
 #include "dsasl-client.h"
 #include "settings.h"
 #include "settings-parser.h"
@@ -42,8 +44,8 @@ struct authtest_input {
 	bool success;
 	bool internal_failure;
 
-	const struct dsasl_client_mech *sasl_mech;
 	struct dsasl_client *sasl_client;
+	struct dsasl_client_session *sasl_session;
 
 	struct auth_client_request *request;
 
@@ -204,13 +206,15 @@ auth_callback(struct auth_client_request *request,
 		buf = t_buffer_create(MAX_BASE64_DECODED_SIZE(input_len));
 		if (base64_decode(data_base64, input_len, buf) < 0)
 			i_fatal("Server sent invalid base64 input");
-		if (dsasl_client_input(input->sasl_client, buf->data, buf->used,
-				       &error) != DSASL_CLIENT_RESULT_OK) {
+		if (dsasl_client_session_input(input->sasl_session,
+				buf->data, buf->used,
+				&error) != DSASL_CLIENT_RESULT_OK) {
 			e_error(input->event, "internal auth failure: %s", error);
 			auth_client_request_abort(&request, error);
 			break;
-		} else if (dsasl_client_output(input->sasl_client, &sasl_output,
-					       &sasl_output_len, &error) != DSASL_CLIENT_RESULT_OK) {
+		} else if (dsasl_client_session_output(input->sasl_session,
+				&sasl_output, &sasl_output_len,
+				&error) != DSASL_CLIENT_RESULT_OK) {
 			e_error(input->event, "internal auth failure: %s", error);
 			auth_client_request_abort(&request, error);
 			break;
@@ -266,11 +270,64 @@ auth_channel_bind_callback(const char *type, void *context,
 	return 0;
 }
 
+static void
+cmd_auth_init_sasl_client(struct authtest_input *input,
+			  const char *const *server_mechanisms)
+{
+	struct client_auth_settings sasl_set;
+	struct dsasl_client_parameters sasl_params;
+	const char *error;
+	int ret;
+
+	i_zero(&sasl_set);
+	sasl_set.mechanism = input->mechanism;
+	if (input->master_user == NULL)
+		sasl_set.authid = input->username;
+	else {
+		sasl_set.authid = input->master_user;
+		sasl_set.authzid = input->username;
+	}
+	sasl_set.password = input->password;
+
+	i_zero(&sasl_params);
+	/* Translate to SASL/GSSAPI/Kerberos service name (IANA-registered) */
+	if (strcasecmp(input->info.protocol, "POP3") == 0)
+		sasl_params.protocol = "pop";
+	else if (strcasecmp(input->info.protocol, "Submission") == 0 ||
+		 strcasecmp(input->info.protocol, "LMTP") == 0)
+		sasl_params.protocol = "smtp";
+	else
+		sasl_params.protocol = input->info.protocol;
+
+	if (input->info.local_name != NULL)
+		sasl_params.host = input->info.local_name;
+	else if (input->info.local_ip.family != 0)
+		sasl_params.host = net_ip2addr(&input->info.local_ip);
+	else
+		sasl_params.host = "localhost";
+	sasl_params.port = input->info.local_port;
+	sasl_params.server_mechanisms = server_mechanisms;
+
+	ret = dsasl_client_session_create(input->sasl_client, input->event,
+					  &sasl_params, &sasl_set,
+					  &input->sasl_session, &error);
+	if (ret <= 0)
+		i_fatal("Failed to initialize SASL client session: %s", error);
+
+	dsasl_client_session_enable_channel_binding(
+		input->sasl_session, SSL_IOSTREAM_PROTOCOL_VERSION_TLS1_3,
+		auth_channel_bind_callback, input);
+}
+
+static void cmd_auth_deinit_sasl_client(struct authtest_input *input)
+{
+	dsasl_client_session_destroy(&input->sasl_session);
+}
+
 static void auth_connected(struct auth_client *client,
 			   const char *connect_error, void *context)
 {
 	struct authtest_input *input = context;
-	const char *mech = dsasl_client_mech_get_name(input->sasl_mech);
 	struct auth_request_info info;
 	const unsigned char *sasl_output;
 	size_t sasl_output_len;
@@ -282,16 +339,20 @@ static void auth_connected(struct auth_client *client,
 			return;
 		i_fatal("Couldn't connect to auth socket: %s", connect_error);
 	}
+
+	cmd_auth_init_sasl_client(input,
+				  auth_client_get_available_mech_names(client));
+
+	const char *mech =
+		dsasl_client_session_get_mech_name(input->sasl_session);
+
 	if (auth_client_find_mech(client, mech) == NULL)
 		i_fatal("SASL mechanism '%s' not supported by server", mech);
 
-	if (dsasl_client_output(input->sasl_client, &sasl_output,
-				&sasl_output_len,
-				&error) != DSASL_CLIENT_RESULT_OK)
+	if (dsasl_client_session_output(input->sasl_session,
+		&sasl_output, &sasl_output_len,
+		&error) != DSASL_CLIENT_RESULT_OK)
 		i_fatal("Failed to create initial SASL reply: %s", error);
-	sasl_output_base64 =
-		t_str_new(MAX_BASE64_ENCODED_SIZE(sasl_output_len));
-	base64_encode(sasl_output, sasl_output_len, sasl_output_base64);
 
 	i_zero(&info);
 	info.mech = mech;
@@ -308,7 +369,12 @@ static void auth_connected(struct auth_client *client,
 	info.real_remote_port = input->info.real_remote_port;
 	info.extra_fields = input->info.extra_fields;
 	info.forward_fields = input->info.forward_fields;
-	info.initial_resp_base64 = str_c(sasl_output_base64);
+	if (sasl_output != NULL) {
+		sasl_output_base64 =
+			t_str_new(MAX_BASE64_ENCODED_SIZE(sasl_output_len));
+		base64_encode(sasl_output, sasl_output_len, sasl_output_base64);
+		info.initial_resp_base64 = str_c(sasl_output_base64);
+	}
 	if (auth_want_log_debug())
 		info.flags |= AUTH_REQUEST_FLAG_DEBUG;
 
@@ -317,57 +383,6 @@ static void auth_connected(struct auth_client *client,
 
 	auth_client_request_enable_channel_binding(
 		input->request, auth_channel_bind_callback, input);
-}
-
-static void cmd_auth_init_sasl_client(struct authtest_input *input)
-{
-	struct dsasl_client_settings sasl_set;
-
-	if (input->mechanism != NULL) {
-		input->sasl_mech = dsasl_client_mech_find(input->mechanism);
-		if (input->sasl_mech == NULL)
-			i_fatal("SASL mechanism '%s' not supported by client",
-				input->mechanism);
-	}
-	if (input->sasl_mech == NULL)
-		input->sasl_mech = &dsasl_client_mech_plain;
-
-	i_zero(&sasl_set);
-	sasl_set.event_parent = input->event;
-	if (input->master_user == NULL)
-		sasl_set.authid = input->username;
-	else {
-		sasl_set.authid = input->master_user;
-		sasl_set.authzid = input->username;
-	}
-	sasl_set.password = input->password;
-
-	/* Translate to SASL/GSSAPI/Kerberos service name (IANA-registered) */
-	if (strcasecmp(input->info.protocol, "POP3") == 0)
-		sasl_set.protocol = "pop";
-	else if (strcasecmp(input->info.protocol, "Submission") == 0 ||
-		 strcasecmp(input->info.protocol, "LMTP") == 0)
-		sasl_set.protocol = "smtp";
-	else
-		sasl_set.protocol = input->info.protocol;
-
-	if (input->info.local_name != NULL)
-		sasl_set.host = input->info.local_name;
-	else if (input->info.local_ip.family != 0)
-		sasl_set.host = net_ip2addr(&input->info.local_ip);
-	else
-		sasl_set.host = "localhost";
-	sasl_set.port = input->info.local_port;
-
-	input->sasl_client = dsasl_client_new(input->sasl_mech, &sasl_set);
-	dsasl_client_enable_channel_binding(
-		input->sasl_client, SSL_IOSTREAM_PROTOCOL_VERSION_TLS1_3,
-		auth_channel_bind_callback, input);
-}
-
-static void cmd_auth_deinit_sasl_client(struct authtest_input *input)
-{
-	dsasl_client_free(&input->sasl_client);
 }
 
 static void
@@ -379,8 +394,6 @@ cmd_auth_input(const char *auth_socket_path, struct authtest_input *input)
 		auth_socket_path = t_strconcat(doveadm_settings->base_dir,
 					       "/auth-client", NULL);
 	}
-
-	cmd_auth_init_sasl_client(input);
 
 	client = auth_client_init(auth_socket_path, getpid(),
 				  auth_want_log_debug());
@@ -436,6 +449,9 @@ auth_user_info_parse_arg(struct auth_user_info *info, const char *arg,
 		if (net_str2port(value, &info->real_remote_port) < 0)
 			i_fatal("real_rport: Invalid port number");
 	} else if (str_begins(arg, "forward_", &key)) {
+		if (!auth_forward_field_line_is_valid(key))
+			i_fatal("forward field: Invalid characters: %s",
+				str_sanitize(t_strcut(key, '='), 64));
 		array_push_back(forward_fields, &key);
 	} else {
 		if (!array_is_created(&info->extra_fields))
@@ -552,12 +568,12 @@ static void cmd_auth_cache_status(struct doveadm_cmd_context *cctx)
 
 static void authtest_input_init(struct authtest_input *input)
 {
-	dsasl_clients_init();
-#ifdef BUILTIN_GSSAPI
-	dsasl_clients_init_gssapi();
-#endif
-
 	i_zero(input);
+
+	input->sasl_client = dsasl_client_create(NULL);
+#ifdef BUILTIN_GSSAPI
+	dsasl_client_init_gssapi(input->sasl_client);
+#endif
 	input->pool = pool_alloconly_create("auth input", 256);
 	input->info.protocol = "doveadm";
 	input->info.debug = auth_want_log_debug();
@@ -569,7 +585,7 @@ static void authtest_input_deinit(struct authtest_input *input)
 {
 	pool_unref(&input->pool);
 
-	dsasl_clients_deinit();
+	dsasl_client_unref(&input->sasl_client);
 }
 
 static void cmd_auth_test(struct doveadm_cmd_context *cctx)
@@ -686,8 +702,6 @@ static void cmd_auth_login(struct doveadm_cmd_context *cctx)
 		auth_cmd_help(cctx);
 	if (!doveadm_cmd_param_str(cctx, "password", &input.password))
 		input.password = t_askpass("Password: ");
-
-	cmd_auth_init_sasl_client(&input);
 
 	input.event = event_create(cctx->event);
 	event_set_append_log_prefix(input.event,

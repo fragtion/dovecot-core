@@ -10,6 +10,7 @@
 #include "safe-mkstemp.h"
 #include "ostream.h"
 #include "settings.h"
+#include "config-bin-filter.h"
 #include "master-service-settings.h"
 #include "config-parser.h"
 #include "config-request.h"
@@ -43,10 +44,12 @@
    <32bit: all setting keys size>
    <all setting keys - see below>
 
-   <32bit: event filter strings count>
-   Repeat for "event filter strings count":
-     <NUL-terminated string: event filter string>
-     <32bit: number of named list filter elements>
+   <0..3 bytes for 32bit alignment>
+   <32bit: filter count>
+   <32bit: filter strings size>
+   Repeat for "filter count":
+     <struct settings_bin_filter>
+   <filter strings - see below>
 
    Repeat until "settings full size" is reached:
      <64bit: settings block size>
@@ -74,7 +77,8 @@
      Repeat for "filter count":
        <64bit: filter settings offset>
      Repeat for "filter count":
-       <32bit: event filter string index number>
+       <32bit: filter index number>
+     <filter index - see below>
      <trailing safety NUL>
 
    The order of filters is important in the output. lib-settings applies the
@@ -114,6 +118,57 @@
    <32bit: setting blocks count>
      <32bit: setting block name index>
 
+   Filters
+   -------
+
+   Each filter is a fixed size struct settings_bin_filter record (see
+   lib-settings/settings-bin-filter.h). A filter matches when all of its
+   conditions match. A filter without any conditions always matches.
+
+   All offsets in the records are relative to the beginning of the first
+   record, and they point to the filter strings area. 0 means the condition
+   doesn't exist. The filter strings area contains:
+
+   - NUL-terminated strings (protocol, local_name, filter names)
+   - <struct settings_bin_filter_net> for local/remote nets (32bit aligned)
+   - <32bit: filter name relative offset>[filter names count] (32bit aligned)
+
+   Filter names are "key" for named filters, and "key/escaped-value" for
+   named list filters, where escaped-value is settings_section_escape()d.
+   Include groups use "@label/name" filter names.
+
+   Filter index
+   ------------
+
+   Each settings block has a hash table of filter names, which is used to
+   quickly find the filters that can match a settings lookup. Each filter in
+   the block is listed exactly once in the index: under its primary name, or
+   in the no-name list if the filter has no names (global, protocol, local,
+   remote and local_name filters). The primary name is the include group name
+   for group filters, otherwise the innermost filter name. Since all of the
+   filter's names must match, a filter can only match a lookup that has the
+   filter's primary name. The hash table uses linear probing and is at most
+   half full, so there is always an empty node to stop the probing.
+
+   The filter index lists are sorted in descending order. lib-settings
+   merges the lists that can match the lookup and applies the filters in the
+   same descending order as without the index.
+
+   The <filter index> contents are (relative offsets are from the beginning
+   of the filter index):
+
+   <0..3 bytes to pad to 32bit offset>
+   <32bit: hash table nodes count>
+   Repeat for "hash table nodes count":
+     <32bit: filter name relative offset, 0 = empty node>
+     <32bit: filter index list relative offset>
+   <32bit: no-name filter index list relative offset>
+   Strings and lists:
+     <NUL-terminated string: filter name>
+     <filter index list (32bit aligned)>:
+       <32bit: count>
+       <32bit: block filter index>[count]
+
    Groups
    ------
 
@@ -145,8 +200,12 @@ struct config_dump_full_context {
 	struct ostream *output;
 	enum config_dump_full_dest dest;
 
+	pool_t pool;
 	struct config_filter_parser *const *filters;
 	uint32_t filter_output_count;
+	/* Primary name for each filter, which is used for indexing it.
+	   NULL if the filter has no names. */
+	const char **filter_primary_names;
 
 	uint32_t *filter_indexes_32;
 	uint64_t *filter_offsets_64;
@@ -226,30 +285,34 @@ config_dump_full_write_cache_paths(struct ostream *output,
 								    main_path->path);
 }
 
-static bool
-config_dump_keys_hash_try(struct config_parsed *config,
-			  uint32_t key_prefix, unsigned int hash_table_size)
-{
-	const HASH_TABLE_TYPE(config_key) all_keys =
-		config_parsed_get_all_keys(config);
-	const char *name;
-	struct config_parser_key *config_key;
-	bool ret = TRUE;
+/* Number of hash table key prefixes to try for each hash table size before
+   trying a larger size. */
+#define KEYS_HASH_PREFIX_TRIES 128
+/* Knuth's multiplicative hashing constant (TAOCP Vol. 3, section 6.4): the
+   prime closest to 2^32/phi, where phi is the golden ratio. Multiplying by it
+   (mod 2^32) is "Fibonacci hashing". Because the constant is odd, i -> i*K is
+   a bijection, so all the tries get different prefixes. Because phi is the
+   "most irrational" number, i*K/2^32 mod 1 spreads consecutive i as evenly as
+   possible (three-distance theorem), so the prefixes differ in their high bits
+   as well, not only in the low bits like i itself would. */
+#define KEYS_HASH_PREFIX_MULTIPLIER 2654435761U
 
-	bool *table = i_new(bool, hash_table_size);
-	struct hash_iterate_context *iter = hash_table_iterate_init(all_keys);
-	while (hash_table_iterate(iter, all_keys, &name, &config_key)) {
-		uint32_t key_hash = (key_prefix ^ str_stable_hash(name)) %
+static bool
+config_dump_keys_hash_try(const uint32_t *key_hashes, unsigned int keys_count,
+			  uint32_t key_prefix, unsigned int hash_table_size,
+			  bool *table)
+{
+	unsigned int i;
+
+	memset(table, 0, sizeof(table[0]) * hash_table_size);
+	for (i = 0; i < keys_count; i++) {
+		uint32_t key_hash = (key_prefix ^ key_hashes[i]) %
 			hash_table_size;
-		if (table[key_hash]) {
-			ret = FALSE;
-			break;
-		}
+		if (table[key_hash])
+			return FALSE;
 		table[key_hash] = TRUE;
 	}
-	hash_table_iterate_deinit(&iter);
-	i_free(table);
-	return ret;
+	return TRUE;
 }
 
 static unsigned int
@@ -329,30 +392,60 @@ config_dump_keys_hash_table(struct config_parsed *config, buffer_t *buf)
 {
 	const HASH_TABLE_TYPE(config_key) all_keys =
 		config_parsed_get_all_keys(config);
-	unsigned int i, hash_table_size = hash_table_count(all_keys);
+	unsigned int i, keys_count = hash_table_count(all_keys);
+	const char *name;
+	struct config_parser_key *config_key;
+	uint32_t key_prefix = 0;
+
+	/* Hash the keys only once */
+	uint32_t *key_hashes = i_new(uint32_t, keys_count);
+	i = 0;
+	struct hash_iterate_context *iter = hash_table_iterate_init(all_keys);
+	while (hash_table_iterate(iter, all_keys, &name, &config_key))
+		key_hashes[i++] = str_stable_hash(name);
+	hash_table_iterate_deinit(&iter);
+	i_assert(i == keys_count);
 
 	/* Find a hash table where no settings keys have collisions. We can
 	   spend more time here so later settings lookups are more efficient by
-	   not having to handle key collisions. */
+	   not having to handle key collisions.
+
+	   The probability of n randomly hashed keys having no collisions in a
+	   hash table of m nodes is about exp(-n*n/(2*m)). With
+	   KEYS_HASH_PREFIX_TRIES tries per size, sizes below
+	   n*n/(2*ln(KEYS_HASH_PREFIX_TRIES)) ~ n*n/10 practically never
+	   succeed, so don't waste time trying them. */
+	uint64_t min_size = (uint64_t)keys_count * keys_count / 10;
+	unsigned int hash_table_size =
+		primes_closest(min_size < UINT_MAX ? min_size : UINT_MAX);
 	for (;;) {
+		bool *table = i_new(bool, hash_table_size);
 		/* Try a few times to fit the hash table into a smaller node
 		   count by using different key prefixes. Use predictable key
 		   prefixes, so the hash table sizes are also predictable (and
-		   easier to debug) across different runs. */
-		for (i = 0; i < 10; i++) {
-			uint32_t key_prefix = i;
-			if (config_dump_keys_hash_try(config, key_prefix,
-						      hash_table_size)) {
-				config_dump_keys_hash(config, buf,
-					key_prefix, hash_table_size);
-				return;
-			}
+		   easier to debug) across different runs. Prefixes that differ
+		   only in their lowest bits change the hashes only a little, so
+		   mostly the same keys keep colliding - multiply to change all
+		   the bits for each try (see KEYS_HASH_PREFIX_MULTIPLIER). The
+		   multiplication is meant to wrap. */
+		for (i = 0; i < KEYS_HASH_PREFIX_TRIES; i++) {
+			key_prefix = (uint32_t)((uint64_t)i *
+						KEYS_HASH_PREFIX_MULTIPLIER);
+			if (config_dump_keys_hash_try(key_hashes, keys_count,
+						      key_prefix,
+						      hash_table_size, table))
+				break;
 		}
+		i_free(table);
+		if (i < KEYS_HASH_PREFIX_TRIES)
+			break;
 		/* Continue with a larger hash table size until we succeed.
 		   In theory this could cause huge hash table sizes (or even
 		   out of memory), but practically that shouldn't happen. */
 		hash_table_size = primes_closest(hash_table_size + 1);
 	}
+	i_free(key_hashes);
+	config_dump_keys_hash(config, buf, key_prefix, hash_table_size);
 }
 
 static void
@@ -435,51 +528,6 @@ config_dump_full_append_filter(string_t *str,
 
 	if (str_len(str) > 0)
 		str_truncate(str, str_len(str) - 5);
-}
-
-static uint32_t
-config_filter_get_name_list_counts(const struct config_filter *filter)
-{
-	uint32_t count = 0;
-	for (; filter != NULL; filter = filter->parent) {
-		if (filter->filter_name_array)
-			count++;
-	}
-	return count;
-}
-
-static void
-config_dump_full_write_filters(struct ostream *output,
-			       struct config_parsed *config)
-{
-	struct config_filter_parser *const *filters =
-		config_parsed_get_filter_parsers(config);
-	unsigned int i, filter_count = 0;
-
-	while (filters[filter_count] != NULL) filter_count++;
-
-	uint32_t filter_count_32 = filter_count;
-	o_stream_nsend(output, &filter_count_32, sizeof(filter_count_32));
-
-	/* the first filter is the global empty filter */
-	uint32_t named_list_filter_count = 0;
-	o_stream_nsend(output, "", 1);
-	o_stream_nsend(output, &named_list_filter_count,
-		       sizeof(named_list_filter_count));
-
-	string_t *str = str_new(default_pool, 128);
-	for (i = 1; i < filter_count; i++) T_BEGIN {
-		str_truncate(str, 0);
-		config_dump_full_append_filter(str, &filters[i]->filter);
-		str_append_c(str, '\0');
-		o_stream_nsend(output, str_data(str), str_len(str));
-
-		named_list_filter_count =
-			config_filter_get_name_list_counts(&filters[i]->filter);
-		o_stream_nsend(output, &named_list_filter_count,
-			       sizeof(named_list_filter_count));
-	} T_END;
-	str_free(&str);
 }
 
 static void
@@ -933,6 +981,15 @@ int config_dump_full(struct config_parsed *config,
 
 	o_stream_cork(output);
 
+	struct config_dump_full_context ctx = {
+		.config = config,
+		.pool = pool_alloconly_create("config dump full", 1024),
+		.dovecot_config_version = dovecot_config_version,
+		.output = output,
+		.dest = dest,
+		.filters = config_parsed_get_filter_parsers(config),
+	};
+
 	if (import_environment_r != NULL) {
 		const char *value =
 			config_parsed_get_setting(config,
@@ -953,16 +1010,9 @@ int config_dump_full(struct config_parsed *config,
 		if (cache_path != NULL)
 			final_path = cache_path;
 		config_dump_full_write_all_keys(output, config);
-		config_dump_full_write_filters(output, config);
+		config_bin_filters_write(output, ctx.filters, ctx.pool,
+					 &ctx.filter_primary_names);
 	}
-
-	struct config_dump_full_context ctx = {
-		.config = config,
-		.dovecot_config_version = dovecot_config_version,
-		.output = output,
-		.dest = dest,
-		.filters = config_parsed_get_filter_parsers(config),
-	};
 
 	/* first filter should be the global one */
 	i_assert(ctx.filters[0] != NULL &&
@@ -1090,6 +1140,12 @@ int config_dump_full(struct config_parsed *config,
 			o_stream_nsend(output, ctx.filter_indexes_32,
 				       sizeof(ctx.filter_indexes_32[0]) *
 				       ctx.filter_output_count);
+			T_BEGIN {
+				config_bin_filter_index_write(output,
+					ctx.filter_primary_names,
+					ctx.filter_indexes_32,
+					ctx.filter_output_count);
+			} T_END;
 			/* safety NUL at the end of the block */
 			o_stream_nsend(output, "", 1);
 		}
@@ -1111,6 +1167,7 @@ int config_dump_full(struct config_parsed *config,
 	}
 	bool failed = i < parser_count;
 	config_export_free(&export_ctx);
+	pool_unref(&ctx.pool);
 	str_free(&dump_ctx.delayed_output);
 
 	if (dest != CONFIG_DUMP_FULL_DEST_STDOUT) {

@@ -9,6 +9,7 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-auth-client \
 	-I$(top_srcdir)/src/lib-ssl-iostream \
 	-I$(top_srcdir)/src/lib-http \
+	-I$(top_srcdir)/src/lib-url \
 	-I$(top_srcdir)/src/lib-json \
 	-I$(top_srcdir)/src/lib-doveadm \
 	-I$(top_srcdir)/src/lib-var-expand \

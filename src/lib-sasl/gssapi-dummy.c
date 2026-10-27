@@ -26,8 +26,12 @@ struct gss_ctx_id_struct {
 	gss_OID_desc mech_type;
 };
 
-gss_OID GSS_C_NT_HOSTBASED_SERVICE = NULL;
-const gss_OID GSS_KRB5_NT_PRINCIPAL_NAME = NULL;
+static gss_OID_desc GSS_C_NT_HOSTBASED_SERVICE_DESC =
+	{ .length = 1, .elements = "\x01" };
+static gss_OID_desc GSS_KRB5_NT_PRINCIPAL_NAME_DESC =
+	{ .length = 1, .elements = "\x02" };
+gss_OID GSS_C_NT_HOSTBASED_SERVICE = &GSS_C_NT_HOSTBASED_SERVICE_DESC;
+const gss_OID GSS_KRB5_NT_PRINCIPAL_NAME = &GSS_KRB5_NT_PRINCIPAL_NAME_DESC;
 
 static void gss_alloc_buffer(gss_buffer_t buffer, size_t length);
 
@@ -177,8 +181,8 @@ _decode_uint32(const unsigned char **_input, size_t *_input_left,
 	if (input_left < 4)
 		return -1;
 
-	*num_r = (OM_uint32)(input[0] << 24) | (OM_uint32)(input[1] << 16) |
-		 (OM_uint32)(input[2] << 8) | (OM_uint32)(input[3] << 0);
+	*num_r = ((OM_uint32)input[0] << 24) | ((OM_uint32)input[1] << 16) |
+		 ((OM_uint32)input[2] << 8) | ((OM_uint32)input[3] << 0);
 
 	*_input += 4;
 	*_input_left -= 4;
@@ -222,7 +226,7 @@ gss_parse_sec_context(struct gss_ctx_id_struct *ctx,
 
 	if (_decode_uint32(&input, &input_left, &ctx->mech_type.length) < 0)
 	    return GSS_S_BAD_MECH;
-	if (ctx->mech_type.length > input_left)
+	if (ctx->mech_type.length == 0 || ctx->mech_type.length > input_left)
 	    return GSS_S_BAD_MECH;
 	ctx->mech_type.elements = p_malloc(ctx->pool, ctx->mech_type.length);
 	memcpy(ctx->mech_type.elements, input, ctx->mech_type.length);
@@ -373,8 +377,11 @@ gss_unwrap(OM_uint32 *minor_status, gss_ctx_id_t context_handle ATTR_UNUSED,
 	i_assert(conf_state == NULL);
 
 	gss_alloc_buffer(output_message_buffer, input_message_buffer->length);
-	memcpy(output_message_buffer->value, input_message_buffer->value,
-	       input_message_buffer->length);
+	if (input_message_buffer->length > 0) {
+		memcpy(output_message_buffer->value,
+		       input_message_buffer->value,
+		       input_message_buffer->length);
+	}
 
 	*minor_status = 0;
 	return 0;

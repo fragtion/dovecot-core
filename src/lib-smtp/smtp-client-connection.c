@@ -14,6 +14,7 @@
 #include "iostream-ssl.h"
 #include "str.h"
 #include "settings.h"
+#include "client-auth-settings.h"
 #include "dsasl-client.h"
 #include "dns-lookup.h"
 #include "smtp-syntax.h"
@@ -519,6 +520,16 @@ smtp_client_connection_xclient_cb(const struct smtp_reply *reply,
 	if (conn->state == SMTP_CLIENT_CONNECTION_STATE_DISCONNECTED)
 		return;
 
+	if (!smtp_reply_is_success(reply) && !conn->xclient_rejected) {
+		/* The server dropped the forwarded client information: it
+		   generates its own session ID, loses the client IP and port
+		   and resets the proxy TTL. Delivery still continues. Warn
+		   once: a long XCLIENT is split into several commands. */
+		conn->xclient_rejected = TRUE;
+		e_warning(conn->event, "Server rejected XCLIENT handshake: %s",
+			  smtp_reply_log(reply));
+	}
+
 	if (conn->to_connect != NULL)
 		timeout_reset(conn->to_connect);
 	if (--conn->xclient_replies_expected == 0)
@@ -767,7 +778,7 @@ smtp_client_connection_clear_password(struct smtp_client_connection *conn)
 static void
 smtp_client_connection_auth_deinit(struct smtp_client_connection *conn)
 {
-	dsasl_client_free(&conn->sasl_client);
+	dsasl_client_session_destroy(&conn->sasl_session);
 	i_free(conn->sasl_ir);
 }
 
@@ -826,13 +837,15 @@ smtp_client_connection_auth_cb(const struct smtp_reply *reply,
 				"Authentication failed: "
 				"Server sent non-base64 input for AUTH: %s",
 				reply->text_lines[0]);
-		} else if (dsasl_client_input(conn->sasl_client,
-					      buf->data, buf->used,
-					      &error) != DSASL_CLIENT_RESULT_OK) {
+		} else if (dsasl_client_session_input(
+				conn->sasl_session, buf->data, buf->used,
+				&error) != DSASL_CLIENT_RESULT_OK) {
 			error = t_strdup_printf("Authentication failed: %s",
 						error);
-		} else if (dsasl_client_output(conn->sasl_client, &sasl_output,
-					       &sasl_output_len, &error) != DSASL_CLIENT_RESULT_OK) {
+		} else if (dsasl_client_session_output(
+				conn->sasl_session,
+				&sasl_output, &sasl_output_len,
+				&error) != DSASL_CLIENT_RESULT_OK) {
 			error = t_strdup_printf("Authentication failed: %s",
 						error);
 		} else {
@@ -875,27 +888,16 @@ smtp_client_connection_auth_cb(const struct smtp_reply *reply,
 
 static int
 smtp_client_connection_get_sasl_mech(struct smtp_client_connection *conn,
-				     const struct dsasl_client_mech **mech_r,
+				     const char **mech_name_r,
 				     const char **error_r)
 {
 	const struct smtp_client_settings *set = &conn->set;
 	const char *const *mechanisms;
 
-	if (set->sasl_mech != NULL) {
-		const char *mech = dsasl_client_mech_get_name(set->sasl_mech);
+	*mech_name_r = NULL;
 
-		if (!str_array_icase_find(conn->caps.auth_mechanisms, mech)) {
-			*error_r = t_strdup_printf(
-				"Server doesn't support `%s' SASL mechanism",
-				mech);
-			return -1;
-		}
-		*mech_r = set->sasl_mech;
-		return 0;
-	}
-	if (set->sasl_mechanisms == NULL ||
-		set->sasl_mechanisms[0] == '\0') {
-		*mech_r = &dsasl_client_mech_plain;
+	if (set->sasl_mechanisms == NULL || set->sasl_mechanisms[0] == '\0') {
+		*mech_name_r = "";
 		return 0;
 	}
 
@@ -904,14 +906,8 @@ smtp_client_connection_get_sasl_mech(struct smtp_client_connection *conn,
 	for (; *mechanisms != NULL; mechanisms++) {
 		if (str_array_icase_find(conn->caps.auth_mechanisms,
 					 *mechanisms)) {
-			*mech_r = dsasl_client_mech_find(*mechanisms);
-			if (*mech_r != NULL)
-				return 0;
-
-			*error_r = t_strdup_printf(
-				"Support for SASL mechanism `%s' is missing",
-				*mechanisms);
-			return -1;
+			*mech_name_r = *mechanisms;
+			return 0;
 		}
 	}
 	*error_r = t_strdup_printf(
@@ -920,19 +916,43 @@ smtp_client_connection_get_sasl_mech(struct smtp_client_connection *conn,
 	return -1;
 }
 
+static void
+smtp_client_connection_send_auth(struct smtp_client_connection *conn,
+				 const char *mech_name, const char *init_resp)
+{
+	struct smtp_client_command *cmd =
+		smtp_client_command_new(conn, SMTP_CLIENT_COMMAND_FLAG_PRELOGIN,
+					smtp_client_connection_auth_cb, conn);
+	if (init_resp == NULL)
+		smtp_client_command_printf(cmd, "AUTH %s", mech_name);
+	else if (*init_resp == '\0')
+		smtp_client_command_printf(cmd, "AUTH %s =", mech_name);
+	else {
+		smtp_client_command_printf(cmd, "AUTH %s %s",
+					   mech_name, init_resp);
+	}
+	smtp_client_command_submit(cmd);
+	conn->cmd_auth = cmd;
+
+	smtp_client_connection_set_state(
+		conn, SMTP_CLIENT_CONNECTION_STATE_AUTHENTICATING);
+}
+
 static bool
 smtp_client_connection_authenticate(struct smtp_client_connection *conn)
 {
+	struct smtp_client *client = conn->client;
 	const struct smtp_client_settings *set = &conn->set;
-	struct dsasl_client_settings sasl_set;
-	const struct dsasl_client_mech *sasl_mech = NULL;
-	struct smtp_client_command *cmd;
+	struct client_auth_settings sasl_set;
+	const char *mech_name = NULL;
 	const unsigned char *sasl_output;
 	size_t sasl_output_len;
 	string_t *sasl_output_base64;
 	const char *error;
+	int ret;
 
-	if (set->username == NULL && set->sasl_mech == NULL) {
+	if (set->username == NULL &&
+	    (set->sasl_mechanisms == NULL || *set->sasl_mechanisms == '\0')) {
 		if (!conn->set.xclient_defer)
 			smtp_client_connection_send_xclient(conn);
 		return (conn->xclient_replies_expected == 0);
@@ -951,16 +971,7 @@ smtp_client_connection_authenticate(struct smtp_client_connection *conn)
 		return FALSE;
 	}
 
-	if (set->master_user != NULL) {
-		e_debug(conn->event, "Authenticating as %s for user %s",
-			set->master_user, set->username);
-	} else if (set->username == NULL) {
-		e_debug(conn->event, "Authenticating");
-	} else {
-		e_debug(conn->event, "Authenticating as %s", set->username);
-	}
-
-	if (smtp_client_connection_get_sasl_mech(conn, &sasl_mech,
+	if (smtp_client_connection_get_sasl_mech(conn, &mech_name,
 						 &error) < 0) {
 		error = t_strdup_printf("Authentication failed: %s", error);
 		smtp_client_connection_fail(
@@ -970,7 +981,7 @@ smtp_client_connection_authenticate(struct smtp_client_connection *conn)
 	}
 
 	i_zero(&sasl_set);
-	sasl_set.event_parent = conn->event;
+	sasl_set.mechanism = mech_name;
 	if (set->master_user == NULL)
 		sasl_set.authid = set->username;
 	else {
@@ -978,20 +989,44 @@ smtp_client_connection_authenticate(struct smtp_client_connection *conn)
 		sasl_set.authzid = set->username;
 	}
 	sasl_set.password = set->password;
-	sasl_set.protocol = "smtp";
-	sasl_set.host = conn->host;
-	sasl_set.port = conn->port;
 
-	conn->sasl_client = dsasl_client_new(sasl_mech, &sasl_set);
+	struct dsasl_client_parameters sasl_params = {
+		.protocol = "smtp",
+		.host = conn->host,
+		.port = conn->port,
+		.server_mechanisms = conn->caps.auth_mechanisms,
+	};
 
-	if (dsasl_client_output(conn->sasl_client, &sasl_output,
-				&sasl_output_len, &error) != DSASL_CLIENT_RESULT_OK) {
+	ret = dsasl_client_session_create(smtp_client_get_sasl_client(client),
+					  conn->event, &sasl_params, &sasl_set,
+					  &conn->sasl_session, &error);
+	if (ret <= 0) {
 		error = t_strdup_printf(
-			"Failed to create initial %s SASL reply: %s",
-			dsasl_client_mech_get_name(sasl_mech), error);
+			"Failed to initialize authentication: %s", error);
 		smtp_client_connection_fail(
 			conn, SMTP_CLIENT_COMMAND_ERROR_AUTH_FAILED,
 			error, "Internal authentication failure");
+		return FALSE;
+	}
+	mech_name = dsasl_client_session_get_mech_name(conn->sasl_session);
+
+	if (dsasl_client_session_output(conn->sasl_session,
+					&sasl_output, &sasl_output_len,
+					&error) != DSASL_CLIENT_RESULT_OK) {
+		error = t_strdup_printf(
+			"Failed to create initial %s SASL reply: %s",
+			mech_name, error);
+		smtp_client_connection_fail(
+			conn, SMTP_CLIENT_COMMAND_ERROR_AUTH_FAILED,
+			error, "Internal authentication failure");
+		return FALSE;
+	}
+	if (sasl_output == NULL) {
+		smtp_client_connection_send_auth(conn, mech_name, NULL);
+		return FALSE;
+	}
+	if (sasl_output_len == 0) {
+		smtp_client_connection_send_auth(conn, mech_name, "");
 		return FALSE;
 	}
 
@@ -1012,31 +1047,16 @@ smtp_client_connection_authenticate(struct smtp_client_connection *conn)
 	   This indicates that the response is present, but contains no data.
 	 */
 
-	const char *init_resp = "";
-	const char *mech_name =  dsasl_client_mech_get_name(sasl_mech);
+	const char *init_resp = NULL;
 
 	i_assert(conn->sasl_ir == NULL);
-	if (str_len(sasl_output_base64) == 0)
-		init_resp = "=";
-	else if ((5 + strlen(mech_name) + 1 + str_len(sasl_output_base64)) >
-		 SMTP_BASE_LINE_LENGTH_LIMIT)
+	if ((5 + strlen(mech_name) + 1 + str_len(sasl_output_base64)) >
+	    SMTP_BASE_LINE_LENGTH_LIMIT)
 		conn->sasl_ir = i_strdup(str_c(sasl_output_base64));
 	else
 		init_resp = str_c(sasl_output_base64);
 
-	cmd = smtp_client_command_new(conn, SMTP_CLIENT_COMMAND_FLAG_PRELOGIN,
-				      smtp_client_connection_auth_cb, conn);
-	if (*init_resp == '\0')
-		smtp_client_command_printf(cmd, "AUTH %s", mech_name);
-	else {
-		smtp_client_command_printf(cmd, "AUTH %s %s",
-					   mech_name, init_resp);
-	}
-	smtp_client_command_submit(cmd);
-	conn->cmd_auth = cmd;
-
-	smtp_client_connection_set_state(
-		conn, SMTP_CLIENT_CONNECTION_STATE_AUTHENTICATING);
+	smtp_client_connection_send_auth(conn, mech_name, init_resp);
 	return FALSE;
 }
 
@@ -1612,7 +1632,6 @@ smtp_client_connection_init_ssl_ctx(struct smtp_client_connection *conn,
 				    const char **error_r)
 {
 	struct smtp_client *client = conn->client;
-	int ret;
 
 	if (conn->ssl_ctx != NULL)
 		return 0;
@@ -1630,16 +1649,12 @@ smtp_client_connection_init_ssl_ctx(struct smtp_client_connection *conn,
 			"Requested SSL connection, but no SSL settings given";
 		return -1;
 	}
-	if ((ret = ssl_iostream_client_context_cache_get(conn->set.ssl, &conn->ssl_ctx,
-							 error_r)) <= 0)
-		return ret;
-	const char *application_protocol = smtp_protocol_name(conn->protocol);
 	const char *const names[] = {
-		application_protocol,
+		smtp_protocol_name(conn->protocol),
 		NULL
 	};
-	ssl_iostream_context_set_application_protocols(conn->ssl_ctx, names);
-	return 0;
+	return ssl_iostream_client_context_cache_get(conn->set.ssl, names,
+						     &conn->ssl_ctx, error_r);
 }
 
 static int
@@ -2014,6 +2029,7 @@ void smtp_client_connection_connect(
 	conn->xclient_replies_expected = 0;
 	conn->authenticated = FALSE;
 	conn->xclient_sent = FALSE;
+	conn->xclient_rejected = FALSE;
 	conn->connect_failed = FALSE;
 	conn->connect_succeeded = FALSE;
 	conn->handshake_failed = FALSE;
@@ -2168,10 +2184,8 @@ smtp_client_connection_do_create(struct smtp_client *client, const char *name,
 			conn->password = p_strdup(pool, set->password);
 			conn->set.password = conn->password;
 		}
-		if (set->sasl_mech != NULL)
-			conn->set.sasl_mech = set->sasl_mech;
-		else if (set->sasl_mechanisms != NULL &&
-			 *set->sasl_mechanisms != '\0') {
+		if (set->sasl_mechanisms != NULL &&
+		    *set->sasl_mechanisms != '\0') {
 			conn->set.sasl_mechanisms =
 				p_strdup(pool, set->sasl_mechanisms);
 		}

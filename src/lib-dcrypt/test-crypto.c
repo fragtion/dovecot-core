@@ -1822,6 +1822,77 @@ static void test_sign_verify_x962_fixed_width(void)
 	test_end();
 }
 
+static void test_sign_verify_x962_curves(void)
+{
+	static const struct {
+		const char *curve;
+		const char *digest;
+		size_t rs_len;
+	} tests[] = {
+		{ SN_secp384r1, "sha384", 48 },
+		/* the DER signature is over 127 bytes long */
+		{ SN_secp521r1, "sha512", 66 },
+	};
+	const char *data = "signed data";
+	const char *error;
+	bool valid;
+
+	test_begin("sign and verify (x9.62) P-384 and P-521");
+	for (unsigned int i = 0; i < N_ELEMENTS(tests); i++) T_BEGIN {
+		struct dcrypt_keypair pair;
+		buffer_t *signature = t_buffer_create(256);
+
+		/* the signature is appended after existing data */
+		buffer_append(signature, "prefix", 6);
+
+		if (!dcrypt_keypair_generate(&pair, DCRYPT_KEY_EC, 0,
+					     tests[i].curve, &error))
+			i_fatal("%s", error);
+		test_assert_idx(dcrypt_sign(pair.priv, tests[i].digest,
+					    DCRYPT_SIGNATURE_FORMAT_X962,
+					    data, strlen(data), signature, 0,
+					    &error), i);
+		test_assert_idx(signature->used == 6 + 2 * tests[i].rs_len, i);
+		test_assert_idx(memcmp(signature->data, "prefix", 6) == 0, i);
+		const unsigned char *sig = CONST_PTR_OFFSET(signature->data, 6);
+		test_assert_idx(dcrypt_verify(pair.pub, tests[i].digest,
+					      DCRYPT_SIGNATURE_FORMAT_X962,
+					      data, strlen(data),
+					      sig, signature->used - 6,
+					      &valid, 0, &error) && valid, i);
+		dcrypt_keypair_unref(&pair);
+	} T_END;
+	test_end();
+}
+
+static void test_sign_dss_append(void)
+{
+	const char *data = "signed data";
+	struct dcrypt_keypair pair;
+	buffer_t *signature = t_buffer_create(256);
+	const char *error;
+	bool valid;
+
+	test_begin("sign (dss) appends to the signature buffer");
+	if (!dcrypt_keypair_generate(&pair, DCRYPT_KEY_EC, 0,
+				     SN_X9_62_prime256v1, &error))
+		i_fatal("%s", error);
+	buffer_append(signature, "prefix", 6);
+	test_assert(dcrypt_sign(pair.priv, SN_sha256,
+				DCRYPT_SIGNATURE_FORMAT_DSS,
+				data, strlen(data), signature, 0, &error));
+	test_assert(signature->used > 6);
+	test_assert(memcmp(signature->data, "prefix", 6) == 0);
+	test_assert(dcrypt_verify(pair.pub, SN_sha256,
+				  DCRYPT_SIGNATURE_FORMAT_DSS,
+				  data, strlen(data),
+				  CONST_PTR_OFFSET(signature->data, 6),
+				  signature->used - 6, &valid, 0, &error) &&
+		    valid);
+	dcrypt_keypair_unref(&pair);
+	test_end();
+}
+
 static void test_static_verify_ecdsa(void)
 {
 	test_begin("static verify (ecdsa)");
@@ -2166,6 +2237,33 @@ static void test_sign_verify_ed25519(void)
 
 	dcrypt_keypair_unref(&pair);
 
+	test_end();
+}
+
+static void test_sign_verify_x962_ed25519(void)
+{
+	const char *data = "signed data";
+	struct dcrypt_keypair pair;
+	buffer_t *signature = t_buffer_create(128);
+	unsigned char sig[64] = { 0 };
+	const char *error;
+	bool valid;
+
+	test_begin("sign and verify (x9.62) reject ed25519");
+	if (!dcrypt_keypair_generate(&pair, DCRYPT_KEY_EC, 0, SN_ED25519,
+				     &error))
+		i_fatal("%s", error);
+	test_assert(!dcrypt_sign(pair.priv, SN_sha256,
+				 DCRYPT_SIGNATURE_FORMAT_X962,
+				 data, strlen(data), signature, 0, &error));
+	test_assert_strcmp(error, "Format requires an EC key");
+	test_assert(signature->used == 0);
+	test_assert(!dcrypt_verify(pair.pub, SN_sha256,
+				   DCRYPT_SIGNATURE_FORMAT_X962,
+				   data, strlen(data), sig, sizeof(sig),
+				   &valid, 0, &error));
+	test_assert_strcmp(error, "Format requires an EC key");
+	dcrypt_keypair_unref(&pair);
 	test_end();
 }
 
@@ -2584,11 +2682,14 @@ int main(void)
 		test_sign_verify_ecdsa,
 		test_sign_verify_x962,
 		test_sign_verify_x962_fixed_width,
+		test_sign_verify_x962_curves,
+		test_sign_dss_append,
 		test_static_verify_ecdsa,
 		test_static_verify_rsa,
 		test_static_verify_ecdsa_x962,
 #ifdef HAVE_X25519
 		test_sign_verify_ed25519,
+		test_sign_verify_x962_ed25519,
 		test_sign_verify_ed448,
 		test_static_verify_ed25519,
 		test_static_verify_ed448,

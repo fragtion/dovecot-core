@@ -10,11 +10,11 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-ssl-iostream \
 	-I$(top_srcdir)/src/lib-master \
 	-I$(top_srcdir)/src/lib-var-expand \
+	-I$(top_srcdir)/src/lib-url \
 	-DPKG_RUNDIR=\""$(rundir)"\"
 
 libhttp_la_SOURCES = \
 	http-date.c \
-	http-url.c \
 	http-parser.c \
 	http-header.c \
 	http-header-parser.c \
@@ -43,7 +43,6 @@ libhttp_la_SOURCES = \
 headers = \
 	http-common.h \
 	http-date.h \
-	http-url.h \
 	http-parser.h \
 	http-header.h \
 	http-header-parser.h \
@@ -64,7 +63,6 @@ pkginc_lib_HEADERS = $(headers)
 
 test_programs = \
 	test-http-date \
-	test-http-url \
 	test-http-header-parser \
 	test-http-transfer \
 	test-http-auth \
@@ -86,6 +84,7 @@ test_libs = \
 	../lib-dns/libdns.la \
 	../lib-var-expand/libvar_expand.la \
 	../lib-regex/libdregex.la \
+	../lib-url/liburl.la \
 	../lib-test/libtest.la \
 	../lib/liblib.la
 
@@ -96,11 +95,8 @@ test_deps = \
 	../lib-dns/libdns.la \
 	../lib-var-expand/libvar_expand.la \
 	../lib-regex/libdregex.la \
+	../lib-url/liburl.la \
 	../lib/liblib.la
-
-test_http_url_SOURCES = test-http-url.c
-test_http_url_LDADD = http-url.lo http-header.lo $(test_libs) $(LIBDOVECOT_TEST_LIBS)
-test_http_url_DEPENDENCIES = $(test_deps)
 
 test_http_date_SOURCES = test-http-date.c
 test_http_date_LDADD = http-date.lo  $(test_libs) $(LIBDOVECOT_TEST_LIBS)
@@ -142,12 +138,12 @@ test_http_request_parser_SOURCES = test-http-request-parser.c
 test_http_request_parser_LDADD = \
 	http-date.lo \
 	http-parser.lo \
-	http-url.lo \
 	http-header.lo \
 	http-header-parser.lo \
 	http-transfer-chunked.lo \
 	http-message-parser.lo \
 	http-request-parser.lo \
+	http-request.lo \
 	$(test_libs) $(LIBDOVECOT_TEST_LIBS)
 test_http_request_parser_DEPENDENCIES = $(test_deps)
 

@@ -1,5 +1,6 @@
 deps = [
   dep_lib,
+  dep_url,
   dep_settings,
   dep_ssl_iostream,
   dep_mail,
@@ -7,6 +8,7 @@ deps = [
   dep_master,
   dep_dns_client,
   dep_program_client,
+  dep_auth_client,
 ]
 
 lib_smtp = static_library(

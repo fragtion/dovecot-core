@@ -26,6 +26,7 @@
 #include "master-service.h"
 #include "login-client.h"
 #include "auth-client.h"
+#include "auth-master.h"
 #include "dsasl-client.h"
 #include "login-proxy.h"
 #include "settings-parser.h"
@@ -37,6 +38,8 @@ struct client *clients = NULL;
 struct client *destroyed_clients = NULL;
 static struct client *last_client = NULL;
 static unsigned int clients_count = 0;
+/* Number of clients in the clients linked list */
+static unsigned int clients_active_count = 0;
 
 static struct client *client_fd_proxies = NULL;
 static unsigned int client_fd_proxies_count = 0;
@@ -260,7 +263,7 @@ static bool application_protocol_equals(const char *proto)
 }
 
 int client_alloc(int fd, const struct master_service_connection *conn,
-		 struct client **client_r)
+		 struct event *event_parent, struct client **client_r)
 {
 	struct client *client;
 	const char *error;
@@ -283,6 +286,7 @@ int client_alloc(int fd, const struct master_service_connection *conn,
 	p_array_init(&client->module_contexts, client->pool, 5);
 
 	client->fd = fd;
+	client->pending_plaintext_fd = -1;
 	client->local_ip = conn->local_ip;
 	client->local_port = conn->local_port;
 	client->ip = conn->remote_ip;
@@ -293,7 +297,7 @@ int client_alloc(int fd, const struct master_service_connection *conn,
 	client->real_remote_port = conn->real_remote_port;
 	client->listener_name = p_strdup(client->pool, conn->name);
 	/* This event must exist before client_is_trusted() is called */
-	client->event = event_create(master_service_get_event(master_service));
+	client->event = event_create(event_parent);
 	event_add_category(client->event, &login_binary->event_category);
 	event_add_ip(client->event, "local_ip", &conn->local_ip);
 	event_add_int(client->event, "local_port", conn->local_port);
@@ -301,8 +305,6 @@ int client_alloc(int fd, const struct master_service_connection *conn,
 	event_add_int(client->event, "remote_port", conn->remote_port);
 	event_add_str(client->event, "protocol", login_binary->protocol);
 	event_add_str(client->event, "service", master_service_get_name(master_service));
-	settings_event_add_list_filter_name(client->event, "service",
-		master_service_get_name(master_service));
 
 	/* Get settings before using log callback */
 	event_set_ptr(client->event, SETTINGS_EVENT_VAR_EXPAND_CALLBACK,
@@ -389,6 +391,7 @@ int client_init(struct client *client)
 	client->list_type = CLIENT_LIST_TYPE_ACTIVE;
 	DLLIST_PREPEND(&clients, client);
 	clients_count++;
+	clients_active_count++;
 
 	client->to_disconnect =
 		timeout_add(CLIENT_LOGIN_TIMEOUT_MSECS,
@@ -513,6 +516,8 @@ void client_destroy(struct client *client, const char *reason)
 	i_assert(!client->fd_proxying);
 	i_assert(client->list_type == CLIENT_LIST_TYPE_ACTIVE);
 	DLLIST_REMOVE(&clients, client);
+	i_assert(clients_active_count > 0);
+	clients_active_count--;
 	client->list_type = CLIENT_LIST_TYPE_DESTROYED;
 	DLLIST_PREPEND(&destroyed_clients, client);
 
@@ -529,6 +534,7 @@ void client_destroy(struct client *client, const char *reason)
 		client->authenticating = FALSE;
 		login_client_request_abort(login_client_list,
 					   client->master_tag);
+		i_close_fd(&client->pending_plaintext_fd);
 		client->refcount--;
 	} else if (client->auth_request != NULL ||
 		   client->anvil_query != NULL) {
@@ -561,7 +567,7 @@ void client_destroy(struct client *client, const char *reason)
 		i_free_and_null(client->proxy_password);
 	}
 
-	dsasl_client_free(&client->proxy_sasl_client);
+	dsasl_client_session_destroy(&client->proxy_sasl_session);
 	if (client->login_proxy != NULL)
 		login_proxy_free(&client->login_proxy);
 	if (client->v.destroy != NULL)
@@ -639,10 +645,12 @@ bool client_unref(struct client **_client)
 	o_stream_unref(&client->output);
 	o_stream_unref(&client->multiplex_orig_output);
 	i_close_fd(&client->fd);
+	i_close_fd(&client->pending_plaintext_fd);
 	event_unref(&client->event);
 	event_unref(&client->event_auth);
 	client_settings_free(client);
 
+	i_free(client->proxy_mech_name);
 	i_free(client->proxy_user);
 	i_free(client->proxy_master_user);
 	i_free(client->virtual_user);
@@ -666,39 +674,66 @@ void client_common_default_free(struct client *client ATTR_UNUSED)
 {
 }
 
-bool client_destroy_oldest(bool kill, struct timeval *created_r)
+static struct client *
+client_find_oldest_unauthenticated(bool prefer_refcount1)
 {
 	struct client *client, *last_refcount_non1 = NULL;
 
-	/* destroy the last client that hasn't successfully authenticated yet.
+	/* find the last client that hasn't successfully authenticated yet.
 	   this is usually the last client, but don't kill it if it's just
-	   waiting for master to finish its job. Also prefer to kill clients
-	   that can immediately be killed (i.e. refcount=1) */
+	   waiting for master to finish its job. Optionally prefer to kill
+	   clients that can immediately be freed (i.e. refcount=1) */
 	for (client = last_client; client != NULL; client = client->prev) {
 		if (client->master_tag != 0) {
 			/* never kill clients that are just waiting */
-		} else if (client->refcount > 1)
+		} else if (prefer_refcount1 && client->refcount > 1)
 			last_refcount_non1 = client;
 		else
-			break;
+			return client;
 	}
-	if (client == NULL) {
-		client = last_refcount_non1;
-		if (client == NULL)
-			return FALSE;
-	}
+	return last_refcount_non1;
+}
+
+static void client_destroy_resource_constraint(struct client *client)
+{
+	client_notify_disconnect(client, CLIENT_DISCONNECT_RESOURCE_CONSTRAINT,
+				 "Connection queue full");
+	client_destroy(client, "Connection queue full");
+}
+
+bool client_destroy_oldest(bool kill, struct timeval *created_r)
+{
+	struct client *client;
+
+	client = client_find_oldest_unauthenticated(TRUE);
+	if (client == NULL)
+		return FALSE;
 
 	*created_r = client->created;
 	if (!kill)
 		return TRUE;
 
-	client_notify_disconnect(client, CLIENT_DISCONNECT_RESOURCE_CONSTRAINT,
-				 "Connection queue full");
 	client_ref(client);
-	client_destroy(client, "Connection queue full");
+	client_destroy_resource_constraint(client);
 	/* return TRUE only if the client was actually freed */
 	i_assert(client->create_finished);
 	return !client_unref(&client);
+}
+
+void clients_check_unauthenticated_limit(unsigned int limit)
+{
+	struct client *client;
+
+	while (clients_active_count > limit) {
+		/* Don't prefer refcount=1 clients here. Otherwise clients
+		   that are e.g. waiting for SASL continuation would never be
+		   killed, and the newest client would be killed instead. */
+		client = client_find_oldest_unauthenticated(FALSE);
+		if (client == NULL)
+			break;
+		client->unauthenticated_limit_reached = TRUE;
+		client_destroy_resource_constraint(client);
+	}
 }
 
 void clients_destroy_all_reason(const char *reason)
@@ -769,7 +804,6 @@ int client_sni_callback(const char *name, const char **error_r,
 	struct client *client = context;
 	struct ssl_iostream_context *ssl_ctx;
 	const struct ssl_iostream_settings *ssl_set;
-	int ret;
 
 	if (client->ssl_servername_settings_read)
 		return 0;
@@ -785,15 +819,13 @@ int client_sni_callback(const char *name, const char **error_r,
 
 	ssl_server_settings_to_iostream_set(client->ssl_set,
 		client->ssl_server_set, &ssl_set);
-	if ((ret = ssl_iostream_server_context_cache_get(ssl_set, &ssl_ctx, error_r)) < 0) {
+	if (ssl_iostream_server_context_cache_get(ssl_set,
+			login_binary->application_protocols,
+			&ssl_ctx, error_r) < 0) {
 		settings_free(ssl_set);
 		return -1;
 	}
 	settings_free(ssl_set);
-	if (ret > 0 && login_binary->application_protocols != NULL) {
-		ssl_iostream_context_set_application_protocols(ssl_ctx,
-			login_binary->application_protocols);
-	}
 	ssl_iostream_change_context(client->ssl_iostream, ssl_ctx);
 	ssl_iostream_context_unref(&ssl_ctx);
 
@@ -1049,6 +1081,20 @@ void client_add_forward_field(struct client *client, const char *key,
 	array_push_back(&client->forward_fields, &entry);
 }
 
+bool client_forward_field_check(struct client *client, const char *field)
+{
+	/* the backend rejects a forward field with control characters:
+	   imap-login (ID) and LMTP (XRCPTFORWARD) drop just the field, the
+	   XCLIENT FORWARD backends reject the whole command. Warn here too,
+	   so the bad passdb value shows up on the proxy as well */
+	if (auth_forward_field_line_is_valid(field))
+		return TRUE;
+	e_warning(client->event,
+		  "Ignoring invalid passdb field forward_%s",
+		  str_sanitize(t_strcut(field, '='), 64));
+	return FALSE;
+}
+
 bool client_forward_decode_base64(struct client *client, const char *value)
 {
 	size_t value_len = strlen(value);
@@ -1064,9 +1110,17 @@ bool client_forward_decode_base64(struct client *client, const char *value)
 	char **_fields = p_strsplit_tabescaped(client->preproxy_pool,
 					       str_c(str));
 	const char *const *fields = (const char *const *)_fields;
+	for (unsigned int i = 0; fields[i] != NULL; i++) {
+		if (!auth_forward_field_line_is_valid(fields[i]))
+			return FALSE;
+	}
 	unsigned int fields_count = str_array_length(fields);
-	p_array_init(&client->forward_fields,
-		     client->preproxy_pool, fields_count);
+	if (!array_is_created(&client->forward_fields)) {
+		p_array_init(&client->forward_fields,
+			     client->preproxy_pool, fields_count);
+	} else {
+		array_clear(&client->forward_fields);
+	}
 	array_append(&client->forward_fields, fields, fields_count);
 	return TRUE;
 }
@@ -1196,7 +1250,12 @@ client_var_expand_func_passdb(const char *field_name, const char **value_r,
 		if (strncmp(client->auth_passdb_args[i], field_name,
 			    field_name_len) == 0 &&
 		    client->auth_passdb_args[i][field_name_len] == '=') {
-			*value_r = client->auth_passdb_args[i] + field_name_len+1;
+			/* passdb fields may carry the control characters
+			   tabescape round-trips (TAB, CR, LF) and
+			   anything a passdb returns; never expand them raw */
+			*value_r = str_sanitize(
+				client->auth_passdb_args[i] + field_name_len + 1,
+				SIZE_MAX);
 			break;
 		}
 	}
@@ -1444,6 +1503,13 @@ bool client_get_extra_disconnect_reason(struct client *client,
 		ioloop_time - client->auth_first_started.tv_sec;
 
 	*event_reason_r = NULL;
+
+	if (client->unauthenticated_limit_reached) {
+		*event_reason_r = "unauthenticated_client_limit";
+		*human_reason_r = "login_unauthenticated_client_limit was hit"
+				 " and this login session was killed.";
+		return TRUE;
+	}
 
 	if (client->ssl_iostream != NULL &&
 	    !ssl_iostream_is_handshaked(client->ssl_iostream)) {

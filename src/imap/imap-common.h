@@ -1,9 +1,6 @@
 #ifndef IMAP_COMMON_H
 #define IMAP_COMMON_H
 
-/* Disconnect client after idling this many milliseconds */
-#define CLIENT_IDLE_TIMEOUT_MSECS (60*30*1000)
-
 /* If we can't send anything to client for this long, disconnect the client */
 #define CLIENT_OUTPUT_TIMEOUT_MSECS (5*60*1000)
 
@@ -38,6 +35,7 @@ int client_create_from_input(const struct mail_storage_service_input *input,
 			     const struct imap_logout_stats *stats,
 			     int fd_in, int fd_out,
 			     enum client_create_flags flags,
+			     const buffer_t *input_buf,
 			     struct client **client_r, const char **error_r);
 
 #endif

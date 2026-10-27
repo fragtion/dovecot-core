@@ -1,6 +1,7 @@
 /* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
+#include "abnf.h"
 #include "ioloop.h"
 #include "str.h"
 #include "hostpid.h"
@@ -13,6 +14,7 @@
 #include "time-util.h"
 #include "failures-private.h"
 
+#include <ctype.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <syslog.h>
@@ -71,10 +73,40 @@ static bool log_fd_can_close(int fd)
 	return fd != STDOUT_FILENO && fd != STDERR_FILENO;
 }
 
+static const char *
+log_prefix_sanitize_pos(const char *str, unsigned int *type_pos_r)
+{
+	i_assert(*type_pos_r <= strlen(str));
+
+	if (!abnf_contains_ascii_ctrl(str))
+		return str;
+
+	string_t *dst = t_str_new(strlen(str) + 16);
+	if (*type_pos_r != 0) {
+		str_append_ctrl_escaped(dst, t_strndup(str, *type_pos_r),
+					abnf_is_ascii_ctrl);
+		str += *type_pos_r;
+		*type_pos_r = str_len(dst);
+	}
+	str_append_ctrl_escaped(dst, str, abnf_is_ascii_ctrl);
+	return str_c(dst);
+}
+
 static const char *log_prefix_sanitize(const char *str)
 {
-	/* we really only care about LFs, which can break everything. */
-	return t_str_replace(str, '\n', ' ');
+	unsigned int type_pos = 0;
+	return log_prefix_sanitize_pos(str, &type_pos);
+}
+
+static void log_message_sanitize(string_t *str, size_t body_pos)
+{
+	const char *body = str_c(str) + body_pos;
+	if (!abnf_contains_ascii_ctrl(body))
+		return;
+
+	body = t_strdup(body);
+	str_truncate(str, body_pos);
+	str_append_log_escaped(str, body);
 }
 
 static int ATTR_FORMAT(2, 0)
@@ -88,6 +120,7 @@ default_write(const struct failure_context *ctx,
 
 	/* make sure there's no %n in there and fix %m */
 	str_vprintfa(data, printf_format_fix(format), args);
+	log_message_sanitize(data, prefix_len);
 
 	int fd;
 	switch (ctx->type) {
@@ -100,15 +133,6 @@ default_write(const struct failure_context *ctx,
 	default:
 		fd = log_fd;
 		break;
-	}
-
-	const char *p;
-	while ((p = strchr(str_c(data), '\n')) != NULL) {
-		size_t line_len = p - str_c(data) + 1;
-		if (log_fd_write(fd, str_data(data), line_len) < 0)
-			return -1;
-		/* delete the written line, not including the log prefix */
-		str_delete(data, prefix_len, line_len - prefix_len);
 	}
 
 	str_append_c(data, '\n');
@@ -147,6 +171,7 @@ syslog_write(const struct failure_context *ctx,
 	}
 	size_t prefix_len = str_len(data);
 	str_vprintfa(data, format, args);
+	log_message_sanitize(data, prefix_len);
 
 	int level = LOG_ERR;
 	switch (ctx->type) {
@@ -170,16 +195,6 @@ syslog_write(const struct failure_context *ctx,
 	case LOG_TYPE_OPTION:
 		i_unreached();
 	}
-	char *p;
-	while ((p = strchr(str_c_modifiable(data) + prefix_len, '\n')) != NULL) {
-		size_t line_len = p - str_c_modifiable(data) + 1;
-		*p = '\0';
-		syslog(level, "%s", str_c(data));
-		/* delete the written line, not including the log prefix */
-		i_assert(line_len > prefix_len);
-		str_delete(data, prefix_len, line_len - prefix_len);
-	}
-
 	syslog(level, "%s", str_c(data));
 	return 0;
 }
@@ -195,11 +210,14 @@ internal_write(const struct failure_context *ctx,
 {
 	string_t *data;
 	unsigned char log_type = ctx->type + 1;
+	const char *prefix = NULL;
+	unsigned int type_pos = ctx->log_prefix_type_pos;
 
 	if (ctx->log_prefix != NULL) {
 		log_type |= LOG_TYPE_FLAG_DISABLE_LOG_PREFIX;
-		if (ctx->log_prefix_type_pos != 0)
+		if (type_pos != 0)
 			log_type |= LOG_TYPE_FLAG_PREFIX_LEN;
+		prefix = log_prefix_sanitize_pos(ctx->log_prefix, &type_pos);
 	} else if (!log_prefix_sent && log_prefix != NULL) {
 		if (i_failure_send_option_forced("prefix", log_prefix) < 0) {
 			/* Failed to write log prefix. The log message writing
@@ -213,15 +231,16 @@ internal_write(const struct failure_context *ctx,
 	data = t_str_new(128);
 	str_printfa(data, "\001%c%s ", log_type, my_pid);
 	if ((log_type & LOG_TYPE_FLAG_PREFIX_LEN) != 0)
-		str_printfa(data, "%u ", ctx->log_prefix_type_pos);
-	if (ctx->log_prefix != NULL)
-		str_append(data, log_prefix_sanitize(ctx->log_prefix));
+		str_printfa(data, "%u ", type_pos);
+	if (prefix != NULL)
+		str_append(data, prefix);
 	size_t prefix_len = str_len(data);
 
 	str_vprintfa(data, format, args);
+	log_message_sanitize(data, prefix_len);
 
-	if (str_len(data)+1 <= PIPE_BUF && strchr(str_c(data), '\n') == NULL) {
-		/* fast path: Log line is short enough and has no LFs */
+	if (str_len(data)+1 <= PIPE_BUF) {
+		/* fast path: Log line is short enough */
 		str_append_c(data, '\n');
 		return log_fd_write(STDERR_FILENO,
 				    str_data(data), str_len(data));
@@ -345,11 +364,12 @@ static void log_prefix_add(const struct failure_context *ctx, string_t *str)
 		str_append(str, log_prefix_sanitize(ctx->log_prefix));
 		str_append(str, failure_log_type_prefixes[ctx->type]);
 	} else {
-		const char *prefix = log_prefix_sanitize(ctx->log_prefix);
-		i_assert(ctx->log_prefix_type_pos <= strlen(prefix));
-		str_append_data(str, prefix, ctx->log_prefix_type_pos);
+		unsigned int type_pos = ctx->log_prefix_type_pos;
+		const char *prefix =
+			log_prefix_sanitize_pos(ctx->log_prefix, &type_pos);
+		str_append_data(str, prefix, type_pos);
 		str_append(str, failure_log_type_prefixes[ctx->type]);
-		str_append(str, prefix + ctx->log_prefix_type_pos);
+		str_append(str, prefix + type_pos);
 	}
 }
 
@@ -771,6 +791,25 @@ const char *i_get_failure_prefix(void)
 	return log_prefix != NULL ? log_prefix : "";
 }
 
+static size_t
+internal_split_pos(const char *text, size_t text_len, size_t pos)
+{
+	/* log_message_sanitize() writes control characters as <0xNN>.
+	   Don't cut one in the middle: move the split before its '<'. The
+	   escape is 6 bytes, so the '<' is within the 5 bytes before pos. */
+	if (pos >= text_len)
+		return pos;
+	for (size_t i = pos; i > 0 && pos - i < 6; ) {
+		i--;
+		if (text[i] == '<' && text_len - i >= 6 && i + 6 > pos &&
+		    text[i+1] == '0' && text[i+2] == 'x' &&
+		    i_isxdigit(text[i+3]) && i_isxdigit(text[i+4]) &&
+		    text[i+5] == '>')
+			return i;
+	}
+	return pos;
+}
+
 static int internal_send_split(string_t *full_str, size_t prefix_len)
 {
 	/* This function splits the log line into PIPE_BUF sized blocks, so
@@ -801,17 +840,11 @@ static int internal_send_split(string_t *full_str, size_t prefix_len)
 	while (pos < str_len(full_str)) {
 		str_truncate(str, prefix_len);
 		const char *text = str_c(full_str) + pos;
-		const char *lf = strchr(text, '\n');
-		size_t line_len;
-		if (lf == NULL || (size_t)(lf - text) > max_text_len) {
-			str_append_max(str, text, max_text_len);
-			str_append_c(str, '\n');
-			line_len = max_text_len;
-		} else {
-			/* write up to and including the LF */
-			line_len = lf - text + 1;
-			str_append_data(str, text, line_len);
-		}
+		size_t text_len = str_len(full_str) - pos;
+		size_t line_len = internal_split_pos(text, text_len,
+			I_MIN(text_len, max_text_len));
+		str_append_data(str, text, line_len);
+		str_append_c(str, '\n');
 		if (log_fd_write(STDERR_FILENO,
 				 str_data(str), str_len(str)) < 0)
 			return -1;

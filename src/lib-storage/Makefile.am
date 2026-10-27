@@ -23,6 +23,7 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-imap \
 	-I$(top_srcdir)/src/lib-index \
 	-I$(top_srcdir)/src/lib-var-expand \
+	-I$(top_srcdir)/src/lib-url \
 	-DPKG_RUNDIR=\""$(rundir)"\" \
 	-DMODULEDIR=\""$(moduledir)"\"
 
@@ -121,6 +122,7 @@ shlibs = \
 	index/mbox/libstorage_mbox.la \
 	index/imapc/libstorage_imapc.la \
 	../lib-imap-client/libimap_client.la \
+	../lib-pop3-client/libpop3_client.la \
 	index/pop3c/libstorage_pop3c.la \
 	index/raw/libstorage_raw.la \
 	list/libstorage_list.la \
@@ -132,6 +134,7 @@ libstorage_la_LIBADD = $(shlibs)
 libstorage_la_DEPENDENCIES = $(shlibs)
 
 test_programs = \
+	test-mail-autoexpunge \
 	test-mail-search-args-imap \
 	test-mail-search-args-simplify \
 	test-mail \
@@ -161,6 +164,10 @@ test_mail_SOURCES = test-mail.c
 test_mail_LDADD = libstorage.la $(LIBDOVECOT)
 test_mail_DEPENDENCIES = libstorage.la $(LIBDOVECOT_DEPS)
 
+test_mail_autoexpunge_SOURCES = test-mail-autoexpunge.c
+test_mail_autoexpunge_LDADD = libstorage.la $(LIBDOVECOT)
+test_mail_autoexpunge_DEPENDENCIES = libstorage.la $(LIBDOVECOT_DEPS)
+
 test_mail_storage_SOURCES = test-mail-storage.c
 test_mail_storage_LDADD = libstorage.la $(LIBDOVECOT)
 test_mail_storage_DEPENDENCIES = libstorage.la $(LIBDOVECOT_DEPS)
@@ -172,6 +179,24 @@ test_mailbox_list_DEPENDENCIES = libstorage.la $(LIBDOVECOT_DEPS)
 test_index_SOURCES = index/test-index.c
 test_index_LDADD = libstorage.la $(LIBDOVECOT)
 test_index_DEPENDENCIES = libstorage.la $(LIBDOVECOT_DEPS)
+
+fuzz_programs =
+
+if USE_FUZZER
+fuzz_programs += fuzz-mail-search-args-simplify
+
+nodist_EXTRA_fuzz_mail_search_args_simplify_SOURCES = force-cxx-linking.cxx
+
+fuzz_mail_search_args_simplify_CPPFLAGS = $(FUZZER_CPPFLAGS)
+fuzz_mail_search_args_simplify_LDFLAGS = $(FUZZER_LDFLAGS)
+fuzz_mail_search_args_simplify_SOURCES = fuzz-mail-search-args-simplify.c
+fuzz_mail_search_args_simplify_LDADD = libstorage.la $(LIBDOVECOT)
+fuzz_mail_search_args_simplify_DEPENDENCIES = libstorage.la $(LIBDOVECOT_DEPS)
+endif
+
+noinst_PROGRAMS += $(fuzz_programs)
+
+EXTRA_DIST = fuzz-mail-search-args-simplify.dict
 
 pkginc_libdir=$(pkgincludedir)
 pkginc_lib_HEADERS = $(headers)

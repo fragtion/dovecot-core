@@ -1,6 +1,7 @@
 /* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "auth-common.h"
+#include "abnf.h"
 #include "array.h"
 #include "str.h"
 #include "strescape.h"
@@ -54,6 +55,11 @@ auth_fields_find_idx(struct auth_fields *fields, const char *key,
 	return FALSE;
 }
 
+bool auth_fields_key_is_valid(const char *key)
+{
+	return key[0] != '\0' && !abnf_contains_ascii_ctrl(key);
+}
+
 void auth_fields_add(struct auth_fields *fields,
 		     const char *key, const char *value,
 		     enum auth_field_flags flags)
@@ -61,9 +67,9 @@ void auth_fields_add(struct auth_fields *fields,
 	struct auth_field *field;
 	unsigned int idx;
 
-	i_assert(*key != '\0');
-	i_assert(strchr(key, '\t') == NULL &&
-		 strchr(key, '\n') == NULL);
+	/* callers must validate keys from outside auth before adding;
+	   keys from config settings are trusted as-is */
+	i_assert(auth_fields_key_is_valid(key));
 
 	if (!auth_fields_find_idx(fields, key, &idx)) {
 		if (!array_is_created(&fields->fields))
@@ -125,15 +131,16 @@ static int auth_fields_import_prefixed_args(struct auth_fields *fields,
 
 	for (; *args != NULL; args++) {
 		value = strchr(*args, '=');
-		if (value == NULL) {
-			key = *prefix != '\0' ? t_strconcat(prefix, *args, NULL) : *args;
-		} else {
+		if (value == NULL)
+			key = *args;
+		else
 			key = t_strdup_until(*args, value++);
-			if (*prefix != '\0')
-				key = t_strconcat(prefix, key, NULL);
-		}
-		if (key[0] == '\0')
+		if (!auth_fields_key_is_valid(key)) {
 			ret = -1;
+			continue;
+		}
+		if (*prefix != '\0')
+			key = t_strconcat(prefix, key, NULL);
 		auth_fields_add(fields, key, value, flags);
 	}
 	return ret;

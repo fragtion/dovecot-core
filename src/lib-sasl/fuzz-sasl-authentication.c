@@ -8,6 +8,7 @@
 #include "hex-binary.h"
 #include "ioloop.h"
 #include "istream.h"
+#include "client-auth-settings.h"
 #include "password-scheme.h"
 #include "gssapi-dummy.h"
 #include "sasl-server.h"
@@ -48,6 +49,7 @@ struct fuzz_sasl_context {
 	const struct fuzz_sasl_parameters *params;
 
 	struct dsasl_client *client;
+	struct dsasl_client_session *session;
 
 	const char *server_cbind_type;
 	const char *authid;
@@ -378,6 +380,10 @@ static void fuzz_assert_success_validity(struct fuzz_sasl_context *fctx)
 		SASL_MECH_NAME_OAUTHBEARER,
 		SASL_MECH_NAME_PLAIN,
 		SASL_MECH_NAME_XOAUTH2,
+#ifdef HAVE_GSSAPI
+		SASL_MECH_NAME_GSSAPI,
+		SASL_MECH_NAME_GSS_SPNEGO,
+#endif
 		NULL
 	};
 
@@ -434,7 +440,8 @@ fuzz_server_request_output(struct sasl_server_req_ctx *rctx,
 		const char *error = NULL;
 
 		fuzz_sasl_amend_data(fctx, &data, &size);
-		result = dsasl_client_input(fctx->client, data, size, &error);
+		result = dsasl_client_session_input(fctx->session, data, size,
+						    &error);
 		if (result != DSASL_CLIENT_RESULT_OK) {
 			e_debug(fuzz_event, "client input error: %s", error);
 			fctx->finished = TRUE;
@@ -511,9 +518,8 @@ static void fuzz_sasl_interact(struct fuzz_sasl_context *fctx)
 	enum dsasl_client_result result;
 
 	if (fctx->auth_initial) {
-		result = dsasl_client_output(fctx->client,
-					  &sasl_data, &sasl_data_size,
-					  &error);
+		result = dsasl_client_session_output(
+			fctx->session, &sasl_data, &sasl_data_size, &error);
 		if (result != DSASL_CLIENT_RESULT_OK) {
 			e_debug(fuzz_event, "client initial error: %s", error);
 			fctx->finished = TRUE;
@@ -533,8 +539,8 @@ static void fuzz_sasl_interact(struct fuzz_sasl_context *fctx)
 		sasl_data_size = 0;
 
 		if (!fctx->out_of_band_cycle) {
-			result = dsasl_client_output(
-				fctx->client, &sasl_data, &sasl_data_size,
+			result = dsasl_client_session_output(
+				fctx->session, &sasl_data, &sasl_data_size,
 				&error);
 			if (result != DSASL_CLIENT_RESULT_OK) {
 				e_debug(fuzz_event, "client output error: %s",
@@ -666,15 +672,16 @@ static void fuzz_sasl_run(struct istream *input)
 	e_debug(fuzz_event, "run: %s", str_sanitize(params.mech, 1024));
 
 #ifdef HAVE_GSSAPI
-	if (strcmp(params.mech, SASL_MECH_NAME_GSSAPI) == 0 ||
-	    strcmp(params.mech, SASL_MECH_NAME_GSS_SPNEGO) == 0) {
+	if (strcasecmp(params.mech, SASL_MECH_NAME_GSSAPI) == 0 ||
+	    strcasecmp(params.mech, SASL_MECH_NAME_GSS_SPNEGO) == 0) {
 		gss_dummy_add_principal(params.authid);
 		gss_dummy_kinit(params.authid);
 	}
 #endif
 
-	const struct dsasl_client_mech *client_mech;
 	struct fuzz_sasl_context fctx;
+	const char *error;
+	int ret;
 
 	i_zero(&fctx);
 	fctx.pool = pool_alloconly_create(MEMPOOL_GROWING"fuzz_sasl", 2048);
@@ -682,29 +689,47 @@ static void fuzz_sasl_run(struct istream *input)
 	fctx.fuzz_input = input;
 	fctx.auth_initial = auth_initial;
 
-	sasl_server_request_create(&fctx.ssrctx, server_mech, "imap", NULL);
+	fctx.client = dsasl_client_create(fuzz_event);
+#ifdef HAVE_LOCAL_FUZZER
+	dsasl_client_init_ntlm_dummy(fctx.client);
+#endif
+#ifdef HAVE_GSSAPI
+	dsasl_client_init_gssapi(fctx.client);
+#endif
+	i_assert(fctx.client != NULL);
 
-	struct dsasl_client_settings client_set = {
-		.event_parent = fuzz_event,
+	sasl_server_request_create(&fctx.ssrctx, server_mech, "imap",
+				   SASL_SERVER_REQUEST_FLAG_CBIND_AVAILABLE,
+				   NULL);
+
+	struct client_auth_settings client_set = {
+		.mechanism = params.mech,
 		.authid = params.authid,
 		.authzid = params.authzid,
 		.password = params.client_password,
+	};
+	struct dsasl_client_parameters client_params = {
 		.protocol = "imap",
 		.host = "example.com",
 	};
-	client_mech = dsasl_client_mech_find(params.mech);
-	if (client_mech != NULL) {
-		fctx.client = dsasl_client_new(client_mech, &client_set);
-		i_assert(fctx.client != NULL);
+	ret = dsasl_client_session_create(fctx.client, fuzz_event,
+					  &client_params, &client_set,
+					  &fctx.session, &error);
+	if (ret <= 0) {
+		e_debug(fuzz_event, "Failed to create %s SASL session: %s",
+			params.mech, error);
+	} else {
+		i_assert(fctx.session != NULL);
 
-		dsasl_client_enable_channel_binding(
-			fctx.client, SSL_IOSTREAM_PROTOCOL_VERSION_TLS1_3,
+		dsasl_client_session_enable_channel_binding(
+			fctx.session, SSL_IOSTREAM_PROTOCOL_VERSION_TLS1_3,
 			fuzz_client_channel_binding_callback, &fctx);
 
 		fuzz_sasl_interact(&fctx);
+		dsasl_client_session_destroy(&fctx.session);
 	}
 
-	dsasl_client_free(&fctx.client);
+	dsasl_client_unref(&fctx.client);
 	sasl_server_request_destroy(&fctx.ssrctx);
 
 	sasl_server_instance_unref(&server_inst);
@@ -731,13 +756,6 @@ FUZZ_BEGIN_DATA(const unsigned char *data, size_t size)
 		event_set_forced_debug(fuzz_event, TRUE);
 
 	password_schemes_init();
-	dsasl_clients_init();
-#ifdef HAVE_LOCAL_FUZZER
-	dsasl_client_mech_ntlm_init_dummy();
-#endif
-#ifdef HAVE_GSSAPI
-	dsasl_clients_init_gssapi();
-#endif
 
 	struct istream *input = i_stream_create_from_data(data, size);
 	struct ioloop *ioloop = io_loop_create();
@@ -749,7 +767,6 @@ FUZZ_BEGIN_DATA(const unsigned char *data, size_t size)
 	io_loop_destroy(&ioloop);
 	i_stream_unref(&input);
 
-	dsasl_clients_deinit();
 	password_schemes_deinit();
 
 	event_unref(&fuzz_event);

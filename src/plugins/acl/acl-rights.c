@@ -189,23 +189,28 @@ int acl_rights_parse_line(const char *line, pool_t pool,
 {
 	const char *id_str, *const *right_names, *error = NULL;
 
-	/* <id> [<imap acls>] [:<named acls>] */
+	/* [ \t]["]<id>["] [<imap acls>] [:<named acls>]
+	 * Tokens can be separated by spaces or tabs.
+	 * Leading whitespace must be removed by calling code. */
 	if (*line == '"') {
 		line++;
-		if (str_unescape_next(&line, &id_str) < 0 ||
-		    (line[0] != ' ' && line[0] != '\0')) {
+
+		if (str_unescape_next(&line, &id_str) < 0) {
 			*error_r = "Invalid quoted ID";
 			return -1;
 		}
-		if (line[0] == ' ')
-			line++;
+
+		const char *orig_line = line;
+		line = str_skip_lwsp(orig_line);
+		if (line == orig_line && *line != '\0') {
+			*error_r = "End-quote not followed by whitespace";
+			return -1;
+		}
 	} else {
 		id_str = line;
-		line = strchr(id_str, ' ');
-		if (line == NULL)
-			line = "";
-		else
-			id_str = t_strdup_until(id_str, line++);
+		line = str_skip_nonlwsp(id_str);
+		if (*line != '\0')
+			id_str = t_strdup_until(id_str, line);
 	}
 
 	i_zero(rights_r);
@@ -226,6 +231,7 @@ int acl_rights_parse_line(const char *line, pool_t pool,
 		return -1;
 	}
 
+	/* identifier points into a temp buffer; copy into the pool */
 	rights_r->identifier = p_strdup(pool, rights_r->identifier);
 	return 0;
 }
@@ -339,8 +345,7 @@ acl_right_names_parse(pool_t pool, const char *acl, const char **error_r)
 	unsigned int i;
 
 	/* parse IMAP ACL list */
-	while (*acl == ' ' || *acl == '\t')
-		acl++;
+	acl = str_skip_lwsp(acl);
 
 	t_array_init(&rights, 64);
 	while (*acl != '\0' && *acl != ' ' && *acl != '\t' && *acl != ':') {
@@ -357,7 +362,7 @@ acl_right_names_parse(pool_t pool, const char *acl, const char **error_r)
 		array_push_back(&rights, &acl_letter_map[i].name);
 		acl++;
 	}
-	while (*acl == ' ' || *acl == '\t') acl++;
+	acl = str_skip_lwsp(acl);
 
 	if (*acl != '\0') {
 		/* parse our own extended ACLs */
