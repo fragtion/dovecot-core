@@ -211,6 +211,7 @@ python3 phase1.py --nodes 4 --users 2 --kill-node node3
 python3 phase1.py --nodes 3 --users 3 --lmtp-route
 python3 phase1.py --nodes 3 --users 2 --tls
 python3 newmails.py
+python3 idleusers.py
 ```
 
 A run passes with `problems: 0`. See `src/mesh/README.md`.

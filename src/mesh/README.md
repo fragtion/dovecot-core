@@ -450,6 +450,7 @@ python3 phase1.py --nodes 3 --users 3 --topology full
 python3 phase1.py ... --keep   # leave the nodes running in /var/tmp/meshtest
 python3 moves.py --nodes 3 --mails 500   # moved mails aren't transferred
 python3 newmails.py   # a mail new on two nodes gets the same flags
+python3 idleusers.py  # idle users reach every node, differing copies merge
 ```
 
 `moves.py` seeds a user with mails, lets the mesh replicate them, moves

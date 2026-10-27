@@ -6,6 +6,7 @@
 # what replication sends between them.
 
 import os
+import pwd
 import shutil
 import signal
 import subprocess
@@ -63,13 +64,7 @@ namespace inbox {{
 {passdb_first}passdb static {{
   password = {user_password}
 }}
-userdb static {{
-  fields {{
-    uid = vmail
-    gid = vmail
-    home = {dir}/home/%{{user}}
-  }}
-}}
+{userdb}
 
 service imap-login {{
   inet_listener imap {{
@@ -131,9 +126,25 @@ class Node:
                 user_password=USER_PASSWORD,
                 passdb_first=(mesh_route_passdb(self)
                               if self.cluster.lmtp_route else ""),
+                userdb=self.userdb_config(),
                 ssl_config=self.cluster.ssl_config(),
                 doveadm_ssl="yes" if self.cluster.tls else "no",
                 extra=self.cluster.extra_config(self)))
+
+    def userdb_config(self):
+        if self.cluster.userdb_users is None:
+            # can't list its users
+            return ("userdb static {\n  fields {\n    uid = vmail\n"
+                    "    gid = vmail\n    home = %s/home/%%{user}\n  }\n}"
+                    % self.dir)
+        # a passwd-file can list its users, like a typical setup
+        pw = pwd.getpwnam("vmail")
+        path = os.path.join(self.dir, "users")
+        with open(path, "w") as f:
+            for user in self.cluster.userdb_users:
+                f.write("%s::%d:%d::%s/home/%s::\n" %
+                        (user, pw.pw_uid, pw.pw_gid, self.dir, user))
+        return ("userdb passwd-file {\n  passwd_file_path = %s\n}" % path)
 
     def master_pid(self):
         try:
@@ -300,8 +311,11 @@ def mesh_config(cluster, node, topology="anchor", extra=""):
 
 class Cluster:
     def __init__(self, n, root=ROOT, extra=None, mesh=False,
-                 topology="anchor", lmtp_route=False, tls=False):
+                 topology="anchor", lmtp_route=False, tls=False,
+                 userdb_users=None):
         self.root = root
+        # a passwd-file userdb with these users instead of a static one
+        self.userdb_users = userdb_users
         self.extra = extra or (lambda node: "")
         self.mesh = mesh
         self.topology = topology

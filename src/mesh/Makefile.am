@@ -62,6 +62,7 @@ EXTRA_DIST = \
 	mesh-ui-gen.pl \
 	$(UI_FILES) \
 	harness/cluster.py \
+	harness/idleusers.py \
 	harness/moves.py \
 	harness/newmails.py \
 	harness/phase0.py \
