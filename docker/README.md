@@ -75,7 +75,9 @@ Starting from the `dovecot.conf` of a host install:
 2. Remove the `unix_listener /var/spool/postfix/private/auth { ... }`
    block from `service auth`: Postfix's spool directory isn't in the
    container. `mesh.conf` adds a listener on `127.0.0.1:12346` for Postfix
-   instead; copy any `auth_mechanisms` line from the old block into it.
+   instead. Postfix's clients get the global `auth_mechanisms` (an
+   `auth_mechanisms` line inside a listener block has no effect), so add
+   any mechanism they need there, e.g. `login`.
 
 3. Mail is delivered over LMTP instead of `dovecot-lda`. `mesh.conf` has a
    `protocol lmtp` block with the Sieve plugin and mailbox
