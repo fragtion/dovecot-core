@@ -8,6 +8,8 @@
 
 #include "http-transfer.h"
 
+#include <ctype.h>
+
 #define MIN_CHUNK_SIZE_WITH_EXTRA 6
 
 /*
@@ -69,13 +71,7 @@ http_transfer_chunked_parse_size(struct http_transfer_chunked_istream *tcstream)
 	/* chunk-size     = 1*HEXDIG */
 
 	while (tcstream->cur < tcstream->end) {
-		if (*tcstream->cur >= '0' && *tcstream->cur <= '9')
-			size = *tcstream->cur-'0';
-		else if (*tcstream->cur >= 'A' && *tcstream->cur <= 'F')
-			size = *tcstream->cur-'A' + 10;
-		else if (*tcstream->cur >= 'a' && *tcstream->cur <= 'f')
-			size = *tcstream->cur-'a' + 10;
-		else {
+		if (!i_isxdigit(*tcstream->cur)) {
 			if (tcstream->parsed_chars == 0) {
 				io_stream_set_error(
 					&tcstream->istream.iostream,
@@ -87,7 +83,11 @@ http_transfer_chunked_parse_size(struct http_transfer_chunked_istream *tcstream)
 			tcstream->parsed_chars = 0;
 			return 1;
 		}
-		if (tcstream->chunk_size > (uoff_t)-1 >> 4) {
+		if (*tcstream->cur <= '9')
+			size = *tcstream->cur - '0';
+		else
+			size = (*tcstream->cur | 0x20) - 'a' + 10;
+		if (tcstream->chunk_size > UOFF_T_MAX >> 4) {
 			io_stream_set_error(&tcstream->istream.iostream,
 					    "Chunk size exceeds integer limit");
 			return -1;
@@ -352,17 +352,21 @@ http_transfer_chunked_parse_next(struct http_transfer_chunked_istream *tcstream)
 
 		if (ret > 0) {
 			if (tcstream->state == HTTP_CHUNKED_PARSE_STATE_DATA) {
+				uoff_t limit = tcstream->max_size > 0 ?
+					tcstream->max_size : UOFF_T_MAX;
+
 				tcstream->chunk_v_offset = input->v_offset;
 
-				tcstream->size += tcstream->chunk_size;
-				if (tcstream->max_size > 0 &&
-				    tcstream->size > tcstream->max_size) {
+				i_assert(tcstream->size <= limit);
+				if (tcstream->chunk_size >
+				    limit - tcstream->size) {
 					io_stream_set_error(
 						&tcstream->istream.iostream,
 						"Total chunked payload size exceeds maximum");
 					stream->istream.stream_errno = EMSGSIZE;
 					return -1;
 				}
+				tcstream->size += tcstream->chunk_size;
 			}
 			return ret;
 		}
