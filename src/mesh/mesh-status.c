@@ -259,7 +259,9 @@ static bool mesh_user_has_problem(const struct mesh_user *user)
 
 	array_foreach_elem(&mesh_peers, peer) {
 		status = mesh_user_peer_status(user, peer);
-		if (strcmp(status, "ok") != 0 && strcmp(status, "relayed") != 0)
+		if (strcmp(status, "ok") != 0 &&
+		    strcmp(status, "relayed") != 0 &&
+		    strcmp(status, "absent") != 0)
 			return TRUE;
 	}
 	return FALSE;
@@ -337,6 +339,7 @@ void mesh_heartbeat_headers(ARRAY_TYPE(const_string) *headers)
 	ADD("X-Mesh-Pending", dec2str(mesh_queue_pending_count()));
 	ADD("X-Mesh-Running", dec2str(mesh_queue_running_count()));
 	ADD("X-Mesh-Users", dec2str(hash_table_count(mesh_users)));
+	ADD("X-Mesh-Users-Hash", mesh_userlist_hash());
 	ADD("X-Mesh-Peers-Up", str_c(peers_up));
 #undef ADD
 }

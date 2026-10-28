@@ -247,6 +247,12 @@ mesh_http_lease(struct http_server_request *req,
 		http_server_request_fail(req, 400, "Missing gen");
 		return;
 	}
+	if (!mesh_local_has_user(username)) {
+		/* our userdb doesn't list the user: the peer syncs it only
+		   with the nodes that have it */
+		http_server_request_fail(req, 404, "Unknown user");
+		return;
+	}
 	user = mesh_user_lookup(username, TRUE);
 	if (user->running_peer != NULL ||
 	    (mesh_user_is_leased(user) && user->lease_peer != peer)) {
@@ -453,7 +459,10 @@ mesh_http_api(struct http_server_request *req, const char *path)
 
 	if (strcmp(path, "heartbeat") == 0 && is_get)
 		mesh_http_heartbeat(req);
-	else if (strcmp(path, "status") == 0 && is_get) {
+	else if (strcmp(path, "userlist") == 0 && is_get) {
+		mesh_userlist_export(body);
+		mesh_http_send(req, 200, "text/plain", body);
+	} else if (strcmp(path, "status") == 0 && is_get) {
 		mesh_status_json(body);
 		mesh_http_send_json(req, body);
 	} else if (strcmp(path, "users") == 0 && is_get) {

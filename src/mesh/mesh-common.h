@@ -13,6 +13,10 @@ struct master_service_connection;
 /* mesh_queue_sync_finished() exit code: the peer is syncing the user with
    someone else right now. Not an error; retried shortly. */
 #define MESH_SYNC_EXIT_BUSY -1000
+/* mesh_queue_sync_finished() exit code: the peer doesn't have the user
+   (its userdb doesn't list it). Not an error; the user is synced with the
+   nodes that have it. */
+#define MESH_SYNC_EXIT_NOUSER -1001
 
 /* Why a user needs to be pushed to a peer. Higher wins. */
 enum mesh_priority {
@@ -170,7 +174,8 @@ bool mesh_user_is_leased(const struct mesh_user *user);
    of syncs between this node and the peer. */
 bool mesh_user_peer_is_direct(const struct mesh_user *user,
 			      const struct mesh_peer *peer);
-/* syncing, pending, error, relayed, never or ok */
+/* syncing, absent (the peer doesn't have the user), pending, error,
+   relayed, never or ok */
 const char *mesh_user_peer_status(const struct mesh_user *user,
 				  const struct mesh_peer *peer);
 /* A session for the user with the peer is starting. */
@@ -181,6 +186,28 @@ void mesh_user_peer_set_state(struct mesh_user_peer *up, const char *state);
 void mesh_queue_startup_sync(void);
 unsigned int mesh_queue_pending_count(void);
 unsigned int mesh_queue_running_count(void);
+
+/* mesh-userlist.c */
+void mesh_userlist_init(void);
+void mesh_userlist_deinit(void);
+/* Read this node's users from the userdb. push_new: push the users that
+   are new here to the nodes that have them. */
+void mesh_userlist_refresh(bool push_new);
+/* Refresh the list every mesh_userlist_refresh_interval from now on. */
+void mesh_userlist_start_refreshing(void);
+/* Hash of this node's user list, "*" if it isn't known (then the node is
+   assumed to have every user). */
+const char *mesh_userlist_hash(void);
+/* The hash line, then one user per line. */
+void mesh_userlist_export(string_t *dest);
+/* Whether this node's userdb lists the user (TRUE if not known). */
+bool mesh_local_has_user(const char *username);
+/* Whether the peer's userdb lists the user (TRUE if not known). */
+bool mesh_peer_has_user(const struct mesh_peer *peer, const char *username);
+/* The peer reported this user list hash: fetch its list if it changed. */
+void mesh_peer_users_hash_seen(struct mesh_peer *peer, const char *hash);
+/* The peer refused to sync the user, because it doesn't have it. */
+void mesh_peer_user_missing(struct mesh_peer *peer, const char *username);
 
 /* mesh-sync.c */
 struct doveadm_client;

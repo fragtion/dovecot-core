@@ -166,6 +166,7 @@ function renderNodes(s) {
 const STATUS_PILL = {
   ok: ["ok", "ok"],
   relayed: ["", "via anchor"],
+  absent: ["", "not on node"],
   pending: ["info", "pending"],
   syncing: ["info syncing", "syncing"],
   error: ["bad", "error"],

@@ -31,6 +31,7 @@ mesh_SOURCES = \
 	mesh-status.c \
 	mesh-sync.c \
 	mesh-ui.c \
+	mesh-userlist.c \
 	mesh-verify.c
 
 nodist_mesh_SOURCES = \

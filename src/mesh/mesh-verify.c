@@ -605,7 +605,7 @@ mesh_verify_start(const char *username, mesh_verify_callback_t *callback,
 	/* count first: a callback may run immediately on failure */
 	verify->pending = 1;
 	array_foreach_elem(&mesh_peers, peer) {
-		if (peer->up)
+		if (peer->up && mesh_peer_has_user(peer, username))
 			verify->pending++;
 	}
 
@@ -618,7 +618,7 @@ mesh_verify_start(const char *username, mesh_verify_callback_t *callback,
 	str_append(path, "/mesh/v1/fingerprint?user=");
 	mesh_url_encode(path, username);
 	array_foreach_elem(&mesh_peers, peer) {
-		if (!peer->up)
+		if (!peer->up || !mesh_peer_has_user(peer, username))
 			continue;
 		struct mesh_verify_node *pnode =
 			p_new(pool, struct mesh_verify_node, 1);

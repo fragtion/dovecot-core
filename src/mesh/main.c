@@ -53,8 +53,11 @@ static void main_init(void)
 	mesh_status_init();
 	mesh_conn_init();
 	mesh_peers_init();
+	mesh_userlist_init();
 	mesh_queue_init();
 	mesh_state_init();
+	/* before the first heartbeat reply, which tells peers who we have */
+	mesh_userlist_refresh(FALSE);
 	mesh_http_init();
 	mesh_verify_init();
 	mesh_queue_startup_sync();
@@ -70,6 +73,7 @@ static void main_deinit(void)
 	mesh_state_deinit();
 	mesh_http_deinit();
 	mesh_queue_deinit();
+	mesh_userlist_deinit();
 	mesh_peers_deinit();
 	mesh_conn_deinit();
 	mesh_status_deinit();

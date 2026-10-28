@@ -14,6 +14,7 @@
 #include "http-response.h"
 
 #include <ctype.h>
+#include <sysexits.h>
 
 /* dsync's own per-user lock timeout (-l) */
 #define MESH_DSYNC_LOCK_TIMEOUT_SECS 30
@@ -213,6 +214,15 @@ mesh_sync_reply(const struct doveadm_server_reply *reply, void *context)
 	struct mesh_sync *sync = context;
 	const char *error = NULL;
 
+	if (reply->exit_code == EX_NOUSER &&
+	    mesh_local_has_user(sync->user->username)) {
+		/* The peer's userdb doesn't list the user, although its list
+		   (or our copy of it) did, e.g. the user was just removed */
+		mesh_peer_user_missing(sync->peer, sync->user->username);
+		mesh_sync_finish(sync, MESH_SYNC_EXIT_NOUSER,
+				 "Peer doesn't have the user");
+		return;
+	}
 	if (reply->exit_code != 0 &&
 	    reply->exit_code != DOVEADM_EX_CHANGED) {
 		error = t_strdup_printf("doveadm sync failed: %s%s%s",
@@ -372,6 +382,13 @@ mesh_sync_lease_response(const struct http_response *resp, void *context)
 	sync->lease_req = NULL;
 	if (resp->status == 409) {
 		mesh_sync_finish(sync, MESH_SYNC_EXIT_BUSY, "Peer is busy");
+		return;
+	}
+	if (resp->status == 404) {
+		/* the peer's userdb doesn't list the user */
+		mesh_peer_user_missing(sync->peer, sync->user->username);
+		mesh_sync_finish(sync, MESH_SYNC_EXIT_NOUSER,
+				 "Peer doesn't have the user");
 		return;
 	}
 	if (resp->status / 100 != 2) {

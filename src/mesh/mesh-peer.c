@@ -94,6 +94,8 @@ mesh_heartbeat_response(const struct http_response *resp,
 		peer->remote_users = 0;
 	i_free(peer->last_error);
 	mesh_peer_set_up(peer, TRUE, NULL);
+	mesh_peer_users_hash_seen(peer,
+		http_response_get(resp, "X-Mesh-Users-Hash"));
 }
 
 static void mesh_heartbeat_send(struct mesh_peer *peer)
@@ -293,22 +295,28 @@ static void mesh_anchor_score(const char *username, const char *node,
 	sha1_get_digest(str_data(str), str_len(str), digest_r);
 }
 
-/* Rendezvous hashing over the nodes that are up: every node computes the
-   same anchor as long as they agree on which nodes are up, and a node going
-   down moves only the users anchored to it. */
+/* Rendezvous hashing over the nodes that are up and have the user: every
+   node computes the same anchor as long as they agree on which nodes are up
+   and who has the user, and a node going down moves only the users
+   anchored to it. */
 const char *mesh_anchor_name(const char *username)
 {
 	unsigned char best[SHA1_RESULTLEN], digest[SHA1_RESULTLEN];
 	const char *best_name = mesh_node_name;
+	bool have_best;
 	struct mesh_peer *peer;
 
 	T_BEGIN {
-		mesh_anchor_score(username, mesh_node_name, best);
+		have_best = mesh_local_has_user(username);
+		if (have_best)
+			mesh_anchor_score(username, mesh_node_name, best);
 		array_foreach_elem(&mesh_peers, peer) {
-			if (!peer->up)
+			if (!peer->up || !mesh_peer_has_user(peer, username))
 				continue;
 			mesh_anchor_score(username, peer->name, digest);
-			if (memcmp(digest, best, sizeof(best)) > 0) {
+			if (!have_best ||
+			    memcmp(digest, best, sizeof(best)) > 0) {
+				have_best = TRUE;
 				memcpy(best, digest, sizeof(best));
 				best_name = peer->name;
 			}

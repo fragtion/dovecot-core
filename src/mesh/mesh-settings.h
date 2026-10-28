@@ -45,6 +45,7 @@ struct mesh_settings {
 	bool mesh_dsync_debug;
 	/* learn all users from the userdb for the periodic syncs */
 	bool mesh_list_users;
+	unsigned int mesh_userlist_refresh_interval;
 
 	/* generated: */
 	enum mesh_topology parsed_topology;

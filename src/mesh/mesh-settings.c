@@ -119,6 +119,7 @@ static const struct setting_define mesh_setting_defines[] = {
 	DEF(TIME, mesh_verify_interval),
 	DEF(BOOL, mesh_dsync_debug),
 	DEF(BOOL, mesh_list_users),
+	DEF(TIME, mesh_userlist_refresh_interval),
 
 	SETTING_DEFINE_LIST_END
 };
@@ -142,6 +143,7 @@ static const struct mesh_settings mesh_default_settings = {
 	.mesh_verify_interval = 0,
 	.mesh_dsync_debug = FALSE,
 	.mesh_list_users = TRUE,
+	.mesh_userlist_refresh_interval = 60,
 };
 
 const struct setting_parser_info mesh_setting_parser_info = {

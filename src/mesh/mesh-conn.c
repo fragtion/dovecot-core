@@ -70,12 +70,14 @@ static void mesh_waiter_reply(struct mesh_conn *mconn, const char *id,
 	o_stream_nsend(mconn->conn.output, str_data(str), str_len(str));
 }
 
-static bool mesh_peers_usable(void)
+/* Whether another node that has the user can receive its mail now. */
+static bool mesh_peers_usable(const char *username)
 {
 	struct mesh_peer *peer;
 
 	array_foreach_elem(&mesh_peers, peer) {
-		if (mesh_peer_usable(peer))
+		if (mesh_peer_usable(peer) &&
+		    mesh_peer_has_user(peer, username))
 			return TRUE;
 	}
 	return FALSE;
@@ -118,7 +120,7 @@ static int mesh_notify_input_args(struct connection *conn,
 	struct mesh_waiter *waiter;
 
 	if (str_array_length(args) >= 3 && strcmp(args[0], "WAIT") == 0) {
-		if (!mesh_peers_usable()) {
+		if (!mesh_peers_usable(args[2])) {
 			mesh_waiter_reply(mconn, args[1], "nopeers");
 			return 1;
 		}

@@ -87,12 +87,22 @@ every user is pushed every `mesh_incremental_sync_interval` (catches
 changes nobody notified, e.g. a lost notification), fully every
 `mesh_full_sync_interval`, at startup, and when peers come up or the
 anchor moves. "Every user" includes all users the userdb lists (read at
-startup and with each full sync), so users who don't change anything
-still reach a new or emptied node. A userdb that can't list its users
-(e.g. `static`) covers only users that changed something or that a peer
-asked about; set `mesh_list_users = no` for it. Failures are retried with backoff from 1s up to 60s; after
-three failures in a row the state is dropped and the next session is
-stateless.
+startup and every `mesh_userlist_refresh_interval`), so users who don't
+change anything still reach a new or emptied node. A userdb that can't
+list its users (e.g. `static`) covers only users that changed something
+or that a peer asked about; set `mesh_list_users = no` for it. Failures
+are retried with backoff from 1s up to 60s; after three failures in a
+row the state is dropped and the next session is stateless.
+
+**Users on some nodes only.** The nodes' userdbs don't need to list the
+same users: a user is replicated only between the nodes whose userdb
+lists it, and its anchor is chosen among them. Each node tells the others
+a hash of its user list in its heartbeat replies, and they fetch the list
+(`/mesh/v1/userlist`) when it changes. Adding a user to a node's userdb
+copies the user's mail to it within `mesh_userlist_refresh_interval`;
+removing it stops replicating the user to that node (its mail there
+stays). A node whose userdb can't list its users is assumed to have
+everyone. Names are compared case-insensitively.
 
 **Verification.** `doveadm mesh verify <user>` (or the web UI) compares
 a fingerprint of the user's mailboxes on all nodes that are up: per
@@ -243,7 +253,8 @@ Mesh service:
 | `mesh_max_parallel_syncs` | 4 | Sessions this node runs at the same time. |
 | `mesh_verify_interval` | 0 | Verify one of this node's anchored users this often (0 = never). |
 | `mesh_dsync_debug` | no | Run dsync with debug logging. |
-| `mesh_list_users` | yes | Learn all users from the userdb at startup and with each full sync. |
+| `mesh_list_users` | yes | Learn all users from the userdb, and replicate each user only between the nodes whose userdb lists it. `no`: every node is assumed to have every user. |
+| `mesh_userlist_refresh_interval` | 1min | Read the userdb's users again this often, to notice added and removed users (0 = only at startup). |
 
 Mesh plugin (mail processes):
 
@@ -319,9 +330,8 @@ Common tasks:
 - **Adding a node**: add its `mesh_peer` to every node's configuration and
   `doveadm reload`. At startup the new node lists the users from its
   userdb and syncs each with its anchor; sessions go both ways, so an
-  empty node gets every user's mail with these first (stateless)
-  sessions. Anchors of some users move to it. The userdb must have the
-  same users on all nodes.
+  empty node gets the mail of every user its userdb lists with these
+  first (stateless) sessions. Anchors of some users move to it.
 - **Removing a node**: remove its `mesh_peer` everywhere and reload.
 - **Something looks wrong with a user**: `doveadm mesh verify <user>`,
   then `doveadm mesh sync -f <user>` to repair, and verify again.
