@@ -47,9 +47,9 @@ mesh.
 
 | Host | In the container | |
 |---|---|---|
-| `/usr/local/apps/dovecot/etc/dovecot` | `/etc/dovecot` | `dovecot.conf`, `mesh.conf`, `passwd`, `users`. Also reachable as `/usr/local/apps/dovecot/etc/dovecot`, so the paths in your configuration stay valid. |
+| `/etc/dovecot` | `/etc/dovecot` | `dovecot.conf`, `mesh.conf`, `passwd`, `users`, e.g. copied from `/usr/local/apps/dovecot/etc/dovecot`. Also reachable as `/usr/local/apps/dovecot/etc/dovecot` in the container, so the paths in your configuration stay valid. |
 | `/home/vmail` | `/home/vmail` | Mail, indexes, Sieve scripts. |
-| `/var/lib/dovecot-mesh` | `/var/lib/dovecot` | The mesh's state (`mesh.db`). Keep it: without it the next sessions compare all mails. |
+| `data/` beside `compose.yaml` | `/var/lib/dovecot` | The mesh's state (`mesh.db`). Keep it: without it the next sessions compare all mails. |
 | `/var/log` | `/var/log` | For `log_path` and `info_log_path` files. |
 | `/etc/letsencrypt` | `/etc/letsencrypt` (read-only) | Certificates. |
 
@@ -87,8 +87,10 @@ Starting from the `dovecot.conf` of a host install:
 4. If the host has no IPv6, add `listen = *` (Dovecot listens on `*, ::`
    by default and doesn't start if `::` fails).
 
-5. The `passwd` and `users` files must list the same users on every node.
-   The mesh doesn't replicate them.
+5. Each node's `passwd` and `users` files say which users it has: a user
+   is replicated only between the nodes that list it. The mesh doesn't
+   replicate these files; edit them on each node that should have a
+   user.
 
 `maildir_ignore_new_dir` must not be set (it existed only for the
 Syncthing setup).
@@ -96,7 +98,7 @@ Syncthing setup).
 Check the configuration without starting anything:
 
 ```sh
-docker run --rm -v /usr/local/apps/dovecot/etc/dovecot:/etc/dovecot \
+docker run --rm -v /etc/dovecot:/etc/dovecot \
 	-v /etc/letsencrypt:/etc/letsencrypt:ro \
 	ghcr.io/fragtion/dovecotmesh doveconf -n | less
 ```
@@ -253,12 +255,15 @@ sudo python3 docker/test/smoke-test.py --image ghcr.io/fragtion/dovecotmesh
 2. Add its `mesh_peer` block to `mesh.conf` on every node, and reload the
    running ones: `docker exec dovecot doveadm reload`.
 3. Start it. It lists the users from its userdb and syncs each one, so it
-   receives everybody's mail; `doveadm mesh status` shows the progress.
+   receives the mail of every user it lists; `doveadm mesh status` shows
+   the progress.
    Some users' anchors move to it.
 4. Add it to DNS/MX once nothing is pending.
 
-**A user**: add them to `passwd` and `users` on every node. The first
-delivery or login creates their mailboxes, and the mesh replicates them.
+**A user**: add them to `passwd` and `users` on every node that should
+have them. The first delivery or login creates their mailboxes, and the
+mesh replicates them between those nodes. Adding an existing user to
+another node's files copies their mail there within a minute.
 
 ## Operating it
 

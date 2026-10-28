@@ -1,9 +1,14 @@
 # Dovecot Mesh on one node, next to Postfix on the host. The same file on
-# every node. See docker/README.md.
+# every node, e.g. in /root/docker/mail/dovecotmesh/ with the mesh's state
+# in data/ beside it. See docker/README.md.
+#
+# Pin the image in a .env file beside this one, e.g.
+#   DOVECOTMESH_IMAGE=ghcr.io/fragtion/dovecotmesh:sha-0123456
 services:
   dovecot:
-    image: ghcr.io/fragtion/dovecotmesh:latest
+    image: ${DOVECOTMESH_IMAGE:-ghcr.io/fragtion/dovecotmesh:latest}
     container_name: dovecot
+    # starts with Docker at boot; no systemd unit needed
     restart: unless-stopped
     # Listeners bind on the host as before (IMAP, POP3, LMTP and SASL for
     # Postfix on 127.0.0.1, doveadm and mesh HTTP for the other nodes), and
@@ -16,11 +21,11 @@ services:
     volumes:
       # dovecot.conf, mesh.conf, passwd and users. Also reachable as
       # /usr/local/apps/dovecot/etc/dovecot inside the container.
-      - /usr/local/apps/dovecot/etc/dovecot:/etc/dovecot
+      - /etc/dovecot:/etc/dovecot
       # Mail, indexes and Sieve scripts
       - /home/vmail:/home/vmail
       # Mesh state (the pair states between nodes): keep it
-      - /var/lib/dovecot-mesh:/var/lib/dovecot
+      - ./data:/var/lib/dovecot
       # log_path and info_log_path files
       - /var/log:/var/log
       - /etc/letsencrypt:/etc/letsencrypt:ro
