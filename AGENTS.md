@@ -213,6 +213,7 @@ python3 phase1.py --nodes 3 --users 2 --tls
 python3 newmails.py
 python3 idleusers.py
 python3 overlap.py
+python3 partialusers.py
 python3 stall.py
 ```
 

@@ -141,7 +141,11 @@ class Node:
         pw = pwd.getpwnam("vmail")
         path = os.path.join(self.dir, "users")
         with open(path, "w") as f:
-            for user in self.cluster.userdb_users:
+            users = self.cluster.userdb_users
+            if callable(users):
+                # a different list per node
+                users = users(self)
+            for user in users:
                 f.write("%s::%d:%d::%s/home/%s::\n" %
                         (user, pw.pw_uid, pw.pw_gid, self.dir, user))
         return ("userdb passwd-file {\n  passwd_file_path = %s\n}" % path)

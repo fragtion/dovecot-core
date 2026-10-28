@@ -67,6 +67,7 @@ EXTRA_DIST = \
 	harness/moves.py \
 	harness/newmails.py \
 	harness/overlap.py \
+	harness/partialusers.py \
 	harness/phase0.py \
 	harness/phase1.py \
 	harness/stall.py \

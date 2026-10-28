@@ -504,6 +504,7 @@ python3 newmails.py   # a mail new on two nodes gets the same flags
 python3 idleusers.py  # idle users reach every node, differing copies merge
 python3 overlap.py    # copies sharing some mails under other UIDs merge
 python3 overlap.py --same-uidlist  # different mails, copied dovecot-uidlist
+python3 partialusers.py  # users on some nodes only, added and removed
 python3 stall.py      # a stalled session times out on both nodes, loses nothing
 ```
 
