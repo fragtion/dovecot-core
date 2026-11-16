@@ -7,8 +7,6 @@
    mails for the same user. */
 #define MESH_LOCK_FILENAME ".dovecot-mesh.lock"
 
-extern const char *mesh_plugin_dependencies[];
-
 void mesh_plugin_init(struct module *module);
 void mesh_plugin_deinit(void);
 

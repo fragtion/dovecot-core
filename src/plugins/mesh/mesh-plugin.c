@@ -71,7 +71,6 @@ struct mesh_transaction {
 };
 
 const char *mesh_plugin_version = DOVECOT_ABI_VERSION;
-const char *mesh_plugin_dependencies[] = { "notify", NULL };
 
 static MODULE_CONTEXT_DEFINE_INIT(mesh_user_module,
 				  &mail_user_module_register);
@@ -590,3 +589,8 @@ void mesh_plugin_deinit(void)
 	mail_storage_hooks_remove(&mesh_mail_storage_hooks);
 	notify_unregister(&mesh_notify_ctx);
 }
+
+const struct setting_plugin_info mesh_plugin_info = {
+	.plugin = "lib25_mesh_plugin",
+	.required_plugins = (const char *const []) { "notify", NULL },
+};
