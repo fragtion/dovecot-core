@@ -90,6 +90,8 @@ struct login_proxy {
 	unsigned int reconnect_count;
 	enum auth_proxy_ssl_flags ssl_flags;
 	char *rawlog_dir;
+	/* Compression mechanism enabled by the client, or NULL */
+	char *compression;
 
 	login_proxy_input_callback_t *input_callback;
 	login_proxy_side_channel_input_callback_t *side_callback;
@@ -169,6 +171,8 @@ static void login_proxy_free_errstr(struct login_proxy **_proxy,
 	if (iostream_proxy_is_waiting_output(proxy->iostream_proxy,
 					     LOGIN_PROXY_SIDE_CLIENT))
 		str_append(log_msg, ", server output blocked");
+	if (proxy->compression != NULL)
+		str_printfa(log_msg, ", compression=%s", proxy->compression);
 
 	str_append_c(log_msg, ')');
 	login_proxy_free_full(_proxy, str_c(log_msg), errstr, disconnect_side,
@@ -691,6 +695,7 @@ static void login_proxy_free_final(struct login_proxy *proxy)
 	array_free(&proxy->redirect_path);
 	i_free(proxy->host);
 	i_free(proxy->rawlog_dir);
+	i_free(proxy->compression);
 	i_free(proxy);
 }
 
@@ -779,6 +784,8 @@ login_proxy_free_full(struct login_proxy **_proxy, const char *log_msg,
 		e->add_int("idle_usecs", idle_usecs);
 		e->add_int("net_in_bytes", proxy->server_output->offset);
 		e->add_int("net_out_bytes", proxy->client_output->offset);
+		if (proxy->compression != NULL)
+			e->add_str("compression", proxy->compression);
 	} else {
 		if (client_get_extra_disconnect_reason(client, &human_reason,
 						       &event_reason))
@@ -924,11 +931,35 @@ bool login_proxy_failed(struct login_proxy *proxy, struct event *event,
 	return FALSE;
 }
 
+static int
+login_proxy_channel_bind_callback(const char *type, void *context,
+				  const buffer_t **data_r, const char **error_r)
+{
+	struct login_proxy *proxy = context;
+
+	return ssl_iostream_get_channel_binding(proxy->server_ssl_iostream,
+						type, data_r, error_r);
+}
+
+void login_proxy_sasl_enable_channel_binding(struct client *client)
+{
+	struct login_proxy *proxy = client->login_proxy;
+
+	if (proxy->server_ssl_iostream == NULL)
+		return;
+	dsasl_client_session_enable_channel_binding(
+		client->proxy_sasl_session,
+		ssl_iostream_get_protocol_version(proxy->server_ssl_iostream),
+		login_proxy_channel_bind_callback, proxy);
+}
+
 int login_proxy_sasl_step(struct client *client, string_t *str)
 {
 	const unsigned char *data;
 	size_t data_len;
 	const char *error;
+
+	i_assert(client->proxy_sasl_session != NULL);
 
 	enum dsasl_client_result sasl_res =
 		dsasl_client_session_input(client->proxy_sasl_session,
@@ -963,6 +994,21 @@ int login_proxy_sasl_step(struct client *client, string_t *str)
 	str_truncate(str, 0);
 	base64_encode(data, data_len, str);
 	return 0;
+}
+
+int login_proxy_sasl_verify_success(struct client *client)
+{
+	const char *error;
+
+	if (client->proxy_sasl_session == NULL ||
+	    dsasl_client_session_verify_success(client->proxy_sasl_session,
+						&error) == 0)
+		return 0;
+
+	login_proxy_failed(client->login_proxy,
+			   login_proxy_get_event(client->login_proxy),
+			   LOGIN_PROXY_FAILURE_TYPE_PROTOCOL, error);
+	return -1;
 }
 
 bool login_proxy_is_ourself(const struct client *client, const char *host,
@@ -1184,17 +1230,31 @@ login_proxy_finished(enum iostream_proxy_side side,
 		/* success */
 		errstr = "";
 		break;
-	case IOSTREAM_PROXY_STATUS_INPUT_ERROR:
-		errstr = side == LOGIN_PROXY_SIDE_CLIENT ?
-			i_stream_get_error(proxy->client_input) :
-			i_stream_get_error(proxy->server_input);
+	case IOSTREAM_PROXY_STATUS_INPUT_ERROR: {
+		struct istream *input = side == LOGIN_PROXY_SIDE_CLIENT ?
+			proxy->client_input : proxy->server_input;
+		/* EPIPE means that the connection was closed, which the istream
+		   just couldn't treat as a clean EOF. For example the IMAP
+		   COMPRESS deflate stream never ends with a final block, so the
+		   zlib istream reports an "unexpected EOF" error when the
+		   parent stream reaches EOF. Treat these as clean
+		   disconnections, the same as io_stream_get_disconnect_reason()
+		   does. */
+		errstr = input->stream_errno == EPIPE ? "" :
+			i_stream_get_error(input);
 		break;
-	case IOSTREAM_PROXY_STATUS_OTHER_SIDE_OUTPUT_ERROR:
+	}
+	case IOSTREAM_PROXY_STATUS_OTHER_SIDE_OUTPUT_ERROR: {
+		struct ostream *output = side == LOGIN_PROXY_SIDE_CLIENT ?
+			proxy->server_output : proxy->client_output;
 		server_side = !server_side;
-		errstr = side == LOGIN_PROXY_SIDE_CLIENT ?
-			o_stream_get_error(proxy->server_output) :
-			o_stream_get_error(proxy->client_output);
+		/* EPIPE means that the other side had already closed the
+		   connection, so this is a clean disconnection the same as
+		   input EOF. */
+		errstr = output->stream_errno == EPIPE ? "" :
+			o_stream_get_error(output);
 		break;
+	}
 	default:
 		i_unreached();
 	}
@@ -1425,6 +1485,12 @@ void login_proxy_multiplex_input_start(struct login_proxy *proxy)
 	/* caller needs to break out of the proxy_input() loop and get it
 	   called again to update the istream. */
 	i_stream_set_input_pending(input, TRUE);
+}
+
+void login_proxy_set_compression(struct login_proxy *proxy, const char *name)
+{
+	i_free(proxy->compression);
+	proxy->compression = i_strdup(name);
 }
 
 static void proxy_kill_idle(struct login_proxy *proxy)

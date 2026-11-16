@@ -46,6 +46,10 @@ struct mail_index_sync_map_ctx;
 typedef int mail_index_expunge_handler_t(struct mail_index_sync_map_ctx *ctx,
 					 const void *data, void **sync_context);
 
+/* Extension record offsets are 16bit and the records are reordered so that
+   the record size stays below 64kB. */
+#define MAIL_INDEX_RECORD_MAX_SIZE 65536
+
 #define MAIL_INDEX_HEADER_SIZE_ALIGN(size) \
 	(((size) + 7) & ~7U)
 
@@ -111,6 +115,9 @@ struct mail_index_registered_ext {
 	uint16_t record_align;
 
 	mail_index_expunge_handler_t *expunge_handler;
+	/* The extension was registered only by reading it from the index
+	   file. The defaults are from the file, which may be corrupted. */
+	bool map_registered;
 };
 
 struct mail_index_modseq_header {
@@ -157,6 +164,10 @@ struct mail_index_map {
 	struct mail_index_modseq_header modseq_hdr_snapshot;
 
 	struct mail_index_record_map *rec_map;
+
+	/* The records have been verified to have valid UIDs. Syncing keeps
+	   them valid, so this is preserved when the map is cloned. */
+	bool records_verified;
 };
 
 struct mail_index_module_register {
@@ -414,9 +425,20 @@ int mail_index_map_ext_get_next(struct mail_index_map *map,
 				unsigned int *offset,
 				const struct mail_index_ext_header **ext_hdr_r,
 				const char **name_r);
+/* Register an extension that was found from the index file. If it's later
+   registered with mail_index_ext_register(), the defaults are replaced. */
+uint32_t mail_index_map_ext_register(struct mail_index *index,
+				     const char *name,
+				     uint32_t hdr_size, uint16_t record_size,
+				     uint16_t record_align);
 int mail_index_map_ext_hdr_check(const struct mail_index_header *hdr,
 				 const struct mail_index_ext_header *ext_hdr,
 				 const char *name, const char **error_r);
+/* Same as mail_index_map_ext_hdr_check(), but for extension introduction
+   that doesn't have record_offset set yet. */
+int mail_index_map_ext_intro_hdr_check(const struct mail_index_header *hdr,
+				       const struct mail_index_ext_header *ext_hdr,
+				       const char *name, const char **error_r);
 unsigned int mail_index_map_ext_hdr_offset(unsigned int name_len);
 
 void mail_index_fsck_locked(struct mail_index *index);

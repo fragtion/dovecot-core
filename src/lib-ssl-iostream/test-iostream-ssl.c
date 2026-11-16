@@ -8,6 +8,7 @@
 #include "iostream-openssl.h"
 #include "iostream-ssl.h"
 #include "iostream-ssl-test.h"
+#include "settings.h"
 
 #include <sys/socket.h>
 
@@ -332,7 +333,7 @@ test_iostream_ssl_alpn_handshake(const struct ssl_iostream_settings *server_set,
 
 static void test_iostream_ssl_context_cache_alpn(void)
 {
-	struct ssl_iostream_settings server_set, client_set;
+	struct ssl_iostream_settings server_set, *client_set;
 	struct ssl_iostream_context *ctx1, *ctx2, *ctx3;
 	const char *const imap_protos[] = { "imap", NULL };
 	const char *const http_protos[] = { "http/1.1", NULL };
@@ -342,19 +343,19 @@ static void test_iostream_ssl_context_cache_alpn(void)
 	test_begin("ssl: context cache application protocols");
 
 	ssl_iostream_test_settings_server(&server_set);
-	ssl_iostream_test_settings_client(&client_set);
-	client_set.allow_invalid_cert = TRUE;
+	client_set = ssl_iostream_test_settings_client();
+	client_set->allow_invalid_cert = TRUE;
 
 	/* The ALPN protocols are part of the SSL_CTX, so contexts wanting
 	   different protocols must not be shared. */
 	test_assert(ssl_iostream_client_context_cache_get(
-		&client_set, http_protos, &ctx1, &error) == 0);
+		client_set, http_protos, &ctx1, &error) == 0);
 	test_assert(ssl_iostream_client_context_cache_get(
-		&client_set, imap_protos, &ctx2, &error) == 0);
+		client_set, imap_protos, &ctx2, &error) == 0);
 	test_assert(ctx1 != ctx2);
 	/* ... while the same protocols still share one context. */
 	test_assert(ssl_iostream_client_context_cache_get(
-		&client_set, imap_protos, &ctx3, &error) == 0);
+		client_set, imap_protos, &ctx3, &error) == 0);
 	test_assert(ctx3 == ctx2);
 	ssl_iostream_context_unref(&ctx1);
 	ssl_iostream_context_unref(&ctx2);
@@ -362,9 +363,9 @@ static void test_iostream_ssl_context_cache_alpn(void)
 
 	/* Wanting no protocols isn't the same as wanting some. */
 	test_assert(ssl_iostream_client_context_cache_get(
-		&client_set, NULL, &ctx1, &error) == 0);
+		client_set, NULL, &ctx1, &error) == 0);
 	test_assert(ssl_iostream_client_context_cache_get(
-		&client_set, imap_protos, &ctx2, &error) == 0);
+		client_set, imap_protos, &ctx2, &error) == 0);
 	test_assert(ctx1 != ctx2);
 	ssl_iostream_context_unref(&ctx1);
 	ssl_iostream_context_unref(&ctx2);
@@ -374,8 +375,8 @@ static void test_iostream_ssl_context_cache_alpn(void)
 	/* An HTTP client that initialized its context first must not make an
 	   imap connection using the same settings send ALPN http/1.1. */
 	test_assert(ssl_iostream_client_context_cache_get(
-		&client_set, http_protos, &ctx1, &error) == 0);
-	test_assert(test_iostream_ssl_alpn_handshake(&server_set, &client_set,
+		client_set, http_protos, &ctx1, &error) == 0);
+	test_assert(test_iostream_ssl_alpn_handshake(&server_set, client_set,
 						     imap_protos, imap_protos,
 						     &proto) == 0);
 	test_assert(null_strcmp(proto, "imap") == 0);
@@ -383,19 +384,20 @@ static void test_iostream_ssl_context_cache_alpn(void)
 
 	/* Sending the wrong ALPN is what made the server reject the
 	   handshake with no_application_protocol. */
-	test_assert(test_iostream_ssl_alpn_handshake(&server_set, &client_set,
+	test_assert(test_iostream_ssl_alpn_handshake(&server_set, client_set,
 						     imap_protos, http_protos,
 						     &proto) < 0);
 
 	io_loop_destroy(&ioloop);
 	ssl_iostream_context_cache_free();
+	settings_free(client_set);
 
 	test_end();
 }
 
 static void test_iostream_ssl_handshake(void)
 {
-	struct ssl_iostream_settings server_set, client_set;
+	struct ssl_iostream_settings server_set, *client_set;
 	struct ioloop *ioloop;
 	int idx = 0;
 
@@ -405,98 +407,108 @@ static void test_iostream_ssl_handshake(void)
 
 	/* allow invalid cert, connect to localhost */
 	ssl_iostream_test_settings_server(&server_set);
-	ssl_iostream_test_settings_client(&client_set);
-	client_set.allow_invalid_cert = TRUE;
-	test_assert_idx(test_iostream_ssl_handshake_real(&server_set, &client_set,
+	client_set = ssl_iostream_test_settings_client();
+	client_set->allow_invalid_cert = TRUE;
+	test_assert_idx(test_iostream_ssl_handshake_real(&server_set, client_set,
 							 "localhost") == 0, idx);
 	idx++;
+	settings_free(client_set);
 
 	/* allow invalid cert, connect to failhost */
 	ssl_iostream_test_settings_server(&server_set);
-	ssl_iostream_test_settings_client(&client_set);
-	client_set.allow_invalid_cert = TRUE;
-	test_assert_idx(test_iostream_ssl_handshake_real(&server_set, &client_set,
+	client_set = ssl_iostream_test_settings_client();
+	client_set->allow_invalid_cert = TRUE;
+	test_assert_idx(test_iostream_ssl_handshake_real(&server_set, client_set,
 							 "failhost") == 0, idx);
 	idx++;
+	settings_free(client_set);
 
 	/* verify remote cert */
 	ssl_iostream_test_settings_server(&server_set);
-	ssl_iostream_test_settings_client(&client_set);
-	client_set.verify_remote_cert = TRUE;
-	test_assert_idx(test_iostream_ssl_handshake_real(&server_set, &client_set,
+	client_set = ssl_iostream_test_settings_client();
+	client_set->verify_remote_cert = TRUE;
+	test_assert_idx(test_iostream_ssl_handshake_real(&server_set, client_set,
 							 "127.0.0.1") == 0, idx);
 	idx++;
+	settings_free(client_set);
 
 	/* verify remote cert, missing hostname */
 	ssl_iostream_test_settings_server(&server_set);
-	ssl_iostream_test_settings_client(&client_set);
-	client_set.verify_remote_cert = TRUE;
+	client_set = ssl_iostream_test_settings_client();
+	client_set->verify_remote_cert = TRUE;
 	test_expect_error_string("client: SSL certificate doesn't "
 				 "match expected host name failhost");
-	test_assert_idx(test_iostream_ssl_handshake_real(&server_set, &client_set,
+	test_assert_idx(test_iostream_ssl_handshake_real(&server_set, client_set,
 							 "failhost") != 0, idx);
 	idx++;
+	settings_free(client_set);
 
 	/* verify remote cert, missing CA */
 	ssl_iostream_test_settings_server(&server_set);
-	ssl_iostream_test_settings_client(&client_set);
-	client_set.verify_remote_cert = TRUE;
-	i_zero(&client_set.ca);
+	client_set = ssl_iostream_test_settings_client();
+	client_set->verify_remote_cert = TRUE;
+	i_zero(&client_set->ca);
 	test_expect_error_string("client: Received invalid SSL certificate");
-	test_assert_idx(test_iostream_ssl_handshake_real(&server_set, &client_set,
+	test_assert_idx(test_iostream_ssl_handshake_real(&server_set, client_set,
 							 "127.0.0.1") != 0, idx);
 	idx++;
+	settings_free(client_set);
 
 	/* verify remote cert, require CRL */
 	ssl_iostream_test_settings_server(&server_set);
-	ssl_iostream_test_settings_client(&client_set);
-	client_set.verify_remote_cert = TRUE;
-	client_set.skip_crl_check = FALSE;
+	client_set = ssl_iostream_test_settings_client();
+	client_set->verify_remote_cert = TRUE;
+	client_set->skip_crl_check = FALSE;
 	test_expect_error_string("client: Received invalid SSL certificate");
-	test_assert_idx(test_iostream_ssl_handshake_real(&server_set, &client_set,
+	test_assert_idx(test_iostream_ssl_handshake_real(&server_set, client_set,
 							 "127.0.0.1") != 0, idx);
 	idx++;
+	settings_free(client_set);
 
 	/* missing server credentials */
 	ssl_iostream_test_settings_server(&server_set);
 	i_zero(&server_set.cert.key);
-	ssl_iostream_test_settings_client(&client_set);
-	client_set.verify_remote_cert = TRUE;
+	client_set = ssl_iostream_test_settings_client();
+	client_set->verify_remote_cert = TRUE;
 	test_expect_error_string("client(failhost): SSL certificate not received");
-	test_assert_idx(test_iostream_ssl_handshake_real(&server_set, &client_set,
+	test_assert_idx(test_iostream_ssl_handshake_real(&server_set, client_set,
 							 "failhost") != 0, idx);
 	idx++;
+	settings_free(client_set);
 	ssl_iostream_test_settings_server(&server_set);
 	i_zero(&server_set.cert.cert);
-	ssl_iostream_test_settings_client(&client_set);
-	client_set.verify_remote_cert = TRUE;
+	client_set = ssl_iostream_test_settings_client();
+	client_set->verify_remote_cert = TRUE;
 	test_expect_error_string("client(failhost): SSL certificate not received");
-	test_assert_idx(test_iostream_ssl_handshake_real(&server_set, &client_set,
+	test_assert_idx(test_iostream_ssl_handshake_real(&server_set, client_set,
 							 "failhost") != 0, idx);
 	idx++;
+	settings_free(client_set);
 
 	/* invalid client credentials: missing credentials */
 	ssl_iostream_test_settings_server(&server_set);
-	ssl_iostream_test_settings_client(&client_set);
-	client_set.verify_remote_cert = TRUE;
+	client_set = ssl_iostream_test_settings_client();
+	client_set->verify_remote_cert = TRUE;
 	server_set.verify_remote_cert = TRUE;
-	server_set.ca = client_set.ca;
+	server_set.ca = client_set->ca;
 	test_expect_error_string("server: SSL certificate not received");
-	test_assert_idx(test_iostream_ssl_handshake_real(&server_set, &client_set,
+	test_assert_idx(test_iostream_ssl_handshake_real(&server_set, client_set,
 							 "127.0.0.1") != 0, idx);
 	idx++;
+	settings_free(client_set);
 
 	/* invalid client credentials: incorrect extended usage */
 	ssl_iostream_test_settings_server(&server_set);
-	ssl_iostream_test_settings_client(&client_set);
-	client_set.verify_remote_cert = TRUE;
+	client_set = ssl_iostream_test_settings_client();
+	client_set->verify_remote_cert = TRUE;
 	server_set.verify_remote_cert = TRUE;
-	server_set.ca = client_set.ca;
-	client_set.cert = server_set.cert;
+	server_set.ca = client_set->ca;
+	client_set->cert = server_set.cert;
 	test_expect_error_string("server: Received invalid SSL certificate");
-	test_assert_idx(test_iostream_ssl_handshake_real(&server_set, &client_set,
+	test_assert_idx(test_iostream_ssl_handshake_real(&server_set, client_set,
 							 "127.0.0.1") != 0, idx);
 	idx++;
+	settings_free(client_set);
 
 	io_loop_destroy(&ioloop);
 	ssl_iostream_context_cache_free();
@@ -507,6 +519,7 @@ static void test_iostream_ssl_handshake(void)
 static void test_iostream_ssl_get_buffer_avail_size(void)
 {
 	struct ssl_iostream_settings set;
+	struct ssl_iostream_settings *client_set;
 	struct test_endpoint *server, *client;
 	struct ioloop *ioloop;
 	int fd[2];
@@ -523,10 +536,11 @@ static void test_iostream_ssl_get_buffer_avail_size(void)
 
 	ssl_iostream_test_settings_server(&set);
 	server = create_test_endpoint(fd[0], &set);
-	ssl_iostream_test_settings_client(&set);
-	set.allow_invalid_cert = TRUE;
-	client = create_test_endpoint(fd[1], &set);
+	client_set = ssl_iostream_test_settings_client();
+	client_set->allow_invalid_cert = TRUE;
+	client = create_test_endpoint(fd[1], client_set);
 	client->client = TRUE;
+	settings_free(client_set);
 
 	client->other = server;
 	server->other = client;
@@ -599,6 +613,7 @@ static void test_iostream_ssl_get_buffer_avail_size(void)
 static void test_iostream_ssl_small_packets(void)
 {
 	struct ssl_iostream_settings set;
+	struct ssl_iostream_settings *client_set;
 	struct test_endpoint *server, *client;
 	struct ioloop *ioloop;
 	int fd[2];
@@ -615,10 +630,11 @@ static void test_iostream_ssl_small_packets(void)
 
 	ssl_iostream_test_settings_server(&set);
 	server = create_test_endpoint(fd[0], &set);
-	ssl_iostream_test_settings_client(&set);
-	set.allow_invalid_cert = TRUE;
-	client = create_test_endpoint(fd[1], &set);
+	client_set = ssl_iostream_test_settings_client();
+	client_set->allow_invalid_cert = TRUE;
+	client = create_test_endpoint(fd[1], client_set);
 	client->client = TRUE;
+	settings_free(client_set);
 
 	test_assert(ssl_iostream_context_init_server(server->set, &server->ctx,
 		    &error) == 0);
@@ -714,7 +730,7 @@ static void
 test_ssl_endpoints_create(struct test_endpoint **server_r,
 			  struct test_endpoint **client_r)
 {
-	struct ssl_iostream_settings set;
+	struct ssl_iostream_settings set, *client_set;
 	struct test_endpoint *server, *client;
 	int fd[2];
 	const char *error;
@@ -726,10 +742,11 @@ test_ssl_endpoints_create(struct test_endpoint **server_r,
 
 	ssl_iostream_test_settings_server(&set);
 	server = create_test_endpoint(fd[0], &set);
-	ssl_iostream_test_settings_client(&set);
-	set.allow_invalid_cert = TRUE;
-	client = create_test_endpoint(fd[1], &set);
+	client_set = ssl_iostream_test_settings_client();
+	client_set->allow_invalid_cert = TRUE;
+	client = create_test_endpoint(fd[1], client_set);
 	client->client = TRUE;
+	settings_free(client_set);
 
 	test_assert(ssl_iostream_context_init_server(server->set, &server->ctx,
 						     &error) == 0);
@@ -1044,6 +1061,50 @@ static void test_iostream_ssl_finish(void)
 	test_end();
 }
 
+static void test_iostream_ssl_channel_binding(void)
+{
+	static const char line[] = "hello world\n";
+	struct test_endpoint *server, *client;
+	struct ioloop *ioloop;
+	const buffer_t *client_data, *server_data;
+	const char *error;
+
+	test_begin("ssl: channel binding tls-server-end-point");
+
+	ioloop = io_loop_create();
+	test_ssl_endpoints_create(&server, &client);
+
+	/* not available before the handshake */
+	test_assert(ssl_iostream_get_channel_binding(client->iostream,
+		SSL_CHANNEL_BIND_TYPE_TLS_SERVER_END_POINT,
+		&client_data, &error) < 0);
+
+	server->io = io_add_istream(server->input,
+				    handshake_server_input_callback, server);
+	client->io = io_add_istream(client->input, cork_input_callback,
+				    client);
+	o_stream_nsend_str(server->output, line);
+	buffer_append(client->last_write, line, strlen(line));
+	test_assert(ssl_iostream_handshake(client->iostream) == 0);
+	test_iostream_ssl_cork_wait(client);
+
+	test_assert(ssl_iostream_get_channel_binding(client->iostream,
+		SSL_CHANNEL_BIND_TYPE_TLS_SERVER_END_POINT,
+		&client_data, &error) == 0);
+	test_assert(ssl_iostream_get_channel_binding(server->iostream,
+		SSL_CHANNEL_BIND_TYPE_TLS_SERVER_END_POINT,
+		&server_data, &error) == 0);
+	if (!test_has_failed()) {
+		/* A certificate signed with SHA-256 or stronger */
+		test_assert(client_data->used >= 32);
+		test_assert(buffer_cmp(client_data, server_data));
+	}
+
+	test_ssl_endpoints_destroy(&server, &client);
+	io_loop_destroy(&ioloop);
+	test_end();
+}
+
 int main(void)
 {
 	static void (*const test_functions[])(void) = {
@@ -1054,6 +1115,7 @@ int main(void)
 		test_iostream_ssl_cork,
 		test_iostream_ssl_flush_before_handshake,
 		test_iostream_ssl_finish,
+		test_iostream_ssl_channel_binding,
 		NULL
 	};
 	ssl_iostream_openssl_init();

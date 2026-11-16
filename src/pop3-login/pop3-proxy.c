@@ -112,6 +112,7 @@ static int proxy_send_login(struct pop3_client *client, struct ostream *output)
 			LOGIN_PROXY_FAILURE_TYPE_INTERNAL, reason);
 		return -1;
 	}
+	login_proxy_sasl_enable_channel_binding(&client->common);
 	mech_name = dsasl_client_session_get_mech_name(
 		client->common.proxy_sasl_session);
 
@@ -312,6 +313,8 @@ int pop3_proxy_parse_line(struct client *client, const char *line)
 		}
 		if (!str_begins_with(line, "+OK"))
 			break;
+		if (login_proxy_sasl_verify_success(client) < 0)
+			return -1;
 
 		/* Login successful. Send this line to client. */
 		line = t_strconcat(line, "\r\n", NULL);

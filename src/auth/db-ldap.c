@@ -16,6 +16,7 @@
 #include "env-util.h"
 #include "settings.h"
 #include "ssl-settings.h"
+#include "auth-secrets.h"
 #include "userdb.h"
 #include "db-ldap.h"
 #include "db-ldap-sasl.h"
@@ -64,6 +65,7 @@ struct db_ldap_result_iterate_context {
 	string_t *var, *debug;
 
 	bool skip_null_values;
+	bool no_attributes;
 	LDAPMessage *ldap_msg;
 	LDAP *ld;
 };
@@ -204,9 +206,15 @@ static int db_ldap_request_search(struct ldap_connection *conn,
 	i_assert(conn->conn_state == LDAP_CONN_STATE_BOUND_DEFAULT);
 	i_assert(request->msgid == -1);
 
+	/* An empty attribute list would return all attributes. None of them
+	   would be used, so request none (RFC 4511 section 4.5.1.8). */
+	static const char *const no_attributes[] = { "1.1", NULL };
+	const char *const *attributes = srequest->attributes[0] == NULL ?
+		no_attributes : srequest->attributes;
+
 	ldap_search_ext(
 		conn->ld, *srequest->base == '\0' ? NULL : srequest->base,
-		conn->set->parsed_scope, srequest->filter, (char **)srequest->attributes,
+		conn->set->parsed_scope, srequest->filter, (char **)attributes,
 		0, NULL, NULL, 0, 0, &request->msgid);
 	if (request->msgid == -1) {
 		e_error(authdb_event(request->auth_request),
@@ -975,30 +983,23 @@ static void db_ldap_conn_close(struct ldap_connection *conn)
 	}
 }
 
-static bool
-db_ldap_is_sensitive_field(const char *name)
-{
-	return strstr(name, "nonce") != NULL ||
-	       strstr(name, "password") != NULL ||
-	       strstr(name, "secret") != NULL ||
-	       str_ends_with(name, "key") ||
-	       str_ends_with(name, "pass");
-}
-
 void db_ldap_get_attribute_names(pool_t pool,
 				 const ARRAY_TYPE(const_string) *attrlist,
 				 const char *const **attr_names_r,
 				 const char *const **sensitive_r,
-				 const char *skip_attr)
+				 bool skip_password,
+				 const char *const **skipped_r)
 {
 	unsigned int count = array_is_empty(attrlist) ? 0 : array_count(attrlist);
 	i_assert(count % 2 == 0);
 
 	ARRAY_TYPE(const_string) attr_names;
 	ARRAY_TYPE(const_string) sensitive_attr_names;
+	ARRAY_TYPE(const_string) skipped_attr_names;
 
 	p_array_init(&attr_names, pool, count / 2);
 	p_array_init(&sensitive_attr_names, pool, 2);
+	p_array_init(&skipped_attr_names, pool, 2);
 	string_t *tmp_str = t_str_new(128);
 
 	for (unsigned int index = 0; index < count; ) {
@@ -1006,8 +1007,11 @@ void db_ldap_get_attribute_names(pool_t pool,
 		const char *name = array_idx_elem(attrlist, index++);
 		const char *value = array_idx_elem(attrlist, index++);
 
-		if (skip_attr != NULL && strcmp(skip_attr, name) == 0)
-			continue;
+		bool skip = skip_password &&
+			    (strcmp(name, "password") == 0 ||
+			     strcmp(name, "password_noscheme") == 0);
+		ARRAY_TYPE(const_string) *dest =
+			skip ? &skipped_attr_names : &attr_names;
 
 		const char *error ATTR_UNUSED;
 		str_truncate(tmp_str, 0);
@@ -1031,12 +1035,12 @@ void db_ldap_get_attribute_names(pool_t pool,
 				/* when we free program, this name
 				   would be invalid, so dup it here. */
 				ldap_attr = p_strdup(pool, ldap_attr);
-				array_push_back(&attr_names, &ldap_attr);
+				array_push_back(dest, &ldap_attr);
 			}
 		}
 		var_expand_program_free(&prog);
 
-		if (!db_ldap_is_sensitive_field(name))
+		if (skip || !auth_field_key_is_secret(name))
 			continue;
 
 		/* We want to mark as sensitive ALL the LDAP attributes involved
@@ -1060,6 +1064,18 @@ void db_ldap_get_attribute_names(pool_t pool,
 	*attr_names_r = array_front(&attr_names);
 	if (sensitive_r != NULL)
 		*sensitive_r = array_front(&sensitive_attr_names);
+	if (skipped_r != NULL) {
+		/* An attribute that another field requests is not skipped. */
+		ARRAY_TYPE(const_string) skipped_only;
+		p_array_init(&skipped_only, pool, 2);
+		const char *attr;
+		array_foreach_elem(&skipped_attr_names, attr) {
+			if (!str_array_icase_find(*attr_names_r, attr))
+				array_push_back(&skipped_only, &attr);
+		}
+		array_append_zero(&skipped_only);
+		*skipped_r = array_front(&skipped_only);
+	}
 }
 
 static bool
@@ -1070,10 +1086,15 @@ db_ldap_field_hide_password(struct db_ldap_result_iterate_context *ctx,
 	if (request->set->debug_passwords)
 		return FALSE;
 
+	/* Also hide credential-looking attributes that are used by a field
+	   with an innocent name, e.g. "foo = %{ldap:userPassword}". */
+	if (auth_field_key_is_secret(attr))
+		return TRUE;
+
 	if (ctx->sensitive_attr_names == NULL)
 		return FALSE;
 
-	return str_array_find(ctx->sensitive_attr_names, attr);
+	return str_array_icase_find(ctx->sensitive_attr_names, attr);
 }
 
 static void
@@ -1110,7 +1131,7 @@ get_ldap_fields(struct db_ldap_result_iterate_context *ctx,
 			str_append(ctx->debug, ldap_value->values[0]);
 			for (i = 1; i < count; i++) {
 				str_printfa(ctx->debug, ",%s",
-					    ldap_value->values[0]);
+					    ldap_value->values[i]);
 			}
 		}
 		hash_table_insert(ctx->ldap_attrs,
@@ -1141,6 +1162,7 @@ db_ldap_result_iterate_init_full(struct ldap_connection *conn,
 	ctx->attr_next = ldap_request->attributes;
 	ctx->sensitive_attr_names = ldap_request->sensitive_attr_names;
 	ctx->skip_null_values = skip_null_values;
+	ctx->no_attributes = ldap_request->attributes[0] == NULL;
 	hash_table_create(&ctx->ldap_attrs, pool, 0, strcase_hash, strcasecmp);
 	ctx->var = str_new(ctx->pool, 256);
 	ctx->debug = t_str_new(256);
@@ -1174,6 +1196,15 @@ const char *db_ldap_attribute_as_multi(const char *name)
 	return t_strconcat(DB_LDAP_ATTR_MULTI_PREFIX, name, NULL);
 }
 
+static bool
+db_ldap_attribute_skipped(const struct db_ldap_field_expand_context *ctx,
+			  const char *field_name)
+{
+	if (ctx->skipped_attributes == NULL)
+		return FALSE;
+	return str_array_icase_find(ctx->skipped_attributes, field_name);
+}
+
 static int
 db_ldap_field_multi_expand(const char *data, const char **value_r,
 			   void *context, const char **error_r)
@@ -1181,6 +1212,15 @@ db_ldap_field_multi_expand(const char *data, const char **value_r,
 	struct db_ldap_field_expand_context *ctx = context;
 	struct auth_fields *fields = ctx->fields;
 	const char *field_name = t_str_lcase(data);
+
+	if (db_ldap_attribute_skipped(ctx, field_name)) {
+		*value_r = "";
+		return 0;
+	}
+	if (fields == NULL) {
+		*error_r = "No LDAP result";
+		return -1;
+	}
 
 	const char *value = auth_fields_find(fields,
 					     db_ldap_attribute_as_multi(field_name));
@@ -1203,6 +1243,15 @@ db_ldap_field_single_expand(const char *data, const char **value_r,
 	struct auth_fields *fields = ctx->fields;
 	const char *field_name = t_str_lcase(data);
 
+	if (db_ldap_attribute_skipped(ctx, field_name)) {
+		*value_r = "";
+		return 0;
+	}
+	if (fields == NULL) {
+		*error_r = "No LDAP result";
+		return -1;
+	}
+
 	if (strcmp(field_name, "dn") == 0) {
 		/* DN must be always there */
 		*value_r = auth_fields_find(fields, DB_LDAP_ATTR_DN);
@@ -1210,9 +1259,7 @@ db_ldap_field_single_expand(const char *data, const char **value_r,
 		return 0;
 	}
 
-	*value_r = NULL;
-	if (fields != NULL)
-		*value_r = auth_fields_find(fields, field_name);
+	*value_r = auth_fields_find(fields, field_name);
 
 	if (*value_r == NULL || **value_r == '\0') {
 		*error_r = t_strdup_printf("No such attribute '%s'", field_name);
@@ -1220,7 +1267,7 @@ db_ldap_field_single_expand(const char *data, const char **value_r,
 	} else if (auth_fields_find(fields,
 				  db_ldap_attribute_as_multi(field_name)) != NULL) {
 		e_warning(ctx->event, "Multiple values found for '%s': "
-			              "using value '%s'", field_name, *value_r);
+			              "using the first one", field_name);
 	}
 
 	return 0;
@@ -1327,8 +1374,10 @@ db_ldap_result_finish_debug(struct db_ldap_result_iterate_context *ctx)
 	i_assert(ctx->debug != NULL);
 	orig_len = str_len(ctx->debug);
 	if (orig_len == 0) {
-		e_debug(authdb_event(ctx->ldap_request->auth_request),
-		        "no fields returned by the server");
+		const char *msg = ctx->no_attributes ?
+			"no attributes requested" :
+			"no fields returned by the server";
+		e_debug(authdb_event(ctx->ldap_request->auth_request), "%s", msg);
 		return;
 	}
 

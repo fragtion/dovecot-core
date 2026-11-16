@@ -227,6 +227,13 @@ auth_callback(struct auth_client_request *request,
 		return;
 	case AUTH_REQUEST_STATUS_OK:
 		input->internal_failure = FALSE;
+		if (input->sasl_session != NULL &&
+		    dsasl_client_session_verify_success(input->sasl_session,
+							&error) < 0) {
+			printf("passdb: %s auth failed: %s\n",
+			       input->username, error);
+			break;
+		}
 		input->success = TRUE;
 		printf("passdb: %s auth succeeded\n", input->username);
 		break;

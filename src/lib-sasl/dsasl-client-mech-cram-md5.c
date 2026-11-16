@@ -107,6 +107,15 @@ mech_cram_md5_auth_output(struct dsasl_client_mech_session *msession,
 	return DSASL_CLIENT_RESULT_OK;
 }
 
+static bool
+mech_cram_md5_auth_is_finished(struct dsasl_client_mech_session *msession)
+{
+	struct cram_md5_sasl_session *csession =
+		container_of(msession, struct cram_md5_sasl_session, session);
+
+	return csession->challenge != NULL;
+}
+
 const struct dsasl_client_mech dsasl_client_mech_cram_md5 = {
 	.name = SASL_MECH_NAME_CRAM_MD5,
 
@@ -114,4 +123,5 @@ const struct dsasl_client_mech dsasl_client_mech_cram_md5 = {
 	.auth_check = mech_cram_md5_auth_check,
 	.auth_input = mech_cram_md5_auth_input,
 	.auth_output = mech_cram_md5_auth_output,
+	.auth_is_finished = mech_cram_md5_auth_is_finished,
 };

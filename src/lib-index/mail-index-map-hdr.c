@@ -24,7 +24,7 @@ int mail_index_map_parse_extensions(struct mail_index_map *map)
 	old_count = array_count(&index->extensions);
 	mail_index_map_init_extbufs(map, old_count + 5);
 
-	ext_id = (uint32_t)-1;
+	ext_id = UINT32_MAX;
 	for (i = 0; i < old_count; i++)
 		array_push_back(&map->ext_id_map, &ext_id);
 
@@ -86,6 +86,13 @@ int mail_index_map_parse_keywords(struct mail_index_map *map)
 	   the .log changes, so re-reading dovecot.index header isn't common.
 	   In a later version we could even remove it.
 	*/
+	if (ext->hdr_size < sizeof(*kw_hdr)) {
+		mail_index_set_error(index, "Corrupted index file %s: "
+				     "Keywords header too small (%u < %zu)",
+				     index->filepath, ext->hdr_size,
+				     sizeof(*kw_hdr));
+		return -1;
+	}
 	i_assert(ext->hdr_offset < map->hdr.header_size);
 	kw_hdr = MAIL_INDEX_MAP_HDR_OFFSET(map, ext->hdr_offset);
 	kw_rec = (const void *)(kw_hdr + 1);
@@ -115,7 +122,7 @@ int mail_index_map_parse_keywords(struct mail_index_map *map)
 
 	name_area_end_offset = (const char *)kw_hdr + ext->hdr_size - name;
 	for (i = 0; i < kw_hdr->keywords_count; i++) {
-		if (kw_rec[i].name_offset > name_area_end_offset) {
+		if (kw_rec[i].name_offset >= name_area_end_offset) {
 			mail_index_set_error(index, "Corrupted index file %s: "
 				"name_offset points outside allocated header",
 				index->filepath);
@@ -147,12 +154,10 @@ int mail_index_map_parse_keywords(struct mail_index_map *map)
 		unsigned int kw_idx;
 
 		if (kw_rec[i].name_offset != name_offset) {
-			/* this shouldn't happen, but the old code didn't check
-			   for this so for safety keep this as a warning. */
-			e_warning(index->event,
-				  "Corrupted index file %s: "
-				  "Mismatching keyword name_offset",
-				  index->filepath);
+			mail_index_set_error(index, "Corrupted index file %s: "
+					     "Mismatching keyword name_offset",
+					     index->filepath);
+			return -1;
 		}
 		name_offset += strlen(keyword) + 1;
 
@@ -173,12 +178,10 @@ int mail_index_map_parse_keywords(struct mail_index_map *map)
 		unsigned int kw_idx;
 
 		if (kw_rec[i].name_offset != name_offset) {
-			/* this shouldn't happen, but the old code didn't check
-			   for this so for safety keep this as a warning. */
-			e_warning(index->event,
-				  "Corrupted index file %s: "
-				  "Mismatching keyword name_offset",
-				  index->filepath);
+			mail_index_set_error(index, "Corrupted index file %s: "
+					     "Mismatching keyword name_offset",
+					     index->filepath);
+			return -1;
 		}
 		name_offset += strlen(keyword) + 1;
 
@@ -261,6 +264,12 @@ bool mail_index_check_header_compat(const struct mail_index_header *hdr,
 		*error_r = t_strdup_printf(
 			"record_size too small (%u < %zu)",
 			hdr->record_size, sizeof(struct mail_index_record));
+		return FALSE;
+	}
+	if (hdr->record_size > MAIL_INDEX_RECORD_MAX_SIZE) {
+		*error_r = t_strdup_printf(
+			"record_size too large (%u > %u)",
+			hdr->record_size, MAIL_INDEX_RECORD_MAX_SIZE);
 		return FALSE;
 	}
 	if (hdr->header_size > file_size) {
@@ -384,7 +393,7 @@ int mail_index_map_check_header(struct mail_index_map *map,
 		rec = MAIL_INDEX_REC_AT_SEQ(map, hdr->messages_count);
 		if (rec->uid == 0) {
 			*error_r = "last message has uid=0";
-			return -1;
+			return 0;
 		}
 		if (rec->uid >= hdr->next_uid) {
 			*error_r = t_strdup_printf(

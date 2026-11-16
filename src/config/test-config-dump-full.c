@@ -3,12 +3,14 @@
 #include "lib.h"
 #include "array.h"
 #include "net.h"
+#include "env-util.h"
 #include "write-full.h"
 #include "read-full.h"
 #include "ostream.h"
 #include "settings.h"
 #include "settings-parser.h"
 #include "service-settings.h"
+#include "master-service-settings.h"
 #include "config-filter.h"
 #include "config-parser.h"
 #include "config-request.h"
@@ -166,6 +168,30 @@ static const struct setting_parser_info *const infos[] = {
 };
 
 const struct setting_parser_info *const *all_infos = infos;
+
+static const struct setting_plugin_info test_plugin_info_foo = {
+	.plugin = "lib01_foo_plugin",
+	.required_plugins = (const char *const []) { "bar", NULL },
+};
+static const struct setting_plugin_info test_plugin_info_bar = {
+	.plugin = "lib01_bar_plugin",
+};
+static const struct setting_plugin_info test_plugin_info_baz = {
+	.plugin = "lib01_baz_plugin",
+	.required_plugins = (const char *const []) { "foo", "bar", NULL },
+};
+static const struct setting_plugin_info test_plugin_info_empty = {
+	.plugin = "lib01_empty_plugin",
+	.required_plugins = (const char *const []) { NULL },
+};
+static const struct setting_plugin_info *const plugin_infos[] = {
+	&test_plugin_info_foo,
+	&test_plugin_info_bar,
+	&test_plugin_info_baz,
+	&test_plugin_info_empty,
+	NULL
+};
+const struct setting_plugin_info *const *all_plugin_infos = plugin_infos;
 
 static const char *test_config =
 "dovecot_config_version = "DOVECOT_CONFIG_VERSION"\n"
@@ -587,10 +613,41 @@ static void test_config_dump_full_overrides(void)
 	test_end();
 }
 
+static void test_config_dump_full_required_plugins(void)
+{
+	const char *const *required;
+
+	test_begin("config dump full - required plugins");
+	struct settings_root *root = test_settings_read(NULL, "imap");
+
+	required = settings_root_get_required_plugins(root, "foo");
+	test_assert(required != NULL &&
+		    strcmp(t_strarray_join(required, ","), "bar") == 0);
+	required = settings_root_get_required_plugins(root, "baz");
+	test_assert(required != NULL &&
+		    strcmp(t_strarray_join(required, ","), "foo,bar") == 0);
+	test_assert(settings_root_get_required_plugins(root, "bar") == NULL);
+	test_assert(settings_root_get_required_plugins(root, "empty") == NULL);
+	test_assert(settings_root_get_required_plugins(root, "fo") == NULL);
+	test_assert(settings_root_get_required_plugins(root, "nonexistent") == NULL);
+
+	settings_root_deinit(&root);
+
+	/* no binary config */
+	root = settings_root_init();
+	test_assert(settings_root_get_required_plugins(root, "foo") == NULL);
+	settings_root_deinit(&root);
+	test_end();
+}
+
 static void test_corrupted_lookups(struct settings_root *root)
 {
 	const struct test_settings *set;
 	const char *error;
+
+	(void)settings_root_get_required_plugins(root, "foo");
+	(void)settings_root_get_required_plugins(root, "baz");
+	(void)settings_root_get_required_plugins(root, "nonexistent");
 
 	struct event *event = test_event_create(root);
 	if (settings_get(event, &test_settings_info, 0, &set, &error) == 0)
@@ -689,6 +746,36 @@ static void test_config_dump_full_corruption(void)
 	test_end();
 }
 
+static void test_config_dump_full_defaults_cache(void)
+{
+	struct config_parsed *config;
+	const char *const *specific_protocols;
+	const char *error = NULL;
+
+	test_begin("config dump full - defaults binary cache");
+	env_put("DOVECOT_CONFIG_CACHE", test_dir_get());
+	if (config_parse_file(NULL, CONFIG_PARSE_FLAG_NO_DEFAULTS |
+			      CONFIG_PARSE_FLAG_DEFAULT_VERSION,
+			      NULL, &config, &error) != 1)
+		i_fatal("config_parse_file(): %s", error);
+	int fd = config_dump_full(config, CONFIG_DUMP_FULL_DEST_TEMPDIR,
+				  CONFIG_DUMP_FLAG_WRITE_BINARY_CACHE, NULL);
+	test_assert(fd != -1);
+	config_parsed_free(&config);
+	env_remove("DOVECOT_CONFIG_CACHE");
+
+	/* The cache must not be seen as out of date */
+	struct settings_root *root = settings_root_init();
+	test_assert(settings_read(root, fd,
+				  MASTER_SERVICE_BINARY_CONFIG_DEFAULTS,
+				  NULL, NULL,
+				  SETTINGS_READ_CHECK_CACHE_TIMESTAMPS,
+				  &specific_protocols, &error) == 1);
+	settings_root_deinit(&root);
+	i_close_fd(&fd);
+	test_end();
+}
+
 int main(void)
 {
 	static void (*const test_functions[])(void) = {
@@ -699,7 +786,9 @@ int main(void)
 		test_config_dump_full_service,
 		test_config_dump_full_groups,
 		test_config_dump_full_overrides,
+		test_config_dump_full_required_plugins,
 		test_config_dump_full_corruption,
+		test_config_dump_full_defaults_cache,
 		NULL
 	};
 

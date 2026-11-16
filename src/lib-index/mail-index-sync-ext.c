@@ -40,7 +40,7 @@ void mail_index_sync_init_expunge_handlers(struct mail_index_sync_map_ctx *ctx)
 		if (rext[idx_ext_id].expunge_handler == NULL)
 			continue;
 		map_ext_id = id_map[idx_ext_id];
-		if (map_ext_id == (uint32_t)-1)
+		if (map_ext_id == UINT32_MAX)
 			continue;
 
 		eh.handler = rext[idx_ext_id].expunge_handler;
@@ -157,9 +157,12 @@ static void sync_ext_reorder(struct mail_index_map *map, uint32_t ext_map_idx,
 	offset = MAIL_INDEX_RECORD_MIN_SIZE;
 	max_align = sizeof(uint32_t);
 	for (;;) {
-		min_align = (uint16_t)-1;
+		min_align = UINT16_MAX;
 		for (i = 0; i < count; i++) {
-			if (sorted[i]->record_align > max_align)
+			/* extensions without records may have any
+			   record_align, so ignore it */
+			if (sorted[i]->record_size > 0 &&
+			    sorted[i]->record_align > max_align)
 				max_align = sorted[i]->record_align;
 
 			if (sorted[i]->record_offset == 0 &&
@@ -171,19 +174,19 @@ static void sync_ext_reorder(struct mail_index_map *map, uint32_t ext_map_idx,
 			}
 		}
 		if (i == count) {
-			if (min_align == (uint16_t)-1) {
+			if (min_align == UINT16_MAX) {
 				/* all done */
 				break;
 			}
 			/* we have to leave space here */
-			i_assert(min_align > 1 && min_align < (uint16_t)-1);
+			i_assert(min_align > 1 && min_align < UINT16_MAX);
 			offset += min_align - (offset % min_align);
 		} else {
 			sorted[i]->record_offset = offset;
 			offset += sorted[i]->record_size;
 		}
 
-		i_assert(offset < (uint16_t)-1);
+		i_assert(offset < UINT16_MAX);
 	}
 
 	if ((offset % max_align) != 0) {
@@ -233,6 +236,30 @@ static void sync_ext_reorder(struct mail_index_map *map, uint32_t ext_map_idx,
 	}
 }
 
+/* Get the record size and alignment that the existing extension will have
+   after sync_ext_resize() has applied the intro to it. */
+static void
+sync_ext_resize_get_record_size(const struct mail_transaction_ext_intro *u,
+				const struct mail_index_ext *ext,
+				bool no_shrink, uint16_t *record_size_r,
+				uint16_t *record_align_r)
+{
+	*record_size_r = ext->record_size;
+	*record_align_r = ext->record_align;
+
+	/* record_align isn't validated for extensions without records, so
+	   ignore the intro's record_align if it has no records, and replace
+	   the existing record_align if the extension had no records. */
+	if (u->record_size > 0 &&
+	    (ext->record_size == 0 ||
+	     ext->record_align < u->record_align ||
+	     (ext->record_align > u->record_align && !no_shrink)))
+		*record_align_r = u->record_align;
+	if (ext->record_size < u->record_size ||
+	    (ext->record_size > u->record_size && !no_shrink))
+		*record_size_r = u->record_size;
+}
+
 static void
 sync_ext_resize(const struct mail_transaction_ext_intro *u,
 		uint32_t ext_map_idx, struct mail_index_sync_map_ctx *ctx,
@@ -242,6 +269,7 @@ sync_ext_resize(const struct mail_transaction_ext_intro *u,
 	struct mail_index_ext *ext;
 	struct mail_index_ext_header *ext_hdr;
 	uint32_t old_padded_hdr_size, new_padded_hdr_size, old_record_size;
+	uint16_t new_record_size, new_record_align;
 	bool reorder = FALSE;
 
 	ext = array_idx_modifiable(&ctx->view->map->extensions, ext_map_idx);
@@ -289,16 +317,15 @@ sync_ext_resize(const struct mail_transaction_ext_intro *u,
 		}
 	}
 
-	if (ext->record_align < u->record_align ||
-	    (ext->record_align > u->record_align && !no_shrink)) {
-		ext->record_align = u->record_align;
+	old_record_size = ext->record_size;
+	sync_ext_resize_get_record_size(u, ext, no_shrink, &new_record_size,
+					&new_record_align);
+	if (ext->record_align != new_record_align) {
+		ext->record_align = new_record_align;
 		reorder = TRUE;
 	}
-
-	old_record_size = ext->record_size;
-	if (ext->record_size < u->record_size ||
-	    (ext->record_size > u->record_size && !no_shrink)) {
-		ext->record_size = u->record_size;
+	if (ext->record_size != new_record_size) {
+		ext->record_size = new_record_size;
 		reorder = TRUE;
 	}
 
@@ -408,6 +435,31 @@ mail_index_sync_ext_init_new(struct mail_index_sync_map_ctx *ctx,
 	*ext_map_idx_r = ext_map_idx;
 }
 
+/* Returns TRUE if the records would fit into the maximum record size after
+   the extension at ext_map_idx (UINT32_MAX = new extension) gets the given
+   record size and alignment. This is a conservative estimate, which assumes
+   the maximum alignment padding for each extension. */
+static bool
+sync_ext_record_size_fits(struct mail_index_map *map, uint32_t ext_map_idx,
+			  uint16_t record_size, uint16_t record_align)
+{
+	const struct mail_index_ext *ext;
+	unsigned int i, count = 0;
+	uint32_t size = MAIL_INDEX_RECORD_MIN_SIZE + sizeof(uint64_t);
+
+	if (array_is_created(&map->extensions))
+		ext = array_get(&map->extensions, &count);
+	else
+		ext = NULL;
+	for (i = 0; i < count; i++) {
+		if (i != ext_map_idx && ext[i].record_size > 0)
+			size += ext[i].record_size + ext[i].record_align;
+	}
+	if (record_size > 0)
+		size += record_size + record_align;
+	return size < UINT16_MAX;
+}
+
 int mail_index_sync_ext_intro(struct mail_index_sync_map_ctx *ctx,
 			      const struct mail_transaction_ext_intro *u)
 {
@@ -416,6 +468,7 @@ int mail_index_sync_ext_intro(struct mail_index_sync_map_ctx *ctx,
 	const struct mail_index_ext *ext;
 	const char *name, *error;
 	uint32_t ext_map_idx;
+	uint16_t record_size, record_align;
 	bool no_shrink;
 
 	/* default to ignoring the following extension updates in case this
@@ -424,7 +477,7 @@ int mail_index_sync_ext_intro(struct mail_index_sync_map_ctx *ctx,
 	ctx->cur_ext_ignore = TRUE;
 	ctx->cur_ext_record_size = 0;
 
-	if (u->ext_id != (uint32_t)-1 &&
+	if (u->ext_id != UINT32_MAX &&
 	    (!array_is_created(&map->extensions) ||
 	     u->ext_id >= array_count(&map->extensions))) {
 		/* The extension ID is unknown in this map. */
@@ -444,21 +497,21 @@ int mail_index_sync_ext_intro(struct mail_index_sync_map_ctx *ctx,
 		return -1;
 	}
 
-	if (u->ext_id == (uint32_t)-1 && u->name_size == 0) {
+	if (u->ext_id == UINT32_MAX && u->name_size == 0) {
 		mail_index_sync_set_corrupted(ctx,
 			"Extension introduction without id or name");
 		return -1;
 	}
 
-	if (u->ext_id != (uint32_t)-1) {
+	if (u->ext_id != UINT32_MAX) {
 		name = NULL;
 		ext_map_idx = u->ext_id;
 	} else {
 		name = t_strndup(u + 1, u->name_size);
 		if (!mail_index_map_lookup_ext(map, name, &ext_map_idx))
-			ext_map_idx = (uint32_t)-1;
+			ext_map_idx = UINT32_MAX;
 	}
-	if (ext_map_idx == (uint32_t)-1)
+	if (ext_map_idx == UINT32_MAX)
 		ext = NULL;
 	else {
 		ext = array_idx(&map->extensions, ext_map_idx);
@@ -485,10 +538,25 @@ int mail_index_sync_ext_intro(struct mail_index_sync_map_ctx *ctx,
 	no_shrink = (u->flags & MAIL_TRANSACTION_EXT_INTRO_FLAG_NO_SHRINK) != 0;
 
 	/* make sure the header looks valid before doing anything with it */
-	if (mail_index_map_ext_hdr_check(&map->hdr, &ext_hdr,
-					 name, &error) < 0) {
+	if (mail_index_map_ext_intro_hdr_check(&map->hdr, &ext_hdr,
+					       name, &error) < 0) {
 		mail_index_sync_set_corrupted(ctx,
 			"Broken extension introduction: %s", error);
+		return -1;
+	}
+
+	record_size = u->record_size;
+	record_align = u->record_align;
+	if (ext != NULL && u->reset_id == ext->reset_id) {
+		sync_ext_resize_get_record_size(u, ext, no_shrink,
+						&record_size, &record_align);
+	}
+	if (!sync_ext_record_size_fits(map, ext != NULL ? ext_map_idx :
+				       UINT32_MAX, record_size,
+				       record_align)) {
+		mail_index_sync_set_corrupted(ctx,
+			"Broken extension introduction: "
+			"Record size too large");
 		return -1;
 	}
 
@@ -514,7 +582,7 @@ int mail_index_sync_ext_intro(struct mail_index_sync_map_ctx *ctx,
 
 	ctx->cur_ext_ignore = FALSE;
 	ctx->cur_ext_map_idx = ctx->internal_update ?
-		(uint32_t)-1 : ext_map_idx;
+		UINT32_MAX : ext_map_idx;
 	return 1;
 }
 
@@ -543,7 +611,7 @@ int mail_index_sync_ext_reset(struct mail_index_sync_map_ctx *ctx,
 	struct mail_index_ext_header *ext_hdr;
         struct mail_index_ext *ext;
 
-	if (ctx->cur_ext_map_idx == (uint32_t)-1) {
+	if (ctx->cur_ext_map_idx == UINT32_MAX) {
 		mail_index_sync_set_corrupted(ctx,
 			"Extension reset without intro prefix");
 		return -1;
@@ -576,7 +644,7 @@ int mail_index_sync_ext_hdr_update(struct mail_index_sync_map_ctx *ctx,
 	struct mail_index_map *map = ctx->view->map;
         const struct mail_index_ext *ext;
 
-	if (ctx->cur_ext_map_idx == (uint32_t)-1) {
+	if (ctx->cur_ext_map_idx == UINT32_MAX) {
 		mail_index_sync_set_corrupted(ctx,
 			"Extension header update without intro prefix");
 		return -1;
@@ -609,7 +677,7 @@ mail_index_sync_ext_rec_update(struct mail_index_sync_map_ctx *ctx,
 	void *old_data;
 	uint32_t seq;
 
-	i_assert(ctx->cur_ext_map_idx != (uint32_t)-1);
+	i_assert(ctx->cur_ext_map_idx != UINT32_MAX);
 	i_assert(!ctx->cur_ext_ignore);
 
 	if (u->uid == 0 || u->uid >= view->map->hdr.next_uid) {
@@ -646,9 +714,9 @@ mail_index_sync_ext_atomic_inc(struct mail_index_sync_map_ctx *ctx,
 	const struct mail_index_ext *ext;
 	void *data;
 	uint32_t seq;
-	uint64_t min_value, max_value, orig_num;
+	uint64_t min_value, max_value, orig_num, new_num, diff_abs;
 
-	i_assert(ctx->cur_ext_map_idx != (uint32_t)-1);
+	i_assert(ctx->cur_ext_map_idx != UINT32_MAX);
 	i_assert(!ctx->cur_ext_ignore);
 
 	if (u->uid == 0 || u->uid >= view->map->hdr.next_uid) {
@@ -667,14 +735,35 @@ mail_index_sync_ext_atomic_inc(struct mail_index_sync_map_ctx *ctx,
 	rec = MAIL_INDEX_REC_AT_SEQ(view->map, seq);
 	data = PTR_OFFSET(rec, ext->record_offset);
 
-	min_value = u->diff >= 0 ? 0 : (uint64_t)(-(int64_t)u->diff);
+	switch (ctx->cur_ext_record_size) {
+	case 1:
+		orig_num = *(const uint8_t *)data;
+		break;
+	case 2:
+		orig_num = *(const uint16_t *)data;
+		break;
+	case 4:
+		orig_num = *(const uint32_t *)data;
+		break;
+	case 8:
+		orig_num = *(const uint64_t *)data;
+		break;
+	default:
+		mail_index_sync_set_corrupted(ctx,
+			"Extension record inc with invalid size=%u",
+			ctx->cur_ext_record_size);
+		return -1;
+	}
 
-	max_value = ctx->cur_ext_record_size == 8 ? (uint64_t)-1 :
+	diff_abs = u->diff >= 0 ? (uint64_t)u->diff :
+		(uint64_t)(-(int64_t)u->diff);
+	min_value = u->diff >= 0 ? 0 : diff_abs;
+	max_value = ctx->cur_ext_record_size == 8 ? UINT64_MAX :
 		((uint64_t)1 << (ctx->cur_ext_record_size*8)) - 1;
 	if (u->diff <= 0) {
 		/* skip */
-	} else if (max_value >= (uint32_t)u->diff) {
-		max_value -= u->diff;
+	} else if (max_value >= diff_abs) {
+		max_value -= diff_abs;
 	} else {
 		mail_index_sync_set_corrupted(ctx,
 			"Extension record inc diff=%d larger than max value=%u "
@@ -682,42 +771,6 @@ mail_index_sync_ext_atomic_inc(struct mail_index_sync_map_ctx *ctx,
 		return -1;
 	}
 
-	switch (ctx->cur_ext_record_size) {
-	case 1: {
-		uint8_t *num = data;
-
-		orig_num = *num;
-		if (orig_num >= min_value && orig_num <= max_value)
-			*num += u->diff;
-		break;
-	}
-	case 2: {
-		uint16_t *num = data;
-		orig_num = *num;
-		if (orig_num >= min_value && orig_num <= max_value)
-			*num += u->diff;
-		break;
-	}
-	case 4: {
-		uint32_t *num = data;
-		orig_num = *num;
-		if (orig_num >= min_value && orig_num <= max_value)
-			*num += u->diff;
-		break;
-	}
-	case 8: {
-		uint64_t *num = data;
-		orig_num = *num;
-		if (orig_num >= min_value && orig_num <= max_value)
-			*num += u->diff;
-		break;
-	}
-	default:
-		mail_index_sync_set_corrupted(ctx,
-			"Extension record inc with invalid size=%u",
-			ctx->cur_ext_record_size);
-		return -1;
-	}
 	if (orig_num < min_value) {
 		mail_index_sync_set_corrupted(ctx,
 			"Extension record inc drops number below zero "
@@ -730,6 +783,25 @@ mail_index_sync_ext_atomic_inc(struct mail_index_sync_map_ctx *ctx,
 			"(uid=%u, diff=%d, orig=%"PRIu64")",
 			u->uid, u->diff, orig_num);
 		return -1;
+	}
+	/* the checks above guarantee that this doesn't wrap */
+	new_num = u->diff >= 0 ? orig_num + diff_abs : orig_num - diff_abs;
+
+	switch (ctx->cur_ext_record_size) {
+	case 1:
+		*(uint8_t *)data = (uint8_t)new_num;
+		break;
+	case 2:
+		*(uint16_t *)data = (uint16_t)new_num;
+		break;
+	case 4:
+		*(uint32_t *)data = (uint32_t)new_num;
+		break;
+	case 8:
+		*(uint64_t *)data = new_num;
+		break;
+	default:
+		i_unreached();
 	}
 	return 1;
 }

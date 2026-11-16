@@ -23,9 +23,20 @@ struct lmtp_pre_mail_settings {
 	unsigned int mail_max_lock_timeout;
 };
 
+struct lmtp_proxy_settings {
+	pool_t pool;
+
+	bool lmtp_proxy;
+
+	/* used as default for rcpt settings */
+	unsigned int lmtp_client_command_timeout_msecs;
+	unsigned int lmtp_client_connect_timeout_msecs;
+	in_port_t lmtp_client_port;
+	bool lmtp_client_peer_trusted;
+};
+
 struct lmtp_settings {
 	pool_t pool;
-	bool lmtp_proxy;
 	bool lmtp_save_to_detail_mailbox;
 	bool lmtp_rcpt_check_quota;
 	bool lmtp_add_received_header;
@@ -34,7 +45,6 @@ struct lmtp_settings {
 	unsigned int lmtp_user_concurrency_limit;
 	const char *lmtp_hdr_delivery_address;
 	const char *lmtp_rawlog_dir;
-	const char *lmtp_proxy_rawlog_dir;
 
 	ARRAY_TYPE(const_string) lmtp_client_workarounds;
 
@@ -50,6 +60,7 @@ struct lmtp_settings {
 };
 
 extern const struct setting_parser_info lmtp_pre_mail_setting_parser_info;
+extern const struct setting_parser_info lmtp_proxy_setting_parser_info;
 extern const struct setting_parser_info lmtp_setting_parser_info;
 
 #endif

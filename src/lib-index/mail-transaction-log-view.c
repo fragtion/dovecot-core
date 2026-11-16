@@ -185,7 +185,7 @@ int mail_transaction_log_view_set(struct mail_transaction_log_view *view,
 			   file, make sure NFS attribute cache gets flushed if
 			   necessary. */
 			bool nfs_flush = seq == min_file_seq ||
-				max_file_seq != (uint32_t)-1;
+				max_file_seq != UINT32_MAX;
 
 			ret = mail_transaction_log_find_file(view->log, seq,
 				nfs_flush, &file, &reason);
@@ -205,7 +205,7 @@ int mail_transaction_log_view_set(struct mail_transaction_log_view *view,
 
 		if (file == NULL || file->hdr.file_seq != seq) {
 			i_assert(reason != NULL);
-			if (file == NULL && max_file_seq == (uint32_t)-1 &&
+			if (file == NULL && max_file_seq == UINT32_MAX &&
 			    head == view->log->head) {
 				/* we just wanted to sync everything */
 				i_assert(max_file_offset == UOFF_T_MAX);
@@ -349,7 +349,7 @@ int mail_transaction_log_view_set(struct mail_transaction_log_view *view,
 		return 0;
 	}
 
-	i_assert(max_file_seq == (uint32_t)-1 ||
+	i_assert(max_file_seq == UINT32_MAX ||
 		 max_file_seq == view->head->hdr.file_seq);
 	i_assert(max_file_offset == UOFF_T_MAX ||
 		 max_file_offset <= view->head->sync_offset);
@@ -638,13 +638,27 @@ log_view_is_record_valid(struct mail_transaction_log_file *file,
 	   multiple times. other records are checked internally by
 	   mail_index_sync_record(). */
 	switch (rec_type) {
-	case MAIL_TRANSACTION_APPEND:
-		if ((rec_size % sizeof(struct mail_index_record)) != 0) {
+	case MAIL_TRANSACTION_APPEND: {
+		const struct mail_index_record *recs = data;
+		unsigned int i, count;
+
+		if ((rec_size % sizeof(*recs)) != 0) {
 			mail_transaction_log_file_set_corrupted(file,
 				"Invalid append record size");
 			return FALSE;
 		}
+		count = rec_size / sizeof(*recs);
+		for (i = 0; i < count; i++) {
+			/* uid=UINT32_MAX would wrap next_uid to 0 */
+			if (recs[i].uid == 0 || recs[i].uid == UINT32_MAX) {
+				mail_transaction_log_file_set_corrupted(file,
+					"Append with invalid uid=%u",
+					recs[i].uid);
+				return FALSE;
+			}
+		}
 		break;
+	}
 	case MAIL_TRANSACTION_EXPUNGE:
 		buffer_create_from_const_data(&uid_buf, data, rec_size);
 		array_create_from_buffer(&uids, &uid_buf,
@@ -678,18 +692,34 @@ log_view_is_record_valid(struct mail_transaction_log_file *file,
 		const struct mail_transaction_keyword_update *rec = data;
 		unsigned int seqset_offset;
 
-		seqset_offset = sizeof(*rec) + rec->name_size;
-		if ((seqset_offset % 4) != 0)
-			seqset_offset += 4 - (seqset_offset % 4);
+		if (rec_size < sizeof(*rec)) {
+			mail_transaction_log_file_set_corrupted(file,
+				"Keyword update record too small");
+			return FALSE;
+		}
+		seqset_offset =
+			mail_transaction_keyword_update_get_uids_offset(rec);
 
 		if (rec->name_size == 0) {
 			mail_transaction_log_file_set_corrupted(file,
 				"Trying to use empty keyword");
 			return FALSE;
 		}
+		if (rec->modify_type != MODIFY_ADD &&
+		    rec->modify_type != MODIFY_REMOVE) {
+			mail_transaction_log_file_set_corrupted(file,
+				"Invalid keyword update modify type %u",
+				rec->modify_type);
+			return FALSE;
+		}
 		if (seqset_offset > rec_size) {
 			mail_transaction_log_file_set_corrupted(file,
 				"Invalid keyword update record size");
+			return FALSE;
+		}
+		if (memchr(rec + 1, '\0', rec->name_size) != NULL) {
+			mail_transaction_log_file_set_corrupted(file,
+				"Keyword name contains NUL");
 			return FALSE;
 		}
 
@@ -823,6 +853,13 @@ log_view_get_next(struct mail_transaction_log_view *view,
 			"offset points outside file "
 			"(%"PRIuUOFF_T" + %zu > %zu)",
 			view->cur_offset, sizeof(*hdr), file_size);
+		return -1;
+	}
+
+	if ((view->cur_offset % 4) != 0) {
+		mail_transaction_log_file_set_corrupted(file,
+			"offset isn't 32bit aligned (%"PRIuUOFF_T")",
+			view->cur_offset);
 		return -1;
 	}
 

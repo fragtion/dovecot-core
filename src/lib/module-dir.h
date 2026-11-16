@@ -10,12 +10,17 @@ struct module_dir_load_settings {
 	/* Binary name used for checking if plugin is tried to be loaded for
 	   wrong binary. */
 	const char *binary_name;
-	/* Setting name used in plugin dependency error message */
-	const char *setting_name;
 
 	/* If non-NULL, load only modules where filter_callback returns TRUE */
 	bool (*filter_callback)(const char *name, void *context);
 	void *filter_context;
+	/* If non-NULL, returns the plugins that must be loaded before the
+	   given plugin, or NULL if there are none. The plugin names are
+	   without the "lib<nn>_" prefix and "_plugin" suffix. Loading a
+	   plugin fails if its required plugins aren't already loaded. */
+	const char *const *(*get_required_plugins)(const char *plugin_name,
+						   void *context);
+	void *get_required_plugins_context;
 
 	/* Require all plugins to have <plugin_name>_init() function */
 	bool require_init_funcs:1;
@@ -73,5 +78,8 @@ void *module_get_symbol_quiet(struct module *module, const char *symbol);
 const char *module_file_get_name(const char *fname);
 /* Returns module's name without "_plugin" suffix. */
 const char *module_get_plugin_name(struct module *module);
+/* Returns plugin's name from the filename, i.e. module_file_get_name() without
+   "_plugin" suffix. For example lib02_imap_acl_plugin.so returns imap_acl. */
+const char *module_file_get_plugin_name(const char *fname);
 
 #endif

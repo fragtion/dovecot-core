@@ -53,6 +53,15 @@ mech_anonymous_auth_output(struct dsasl_client_mech_session *msession,
 	return DSASL_CLIENT_RESULT_OK;
 }
 
+static bool
+mech_anonymous_auth_is_finished(struct dsasl_client_mech_session *msession)
+{
+	struct anonymous_sasl_session *asession =
+		container_of(msession, struct anonymous_sasl_session, session);
+
+	return asession->output_sent;
+}
+
 const struct dsasl_client_mech dsasl_client_mech_anonymous = {
 	.name = SASL_MECH_NAME_ANONYMOUS,
 	.flags = DSASL_MECH_SEC_NO_PASSWORD,
@@ -60,4 +69,5 @@ const struct dsasl_client_mech dsasl_client_mech_anonymous = {
 	.auth_new = mech_anonymous_auth_new,
 	.auth_input = mech_anonymous_auth_input,
 	.auth_output = mech_anonymous_auth_output,
+	.auth_is_finished = mech_anonymous_auth_is_finished,
 };

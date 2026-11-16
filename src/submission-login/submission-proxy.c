@@ -298,6 +298,7 @@ proxy_send_login(struct submission_client *client, struct ostream *output)
 			LOGIN_PROXY_FAILURE_TYPE_INTERNAL, reason);
 		return -1;
 	}
+	login_proxy_sasl_enable_channel_binding(&client->common);
 	mech_name = dsasl_client_session_get_mech_name(
 		client->common.proxy_sasl_session);
 
@@ -731,6 +732,8 @@ int submission_proxy_parse_line(struct client *client, const char *line)
 			return 0;
 		if ((status / 100) != 2)
 			break;
+		if (login_proxy_sasl_verify_success(client) < 0)
+			return -1;
 
 		smtp_server_connection_input_lock(cmd->conn);
 

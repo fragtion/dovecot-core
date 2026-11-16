@@ -1153,7 +1153,8 @@ smtp_client_command_mail_submit_after(struct smtp_client_connection *conn,
 
 	flags |= SMTP_CLIENT_COMMAND_FLAG_PIPELINE;
 	cmd = smtp_client_command_new(conn, flags, callback, context);
-	if (!conn->set.mail_send_broken_path || !smtp_address_is_broken(from)) {
+	if (!conn->params.mail_send_broken_path ||
+	    !smtp_address_is_broken(from)) {
 		/* Compose MAIL command with normalized path. */
 		smtp_client_command_printf(cmd, "MAIL FROM:<%s>",
 					   smtp_address_encode(from));
@@ -1392,7 +1393,7 @@ _cmd_bdat_send_chunks(struct _cmd_data_context *ctx,
 		      struct smtp_client_command *after)
 {
 	struct smtp_client_connection *conn = ctx->conn;
-	const struct smtp_client_settings *set = &conn->set;
+	const struct smtp_client_settings *set = conn->set;
 	struct smtp_client_command *const *cmds, *cmd, *cmd_prev;
 	unsigned int count;
 	struct istream *chunk;
@@ -1505,7 +1506,7 @@ smtp_client_command_data_submit_after(struct smtp_client_connection *conn,
 				      smtp_client_command_callback_t *callback,
 				      void *context)
 {
-	const struct smtp_client_settings *set = &conn->set;
+	const struct smtp_client_settings *set = conn->set;
 	struct _cmd_data_context *ctx;
 	struct smtp_client_command *cmd, *cmd_data;
 
@@ -1550,7 +1551,7 @@ smtp_client_command_data_submit_after(struct smtp_client_connection *conn,
 	} else {
 		/* BDAT */
 		p_array_init(&ctx->cmds, ctx->pool,
-			conn->set.max_data_chunk_pipeline);
+			     set->max_data_chunk_pipeline);
 
 		/* The data stream is sent in multiple chunks. Either the size
 		   of the data stream is known or it is not. These cases are

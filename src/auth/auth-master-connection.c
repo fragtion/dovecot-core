@@ -19,6 +19,7 @@
 #include "passdb-cache.h"
 #include "auth-cache.h"
 #include "auth-request-handler.h"
+#include "auth-secrets.h"
 #include "auth-client-connection.h"
 #include "auth-master-connection.h"
 
@@ -45,27 +46,42 @@ static void auth_master_connection_destroy(struct connection *conn);
 static struct connection_list *auth_master_connections = NULL;
 
 static const char *
-auth_master_reply_hide_passwords(struct auth_master_connection *conn,
-				 const char *str)
+auth_master_reply_hide_secrets(struct auth_master_connection *conn,
+				const char *str)
 {
-	char **args, *p, *p2;
-	unsigned int i;
-
 	if (conn->auth->protocol_set->debug_passwords)
 		return str;
+	return auth_field_line_hide_secrets(str);
+}
 
-	/* hide all parameters that have "pass" in their key */
-	args = p_strsplit(pool_datastack_create(), str, "\t");
-	for (i = 0; args[i] != NULL; i++) {
-		p = strstr(args[i], "pass");
-		p2 = strchr(args[i], '=');
-		if (p != NULL && p < p2) {
-			*p2 = '\0';
-			args[i] = p_strconcat(pool_datastack_create(), args[i],
-					      "=<hidden>", NULL);
-		}
+const char *auth_master_input_hide_secrets(const char *const *args)
+{
+	unsigned int fields_idx = 1, cookie_idx = UINT_MAX;
+	string_t *str = t_str_new(128);
+
+	if (strcmp(args[0], "USER") == 0 || strcmp(args[0], "PASS") == 0) {
+		fields_idx = 3;
+	} else if (strcmp(args[0], "LIST") == 0) {
+		fields_idx = 2;
+	} else if (strcmp(args[0], "REQUEST") == 0) {
+		cookie_idx = 4;
+		fields_idx = 5;
+	} else if (strcmp(args[0], "CACHE-FLUSH") == 0 ||
+		   strcmp(args[0], "CACHE-STATUS") == 0) {
+		fields_idx = UINT_MAX;
 	}
-	return t_strarray_join((void *)args, "\t");
+
+	for (unsigned int i = 0; args[i] != NULL; i++) {
+		if (i > 0)
+			str_append_c(str, '\t');
+		if (i == cookie_idx)
+			str_append(str, PASSWORD_HIDDEN_STR);
+		else if (i >= fields_idx)
+			str_append(str, auth_field_hide_secret(args[i]));
+		else
+			str_append(str, args[i]);
+	}
+	return str_c(str);
 }
 
 void auth_master_request_callback(const char *reply,
@@ -75,7 +91,7 @@ void auth_master_request_callback(const char *reply,
 		return;
 
 	e_debug(auth_event, "master userdb out: %s",
-		auth_master_reply_hide_passwords(conn, reply));
+		auth_master_reply_hide_secrets(conn, reply));
 
 	const struct const_iovec iov[] = {
 		{ .iov_base = reply, .iov_len = strlen(reply) },
@@ -363,7 +379,7 @@ static void user_callback(enum userdb_result result,
 	}
 
 	e_debug(auth_event, "userdb out: %s",
-		auth_master_reply_hide_passwords(conn, str_c(str)));
+		auth_master_reply_hide_secrets(conn, str_c(str)));
 
 	str_append_c(str, '\n');
 	o_stream_nsend(conn->conn.output, str_data(str), str_len(str));
@@ -429,7 +445,8 @@ static void pass_callback_finish(struct auth_request *auth_request,
 		break;
 	}
 
-	e_debug(auth_event, "passdb out: %s", str_c(str));
+	e_debug(auth_event, "passdb out: %s",
+		auth_master_reply_hide_secrets(conn, str_c(str)));
 
 	str_append_c(str, '\n');
 	o_stream_nsend(conn->conn.output, str_data(str), str_len(str));
@@ -716,7 +733,10 @@ static int auth_master_input_args(struct connection *_conn,
 	struct auth_master_connection *conn =
 		container_of(_conn, struct auth_master_connection, conn);
 
-	e_debug(auth_event, "master in: %s", t_strarray_join(args, "\t"));
+	e_debug(auth_event, "master in: %s",
+		conn->auth->protocol_set->debug_passwords ?
+		t_strarray_join(args, "\t") :
+		auth_master_input_hide_secrets(args));
 
 	if (strcmp(args[0], "USER") == 0)
 		return master_input_user(conn, args + 1);

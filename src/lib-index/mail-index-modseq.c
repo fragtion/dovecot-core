@@ -43,12 +43,20 @@ void mail_index_modseq_enable(struct mail_index *index)
 	struct mail_index_modseq_header hdr;
 	uint32_t ext_map_idx;
 
-	if (!mail_index_map_get_ext_idx(index->map, index->modseq_ext_id,
-					&ext_map_idx)) {
+	if (mail_index_map_get_modseq_header(index->map) == NULL) {
 		/* modseqs not enabled to the index yet, add them. */
 		view = mail_index_view_open(index);
 		trans = mail_index_transaction_begin(view, 0);
 
+		if (mail_index_map_get_ext_idx(index->map,
+					       index->modseq_ext_id,
+					       &ext_map_idx)) {
+			/* The header has an unexpected size, which can only
+			   happen if the index is corrupted. Fix the size, so
+			   the header can be updated again. */
+			mail_index_ext_resize_hdr(trans, index->modseq_ext_id,
+						  sizeof(hdr));
+		}
 		i_zero(&hdr);
 		hdr.highest_modseq = mail_index_modseq_get_head(index);
 		mail_index_update_header_ext(trans, index->modseq_ext_id,
@@ -251,11 +259,8 @@ mail_index_modseq_update_old_rec(struct mail_index_modseq_sync *ctx,
 	}
 	case MAIL_TRANSACTION_KEYWORD_UPDATE: {
 		const struct mail_transaction_keyword_update *rec = tdata;
-		unsigned int seqset_offset;
-
-		seqset_offset = sizeof(*rec) + rec->name_size;
-		if ((seqset_offset % 4) != 0)
-			seqset_offset += 4 - (seqset_offset % 4);
+		unsigned int seqset_offset =
+			mail_transaction_keyword_update_get_uids_offset(rec);
 
 		buffer_create_from_const_data(&uid_buf,
 					 CONST_PTR_OFFSET(tdata, seqset_offset),
@@ -396,7 +401,11 @@ static void mail_index_modseq_update_header(struct mail_index_modseq_sync *ctx)
 	highest_modseq = mail_transaction_log_view_get_prev_modseq(view->log_view);
 
 	ext = array_idx(&map->extensions, ext_map_idx);
-	old_modseq_hdr = MAIL_INDEX_MAP_HDR_OFFSET(map, ext->hdr_offset);
+	old_modseq_hdr = mail_index_map_get_modseq_header(map);
+	if (old_modseq_hdr == NULL) {
+		/* the header has an unexpected size, don't write past it */
+		return;
+	}
 
 	if (old_modseq_hdr->log_seq < log_seq ||
 	    (old_modseq_hdr->log_seq == log_seq &&

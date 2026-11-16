@@ -15,6 +15,7 @@
 #include "time-util.h"
 #include "master-service.h"
 
+#include "auth-secrets.h"
 #include "auth-master-private.h"
 
 /*
@@ -346,7 +347,7 @@ auth_master_handle_input(struct auth_master_connection *conn,
 	}
 
 	e_debug(conn->conn.event, "auth input: %s",
-		t_strarray_join(args, "\t"));
+		t_strarray_join(auth_client_args_hide_secrets(args), "\t"));
 
 	return auth_master_request_got_reply(&req, args[0], args + 2);
 }
@@ -682,16 +683,15 @@ static bool is_valid_string(const char *str)
 	return TRUE;
 }
 
-static const char *const *args_hide_passwords(const char *const *args)
+const char *const *auth_client_args_hide_secrets(const char *const *args)
 {
 	ARRAY_TYPE(const_string) new_args;
-	const char *p, *p2;
+	const char *value;
 	unsigned int i;
 
-	/* if there are any keys that contain "pass" string */
+	/* if there are any secret keys */
 	for (i = 0; args[i] != NULL; i++) {
-		p = strstr(args[i], "pass");
-		if (p != NULL && p < strchr(args[i], '='))
+		if (auth_field_is_secret(args[i]))
 			break;
 	}
 	if (args[i] == NULL)
@@ -701,15 +701,8 @@ static const char *const *args_hide_passwords(const char *const *args)
 	t_array_init(&new_args, i + 16);
 	array_append(&new_args, args, i);
 	for (; args[i] != NULL; i++) {
-		p = strstr(args[i], "pass");
-		p2 = strchr(args[i], '=');
-		if (p != NULL && p < p2) {
-			p = t_strconcat(t_strdup_until(args[i], p2),
-					"=<hidden>", NULL);
-			array_push_back(&new_args, &p);
-		} else {
-			array_push_back(&new_args, &args[i]);
-		}
+		value = auth_field_hide_secret(args[i]);
+		array_push_back(&new_args, &value);
 	}
 	array_append_zero(&new_args);
 	return array_front(&new_args);
@@ -827,8 +820,16 @@ auth_master_user_event_create(struct auth_master_connection *conn,
 {
 	struct event *event;
 
-	event = event_create(conn->conn.event);
-	event_drop_parent_log_prefixes(event, 1);
+	if (info == NULL || info->event_parent == NULL) {
+		event = event_create(conn->conn.event);
+		event_drop_parent_log_prefixes(event, 1);
+	} else {
+		event = event_create(info->event_parent);
+		event_add_category(event, &event_category_auth_client);
+		event_set_append_log_prefix(event, "auth-master: ");
+		event_set_forced_debug(event,
+			HAS_ALL_BITS(conn->flags, AUTH_MASTER_FLAG_DEBUG));
+	}
 	event_set_append_log_prefix(event, prefix);
 
 	if (info != NULL) {
@@ -917,7 +918,7 @@ auth_lookup_reply_callback(const struct auth_master_reply *reply,
 			e_debug(lookup->event, "auth %s input: (empty)",
 				lookup->expected_reply);
 		} else {
-			args = args_hide_passwords(args);
+			args = auth_client_args_hide_secrets(args);
 			e_debug(lookup->event, "auth %s input: %s",
 				lookup->expected_reply,
 				t_strarray_join(args, " "));
@@ -1037,7 +1038,8 @@ auth_master_pass_lookup_finished(struct auth_master_lookup *_lookup,
 			event_create_passthrough(_lookup->event)->
 			set_name("auth_client_passdb_lookup_finished");
 		e_debug(e->event(), "Finished passdb lookup (%s)",
-			t_strarray_join(fields, " "));
+			t_strarray_join(auth_client_args_hide_secrets(fields),
+					" "));
 	}
 
 	lookup->callback(lookup->context, result, fields);
@@ -1089,7 +1091,7 @@ auth_master_pass_lookup_async(struct auth_master_connection *conn,
 	req = auth_master_request(conn, "PASS", str_data(args), str_len(args),
 				  auth_lookup_reply_callback, &lookup->lookup);
 
-	auth_master_request_set_event(req, lookup->lookup.event);
+	auth_master_request_set_event_internal(req, lookup->lookup.event);
 	auth_master_request_add_destroy_callback(req,
 		auth_master_pass_lookup_destroyed, lookup);
 	lookup->lookup.req = req;
@@ -1204,7 +1206,8 @@ auth_master_user_lookup_finished(struct auth_master_lookup *_lookup,
 			event_create_passthrough(_lookup->event)->
 			set_name("auth_client_userdb_lookup_finished");
 		e_debug(e->event(), "Finished userdb lookup (username=%s %s)",
-			username, t_strarray_join(fields, " "));
+			username, t_strarray_join(
+				auth_client_args_hide_secrets(fields), " "));
 	}
 
 	lookup->callback(lookup->context, result, username, fields);
@@ -1256,7 +1259,7 @@ auth_master_user_lookup_async(struct auth_master_connection *conn,
 	req = auth_master_request(conn, "USER", str_data(args), str_len(args),
 				  auth_lookup_reply_callback, &lookup->lookup);
 
-	auth_master_request_set_event(req, lookup->lookup.event);
+	auth_master_request_set_event_internal(req, lookup->lookup.event);
 	auth_master_request_add_destroy_callback(req,
 		auth_master_user_lookup_destroyed, lookup);
 	lookup->lookup.req = req;
@@ -1378,7 +1381,7 @@ auth_master_user_list_init(struct auth_master_connection *conn,
 	ctx->req = auth_master_request(conn, "LIST",
 				       str_data(args), str_len(args),
 				       auth_user_list_reply_callback, ctx);
-	auth_master_request_set_event(ctx->req, ctx->event);
+	auth_master_request_set_event_internal(ctx->req, ctx->event);
 
 	connection_input_halt(&conn->conn);
 
@@ -1543,7 +1546,7 @@ int auth_master_cache_flush(struct auth_master_connection *conn,
 	req = auth_master_request(conn, "CACHE-FLUSH",
 				  str_data(args), str_len(args),
 				  auth_cache_flush_reply_callback, &ctx);
-	auth_master_request_set_event(req, ctx.event);
+	auth_master_request_set_event_internal(req, ctx.event);
 	(void)auth_master_request_wait(req);
 
 	if (ctx.failed)
@@ -1667,7 +1670,7 @@ int auth_master_cache_get_status(struct auth_master_connection *conn, bool reset
 	req = auth_master_request(conn, "CACHE-STATUS",
 				  str_data(args), str_len(args),
 				  auth_cache_status_reply_callback, &ctx);
-	auth_master_request_set_event(req, ctx.event);
+	auth_master_request_set_event_internal(req, ctx.event);
 	(void)auth_master_request_wait(req);
 
 	if (ctx.failed)

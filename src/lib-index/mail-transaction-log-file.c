@@ -186,11 +186,36 @@ mail_transaction_log_file_skip_to_head(struct mail_transaction_log_file *file)
 	   sync_offset from it so we don't have to read the whole log
 	   file from beginning. */
 	head_offset = map->hdr.log_file_head_offset;
+	if (head_offset > file->last_size) {
+		/* The file may have grown since it was last stat()ed */
+		struct stat st;
+
+		if (fstat(file->fd, &st) < 0) {
+			log_file_set_syscall_error(file, "fstat()");
+			return;
+		}
+		file->last_size = st.st_size;
+		if (head_offset > file->last_size) {
+			/* Corrupted index header. Don't trust the head or the
+			   tail offset, since they're beyond what can actually
+			   be synced. */
+			mail_index_set_error(log->index,
+				"%s: log_file_head_offset points outside log file",
+				log->index->filepath);
+			return;
+		}
+	}
 
 	modseq_hdr = mail_index_map_get_modseq_header(map);
 	if (head_offset < file->hdr.hdr_size) {
 		mail_index_set_error(log->index,
 				     "%s: log_file_head_offset too small",
+				     log->index->filepath);
+		file->sync_offset = file->hdr.hdr_size;
+		file->sync_highest_modseq = file->hdr.initial_modseq;
+	} else if ((head_offset % 4) != 0) {
+		mail_index_set_error(log->index,
+				     "%s: log_file_head_offset isn't 32bit aligned",
 				     log->index->filepath);
 		file->sync_offset = file->hdr.hdr_size;
 		file->sync_highest_modseq = file->hdr.initial_modseq;
@@ -209,14 +234,24 @@ mail_transaction_log_file_skip_to_head(struct mail_transaction_log_file *file)
 				     log->index->filepath);
 		file->sync_offset = file->hdr.hdr_size;
 		file->sync_highest_modseq = file->hdr.initial_modseq;
+	} else if (modseq_hdr->log_offset < file->hdr.hdr_size ||
+		   (modseq_hdr->log_offset % 4) != 0) {
+		mail_index_set_error(log->index,
+				     "%s: modseq_hdr.log_offset is invalid",
+				     log->index->filepath);
+		file->sync_offset = file->hdr.hdr_size;
+		file->sync_highest_modseq = file->hdr.initial_modseq;
 	} else {
 		/* start from where we last stopped tracking modseqs */
 		file->sync_offset = modseq_hdr->log_offset;
 		file->sync_highest_modseq = modseq_hdr->highest_modseq;
 	}
-	if (file->hdr.file_seq == log->index->map->hdr.log_file_seq) {
+	/* If tail_offset is larger than head_offset, the index header is
+	   corrupted. Don't trust it, since syncing would later assert-crash
+	   when it's beyond what was actually synced. */
+	if (map->hdr.log_file_tail_offset <= head_offset) {
 		file->last_read_hdr_tail_offset =
-			log->index->map->hdr.log_file_tail_offset;
+			map->hdr.log_file_tail_offset;
 	}
 	if (file->last_read_hdr_tail_offset > file->max_tail_offset)
 		file->max_tail_offset = file->last_read_hdr_tail_offset;
@@ -291,6 +326,13 @@ mail_transaction_log_init_hdr(struct mail_transaction_log *log,
 			mail_index_map_modseq_get_highest(index->map);
 	} else {
 		hdr->file_seq = 1;
+	}
+	if (hdr->prev_file_seq > MAIL_TRANSACTION_LOG_MAX_FILE_SEQ) {
+		/* The index's log_file_seq must have been corrupted. Start
+		   from the beginning, unless there are existing log files. */
+		hdr->file_seq = 1;
+		hdr->prev_file_seq = 0;
+		hdr->prev_file_offset = 0;
 	}
 	if (hdr->initial_modseq == 0) {
 		/* modseq tracking in log files is required for many reasons
@@ -592,11 +634,29 @@ mail_transaction_log_file_read_hdr(struct mail_transaction_log_file *file,
 			"Header size too small");
 		return 0;
 	}
+	if ((file->hdr.hdr_size % 4) != 0) {
+		/* Transactions are always 32bit aligned */
+		mail_transaction_log_file_set_corrupted(file,
+			"Header size isn't 32bit aligned (%u)",
+			file->hdr.hdr_size);
+		return 0;
+	}
 	if (file->hdr.hdr_size < sizeof(file->hdr)) {
 		/* @UNSAFE: smaller than we expected - zero out the fields we
 		   shouldn't have filled */
 		memset(PTR_OFFSET(&file->hdr, file->hdr.hdr_size), 0,
 		       sizeof(file->hdr) - file->hdr.hdr_size);
+	}
+	if (file->hdr.file_seq == 0 ||
+	    file->hdr.file_seq > MAIL_TRANSACTION_LOG_MAX_FILE_SEQ) {
+		mail_transaction_log_file_set_corrupted(file,
+			"Invalid file_seq=%u", file->hdr.file_seq);
+		return 0;
+	}
+	if (file->hdr.prev_file_seq > MAIL_TRANSACTION_LOG_MAX_FILE_SEQ) {
+		mail_transaction_log_file_set_corrupted(file,
+			"Invalid prev_file_seq=%u", file->hdr.prev_file_seq);
+		return 0;
 	}
 
 	if (file->hdr.indexid == 0) {
@@ -708,7 +768,7 @@ static void log_write_ext_hdr_init_data(struct mail_index *index, buffer_t *buf)
 	hdr->type = MAIL_TRANSACTION_EXT_INTRO;
 
 	intro = buffer_append_space_unsafe(buf, sizeof(*intro));
-	intro->ext_id = (uint32_t)-1;
+	intro->ext_id = UINT32_MAX;
 	intro->hdr_size = rext->hdr_size;
 	intro->record_size = rext->record_size;
 	intro->record_align = rext->record_align;
@@ -1081,6 +1141,14 @@ flag_updates_have_non_internal(const struct mail_transaction_flag_update *u,
 	return FALSE;
 }
 
+static void modseq_increase(uint64_t *modseq)
+{
+	/* Don't wrap a corrupted modseq to 0, which would mean that modseqs
+	   aren't tracked. */
+	if (*modseq < UINT64_MAX)
+		*modseq += 1;
+}
+
 void mail_transaction_update_modseq(const struct mail_transaction_header *hdr,
 				    const void *data, uint64_t *cur_modseq,
 				    unsigned int version)
@@ -1125,7 +1193,7 @@ void mail_transaction_update_modseq(const struct mail_transaction_header *hdr,
 	case MAIL_TRANSACTION_KEYWORD_RESET:
 	case MAIL_TRANSACTION_ATTRIBUTE_UPDATE:
 		/* these changes increase modseq */
-		*cur_modseq += 1;
+		modseq_increase(cur_modseq);
 		break;
 	case MAIL_TRANSACTION_FLAG_UPDATE: {
 		const struct mail_transaction_flag_update *rec = data;
@@ -1133,7 +1201,7 @@ void mail_transaction_update_modseq(const struct mail_transaction_header *hdr,
 
 		count = (trans_size - sizeof(*hdr)) / sizeof(*rec);
 		if (flag_updates_have_non_internal(rec, count, version))
-			*cur_modseq += 1;
+			modseq_increase(cur_modseq);
 		break;
 	}
 	case MAIL_TRANSACTION_MODSEQ_UPDATE: {

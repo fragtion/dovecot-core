@@ -3,6 +3,7 @@
 #include "lib.h"
 #include "array.h"
 #include "bsearch-insert-pos.h"
+#include "byteorder.h"
 #include "istream.h"
 #include "ostream.h"
 #include "file-lock.h"
@@ -496,6 +497,12 @@ mail_index_strmap_read_rec_first(struct mail_index_strmap_read_context *ctx,
 	if (i_stream_read_bytes(ctx->view->strmap->input, &ctx->data, &size, ctx->rec_size) <= 0)
 		return -1;
 	ctx->str_idx_base = ctx->data + count * sizeof(uint32_t);
+	for (i = 0; i < count; i++) {
+		/* string indexes start from 1 */
+		if (cpu32_to_cpu_unaligned(ctx->str_idx_base +
+					   i * sizeof(uint32_t)) == 0)
+			return -1;
+	}
 
 	if (ret == 0) {
 		/* this message has already been expunged, ignore it.
@@ -597,7 +604,7 @@ strmap_read_block_init(struct mail_index_strmap_view *view,
 
 	/* FIXME: when reading multiple blocks we shouldn't have to calculate
 	   this every time */
-	if (!mail_index_lookup_seq_range(view->view, ctx->rec.uid, (uint32_t)-1,
+	if (!mail_index_lookup_seq_range(view->view, ctx->rec.uid, UINT32_MAX,
 					 &seq1, &seq2))
 		seq1 = mail_index_view_get_messages_count(view->view) + 1;
 	ctx->uid_lookup_seq = seq1;

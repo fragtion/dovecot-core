@@ -6,14 +6,13 @@
 #include "smtp-address.h"
 #include "smtp-reply.h"
 
+#include "smtp-client-settings.h"
+
 struct smtp_client;
 struct smtp_client_request;
 
-#define SMTP_DEFAULT_CONNECT_TIMEOUT_MSECS (1000*30)
-#define SMTP_DEFAULT_COMMAND_TIMEOUT_MSECS (1000*60*5)
-#define SMTP_DEFAULT_MAX_REPLY_SIZE (SIZE_MAX)
-#define SMTP_DEFAULT_MAX_DATA_CHUNK_SIZE NET_BLOCK_SIZE
-#define SMTP_DEFAULT_MAX_DATA_CHUNK_PIPELINE 4
+struct dns_client;
+struct ssl_iostream_settings;
 
 enum smtp_client_command_error {
 	/* Server closed the connection */
@@ -46,82 +45,62 @@ struct smtp_client_capability_extra {
 	const char *const *rcpt_param_extensions;
 };
 
-struct smtp_client_settings {
-	struct ip_addr my_ip;
-	const char *my_hostname;
-	const char *temp_path_prefix;
-
+struct smtp_client_parameters {
 	/* Capabilities that are assumed to be enabled no matter whether the
 	   server indicates support. */
 	enum smtp_capability forced_capabilities;
+	/* Capabilities that are disabled no matter whether the server indicates
+	   support. */
+	enum smtp_capability disabled_capabilities;
 	/* Record these extra capabilities if returned in the EHLO response */
 	const char *const *extra_capabilities;
-
-	struct dns_client *dns_client;
-
-	/* SSL settings; if NULL, settings_get() is used automatically */
-	const struct ssl_iostream_settings *ssl;
-	bool ssl_allow_invalid_cert;
-
-	const char *master_user;
-	const char *username;
-	const char *password;
-	/* Space-separated list of SASL mechanisms to try (in the specified
-	   order). The default is to use only SASL PLAIN. */
-	const char *sasl_mechanisms;
-
-	const char *rawlog_dir;
-
-	/* Timeout for SMTP commands. Reset every time more data is being
-	   sent or received.
-	   (default = 5 minutes) */
-	unsigned int command_timeout_msecs;
-	/* Timeout for connecting (DNS lookup, TCP connect, TLS handshake).
-	   (default = 30 seconds) */
-	unsigned int connect_timeout_msecs;
-
-	/* Max total size of reply */
-	size_t max_reply_size;
-
-	/* Maximum BDAT chunk size for the CHUNKING capability */
-	uoff_t max_data_chunk_size;
-	/* Maximum pipelined BDAT commands */
-	unsigned int max_data_chunk_pipeline;
 
 	/* if remote server supports XCLIENT capability,
 	   send this data */
 	struct smtp_proxy_data proxy_data;
 
-	/* the kernel send/receive buffer sizes used for the connection sockets.
-	   Configuring this is mainly useful for the test suite. The kernel
-	   defaults are used when these settings are 0. */
-	size_t socket_send_buffer_size;
-	size_t socket_recv_buffer_size;
-
-	/* Event to use as the parent for the smtp client/connection event. For
-	   specific transactions this can be overridden with
-	   smtp_client_transaction_set_event(). */
-	struct event *event_parent;
-
-	/* enable logging debug messages */
-	bool debug;
-	/* peer is trusted, so e.g. attempt sending XCLIENT data */
-	bool peer_trusted;
 	/* defer sending XCLIENT command until authentication or first mail
 	   transaction. */
 	bool xclient_defer;
-	/* don't clear password after first successful authentication */
-	bool remember_password;
 	/* sending even broken MAIL command path (otherwise a broken address
 	   is sent as <>) */
 	bool mail_send_broken_path;
 	/* Yield verbose user-visible errors for commands and connections that
 	   failed locally. */
 	bool verbose_user_errors;
+
+	/* Settings overrides:
+	   When assigned, these values take precedence over the related
+	   settings. See smtp-client-settings.h for detailed descriptions.
+	 */
+	struct {
+		const char *host;
+		struct ip_addr host_ip;
+		in_port_t port;
+		enum smtp_client_connection_ssl_mode ssl_mode;
+
+		struct ip_addr source_ip;
+
+		/* Timeout for SMTP commands. */
+		unsigned int command_timeout_msecs;
+		/* Timeout for connecting */
+		unsigned int connect_timeout_msecs;
+
+		/* peer is not trusted */
+		bool peer_not_trusted;
+	} overrides;
 };
 
-struct smtp_client *smtp_client_init(const struct smtp_client_settings *set);
+struct smtp_client *smtp_client_init(struct event *event_parent);
 void smtp_client_deinit(struct smtp_client **_client);
+
+/* Specify the SSL settings. By default lib-ssl-iostream automatically looks
+   them up from settings. */
+void smtp_client_set_ssl_settings(struct smtp_client *client,
+				  const struct ssl_iostream_settings *ssl);
+/* Do all lookups using the specified DNS client. */
+void smtp_client_set_dns_client(struct smtp_client *client,
+				struct dns_client *dns_client);
 
 void smtp_client_switch_ioloop(struct smtp_client *client);
 

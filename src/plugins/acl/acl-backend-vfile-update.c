@@ -9,8 +9,11 @@
 #include "file-dotlock.h"
 #include "ostream.h"
 #include "mail-storage.h"
+#include "acl-plugin.h"
 #include "acl-cache.h"
+#include "acl-lookup-dict.h"
 #include "acl-backend-vfile.h"
+#include "acl-rights-cache.h"
 
 #include <utime.h>
 #include <sys/stat.h>
@@ -181,7 +184,7 @@ acl_backend_vfile_update_write(struct acl_object *aclobj,
 
 static void acl_backend_vfile_update_cache(struct acl_object *_aclobj, int fd)
 {
-	struct acl_backend_vfile_validity *validity;
+	struct acl_backend_vfile_validity *old_validity, validity;
 	struct stat st;
 
 	if (fstat(fd, &st) < 0) {
@@ -190,12 +193,20 @@ static void acl_backend_vfile_update_cache(struct acl_object *_aclobj, int fd)
 		return;
 	}
 
-	validity = acl_cache_get_validity(_aclobj->backend->cache,
-					  _aclobj->name);
-	i_assert(validity != NULL);
-	validity->local_validity.last_read_time = ioloop_time;
-	validity->local_validity.last_mtime = st.st_mtime;
-	validity->local_validity.last_size = st.st_size;
+	/* the cache entry may not exist - the mask rebuild flushes it and
+	   re-adds it only when some of the rights match the current user */
+	old_validity = acl_cache_get_validity(_aclobj->backend->cache,
+					      _aclobj->name);
+	if (old_validity != NULL)
+		validity = *old_validity;
+	else
+		i_zero(&validity);
+	validity.local_validity.last_read_time = ioloop_time;
+	validity.local_validity.last_mtime = st.st_mtime;
+	validity.local_validity.last_mtime_usecs = ST_MTIME_NSEC(st) / 1000;
+	validity.local_validity.last_size = st.st_size;
+	acl_cache_set_validity(_aclobj->backend->cache, _aclobj->name,
+			       &validity);
 }
 
 int acl_backend_vfile_object_update(struct acl_object *_aclobj,
@@ -253,16 +264,65 @@ int acl_backend_vfile_object_update(struct acl_object *_aclobj,
 		if (utime(path, &ut) < 0)
 			e_error(event, "utime(%s) failed: %m", path);
 	}
+	/* The mask in the process-wide ACL cache was rebuilt from the file
+	   as it was before this update. Rebuild it from the updated rights,
+	   so this process sees its own change also while the cached validity
+	   is still within acl_cache_ttl. The rebuild flushes the cached
+	   validity, so update it afterwards. */
+	acl_object_rebuild_cache(_aclobj);
 	acl_backend_vfile_update_cache(_aclobj, fd);
 	if (file_dotlock_replace(&dotlock, 0) < 0) {
 		acl_cache_flush(_aclobj->backend->cache, _aclobj->name);
 		return -1;
 	}
-	/* make sure dovecot-acl-list gets updated if we changed any
-	   lookup rights. */
-	if (acl_rights_has_nonowner_lookup_changes(&update->rights) ||
-	    update->modify_mode == ACL_MODIFY_MODE_REPLACE ||
-	    update->modify_mode == ACL_MODIFY_MODE_CLEAR)
-		(void)acl_backend_vfile_acllist_rebuild(backend);
+
+	struct timeval mtime;
+	if (acl_backend_vfile_object_get_mtime(_aclobj, &mtime) < 0)
+		return -1;
+
+	/* The ACL file itself was already updated successfully, a cache
+	   update failure (lock timeout, write error) must not fail the whole
+	   update. It is logged and the cache keeps the pre-update rights.
+	   The dict rebuild below gets the shared mailboxes from the cache but
+	   their rights from the ACL files: a change to an already shared
+	   mailbox still reaches the dict, a mailbox's first share only once
+	   the owner reads this mailbox's ACL file again and finds its mtime
+	   different from the cached one, which brings the cache up to date.
+	   If the ACL file got the same mtime as the cached entry (two
+	   writes within one timestamp tick, a filesystem without
+	   sub-second timestamps, or an update with last_change, whose
+	   mtime has whole seconds), the read doesn't notice the
+	   difference.
+	   The next ACL change doesn't either: it is applied to the stale
+	   cached rights, and the entry gets the new mtime. The entry stays
+	   wrong until a full rebuild (doveadm acl recalc), or until the ACL
+	   file is changed without updating the cache. */
+	int cache_ret = acl_rights_cache_file_update(
+		_aclobj->backend->rights_cache_file, update, _aclobj->name,
+		acl_object_has_global_nonowner_lookup(_aclobj), &mtime);
+	if (cache_ret == 0) {
+		/* There is no cache file yet - create it with a full
+		   rebuild. The chained ACL lookup dict rebuild only runs
+		   when the rebuilt cache contains nonowner lookup rights.
+
+		   In a shared namespace nothing is rebuilt: the owner's cache
+		   is only ever created by the owner's own session. A reshare
+		   made while the owner has no cache reaches the dict when the
+		   owner's next ACL check creates it - the dict rebuild gets
+		   the owner's ids from that cache, so running it here would
+		   not help. */
+		(void)acl_rights_cache_rebuild(backend);
+	} else if (acl_rights_has_nonowner_lookup_changes(&update->rights) ||
+		   update->modify_mode == ACL_MODIFY_MODE_REPLACE ||
+		   update->modify_mode == ACL_MODIFY_MODE_CLEAR) {
+		/* make sure the ACL lookup dict gets updated if we changed
+		   any lookup rights. */
+		struct acl_user *auser = ACL_USER_CONTEXT(
+			mailbox_list_get_user(_aclobj->backend->list));
+		if (auser != NULL) {
+			(void)acl_lookup_dict_rebuild(auser->acl_lookup_dict,
+				_aclobj->backend->set->acl_dict_index);
+		}
+	}
 	return 0;
 }

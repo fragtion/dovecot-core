@@ -179,6 +179,7 @@ static int proxy_write_login(struct imap_client *client, string_t *str)
 			LOGIN_PROXY_FAILURE_TYPE_INTERNAL, reason);
 		return -1;
 	}
+	login_proxy_sasl_enable_channel_binding(&client->common);
 	mech_name = dsasl_client_session_get_mech_name(
 		client->common.proxy_sasl_session);
 
@@ -443,6 +444,8 @@ int imap_proxy_parse_line(struct client *client, const char *line)
 		o_stream_nsend(output, str_data(str), str_len(str));
 		return 1;
 	} else if (imap_reply_begins(line, "L OK", &suffix)) {
+		if (login_proxy_sasl_verify_success(client) < 0)
+			return -1;
 		/* Login successful. Send this line to client. */
 		imap_client->proxy_sent_state &= ENUM_NEGATE(IMAP_PROXY_SENT_STATE_LOGIN);
 		imap_client->proxy_rcvd_state = IMAP_PROXY_RCVD_STATE_LOGIN;
@@ -695,6 +698,7 @@ proxy_side_cmd_compress(struct client *client, const char *const *args,
 	login_proxy_replace_client_iostream_post(client->login_proxy,
 		handler->create_istream(client->input),
 		handler->create_ostream_auto(client->output, client->event));
+	login_proxy_set_compression(client->login_proxy, handler->name);
 	return 0;
 }
 

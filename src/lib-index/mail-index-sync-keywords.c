@@ -98,7 +98,7 @@ static void keywords_ext_register(struct mail_index_sync_map_ctx *ctx,
 	}
 	u->record_align = 1;
 
-	if (ext_map_idx == (uint32_t)-1) {
+	if (ext_map_idx == UINT32_MAX) {
 		u->name_size = strlen(MAIL_INDEX_EXT_KEYWORDS);
 		buffer_append(&ext_intro_buf, MAIL_INDEX_EXT_KEYWORDS,
 			      u->name_size);
@@ -130,7 +130,7 @@ keywords_header_add(struct mail_index_sync_map_ctx *ctx,
 
 	if (!mail_index_map_lookup_ext(map, MAIL_INDEX_EXT_KEYWORDS,
 				       &ext_map_idx))
-		ext_map_idx = (uint32_t)-1;
+		ext_map_idx = UINT32_MAX;
 	else {
 		/* update existing header */
 		ext = array_idx(&map->extensions, ext_map_idx);
@@ -254,22 +254,13 @@ int mail_index_sync_keywords(struct mail_index_sync_map_ctx *ctx,
 	struct mail_index_view *view = ctx->view;
 	const char *keyword_name;
 	const struct mail_index_ext *ext;
-	const uint32_t *uid, *end;
-	uint32_t seqset_offset, ext_map_idx;
-	unsigned int keyword_idx;
+	const struct seq_range *uids;
+	uint32_t ext_map_idx;
+	unsigned int i, count, keyword_idx;
 	int ret;
 
-	i_assert(rec->name_size > 0);
-
-	seqset_offset = sizeof(*rec) + rec->name_size;
-	if ((seqset_offset % 4) != 0)
-		seqset_offset += 4 - (seqset_offset % 4);
-	i_assert(seqset_offset < hdr->size);
-
-	uid = CONST_PTR_OFFSET(rec, seqset_offset);
-	end = CONST_PTR_OFFSET(rec, hdr->size);
-
-	keyword_name = t_strndup(rec + 1, rec->name_size);
+	uids = mail_transaction_keyword_update_get_uids(rec, hdr->size, &count);
+	keyword_name = mail_transaction_keyword_update_get_name(rec);
 	if (!keyword_lookup(ctx, keyword_name, &keyword_idx))
 		keywords_header_add(ctx, keyword_name, &keyword_idx);
 
@@ -298,14 +289,12 @@ int mail_index_sync_keywords(struct mail_index_sync_map_ctx *ctx,
 		ext = array_idx(&view->map->extensions, ext_map_idx);
 	}
 
-	while (uid+2 <= end) {
+	for (i = 0; i < count; i++) {
 		ret = keywords_update_records(ctx, ext, keyword_idx,
 					      rec->modify_type,
-					      uid[0], uid[1]);
+					      uids[i].seq1, uids[i].seq2);
 		if (ret <= 0)
 			return ret;
-
-		uid += 2;
 	}
 
 	return 1;

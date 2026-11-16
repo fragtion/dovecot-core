@@ -148,6 +148,8 @@ static void i_stream_chain_read_next(struct chain_istream *cstream)
 			i_stream_memarea_detach(&cstream->istream);
 		memcpy(i_stream_alloc(&cstream->istream, data_size),
 		       data, data_size);
+		/* i_stream_alloc() changes buffer only if it reallocates. */
+		cstream->istream.buffer = cstream->istream.w_buffer;
 		cstream->istream.pos += data_size;
 		cstream->prev_stream_left += data_size;
 	}
@@ -294,9 +296,11 @@ static struct istream_snapshot *
 i_stream_chain_snapshot(struct istream_private *stream,
 			struct istream_snapshot *prev_snapshot)
 {
-	if (stream->buffer == stream->w_buffer) {
+	if (stream->w_buffer != NULL && stream->buffer >= stream->w_buffer &&
+	    stream->buffer < stream->w_buffer + stream->buffer_size) {
 		/* Two or more istreams have been combined. Snapshot the
-		   w_buffer's contents that contains their data. */
+		   w_buffer's contents that contains their data. The buffer
+		   may point inside w_buffer after skipping. */
 		i_assert(stream->memarea != NULL);
 		return i_stream_default_snapshot(stream, prev_snapshot);
 	}

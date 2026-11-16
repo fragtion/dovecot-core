@@ -61,6 +61,8 @@ const struct setting_keyvalue submission_service_settings_defaults[] = {
 	SETTING_DEFINE_STRUCT_##type(#name, name, struct submission_settings)
 
 static const struct setting_define submission_setting_defines[] = {
+	{ .type = SET_FILTER_NAME, .key = SUBMISSION_RELAY_SETTINGS_FILTER },
+
 	DEF(BOOL, verbose_proctitle),
 	DEF(PATH_DIR, rawlog_dir),
 
@@ -80,22 +82,7 @@ static const struct setting_define submission_setting_defines[] = {
 
 	DEF(BOOLLIST, submission_backend_capabilities),
 
-	DEF(STR, submission_relay_host),
-	DEF(IN_PORT, submission_relay_port),
-	DEF(BOOL, submission_relay_trusted),
-
-	DEF(STR, submission_relay_user),
-	DEF(STR, submission_relay_master_user),
-	DEF(STR, submission_relay_password),
-
-	DEF(ENUM, submission_relay_ssl),
-	DEF(BOOL, submission_relay_ssl_verify),
-
-	DEF(PATH_DIR, submission_relay_rawlog_dir),
-	DEF(TIME, submission_relay_max_idle_time),
-
-	DEF(TIME_MSECS, submission_relay_connect_timeout),
-	DEF(TIME_MSECS, submission_relay_command_timeout),
+	DEF(TIME_HIDDEN, submission_relay_max_idle_time),
 
 	DEF(STR, imap_urlauth_host),
 	DEF(IN_PORT, imap_urlauth_port),
@@ -123,22 +110,7 @@ static const struct submission_settings submission_default_settings = {
 
 	.submission_backend_capabilities = ARRAY_INIT,
 
-	.submission_relay_host = "",
-	.submission_relay_port = 25,
-	.submission_relay_trusted = FALSE,
-
-	.submission_relay_user = "",
-	.submission_relay_master_user = "",
-	.submission_relay_password = "",
-
-	.submission_relay_ssl = "no:smtps:starttls",
-	.submission_relay_ssl_verify = TRUE,
-
-	.submission_relay_rawlog_dir = "",
 	.submission_relay_max_idle_time = 60*29,
-
-	.submission_relay_connect_timeout = 30*1000,
-	.submission_relay_command_timeout = 60*5*1000,
 
 	.imap_urlauth_host = "",
 	.imap_urlauth_port = 143,
@@ -148,6 +120,9 @@ static const struct setting_keyvalue submission_default_settings_keyvalue[] = {
 #ifdef DOVECOT_PRO_EDITION
 	{ "service/submission/process_shutdown_filter", "event=mail_user_session_finished AND rss > 20MB" },
 #endif
+	{ "submission_relay/smtp_client_port", "25" },
+	{ "submission_relay/smtp_client_connect_timeout", "30s" },
+	{ "submission_relay/smtp_client_command_timeout", "5min" },
 	{ NULL, NULL },
 };
 
@@ -228,10 +203,6 @@ submission_settings_verify(void *_set, pool_t pool ATTR_UNUSED, const char **err
 		return FALSE;
 
 #ifndef CONFIG_BINARY
-	if (set->submission_relay_max_idle_time == 0) {
-		*error_r = "submission_relay_max_idle_time must not be 0";
-		return FALSE;
-	}
 	if (set->submission_max_recipients == 0) {
 		*error_r = "submission_max_recipients must not be 0";
 		return FALSE;

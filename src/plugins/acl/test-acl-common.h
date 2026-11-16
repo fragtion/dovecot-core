@@ -30,7 +30,17 @@ void test_acl_common_deinit(void);
    from within a test function so that the teardown happens before the test
    framework removes the test directory. */
 void test_acl_user_init(const char *const *extra_input);
+/* Like test_acl_user_init(), but with the given mail driver instead of
+   maildir. */
+void test_acl_user_init_driver(const char *driver,
+			       const char *const *extra_input);
+/* Like test_acl_user_init(), but also installs the mailbox_list_created hook,
+   so that mailbox operations go through the ACL plugin's list vfuncs. */
+void test_acl_user_init_list_hooks(const char *const *extra_input);
 void test_acl_user_deinit(void);
+/* Makes the user's storage look like one that has a mailbox's files locally
+   only while the mailbox is open (MAIL_STORAGE_CLASS_FLAG_CACHED_FILES). */
+void test_acl_storage_set_cached_files(void);
 
 /* Creates the mailbox unless it already exists. */
 void test_acl_mailbox_create(const char *name);

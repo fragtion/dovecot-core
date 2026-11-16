@@ -23,11 +23,17 @@ struct mail_index_sync_ctx {
 
 	ARRAY(struct mail_index_sync_list) sync_list;
 	uint32_t next_uid;
+	/* the log position up to which this sync handles the changes */
+	uint32_t log_end_seq;
+	uoff_t log_end_offset;
 
 	bool no_warning:1;
 	bool seen_external_expunges:1;
 	bool seen_nonexternal_transactions:1;
 	bool fully_synced:1;
+	/* MAIL_INDEX_SYNC_FLAG_STOP_AT_OFFSET stopped the sync before the
+	   transaction log head */
+	bool stopped_before_head:1;
 };
 
 static void mail_index_sync_add_expunge(struct mail_index_sync_ctx *ctx)
@@ -79,25 +85,19 @@ static void mail_index_sync_add_keyword_update(struct mail_index_sync_ctx *ctx)
 	const struct mail_transaction_keyword_update *u = ctx->data;
 	const char *keyword_names[2];
 	struct mail_keywords *keywords;
-	const uint32_t *uids;
+	const struct seq_range *uids;
+	unsigned int i, count;
 	uint32_t uid;
-	size_t uidset_offset, i, size;
 
-	i_assert(u->name_size > 0);
-
-	uidset_offset = sizeof(*u) + u->name_size;
-	if ((uidset_offset % 4) != 0)
-		uidset_offset += 4 - (uidset_offset % 4);
-	uids = CONST_PTR_OFFSET(u, uidset_offset);
-
-	keyword_names[0] = t_strndup(u + 1, u->name_size);
+	uids = mail_transaction_keyword_update_get_uids(u, ctx->hdr->size,
+							&count);
+	keyword_names[0] = mail_transaction_keyword_update_get_name(u);
 	keyword_names[1] = NULL;
 	keywords = mail_index_keywords_create(ctx->index, keyword_names);
 
-	size = (ctx->hdr->size - uidset_offset) / sizeof(uint32_t);
-	for (i = 0; i < size; i += 2) {
+	for (i = 0; i < count; i++) {
 		/* FIXME: mail_index_update_keywords_range() */
-		for (uid = uids[i]; uid <= uids[i+1]; uid++) {
+		for (uid = uids[i].seq1; uid <= uids[i].seq2; uid++) {
 			mail_index_update_keywords(ctx->sync_trans, uid,
 						   u->modify_type, keywords);
 		}
@@ -263,7 +263,7 @@ mail_index_need_sync(struct mail_index *index, enum mail_index_sync_flags flags,
 	    (index->flags & MAIL_INDEX_OPEN_FLAG_NO_DIRTY) == 0)
 		return TRUE;
 
-	if (log_file_seq == (uint32_t)-1) {
+	if (log_file_seq == UINT32_MAX) {
 		/* we want to sync up to transaction log's head */
 		mail_transaction_log_get_head(index->log,
 					      &log_file_seq, &log_file_offset);
@@ -282,28 +282,46 @@ mail_index_need_sync(struct mail_index *index, enum mail_index_sync_flags flags,
 }
 
 static int
-mail_index_sync_set_log_view(struct mail_index_view *view,
-			     uint32_t start_file_seq, uoff_t start_file_offset)
+mail_index_sync_set_log_view(struct mail_index_sync_ctx *ctx,
+			     uint32_t start_file_seq, uoff_t start_file_offset,
+			     uint32_t end_file_seq, uoff_t end_file_offset)
 {
-	uint32_t log_seq;
-	uoff_t log_offset;
+	uint32_t head_file_seq;
+	uoff_t head_file_offset;
 	const char *reason;
 	bool reset;
 	int ret;
 
-	mail_transaction_log_get_head(view->index->log, &log_seq, &log_offset);
+	mail_transaction_log_get_head(ctx->index->log,
+				      &head_file_seq, &head_file_offset);
+	if (end_file_seq == UINT32_MAX) {
+		end_file_seq = head_file_seq;
+		end_file_offset = head_file_offset;
+	} else if (end_file_seq < start_file_seq ||
+		   (end_file_seq == start_file_seq &&
+		    end_file_offset < start_file_offset)) {
+		/* already synced beyond the end position */
+		end_file_seq = start_file_seq;
+		end_file_offset = start_file_offset;
+	}
+	ctx->stopped_before_head = end_file_seq < head_file_seq ||
+		(end_file_seq == head_file_seq &&
+		 end_file_offset < head_file_offset);
+	ctx->log_end_seq = end_file_seq;
+	ctx->log_end_offset = end_file_offset;
 
-	ret = mail_transaction_log_view_set(view->log_view,
+	ret = mail_transaction_log_view_set(ctx->view->log_view,
                                             start_file_seq, start_file_offset,
-					    log_seq, log_offset, &reset, &reason);
+					    end_file_seq, end_file_offset,
+					    &reset, &reason);
 	if (ret < 0)
 		return -1;
 	if (ret == 0) {
 		/* either corrupted or the file was deleted for
 		   some reason. either way, we can't go forward */
-		mail_index_set_error(view->index,
+		mail_index_set_error(ctx->index,
 			"Unexpected transaction log desync with index %s: %s",
-			view->index->filepath, reason);
+			ctx->index->filepath, reason);
 		return 0;
 	}
 	return 1;
@@ -318,10 +336,33 @@ int mail_index_sync_begin(struct mail_index *index,
 	int ret;
 
 	ret = mail_index_sync_begin_to(index, ctx_r, view_r, trans_r,
-				       (uint32_t)-1, UOFF_T_MAX, flags);
+				       UINT32_MAX, UOFF_T_MAX, flags);
 	i_assert(ret != 0 ||
 		 (flags & MAIL_INDEX_SYNC_FLAG_REQUIRE_CHANGES) != 0);
 	return ret;
+}
+
+/* Returns TRUE if the sync can stop at the given log position. The index
+   header can't point to an older log file than the head, so the position must
+   stay in the head file. */
+static bool
+mail_index_sync_can_stop_at(struct mail_index *index,
+			    uint32_t log_file_seq, uoff_t log_file_offset)
+{
+	const struct mail_transaction_log_file *head = index->log->head;
+
+	if (log_file_seq != head->hdr.file_seq) {
+		/* the log was rotated after the position was read */
+		return FALSE;
+	}
+	if (log_file_offset == head->sync_offset) {
+		/* stopping at the head, so the log can be rotated if needed */
+		return TRUE;
+	}
+	/* If the log has a partially written transaction at the end, it has
+	   to be rotated before anything can be appended to it. The stop
+	   position would then be in the old log file. */
+	return !mail_transaction_log_rotate_is_pending(index->log);
 }
 
 static int
@@ -332,12 +373,18 @@ mail_index_sync_begin_init(struct mail_index *index,
 	const struct mail_index_header *hdr;
 	uint32_t seq;
 	uoff_t offset;
+	bool read_only = (flags & MAIL_INDEX_SYNC_FLAG_READ_ONLY) != 0;
 	bool locked = FALSE;
 	int ret;
 
+	/* UPDATE_TAIL_OFFSET would mark the changes after the stop position
+	   synced */
+	i_assert((flags & MAIL_INDEX_SYNC_FLAG_STOP_AT_OFFSET) == 0 ||
+		 (flags & MAIL_INDEX_SYNC_FLAG_UPDATE_TAIL_OFFSET) == 0);
+
 	/* if we require changes, don't lock transaction log yet. first check
 	   if there's anything to sync. */
-	if ((flags & MAIL_INDEX_SYNC_FLAG_REQUIRE_CHANGES) == 0) {
+	if ((flags & MAIL_INDEX_SYNC_FLAG_REQUIRE_CHANGES) == 0 && !read_only) {
 		if (mail_transaction_log_sync_lock(index->log, "syncing",
 						   &seq, &offset) < 0)
 			return -1;
@@ -367,6 +414,14 @@ mail_index_sync_begin_init(struct mail_index *index,
 	}
 
 	if (locked) {
+		if ((flags & MAIL_INDEX_SYNC_FLAG_STOP_AT_OFFSET) != 0 &&
+		    !mail_index_sync_can_stop_at(index, log_file_seq,
+						 log_file_offset)) {
+			/* the caller needs to sync up to the head instead */
+			mail_transaction_log_sync_unlock(index->log,
+				"can't stop syncing at the given position");
+			return 0;
+		}
 		/* If the log has a partially written transaction at the end,
 		   it can't be appended to. Rotate it now, before anything
 		   tries to write to it. */
@@ -377,6 +432,8 @@ mail_index_sync_begin_init(struct mail_index *index,
 		}
 		seq = index->log->head->hdr.file_seq;
 		offset = index->log->head->sync_offset;
+	} else if (read_only) {
+		mail_transaction_log_get_head(index->log, &seq, &offset);
 	}
 
 	if (!mail_index_need_sync(index, flags, log_file_seq, log_file_offset) &&
@@ -386,7 +443,7 @@ mail_index_sync_begin_init(struct mail_index *index,
 		return 0;
 	}
 
-	if (!locked) {
+	if (!locked && !read_only) {
 		/* it looks like we have something to sync. lock the file and
 		   check again. */
 		flags &= ENUM_NEGATE(MAIL_INDEX_SYNC_FLAG_REQUIRE_CHANGES);
@@ -410,7 +467,10 @@ mail_index_sync_begin_init(struct mail_index *index,
 		mail_index_set_error(index,
 			"broken sync positions in index file %s",
 			index->filepath);
-		mail_index_fsck_locked(index);
+		if (locked)
+			mail_index_fsck_locked(index);
+		else if (mail_index_fsck(index) < 0)
+			return -1;
 	}
 	return 1;
 }
@@ -439,7 +499,9 @@ mail_index_sync_begin_to2(struct mail_index *index,
 		return -1;
 	}
 
-	if (log_file_seq != (uint32_t)-1)
+	if ((flags & MAIL_INDEX_SYNC_FLAG_STOP_AT_OFFSET) != 0)
+		i_assert(log_file_seq != UINT32_MAX);
+	else if (log_file_seq != UINT32_MAX)
 		flags |= MAIL_INDEX_SYNC_FLAG_REQUIRE_CHANGES;
 
 	T_BEGIN {
@@ -466,9 +528,14 @@ mail_index_sync_begin_to2(struct mail_index *index,
 	index->syncing = TRUE;
 
 	/* we wish to see all the changes from last mailbox sync position to
-	   the end of the transaction log */
-	ret = mail_index_sync_set_log_view(ctx->view, hdr->log_file_seq,
-					   hdr->log_file_tail_offset);
+	   the end of the transaction log (or to the requested position) */
+	if ((flags & MAIL_INDEX_SYNC_FLAG_STOP_AT_OFFSET) == 0) {
+		log_file_seq = UINT32_MAX;
+		log_file_offset = 0;
+	}
+	ret = mail_index_sync_set_log_view(ctx, hdr->log_file_seq,
+					   hdr->log_file_tail_offset,
+					   log_file_seq, log_file_offset);
 	if (ret < 0) {
                 mail_index_sync_rollback(&ctx);
 		return -1;
@@ -476,7 +543,12 @@ mail_index_sync_begin_to2(struct mail_index *index,
 	if (ret == 0) {
 		/* if a log file is missing, there's nothing we can do except
 		   to skip over it. fix the problem with fsck and try again. */
-		mail_index_fsck_locked(index);
+		if ((flags & MAIL_INDEX_SYNC_FLAG_READ_ONLY) == 0)
+			mail_index_fsck_locked(index);
+		else if (mail_index_fsck(index) < 0) {
+			mail_index_sync_rollback(&ctx);
+			return -1;
+		}
 		mail_index_sync_rollback(&ctx);
 		*retry_r = TRUE;
 		return 0;
@@ -634,7 +706,8 @@ void mail_index_sync_get_offsets(struct mail_index_sync_ctx *ctx,
 	*offset1_r = ctx->view->map->hdr.log_file_tail_offset != 0 ?
 		ctx->view->map->hdr.log_file_tail_offset :
 		ctx->view->index->log->head->hdr.hdr_size;
-	mail_transaction_log_get_head(ctx->view->index->log, seq2_r, offset2_r);
+	*seq2_r = ctx->log_end_seq;
+	*offset2_r = ctx->log_end_offset;
 }
 
 static void
@@ -682,7 +755,7 @@ bool mail_index_sync_next(struct mail_index_sync_ctx *ctx,
 	uint32_t next_found_uid;
 
 	next_i = UINT_MAX;
-	next_found_uid = (uint32_t)-1;
+	next_found_uid = UINT32_MAX;
 
 	/* FIXME: replace with a priority queue so we don't have to go
 	   through the whole list constantly. and remember to make sure that
@@ -786,7 +859,8 @@ static void mail_index_sync_end(struct mail_index_sync_ctx **_ctx)
 		lock_reason = ctx->reason;
 	else
 		lock_reason = "Mailbox was synchronized";
-	mail_transaction_log_sync_unlock(ctx->index->log, lock_reason);
+	if ((ctx->flags & MAIL_INDEX_SYNC_FLAG_READ_ONLY) == 0)
+		mail_transaction_log_sync_unlock(ctx->index->log, lock_reason);
 
 	mail_index_view_close(&ctx->view);
 	mail_index_transaction_rollback(&ctx->sync_trans);
@@ -900,6 +974,8 @@ int mail_index_sync_commit(struct mail_index_sync_ctx **_ctx)
 	bool want_rotate, index_undeleted, delete_index;
 	int ret = 0, ret2;
 
+	i_assert((ctx->flags & MAIL_INDEX_SYNC_FLAG_READ_ONLY) == 0);
+
 	index_undeleted = ctx->ext_trans->index_undeleted;
 	delete_index = index->index_delete_requested && !index_undeleted &&
 		(ctx->flags & (MAIL_INDEX_SYNC_FLAG_DELETING_INDEX |
@@ -986,10 +1062,15 @@ int mail_index_sync_commit(struct mail_index_sync_ctx **_ctx)
 	   mail_index_sync_update_mailbox_offset() doesn't always update
 	   tail_offset to skip over other committed external transactions.
 	   However, it's still safe to do the rotation because external
-	   transactions don't require syncing. */
+	   transactions don't require syncing.
+
+	   If the sync stopped before the log head, the following changes
+	   haven't been synced yet. Rotating the log or writing the index
+	   would mark them synced, since the index is always written with
+	   tail_offset=head_offset. */
 	want_rotate = ctx->fully_synced &&
 		mail_transaction_log_want_rotate(index->log, &reason);
-	if (ret == 0 &&
+	if (ret == 0 && !ctx->stopped_before_head &&
 	    (want_rotate || mail_index_sync_want_index_write(index, &reason))) {
 		i_free(index->need_recreate);
 		index->index_min_write = FALSE;

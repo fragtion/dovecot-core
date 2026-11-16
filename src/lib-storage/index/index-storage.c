@@ -414,7 +414,7 @@ void index_storage_mailbox_alloc(struct mailbox *box, const char *vname,
 		     box->pool, sizeof(void *), 5);
 
 	ibox = p_new(box->pool, struct index_mailbox_context, 1);
-	ibox->list_index_sync_ext_id = (uint32_t)-1;
+	ibox->list_index_sync_ext_id = UINT32_MAX;
 	ibox->index_flags = MAIL_INDEX_OPEN_FLAG_CREATE |
 		mail_storage_settings_to_index_flags(box->storage->set);
 	if ((box->flags & MAILBOX_FLAG_SAVEONLY) != 0)
@@ -1061,7 +1061,7 @@ index_copy_vsize_extension(struct mail_save_context *ctx,
 		return;
 	uint32_t vsize = *vsizep;
 
-	if (vsize < (uint32_t)-1) {
+	if (vsize < UINT32_MAX) {
 		/* copy the vsize record to the destination index */
 		mail_index_update_ext(ctx->transaction->itrans, dest_seq,
 				      ctx->transaction->box->mail_vsize_ext_id,
@@ -1205,8 +1205,9 @@ int index_storage_expunged_sync_begin(struct mailbox *box,
 		if (ret < 0) {
 			if (box->index->last_error.code ==
 			    MAIL_INDEX_ERROR_CODE_NO_ACCESS)
-		    		return 0;
-			mailbox_set_index_error(box);
+				ret = 0;
+			else
+				mailbox_set_index_error(box);
 		}
 		index_storage_expunging_deinit(box);
 		return ret;

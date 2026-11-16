@@ -46,6 +46,11 @@ cmd_notify_parse_fetch(struct imap_notify_context *ctx,
 {
 	if (list->type == IMAP_ARG_EOL)
 		return -1; /* at least one attribute must be set */
+	if (ctx->fetch_ctx != NULL) {
+		/* don't leak the previous fetch context */
+		ctx->error = "Duplicate MessageNew fetch-att list";
+		return -1;
+	}
 	return imap_fetch_att_list_parse(ctx->client, ctx->pool, list,
 					 ctx->utf8, &ctx->fetch_ctx,
 					 &ctx->error);
@@ -567,7 +572,7 @@ bool cmd_notify(struct client_command_context *cmd)
 	if (ret < 0) {
 		client_send_command_error(cmd, ctx->error != NULL ? ctx->error :
 					  "Invalid arguments.");
-		pool_unref(&ctx->pool);
+		imap_notify_deinit(&ctx);
 		return TRUE;
 	}
 
@@ -585,7 +590,7 @@ bool cmd_notify(struct client_command_context *cmd)
 		}
 		str_append(client_error, "] Unsupported NOTIFY events.");
 		client_send_tagline(cmd, str_c(client_error));
-		pool_unref(&ctx->pool);
+		imap_notify_deinit(&ctx);
 		return TRUE;
 	}
 
@@ -595,17 +600,17 @@ bool cmd_notify(struct client_command_context *cmd)
 		client_send_tagline(cmd,
 			"NO ["IMAP_RESP_CODE_NOTIFICATIONOVERFLOW"] "
 			"Too many mailbox names");
-		pool_unref(&ctx->pool);
+		imap_notify_deinit(&ctx);
 		return TRUE;
 	} else if (imap_notify_refresh_subscriptions(cmd, ctx) < 0) {
 		/* tagline already sent */
-		pool_unref(&ctx->pool);
+		imap_notify_deinit(&ctx);
 		return TRUE;
 	} else if (imap_notify_begin(ctx) < 0) {
 		client_send_tagline(cmd,
 			"NO ["IMAP_RESP_CODE_NOTIFICATIONOVERFLOW"] "
 			"NOTIFY not supported for these mailboxes.");
-		pool_unref(&ctx->pool);
+		imap_notify_deinit(&ctx);
 		return TRUE;
 	}
 	if (cmd->client->notify_ctx != NULL)

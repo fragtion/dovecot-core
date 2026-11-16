@@ -248,39 +248,29 @@ int acl_backend_nonowner_lookups_iter_deinit(struct acl_mailbox_list_context **_
 	return ctx->backend->v->nonowner_lookups_iter_deinit(ctx);
 }
 
-int acl_backend_nonowner_lookups_rebuild(struct acl_backend *backend)
+int acl_backend_nonowner_lookups_rebuild(struct acl_backend *backend,
+					 bool fetch_all)
 {
-	return backend->v->nonowner_lookups_rebuild(backend);
+	return backend->v->nonowner_lookups_rebuild(backend, fetch_all);
 }
 
-void acl_rights_sort(struct acl_object *aclobj)
+int acl_backend_nonowner_lookups_rename(struct acl_backend *backend,
+					const char *name,
+					struct acl_backend *dest_backend,
+					const char *dest_name)
 {
-	struct acl_rights *rights;
-	unsigned int i, dest, count;
+	if (backend->v->nonowner_lookups_rename == NULL)
+		return 0;
+	return backend->v->nonowner_lookups_rename(backend, name,
+						   dest_backend, dest_name);
+}
 
+void acl_object_rights_sort(struct acl_object *aclobj)
+{
 	if (!array_is_created(&aclobj->rights))
 		return;
 
-	array_sort(&aclobj->rights, acl_rights_cmp);
-
-	/* merge identical identifiers */
-	rights = array_get_modifiable(&aclobj->rights, &count);
-	for (dest = 0, i = 1; i < count; i++) {
-		if (acl_rights_cmp(&rights[i], &rights[dest]) == 0) {
-			/* add i's rights to dest and delete i */
-			acl_right_names_merge(aclobj->rights_pool,
-					      &rights[dest].rights,
-					      rights[i].rights, FALSE);
-			acl_right_names_merge(aclobj->rights_pool,
-					      &rights[dest].neg_rights,
-					      rights[i].neg_rights, FALSE);
-		} else {
-			if (++dest != i)
-				rights[dest] = rights[i];
-		}
-	}
-	if (++dest < count)
-		array_delete(&aclobj->rights, dest, count - dest);
+	acl_rights_sort(&aclobj->rights, aclobj->rights_pool);
 }
 
 static void apply_owner_default_rights(struct acl_object *aclobj)
@@ -383,5 +373,19 @@ void acl_object_remove_all_access(struct acl_object *aclobj)
 	rights.id_type = ACL_ID_OWNER;
 	rights.rights = empty_str_array;
 	array_push_back(&aclobj->rights, &rights);
+}
+
+bool acl_object_has_global_nonowner_lookup(const struct acl_object *aclobj)
+{
+	const struct acl_rights *right;
+
+	if (!array_is_created(&aclobj->rights))
+		return FALSE;
+	array_foreach(&aclobj->rights, right) {
+		if (right->global &&
+		    acl_rights_has_nonowner_lookup_changes(right))
+			return TRUE;
+	}
+	return FALSE;
 }
 

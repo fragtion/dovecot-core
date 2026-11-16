@@ -645,6 +645,38 @@ static void test_imapc_auth_ir_success(void)
 }
 
 /*
+ * imapc auth success before the SASL authentication exchange finished
+ */
+
+static void test_imapc_auth_early_success_client(void)
+{
+	imapc_client_set_login_callback(imapc_client,
+					imapc_login_callback, NULL);
+	imapc_client_login(imapc_client);
+	test_expect_error_string("Authentication failed: Server accepted authentication before the SASL authentication exchange finished");
+	imapc_client_run(imapc_client);
+	test_expect_no_more_errors();
+	test_assert(imapc_login_last_reply == IMAPC_COMMAND_STATE_AUTH_FAILED);
+}
+
+static void test_imapc_auth_early_success_server(void)
+{
+	test_server_wait_connection(&server, TRUE);
+	/* CRAM-MD5 needs the challenge of the server first */
+	test_assert(test_imapc_server_expect("1 AUTHENTICATE CRAM-MD5"));
+	o_stream_nsend_str(server.output, "1 OK Logged in\r\n");
+}
+
+static void test_imapc_auth_early_success(void)
+{
+	test_begin("imapc auth success before the SASL authentication exchange finished");
+	test_run_client_server(test_imapc_auth_early_success_client,
+			       test_imapc_auth_early_success_server,
+			       "CRAM-MD5", FALSE);
+	test_end();
+}
+
+/*
  * imapc reconnect
  */
 
@@ -1260,6 +1292,7 @@ int main(int argc ATTR_UNUSED, char *argv[])
 		test_imapc_login_success,
 		test_imapc_auth_success,
 		test_imapc_auth_ir_success,
+		test_imapc_auth_early_success,
 		test_imapc_short_reply,
 		test_imapc_short_reply_no,
 		test_imapc_short_reply_bad,

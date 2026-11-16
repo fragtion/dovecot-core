@@ -741,7 +741,7 @@ mailbox_transaction_get_mailbox(const struct mailbox_transaction_context *t)
 void mailbox_get_seq_range(struct mailbox *box, uint32_t uid1, uint32_t uid2,
 			   uint32_t *seq1_r, uint32_t *seq2_r);
 /* Convert sequence range to uid range. If sequences contain
-   (uint32_t)-1 to specify "*", they're preserved. */
+   UINT32_MAX to specify "*", they're preserved. */
 void mailbox_get_uid_range(struct mailbox *box,
 			   const ARRAY_TYPE(seq_range) *seqs,
 			   ARRAY_TYPE(seq_range) *uids);
@@ -1073,7 +1073,7 @@ int mail_precache(struct mail *mail);
 /* Mark a cached field corrupted and have it recalculated. */
 void mail_set_cache_corrupted(struct mail *mail,
 			      enum mail_fetch_field field,
-			      const char *reason);
+			      const char *reason) ATTR_COLD;
 
 /* Return 128 bit GUID using input string. If guid is already 128 bit hex
    encoded, it's returned as-is. Otherwise SHA1 sum is taken and its last

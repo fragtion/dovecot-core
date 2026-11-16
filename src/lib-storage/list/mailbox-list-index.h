@@ -32,6 +32,11 @@
 #define MAILBOX_LIST_INDEX_HIERARCHY_SEP '~'
 #define MAILBOX_LIST_INDEX_HIERARCHY_ALT_SEP '^'
 
+/* New name_ids are allocated by incrementing the highest name_id, so they're
+   never anywhere close to this in practice. Larger name_ids are treated as
+   corruption, so allocating new name_ids can't wrap to 0. */
+#define MAILBOX_LIST_INDEX_MAX_NAME_ID 0x7fffffff
+
 #define INDEX_LIST_CONTEXT(obj) \
 	MODULE_CONTEXT(obj, mailbox_list_index_module)
 #define INDEX_LIST_CONTEXT_REQUIRE(obj) \
@@ -199,7 +204,7 @@ struct mailbox_list_index_iterate_context {
 extern MODULE_CONTEXT_DEFINE(mailbox_list_index_module,
 			     &mailbox_list_module_register);
 
-void mailbox_list_index_set_index_error(struct mailbox_list *list);
+void mailbox_list_index_set_index_error(struct mailbox_list *list) ATTR_COLD;
 struct mailbox_list_index_node *
 mailbox_list_index_lookup(struct mailbox_list *list, const char *name);
 struct mailbox_list_index_node *

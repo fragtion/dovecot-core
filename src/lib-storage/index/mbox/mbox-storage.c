@@ -388,7 +388,7 @@ mbox_mailbox_alloc(struct mail_storage *storage, struct mailbox_list *list,
 	mbox->storage = MBOX_STORAGE(storage);
 	mbox->mbox_fd = -1;
 	mbox->mbox_lock_type = F_UNLCK;
-	mbox->mbox_list_index_ext_id = (uint32_t)-1;
+	mbox->mbox_list_index_ext_id = UINT32_MAX;
 
 	if (strcmp(mbox->storage->set->mbox_md5, "apop3d") == 0)
 		mbox->md5_v = mbox_md5_apop3d;
@@ -882,7 +882,7 @@ struct mailbox mbox_mailbox = {
 		mbox_save_continue,
 		mbox_save_finish,
 		mbox_save_cancel,
-		mail_storage_copy,
+		mbox_copy,
 		mbox_transaction_save_commit_pre,
 		mbox_transaction_save_commit_post,
 		mbox_transaction_save_rollback,

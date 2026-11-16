@@ -3,6 +3,8 @@
 #include "lib.h"
 #include "ioloop.h"
 #include "write-full.h"
+#include "mail-namespace.h"
+#include "mailbox-list-iter.h"
 #include "test-common.h"
 #include "test-dir.h"
 #include "master-service.h"
@@ -780,6 +782,96 @@ static void test_maildir_sync_quick_check(void)
 	test_end();
 }
 
+static void test_mailbox_invalid_utf8_name(void)
+{
+	struct test_mail_storage_ctx *ctx = test_mail_storage_init();
+	struct test_mail_storage_settings set = {
+		.driver = "maildir",
+		.hierarchy_sep = ".",
+	};
+	struct mail_namespace *ns;
+
+	test_begin("mailbox lookups with invalid UTF-8 name");
+	test_mail_storage_init_user(ctx, &set);
+
+	ns = mail_namespace_find(ctx->user->namespaces, "foo\xff");
+	test_assert(ns != NULL);
+	test_assert(ns == mail_namespace_find_inbox(ctx->user->namespaces));
+
+	/* "foo\xff" must not alias the existing "foo\xEF\xBF\xBD" */
+	struct mailbox *real = mailbox_alloc(ns->list, "foo\xEF\xBF\xBD", 0);
+	struct mailbox *box = mailbox_alloc(ns->list, "foo\xff", 0);
+	struct mailbox *other = mailbox_alloc(ns->list, "other", 0);
+	enum mailbox_existence existence;
+	enum mail_error error_code;
+
+	test_assert_cmp(mailbox_create(real, NULL, FALSE), ==, 0);
+
+	test_assert_cmp(mailbox_open(box), <, 0);
+	(void)mailbox_get_last_error(box, &error_code);
+	test_assert_cmp(error_code, ==, MAIL_ERROR_PARAMS);
+	test_assert_cmp(mailbox_create(box, NULL, FALSE), <, 0);
+	(void)mailbox_get_last_error(box, &error_code);
+	test_assert_cmp(error_code, ==, MAIL_ERROR_PARAMS);
+	test_assert_cmp(mailbox_exists(box, FALSE, &existence), <, 0);
+	test_assert_cmp(mailbox_rename(real, box), <, 0);
+	test_assert_cmp(mailbox_rename(box, other), <, 0);
+
+	test_assert_cmp(mailbox_exists(real, FALSE, &existence), ==, 0);
+	test_assert_cmp(existence, ==, MAILBOX_EXISTENCE_SELECT);
+	test_assert_cmp(mailbox_exists(other, FALSE, &existence), ==, 0);
+	test_assert_cmp(existence, ==, MAILBOX_EXISTENCE_NONE);
+	mailbox_free(&other);
+	mailbox_free(&box);
+	mailbox_free(&real);
+
+	test_mail_storage_deinit_user(ctx);
+	test_mail_storage_deinit(&ctx);
+	test_end();
+}
+
+static void test_subscriptions_invalid_utf8(void)
+{
+	static const char subscriptions[] = "foo\xff\nbar\n";
+	struct test_mail_storage_ctx *ctx = test_mail_storage_init();
+	struct test_mail_storage_settings set = {
+		.driver = "maildir",
+		.hierarchy_sep = ".",
+	};
+	struct mailbox_list_iterate_context *iter;
+	const struct mailbox_info *info;
+	const char *path;
+	unsigned int count = 0;
+	int fd;
+
+	test_begin("subscriptions file with invalid UTF-8 name");
+	/* an error for the invalid name and a warning for removing it */
+	test_expect_errors(2);
+	test_mail_storage_init_user(ctx, &set);
+
+	path = t_strdup_printf("%s%s/subscriptions", ctx->home_root, "testuser");
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd == -1)
+		i_fatal("open(%s) failed: %m", path);
+	if (write_full(fd, subscriptions, sizeof(subscriptions) - 1) < 0)
+		i_fatal("write(%s) failed: %m", path);
+	i_close_fd(&fd);
+
+	iter = mailbox_list_iter_init(ctx->user->namespaces->list, "*",
+				      MAILBOX_LIST_ITER_SELECT_SUBSCRIBED |
+				      MAILBOX_LIST_ITER_RETURN_NO_FLAGS);
+	while ((info = mailbox_list_iter_next(iter)) != NULL) {
+		test_assert_strcmp(info->vname, "bar");
+		count++;
+	}
+	test_assert(mailbox_list_iter_deinit(&iter) == 0);
+	test_assert(count == 1);
+
+	test_mail_storage_deinit_user(ctx);
+	test_mail_storage_deinit(&ctx);
+	test_end();
+}
+
 static void test_mail_parse_human_timestamp(void)
 {
 	int ret;
@@ -861,6 +953,8 @@ int main(int argc, char **argv)
 		test_mailbox_list_maildir,
 		test_mailbox_list_mbox,
 		test_maildir_sync_quick_check,
+		test_mailbox_invalid_utf8_name,
+		test_subscriptions_invalid_utf8,
 		test_mail_parse_human_timestamp,
 		test_mail_parse_human_timestamp_time_interval,
 		test_mail_parse_human_timestamp_fail,

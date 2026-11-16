@@ -185,7 +185,7 @@ static void mbox_sync_read_index_syncs(struct mbox_sync_context *sync_ctx,
 
 	if (uid == 0 || sync_ctx->index_reset) {
 		/* nothing for this or the future ones */
-		uid = (uint32_t)-1;
+		uid = UINT32_MAX;
 	}
 
 	index_sync_changes_read(sync_ctx->sync_changes, uid, sync_expunge_r,
@@ -539,7 +539,7 @@ static int mbox_rewrite_base_uid_last(struct mbox_sync_context *sync_ctx)
 
 	for (i = 0, uid_last = 0; i < sizeof(buf); i++) {
 		if (buf[i] < '0' || buf[i] > '9') {
-			uid_last = (uint32_t)-1;
+			uid_last = UINT32_MAX;
 			break;
 		}
 		uid_last = uid_last * 10 + (buf[i] - '0');
@@ -895,7 +895,7 @@ mbox_sync_seek_to_uid(struct mbox_sync_context *sync_ctx, uint32_t uid)
 
 	i_assert(!sync_ctx->index_reset);
 
-	if (!mail_index_lookup_seq_range(sync_view, uid, (uint32_t)-1,
+	if (!mail_index_lookup_seq_range(sync_view, uid, UINT32_MAX,
 					 &seq1, &seq2)) {
 		/* doesn't exist anymore, seek to end of file */
 		ret = i_stream_get_size(sync_ctx->file_input, TRUE, &size);
@@ -1128,7 +1128,7 @@ static int mbox_sync_loop(struct mbox_sync_context *sync_ctx,
 						   sync_ctx->idx_seq++);
 			}
 
-			if (sync_ctx->next_uid == (uint32_t)-1) {
+			if (sync_ctx->next_uid > MBOX_MAX_UID) {
 				/* oh no, we're out of UIDs. this shouldn't
 				   happen normally, so just try to get it fixed
 				   without crashing. */
@@ -1198,6 +1198,17 @@ static int mbox_sync_loop(struct mbox_sync_context *sync_ctx,
 	if (ret < 0)
 		return -1;
 
+	if (sync_ctx->next_uid > MBOX_MAX_UID && !sync_ctx->renumber_uids &&
+	    !sync_ctx->readonly) {
+		/* next_uid is past MBOX_MAX_UID, and saving is refused until
+		   the mails are renumbered. A read-only mbox can't be
+		   renumbered. */
+		mailbox_set_critical(&sync_ctx->mbox->box,
+				     "Out of UIDs, renumbering them in mbox");
+		sync_ctx->renumber_uids = TRUE;
+		return 0;
+	}
+
 	if (istream_raw_mbox_is_eof(sync_ctx->input)) {
 		/* rest of the messages in index don't exist -> expunge them */
 		while (sync_ctx->idx_seq <= messages_count)
@@ -1215,6 +1226,15 @@ static int mbox_sync_loop(struct mbox_sync_context *sync_ctx,
 		sync_ctx->mbox->mbox_hdr.dirty_flag = 1;
 	}
 	return 1;
+}
+
+static uint32_t mbox_get_uidvalidity_next(struct mailbox_list *list)
+{
+	const char *path;
+
+	path = mailbox_list_get_root_forced(list, MAILBOX_LIST_PATH_TYPE_CONTROL);
+	path = t_strconcat(path, "/"MBOX_UIDVALIDITY_FNAME, NULL);
+	return mailbox_uidvalidity_next(list, path);
 }
 
 static int mbox_write_pseudo(struct mbox_sync_context *sync_ctx, bool force)
@@ -1243,7 +1263,11 @@ static int mbox_write_pseudo(struct mbox_sync_context *sync_ctx, bool force)
 
 	uid_validity = sync_ctx->base_uid_validity != 0 ?
 		sync_ctx->base_uid_validity : sync_ctx->hdr->uid_validity;
-	i_assert(uid_validity != 0);
+	if (uid_validity == 0) {
+		/* never synced */
+		uid_validity =
+			mbox_get_uidvalidity_next(sync_ctx->mbox->box.list);
+	}
 
 	str = t_str_new(1024);
 	str_printfa(str, "%sDate: %s\n"
@@ -1454,15 +1478,6 @@ mbox_sync_index_update_ext_header(struct mbox_mailbox *mbox,
 	}
 }
 
-static uint32_t mbox_get_uidvalidity_next(struct mailbox_list *list)
-{
-	const char *path;
-
-	path = mailbox_list_get_root_forced(list, MAILBOX_LIST_PATH_TYPE_CONTROL);
-	path = t_strconcat(path, "/"MBOX_UIDVALIDITY_FNAME, NULL);
-	return mailbox_uidvalidity_next(list, path);
-}
-
 static int mbox_sync_update_index_header(struct mbox_sync_context *sync_ctx)
 {
 	struct mail_index_view *view;
@@ -1544,7 +1559,7 @@ static int mbox_sync_update_index_header(struct mbox_sync_context *sync_ctx)
 	/* mark recent messages */
 	view = mail_index_transaction_open_updated_view(sync_ctx->t);
 	if (mail_index_lookup_seq_range(view, sync_ctx->last_nonrecent_uid + 1,
-					(uint32_t)-1, &seq, &seq2)) {
+					UINT32_MAX, &seq, &seq2)) {
 		mailbox_recent_flags_set_seqs(&sync_ctx->mbox->box,
 					      view, seq, seq2);
 	}

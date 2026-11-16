@@ -133,6 +133,10 @@ int acl_rights_update_import(struct acl_rights_update *update,
 const char *acl_rights_export(const struct acl_rights *rights);
 
 /* <settings checks> */
+/* Parses an already separated identifier and rights list */
+int acl_rights_parse_fields(const char *id_str, const char *right_names_str,
+			    pool_t pool, struct acl_rights *rights_r,
+			    const char **error_r);
 /* Parses line containing identifier and rights.
  * Requires all leading whitespace to be stripped by the caller. */
 int acl_rights_parse_line(const char *line, pool_t pool,
@@ -145,6 +149,8 @@ void acl_rights_dup(const struct acl_rights *src,
 
 /* Comparison for rights */
 int acl_rights_cmp(const struct acl_rights *r1, const struct acl_rights *r2);
+/* Sort the rights and merge rights with identical identifiers. */
+void acl_rights_sort(ARRAY_TYPE(acl_rights) *rights, pool_t pool);
 
 /* <settings checks> */
 /* Parses acl letter string to names */

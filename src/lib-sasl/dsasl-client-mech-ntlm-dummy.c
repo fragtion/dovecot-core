@@ -90,6 +90,15 @@ mech_ntlm_auth_output(struct dsasl_client_mech_session *msession,
 	i_unreached();
 }
 
+static bool
+mech_ntlm_auth_is_finished(struct dsasl_client_mech_session *msession)
+{
+	struct ntlm_sasl_session *nsession =
+		container_of(msession, struct ntlm_sasl_session, session);
+
+	return nsession->state == STATE_RESPONSE;
+}
+
 const struct dsasl_client_mech dsasl_client_mech_ntlm = {
 	.name = SASL_MECH_NAME_NTLM,
 
@@ -97,6 +106,7 @@ const struct dsasl_client_mech dsasl_client_mech_ntlm = {
 	.auth_check = mech_ntlm_auth_check,
 	.auth_input = mech_ntlm_auth_input,
 	.auth_output = mech_ntlm_auth_output,
+	.auth_is_finished = mech_ntlm_auth_is_finished,
 };
 
 void dsasl_client_init_ntlm_dummy(struct dsasl_client *client)

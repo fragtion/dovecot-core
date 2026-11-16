@@ -3924,6 +3924,11 @@ dcrypt_openssl_private_key_id(struct dcrypt_private_key *key,
 	return dcrypt_openssl_public_key_id_evp(priv, md, result, error_r);
 }
 
+static inline size_t dcrypt_openssl_ec_rs_len(const EVP_PKEY *key)
+{
+	return ((size_t)EVP_PKEY_bits(key) + 7) / 8;
+}
+
 static bool
 dcrypt_x962_remove_der(buffer_t *signature_r, size_t offset, size_t rs_len)
 {
@@ -3952,37 +3957,29 @@ dcrypt_x962_remove_der(buffer_t *signature_r, size_t offset, size_t rs_len)
 static bool dcrypt_x962_add_der(buffer_t *signature_r)
 {
 	const unsigned char *p = signature_r->data;
-	size_t len = signature_r->used;
-	size_t split = len/2;
-	BIGNUM *bn_r = BN_new();
-	BIGNUM *bn_s = BN_new();
-	if (BN_bin2bn(p, split, bn_r) == NULL ||
-	    BN_bin2bn(p+split, split, bn_s) == NULL) {
-		BN_free(bn_r);
-		BN_free(bn_s);
-		return FALSE;
+	size_t split = signature_r->used / 2;
+	BIGNUM *bn_r = BN_bin2bn(p, split, NULL);
+	BIGNUM *bn_s = BN_bin2bn(p + split, split, NULL);
+	ECDSA_SIG *sig = ECDSA_SIG_new();
+	unsigned char *der = NULL;
+	bool ret = FALSE;
+
+	/* ECDSA_SIG_set0() takes the ownership of the BIGNUMs on success */
+	if (bn_r != NULL && bn_s != NULL && sig != NULL &&
+	    ECDSA_SIG_set0(sig, bn_r, bn_s) == 1) {
+		bn_r = bn_s = NULL;
+		int der_len = i2d_ECDSA_SIG(sig, &der);
+		if (der_len > 0) {
+			buffer_clear_safe(signature_r);
+			buffer_append(signature_r, der, der_len);
+			ret = TRUE;
+		}
+		OPENSSL_free(der);
 	}
-	ASN1_SEQUENCE_ANY *seq = sk_ASN1_TYPE_new_null();
-	sk_ASN1_TYPE_reserve(seq, 2);
-	ASN1_INTEGER *ai_r = BN_to_ASN1_INTEGER(bn_r, NULL);
-	ASN1_INTEGER *ai_s = BN_to_ASN1_INTEGER(bn_s, NULL);
-	ASN1_TYPE *t_r = ASN1_TYPE_pack_sequence(ASN1_INTEGER_it(), ai_s, NULL);
-	sk_ASN1_TYPE_unshift(seq, t_r);
-	ASN1_TYPE *t_s = ASN1_TYPE_pack_sequence(ASN1_INTEGER_it(), ai_r, NULL);
-	sk_ASN1_TYPE_unshift(seq, t_s);
-	unsigned char *ptr = NULL;
-	len = i2d_ASN1_SEQUENCE_ANY(seq, &ptr);
-	buffer_clear_safe(signature_r);
-	buffer_append(signature_r, ptr, len);
-	OPENSSL_free(ptr);
-	sk_ASN1_TYPE_free(seq);
-	ASN1_INTEGER_free(ai_r);
-	ASN1_INTEGER_free(ai_s);
-	ASN1_TYPE_free(t_r);
-	ASN1_TYPE_free(t_s);
 	BN_free(bn_r);
 	BN_free(bn_s);
-	return TRUE;
+	ECDSA_SIG_free(sig);
+	return ret;
 }
 
 static bool
@@ -4019,11 +4016,16 @@ dcrypt_openssl_sign(struct dcrypt_private_key *key, const char *algorithm,
 	EVP_PKEY_CTX *pctx = NULL;
 
 	/* NB! Padding is set only on RSA signatures
-	   ECDSA signatures use whatever is default */
+	   ECDSA signatures use whatever is default. A PSS salt is as long as
+	   the digest on every OpenSSL version (RFC 7518 section 3.5). */
 	if (EVP_DigestSignInit_ex(dctx, &pctx, algorithm, NULL, NULL, key->key,
 				  NULL) != 1 ||
 	    (EVP_PKEY_base_id(key->key) == EVP_PKEY_RSA &&
 	     EVP_PKEY_CTX_set_rsa_padding(pctx, pad) != 1) ||
+	    (EVP_PKEY_base_id(key->key) == EVP_PKEY_RSA &&
+	     pad == RSA_PKCS1_PSS_PADDING &&
+	     EVP_PKEY_CTX_set_rsa_pss_saltlen(pctx,
+					      RSA_PSS_SALTLEN_DIGEST) != 1) ||
 	    EVP_DigestSign(dctx, NULL, &siglen, data, data_len) != 1) {
 		ret = dcrypt_openssl_error(error_r);
 	} else {
@@ -4041,7 +4043,7 @@ dcrypt_openssl_sign(struct dcrypt_private_key *key, const char *algorithm,
 			if (format == DCRYPT_SIGNATURE_FORMAT_X962) {
 				/* remove der container */
 				size_t rs_len =
-					(EVP_PKEY_bits(key->key) + 7) / 8;
+					dcrypt_openssl_ec_rs_len(key->key);
 				if (!dcrypt_x962_remove_der(signature_r,
 							    offset, rs_len)) {
 					*error_r = "Invalid ECDSA signature";
@@ -4077,7 +4079,8 @@ dcrypt_openssl_verify(struct dcrypt_public_key *key, const char *algorithm,
 			*error_r = "Format requires an EC key";
 			return FALSE;
 		}
-		if ((signature_len % 2) != 0) {
+		size_t rs_len = dcrypt_openssl_ec_rs_len(key->key);
+		if (signature_len != 2 * rs_len) {
 			*error_r = "Invalid x9.62 signature";
 			return FALSE;
 		}

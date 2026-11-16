@@ -6,6 +6,7 @@
 #include "service-settings.h"
 #include "master-service.h"
 #include "master-service-settings.h"
+#include "smtp-client-settings.h"
 #include "lda-settings.h"
 #include "lmtp-settings.h"
 #include "mail-storage-settings.h"
@@ -62,6 +63,10 @@ const struct setting_keyvalue lmtp_service_settings_defaults[] = {
 #define DEF(type, name) \
 	SETTING_DEFINE_STRUCT_##type(#name, name, struct lmtp_pre_mail_settings)
 
+#undef DEF_MSECS
+#define DEF_MSECS(type, name) \
+	SETTING_DEFINE_STRUCT_##type(#name, name##_msecs, struct lmtp_proxy_settings)
+
 static const struct setting_define lmtp_pre_mail_setting_defines[] = {
 	DEF(TIME, mail_max_lock_timeout),
 
@@ -84,10 +89,47 @@ const struct setting_parser_info lmtp_pre_mail_setting_parser_info = {
 
 #undef DEF
 #define DEF(type, name) \
+	SETTING_DEFINE_STRUCT_##type(#name, name, struct lmtp_proxy_settings)
+
+#undef DEF_MSECS
+#define DEF_MSECS(type, name) \
+	SETTING_DEFINE_STRUCT_##type(#name, name##_msecs, struct lmtp_proxy_settings)
+
+static const struct setting_define lmtp_proxy_setting_defines[] = {
+	DEF(BOOL, lmtp_proxy),
+
+	DEF_MSECS(TIME_MSECS, lmtp_client_command_timeout),
+	DEF_MSECS(TIME_MSECS, lmtp_client_connect_timeout),
+	DEF(IN_PORT, lmtp_client_port),
+	DEF(BOOL, lmtp_client_peer_trusted),
+
+	SETTING_DEFINE_LIST_END
+};
+
+static const struct lmtp_proxy_settings lmtp_proxy_default_settings = {
+	.lmtp_proxy = FALSE,
+
+	.lmtp_client_command_timeout_msecs = SMTP_DEFAULT_COMMAND_TIMEOUT_MSECS,
+	.lmtp_client_connect_timeout_msecs = SMTP_DEFAULT_CONNECT_TIMEOUT_MSECS,
+	.lmtp_client_port = 24,
+	.lmtp_client_peer_trusted = FALSE,
+};
+
+const struct setting_parser_info lmtp_proxy_setting_parser_info = {
+	.name = "lmtp_proxy",
+
+	.defines = lmtp_proxy_setting_defines,
+	.defaults = &lmtp_proxy_default_settings,
+
+	.struct_size = sizeof(struct lmtp_proxy_settings),
+	.pool_offset1 = 1 + offsetof(struct lmtp_proxy_settings, pool),
+};
+
+#undef DEF
+#define DEF(type, name) \
 	SETTING_DEFINE_STRUCT_##type(#name, name, struct lmtp_settings)
 
 static const struct setting_define lmtp_setting_defines[] = {
-	DEF(BOOL, lmtp_proxy),
 	DEF(BOOL, lmtp_save_to_detail_mailbox),
 	DEF(BOOL, lmtp_rcpt_check_quota),
 	DEF(BOOL, lmtp_add_received_header),
@@ -95,7 +137,6 @@ static const struct setting_define lmtp_setting_defines[] = {
 	DEF(UINT, lmtp_user_concurrency_limit),
 	DEF(ENUM, lmtp_hdr_delivery_address),
 	DEF(STR, lmtp_rawlog_dir),
-	DEF(STR, lmtp_proxy_rawlog_dir),
 
 	DEF(BOOLLIST, lmtp_client_workarounds),
 
@@ -110,7 +151,6 @@ static const struct setting_define lmtp_setting_defines[] = {
 };
 
 static const struct lmtp_settings lmtp_default_settings = {
-	.lmtp_proxy = FALSE,
 	.lmtp_save_to_detail_mailbox = FALSE,
 	.lmtp_rcpt_check_quota = FALSE,
 	.lmtp_add_received_header = TRUE,
@@ -118,7 +158,6 @@ static const struct lmtp_settings lmtp_default_settings = {
 	.lmtp_user_concurrency_limit = 10,
 	.lmtp_hdr_delivery_address = "final:none:original",
 	.lmtp_rawlog_dir = "",
-	.lmtp_proxy_rawlog_dir = "",
 
 	.lmtp_client_workarounds = ARRAY_INIT,
 

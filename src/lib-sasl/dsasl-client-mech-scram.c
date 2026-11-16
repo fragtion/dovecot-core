@@ -228,6 +228,15 @@ mech_scram_auth_output(struct dsasl_client_mech_session *msession,
 	return DSASL_CLIENT_RESULT_OK;
 }
 
+static bool
+mech_scram_auth_is_finished(struct dsasl_client_mech_session *msession)
+{
+	struct scram_sasl_session *ssession =
+		container_of(msession, struct scram_sasl_session, session);
+
+	return auth_scram_client_is_finished(&ssession->scram_client);
+}
+
 const struct dsasl_client_mech dsasl_client_mech_scram_sha_1 = {
 	.name = SASL_MECH_NAME_SCRAM_SHA_1,
 
@@ -236,6 +245,7 @@ const struct dsasl_client_mech dsasl_client_mech_scram_sha_1 = {
 	.auth_check = mech_scram_auth_check,
 	.auth_input = mech_scram_auth_input,
 	.auth_output = mech_scram_auth_output,
+	.auth_is_finished = mech_scram_auth_is_finished,
 };
 
 const struct dsasl_client_mech dsasl_client_mech_scram_sha_1_plus = {
@@ -246,6 +256,7 @@ const struct dsasl_client_mech dsasl_client_mech_scram_sha_1_plus = {
 	.auth_check = mech_scram_auth_check,
 	.auth_input = mech_scram_auth_input,
 	.auth_output = mech_scram_auth_output,
+	.auth_is_finished = mech_scram_auth_is_finished,
 };
 
 const struct dsasl_client_mech dsasl_client_mech_scram_sha_256 = {
@@ -256,6 +267,7 @@ const struct dsasl_client_mech dsasl_client_mech_scram_sha_256 = {
 	.auth_check = mech_scram_auth_check,
 	.auth_input = mech_scram_auth_input,
 	.auth_output = mech_scram_auth_output,
+	.auth_is_finished = mech_scram_auth_is_finished,
 };
 
 const struct dsasl_client_mech dsasl_client_mech_scram_sha_256_plus = {
@@ -266,4 +278,5 @@ const struct dsasl_client_mech dsasl_client_mech_scram_sha_256_plus = {
 	.auth_check = mech_scram_auth_check,
 	.auth_input = mech_scram_auth_input,
 	.auth_output = mech_scram_auth_output,
+	.auth_is_finished = mech_scram_auth_is_finished,
 };

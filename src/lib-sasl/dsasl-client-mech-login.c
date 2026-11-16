@@ -76,6 +76,15 @@ mech_login_auth_output(struct dsasl_client_mech_session *msession,
 	i_unreached();
 }
 
+static bool
+mech_login_auth_is_finished(struct dsasl_client_mech_session *msession)
+{
+	struct login_sasl_session *lsession =
+		container_of(msession, struct login_sasl_session, session);
+
+	return lsession->state == STATE_PASS;
+}
+
 const struct dsasl_client_mech dsasl_client_mech_login = {
 	.name = SASL_MECH_NAME_LOGIN,
 
@@ -83,4 +92,5 @@ const struct dsasl_client_mech dsasl_client_mech_login = {
 	.auth_check = mech_login_auth_check,
 	.auth_input = mech_login_auth_input,
 	.auth_output = mech_login_auth_output,
+	.auth_is_finished = mech_login_auth_is_finished,
 };

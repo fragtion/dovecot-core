@@ -4,6 +4,7 @@
 #include "str.h"
 #include "istream-private.h"
 #include "istream-base64.h"
+#include "istream-failure-at.h"
 #include "istream-sized.h"
 #include "base64.h"
 
@@ -28,9 +29,9 @@ static const struct base64_istream_test base64_tests[] = {
 	{ "\n", "", 0 },
 	{ "\r\n", "", 0 },
 	{ "  ", "", 0 },
-	{ "foo", "\x7e\x8a", EPIPE },
-	{ "foo ","\x7e\x8a", EPIPE },
-	{ "Zm9vC", "foo", EPIPE },
+	{ "foo", "\x7e\x8a", EINVAL },
+	{ "foo ","\x7e\x8a", EINVAL },
+	{ "Zm9vC", "foo", EINVAL },
 	{ "Zm9v!", "foo", EINVAL },
 	{ "Zm9!v", "fo", EINVAL },
 	{ "Zm9 v", "foo", 0 },
@@ -53,9 +54,9 @@ static const struct base64_istream_test base64url_tests[] = {
 	{ "\n", "", 0 },
 	{ "\r\n", "", 0 },
 	{ "  ", "", 0 },
-	{ "foo", "\x7e\x8a", EPIPE },
-	{ "foo ","\x7e\x8a", EPIPE },
-	{ "Zm9vC", "foo", EPIPE },
+	{ "foo", "\x7e\x8a", EINVAL },
+	{ "foo ","\x7e\x8a", EINVAL },
+	{ "Zm9vC", "foo", EINVAL },
 	{ "Zm9v!", "foo", EINVAL },
 	{ "Zm9!v", "fo", EINVAL },
 	{ "Zm9 v", "foo", 0 },
@@ -132,7 +133,8 @@ test_istream_base64_io_random(void)
 	unsigned char in_buf[2048];
 	size_t in_buf_size;
 	buffer_t *out_buf;
-	unsigned int i, j, loop_count = ON_VALGRIND ? 100 : 4000;
+	unsigned int i, j, loop_count =
+		ON_VALGRIND || test_is_quick() ? 100 : 4000;
 	int ret;
 
 	out_buf = t_buffer_create(sizeof(in_buf));
@@ -310,6 +312,41 @@ test_istream_base64_io_random(void)
 	test_end();
 }
 
+static void test_istream_base64_parent_error(void)
+{
+	static const struct {
+		const char *input;
+		bool parent_fails;
+		int stream_errno;
+	} tests[] = {
+		/* the parent fails in the middle of a quantum */
+		{ "Zm9vYmFy", TRUE, EPIPE },
+		/* the parent ends in the middle of a quantum */
+		{ "Zm9vYm", FALSE, EINVAL },
+	};
+	struct istream *data_input, *parent, *input;
+
+	test_begin("istream base64 decoder parent error");
+	for (unsigned int i = 0; i < N_ELEMENTS(tests); i++) {
+		data_input = test_istream_create(tests[i].input);
+		if (!tests[i].parent_fails)
+			parent = data_input;
+		else {
+			parent = i_stream_create_failure_at(data_input, 6,
+				tests[i].stream_errno, "parent failed");
+		}
+		input = i_stream_create_base64_decoder(parent);
+		while (i_stream_read(input) > 0) ;
+		test_assert_cmp_idx(input->stream_errno, ==,
+				    tests[i].stream_errno, i);
+		i_stream_unref(&input);
+		if (parent != data_input)
+			i_stream_unref(&parent);
+		i_stream_unref(&data_input);
+	}
+	test_end();
+}
+
 void test_istream_base64_decoder(void)
 {
 	unsigned int i;
@@ -333,5 +370,6 @@ void test_istream_base64_decoder(void)
 		test_end();
 	}
 
+	test_istream_base64_parent_error();
 	test_istream_base64_io_random();
 }

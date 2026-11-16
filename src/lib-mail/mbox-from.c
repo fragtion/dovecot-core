@@ -75,8 +75,14 @@ int mbox_from_parse(const unsigned char *msg, size_t size,
 		while (msg < msg_end && (*msg != '"' || esc)) {
 			if (*msg == '\r' || *msg == '\n')
 				return -1;
-			esc = *msg == '\\';
+			/* "\\" is an escaped backslash: it doesn't escape
+			   the following character */
+			esc = !esc && *msg == '\\';
 			msg++;
+		}
+		if (msg == msg_end) {
+			/* no closing quote */
+			return -1;
 		}
 		msg++;
 	}
@@ -99,6 +105,14 @@ int mbox_from_parse(const unsigned char *msg, size_t size,
 	*/
 	if (msg+29-3-5 > msg_end)
 		return -1;
+
+	/* The fixed part of the date has fields that are skipped below
+	   without looking at them (weekday, the characters after the month
+	   and the year). A line break there would end the line early. */
+	for (const unsigned char *p = msg; p < msg + 29 - 3 - 5; p++) {
+		if (*p == '\r' || *p == '\n')
+			return -1;
+	}
 
 	i_zero(&tm);
 

@@ -39,6 +39,7 @@ static struct ip_addr bind_ip;
 static struct test_server server;
 static struct pop3c_client *pop3c_client;
 static enum pop3c_command_state pop3c_login_last_reply;
+static char pop3c_login_last_text[256];
 
 static struct settings_simple test_set;
 
@@ -112,6 +113,8 @@ pop3c_login_callback(enum pop3c_command_state state, const char *reply,
 	e_debug(client_event, "Login reply: %s %s",
 		pop3c_command_state_names[state], reply);
 	pop3c_login_last_reply = state;
+	i_snprintf(pop3c_login_last_text, sizeof(pop3c_login_last_text),
+		   "%s", reply);
 	io_loop_stop(current_ioloop);
 }
 
@@ -260,6 +263,7 @@ test_run_client_server(test_client_init_t *client_test,
 	const char *error;
 
 	pop3c_login_last_reply = POP3C_COMMAND_STATE_INVALID;
+	pop3c_login_last_text[0] = '\0';
 
 	i_zero(&server);
 	server.pid = (pid_t)-1;
@@ -604,6 +608,40 @@ static void test_pop3c_auth_bad_mech(void)
 	test_begin("pop3c auth bad mech");
 	test_run_client_server(test_pop3c_auth_bad_mech_client,
 			       test_pop3c_auth_bad_mech_server,
+			       "CRAM-MD5", NULL, FALSE);
+	test_end();
+}
+
+/*
+ * pop3c auth success before the SASL authentication exchange finished
+ */
+
+static void test_pop3c_auth_early_success_client(void)
+{
+	pop3c_client_login(pop3c_client, pop3c_login_callback, NULL);
+	pop3c_client_wait_one(pop3c_client);
+	test_assert(pop3c_login_last_reply == POP3C_COMMAND_STATE_ERR);
+	test_assert_strcmp(pop3c_login_last_text,
+			   "Server accepted authentication before the SASL authentication exchange finished");
+}
+
+static void test_pop3c_auth_early_success_server(void)
+{
+	test_server_wait_connection(&server, TRUE);
+	test_assert(test_pop3c_server_expect("CAPA"));
+	o_stream_nsend_str(server.output,
+		"+OK Capability list follows\r\nPIPELINING\r\nSASL CRAM-MD5\r\n.\r\n");
+	/* CRAM-MD5 needs the challenge of the server first */
+	test_assert(test_pop3c_server_expect("AUTH CRAM-MD5"));
+	o_stream_nsend_str(server.output, "+OK Logged in\r\n");
+	test_server_disconnect(&server);
+}
+
+static void test_pop3c_auth_early_success(void)
+{
+	test_begin("pop3c auth success before the SASL authentication exchange finished");
+	test_run_client_server(test_pop3c_auth_early_success_client,
+			       test_pop3c_auth_early_success_server,
 			       "CRAM-MD5", NULL, FALSE);
 	test_end();
 }
@@ -984,6 +1022,7 @@ int main(int argc ATTR_UNUSED, char *argv[])
 		test_pop3c_auth_no_server_support,
 		test_pop3c_auth_bad_base64,
 		test_pop3c_auth_bad_mech,
+		test_pop3c_auth_early_success,
 		test_pop3c_user_pass_success,
 		test_pop3c_auth_plain_success,
 		test_pop3c_auth_login_success,

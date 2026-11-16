@@ -41,6 +41,8 @@ struct auth_scram_client {
 	const char *server_first_message;
 	buffer_t *salt;
 	unsigned int iter;
+	/* The server-final message was received and verified */
+	bool server_final_verified;
 
 	unsigned char *server_signature;
 };
@@ -57,6 +59,9 @@ bool auth_scram_client_state_client_first(struct auth_scram_client *client);
 int auth_scram_client_input(struct auth_scram_client *client,
 			    const unsigned char *input, size_t input_len,
 			    const char **error_r);
+/* Returns TRUE if the server-final message was received and verified, i.e.
+   the server is allowed to report authentication success. */
+bool auth_scram_client_is_finished(struct auth_scram_client *client);
 /* Obtain output from client. This will assert fail if called out of sequence.
  */			    
 void auth_scram_client_output(struct auth_scram_client *client,

@@ -27,6 +27,7 @@
 
 struct lmtp_local_recipient {
 	struct lmtp_recipient *rcpt;
+	struct event *event;
 
 	struct mail_storage_service_user *service_user;
 	struct anvil_query *anvil_query;
@@ -40,6 +41,7 @@ struct lmtp_local_recipient {
 
 struct lmtp_local {
 	struct client *client;
+	struct event *event;
 
 	ARRAY(struct lmtp_local_recipient *) rcpt_to;
 
@@ -61,6 +63,10 @@ lmtp_local_init(struct client *client)
 	local = i_new(struct lmtp_local, 1);
 	local->client = client;
 	i_array_init(&local->rcpt_to, 8);
+
+	local->event = event_create(client->event);
+	event_set_append_log_prefix(local->event, "local: ");
+
 	const struct smtp_server_stats *stats =
 	        smtp_server_connection_get_stats(local->client->conn);
 	local->stats = *stats;
@@ -86,6 +92,7 @@ void lmtp_local_deinit(struct lmtp_local **_local)
 		mailbox_free(&raw_box);
 	}
 
+	event_unref(&local->event);
 	i_free(local);
 }
 
@@ -120,6 +127,7 @@ lmtp_local_rcpt_destroy(struct smtp_server_recipient *rcpt ATTR_UNUSED,
 	lmtp_local_rcpt_anvil_disconnect(llrcpt);
 	settings_free(llrcpt->lda_set);
 	mail_storage_service_user_unref(&llrcpt->service_user);
+	event_unref(&llrcpt->event);
 }
 
 static void
@@ -190,7 +198,7 @@ lmtp_local_rcpt_check_quota(struct lmtp_local_recipient *llrcpt)
 							    &user, &error);
 
 	if (ret < 0) {
-		e_error(rcpt->event, "Failed to initialize user %s: %s",
+		e_error(llrcpt->event, "Failed to initialize user %s: %s",
 			smtp_address_encode(address), error);
 		ret = -1;
 	} else {
@@ -207,7 +215,7 @@ lmtp_local_rcpt_check_quota(struct lmtp_local_recipient *llrcpt)
 			if (mail_error == MAIL_ERROR_NOQUOTA) {
 				lmtp_local_rcpt_reply_overquota(llrcpt, error);
 			} else {
-				e_error(rcpt->event,
+				e_error(llrcpt->event,
 					"mailbox_get_status(%s, STATUS_CHECK_OVER_QUOTA) "
 					"failed: %s",
 					mailbox_get_vname(box),
@@ -270,11 +278,11 @@ lmtp_local_rcpt_anvil_cb(const struct anvil_reply *reply,
 
 	llrcpt->anvil_query = NULL;
 	if (reply->error != NULL) {
-		e_error(rcpt->event,
+		e_error(llrcpt->event,
 			"lmtp_user_concurrency_limit lookup failed - skipping: %s",
 			reply->error);
 	} else if (str_to_uint(reply->reply, &parallel_count) < 0) {
-		e_error(rcpt->event, "Invalid reply from anvil: %s",
+		e_error(llrcpt->event, "Invalid reply from anvil: %s",
 			reply->reply);
 	}
 
@@ -298,11 +306,15 @@ int lmtp_local_rcpt(struct lmtp_recipient *lrcpt)
 {
 	struct client *client = lrcpt->client;
 	struct smtp_server_recipient *rcpt = lrcpt->rcpt;
+	struct event *event;
 	struct lmtp_local_recipient *llrcpt;
 	struct mail_storage_service_input input;
 	struct mail_storage_service_user *service_user;
 	const char *error = NULL, *username = lrcpt->username;
 	int ret = 0;
+
+	event = event_create(rcpt->event);
+	event_set_append_log_prefix(event, "local: ");
 
 	i_zero(&input);
 	input.service = "lmtp";
@@ -318,45 +330,56 @@ int lmtp_local_rcpt(struct lmtp_recipient *lrcpt)
 		client->end_client_tls_secured :
 		smtp_server_connection_is_ssl_secured(client->conn);
 	input.forward_fields = lrcpt->forward_fields;
-	input.event_parent = rcpt->event;
+	input.event_parent = event;
 
 	ret = mail_storage_service_lookup(storage_service, &input,
 					  &service_user, &error);
 	if (ret < 0) {
-		e_error(rcpt->event, "Failed to lookup user %s: %s",
+		e_error(event, "Failed to lookup user %s: %s",
 			username, error);
 		smtp_server_recipient_reply(rcpt, 451, "4.3.0",
 					    "Temporary internal error");
+		event_unref(&event);
 		return -1;
 	}
-	if (ret == 0)
+	if (ret == 0) {
+		event_unref(&event);
 		return lmtp_rcpt_continue(lrcpt);
+	}
 
 	if (client->local == NULL)
 		client->local = lmtp_local_init(client);
 
-	e_debug(rcpt->event, "Recipient maps to local user %s",
+	e_debug(event, "Recipient maps to local user %s",
 		service_user->input.username);
 
+	const struct var_expand_params *params =
+		mail_storage_service_get_var_expand_params(
+			storage_service, &service_user->input);
+	params = var_expand_clone_params(rcpt->pool, params);
+	event_set_ptr(event, SETTINGS_EVENT_VAR_EXPAND_PARAMS, (void *)params);
+
 	llrcpt = p_new(rcpt->pool, struct lmtp_local_recipient, 1);
+	llrcpt->event = event;
 	llrcpt->rcpt = lrcpt;
 	llrcpt->service_user = service_user;
 
 	lrcpt->type = LMTP_RECIPIENT_TYPE_LOCAL;
 	lrcpt->backend_context = llrcpt;
 
+	smtp_server_recipient_add_hook(
+		rcpt, SMTP_SERVER_RECIPIENT_HOOK_DESTROY,
+		lmtp_local_rcpt_destroy, llrcpt);
+
 	if (settings_get(mail_storage_service_user_get_event(service_user),
 			 &lda_setting_parser_info,
 			 0, &llrcpt->lda_set, &error) < 0) {
-		e_error(rcpt->event, "%s", error);
+		e_error(llrcpt->event, "%s", error);
 		smtp_server_recipient_reply(rcpt, 451, "4.3.0",
 					    "Temporary internal error");
 		return -1;
 	}
 
-	smtp_server_recipient_add_hook(
-		rcpt, SMTP_SERVER_RECIPIENT_HOOK_DESTROY,
-		lmtp_local_rcpt_destroy, llrcpt);
 	smtp_server_recipient_add_hook(
 		rcpt, SMTP_SERVER_RECIPIENT_HOOK_APPROVED,
 		lmtp_local_rcpt_approved, llrcpt);
@@ -445,7 +468,7 @@ lmtp_local_deliver(struct lmtp_local *local,
 			 &lmtp_pre_mail_setting_parser_info,
 			 SETTINGS_GET_FLAG_NO_EXPAND,
 			 &pre_mail_set, &error) < 0) {
-		e_error(rcpt->event, "%s", error);
+		e_error(llrcpt->event, "%s", error);
 		smtp_server_recipient_reply(rcpt, 451, "4.3.0",
 					    "Temporary internal error");
 		return -1;
@@ -482,7 +505,7 @@ lmtp_local_deliver(struct lmtp_local *local,
 	client_update_data_state(client, username);
 	if (mail_storage_service_next(storage_service, service_user,
 				      &rcpt_user, &error) < 0) {
-		e_error(rcpt->event, "Failed to initialize user: %s", error);
+		e_error(llrcpt->event, "Failed to initialize user: %s", error);
 		smtp_server_recipient_reply(rcpt, 451, "4.3.0",
 					    "Temporary internal error");
 		return -1;
@@ -495,13 +518,6 @@ lmtp_local_deliver(struct lmtp_local *local,
 		mail_storage_service_user_get_log_prefix(service_user));
 
 	lldctx.rcpt_user = rcpt_user;
-	if (settings_get(rcpt_user->event, &smtp_submit_setting_parser_info, 0,
-			 &lldctx.smtp_set, &error) < 0) {
-		e_error(rcpt->event, "%s", error);
-		smtp_server_recipient_reply(rcpt, 451, "4.3.0",
-					    "Temporary internal error");
-		return -1;
-	}
 
 	if (*lrcpt->detail == '\0' ||
 	    !client->lmtp_set->lmtp_save_to_detail_mailbox)
@@ -516,7 +532,6 @@ lmtp_local_deliver(struct lmtp_local *local,
 
 	lmtp_local_rcpt_anvil_disconnect(llrcpt);
 
-	settings_free(lldctx.smtp_set);
 	return ret;
 }
 
@@ -582,7 +597,6 @@ int lmtp_local_default_deliver(struct client *client,
 	i_zero(&dinput);
 	dinput.session = lldctx->session;
 	dinput.set = llrcpt->lda_set;
-	dinput.smtp_set = lldctx->smtp_set;
 	dinput.session_id = lldctx->session_id;
 	dinput.event_parent = event;
 	dinput.src_mail = lldctx->src_mail;
@@ -715,7 +729,7 @@ lmtp_local_open_raw_mail(struct lmtp_local *local,
 	if (raw_mailbox_alloc_stream(client->raw_mail_user, input,
 				     (time_t)-1, smtp_address_encode(trans->mail_from),
 				     &box) < 0) {
-		e_error(client->event, "Can't open delivery mail as raw: %s",
+		e_error(local->event, "Can't open delivery mail as raw: %s",
 			mailbox_get_last_internal_error(box, &error));
 		mailbox_free(&box);
 		lmtp_local_rcpt_fail_all(local, 451, "4.3.0",

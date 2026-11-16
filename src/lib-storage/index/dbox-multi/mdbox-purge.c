@@ -473,7 +473,7 @@ mdbox_purge_alloc(struct mdbox_storage *storage)
 	ctx = p_new(pool, struct mdbox_purge_context, 1);
 	ctx->pool = pool;
 	ctx->storage = storage;
-	ctx->lowest_primary_file_id = (uint32_t)-1;
+	ctx->lowest_primary_file_id = UINT32_MAX;
 	i_array_init(&ctx->primary_file_ids, 64);
 	i_array_init(&ctx->purge_file_ids, 64);
 	hash_table_create_direct(&ctx->altmoves, pool, 0);
@@ -590,7 +590,7 @@ static int mdbox_altmove_add_files(struct mdbox_purge_context *ctx)
 			cur_map_uid = map_uids[i];
 			if (mdbox_map_lookup_full(dstorage->map, cur_map_uid,
 						  &cur_rec, &cur_refcount) < 0) {
-				cur_refcount = (uint16_t)-1;
+				cur_refcount = UINT16_MAX;
 				ret = -1;
 			}
 			alt_refcount = 1;

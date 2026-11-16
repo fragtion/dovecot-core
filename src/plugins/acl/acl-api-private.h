@@ -16,7 +16,13 @@ struct acl_backend_vfuncs {
 					  const char **name_r);
 	int (*nonowner_lookups_iter_deinit)
 		(struct acl_mailbox_list_context *ctx);
-	int (*nonowner_lookups_rebuild)(struct acl_backend *backend);
+	int (*nonowner_lookups_rebuild)(struct acl_backend *backend,
+					bool fetch_all);
+	/* Optional. NULL if the backend keeps no non-owner lookup list. */
+	int (*nonowner_lookups_rename)(struct acl_backend *backend,
+				       const char *name,
+				       struct acl_backend *dest_backend,
+				       const char *dest_name);
 
 	struct acl_object *(*object_init)(struct acl_backend *backend,
 					  const char *name);
@@ -44,6 +50,7 @@ struct acl_backend {
 	struct event *event;
 	struct mailbox_list *list;
 	struct acl_cache *cache;
+	struct acl_rights_cache_file *rights_cache_file;
 
 	struct acl_object *default_aclobj;
 	struct acl_mask *default_aclmask;
@@ -68,6 +75,12 @@ struct acl_object {
 
 	pool_t rights_pool;
 	ARRAY_TYPE(acl_rights) rights;
+
+	/* The object's mailbox is open while its ACLs are being read. This
+	   matters with MAIL_STORAGE_CLASS_FLAG_CACHED_FILES: only then the
+	   mailbox's ACL file is known to be locally present and up to
+	   date. */
+	bool mailbox_open:1;
 };
 
 struct acl_object_list_iter {
@@ -96,9 +109,13 @@ acl_backend_mask_get_names(struct acl_backend *backend,
 struct acl_object *acl_backend_get_default_object(struct acl_backend *backend);
 int acl_backend_get_default_rights(struct acl_backend *backend,
 				   const struct acl_mask **mask_r);
-void acl_rights_sort(struct acl_object *aclobj);
+void acl_object_rights_sort(struct acl_object *aclobj);
 void acl_object_rebuild_cache(struct acl_object *aclobj);
 void acl_object_remove_all_access(struct acl_object *aclobj);
+/* Returns TRUE if the object's global rights (the configured acl { }
+   settings, see acl_backend_get_mailbox_acl()) give a nonowner the lookup
+   right. The object's rights must have been read. */
+bool acl_object_has_global_nonowner_lookup(const struct acl_object *aclobj);
 
 int acl_backend_get_mailbox_acl(struct acl_backend *backend,
 				struct acl_object *aclobj);

@@ -5,8 +5,14 @@
 #include "strfuncs.h"
 #include "settings.h"
 #include "test-common.h"
+#include "hash-method.h"
+#include "md5.h"
+#include "auth-digest.h"
 #include "client-auth-settings.h"
-#include "dsasl-client.h"
+#include "dsasl-client-private.h"
+#ifdef HAVE_GSSAPI
+#  include "gssapi-dummy.h"
+#endif
 
 #include <unistd.h>
 
@@ -746,6 +752,814 @@ static void test_sasl_client_mech_select(void)
 	dsasl_client_unref(&client);
 }
 
+struct settings_equal_test {
+	const char *label;
+	const char *const *settings1;
+	const char *const *settings2;
+	int expected;
+	/* Expected error, or NULL if there is none. */
+	const char *error;
+};
+
+static void
+test_settings_equal_run(const struct settings_equal_test *tests,
+			unsigned int count)
+{
+	for (unsigned int i = 0; i < count; i++) {
+		struct settings_simple test_set1, test_set2;
+		const char *error = NULL;
+
+		test_begin(t_strdup_printf("sasl client settings equal - %s",
+					   tests[i].label));
+		settings_simple_init(&test_set1, tests[i].settings1);
+		settings_simple_init(&test_set2, tests[i].settings2);
+
+		test_assert_cmp(dsasl_client_settings_equal(test_set1.event,
+							    test_set2.event,
+							    &error),
+				==, tests[i].expected);
+		test_assert_strcmp(error, tests[i].error);
+
+		settings_simple_deinit(&test_set2);
+		settings_simple_deinit(&test_set1);
+		test_end();
+	}
+}
+
+static void test_sasl_client_settings_equal(void)
+{
+	static const char *const user[] = {
+		"client_auth_authid", "user",
+		"client_auth_password", "pass",
+		NULL,
+	};
+	static const char *const user2[] = {
+		"client_auth_authid", "user2",
+		"client_auth_password", "pass",
+		NULL,
+	};
+	static const char *const mech_pass[] = {
+		"client_auth", "PLAIN",
+		"client_auth/PLAIN/mechanism", "PLAIN",
+		"client_auth/PLAIN/password", "pass",
+		NULL,
+	};
+	static const char *const mech_pass2[] = {
+		"client_auth", "PLAIN",
+		"client_auth/PLAIN/mechanism", "PLAIN",
+		"client_auth/PLAIN/password", "pass2",
+		NULL,
+	};
+	static const struct settings_equal_test tests[] = {
+		{ "identical", user, user, 1, NULL },
+		{ "authid differs", user, user2, 0, NULL },
+		{ "mechanism password differs",
+		  mech_pass, mech_pass2, 0, NULL },
+	};
+
+	test_settings_equal_run(tests, N_ELEMENTS(tests));
+}
+
+static unsigned int test_mech_equal_calls;
+static int test_mech_equal_result;
+static const char *test_mech_equal_error;
+
+static int
+test_mech_settings_equal(struct event *event1, struct event *event2,
+			 const char **error_r)
+{
+	/* The client_auth/<mechanism>/authid of event1 and event2, in the
+	   order the mechanisms are called. */
+	static const char *const authids[][2] = {
+		{ "authid1a", "authid2a" },
+		{ "authid1b", "authid2b" },
+	};
+	const struct client_auth_settings *set1, *set2;
+	unsigned int idx = test_mech_equal_calls++;
+
+	if (idx >= N_ELEMENTS(authids))
+		return 1;
+	if (settings_get(event1, &client_auth_setting_parser_info, 0,
+			 &set1, error_r) < 0)
+		return -1;
+	if (settings_get(event2, &client_auth_setting_parser_info, 0,
+			 &set2, error_r) < 0) {
+		settings_free(set1);
+		return -1;
+	}
+	test_assert_strcmp(set1->authid, authids[idx][0]);
+	test_assert_strcmp(set2->authid, authids[idx][1]);
+	settings_free(set1);
+	settings_free(set2);
+
+	*error_r = test_mech_equal_error;
+	return test_mech_equal_result;
+}
+
+static void test_sasl_client_mech_settings_equal(void)
+{
+	static const struct dsasl_client_mech test_mech_no_equal = {
+		.name = "TESTNONE",
+	};
+	static const struct dsasl_client_mech test_mech_equal1 = {
+		.name = "TESTEQ1",
+		.settings_equal = test_mech_settings_equal,
+	};
+	static const struct dsasl_client_mech test_mech_equal2 = {
+		.name = "TESTEQ2",
+		.settings_equal = test_mech_settings_equal,
+	};
+	static const struct dsasl_client_mech *const mechs[] = {
+		&test_mech_no_equal, &test_mech_equal1, &test_mech_equal2,
+	};
+	static const char *const settings1[] = {
+		"client_auth", "TESTEQ1 TESTEQ2",
+		"client_auth/TESTEQ1/mechanism", "TESTEQ1",
+		"client_auth/TESTEQ1/authid", "authid1a",
+		"client_auth/TESTEQ2/mechanism", "TESTEQ2",
+		"client_auth/TESTEQ2/authid", "authid1b",
+		NULL,
+	};
+	static const char *const settings2[] = {
+		"client_auth", "TESTEQ1 TESTEQ2",
+		"client_auth/TESTEQ1/mechanism", "TESTEQ1",
+		"client_auth/TESTEQ1/authid", "authid2a",
+		"client_auth/TESTEQ2/mechanism", "TESTEQ2",
+		"client_auth/TESTEQ2/authid", "authid2b",
+		NULL,
+	};
+	static const struct {
+		const char *label;
+		int result;
+		const char *error;
+		/* Mechanisms called before the result is known. */
+		unsigned int calls;
+	} tests[] = {
+		{ "equal", 1, NULL, 2 },
+		{ "differs", 0, NULL, 1 },
+		{ "error", -1, "mechanism settings error", 1 },
+	};
+
+	for (unsigned int i = 0; i < N_ELEMENTS(tests); i++) {
+		struct settings_simple test_set1, test_set2;
+		const char *error = NULL;
+
+		test_begin(t_strdup_printf(
+			"sasl client mechanism settings equal - %s",
+			tests[i].label));
+		settings_simple_init(&test_set1, settings1);
+		settings_simple_init(&test_set2, settings2);
+		test_mech_equal_calls = 0;
+		test_mech_equal_result = tests[i].result;
+		test_mech_equal_error = tests[i].error;
+
+		test_assert_cmp(dsasl_client_mechs_settings_equal(
+					mechs, N_ELEMENTS(mechs),
+					test_set1.event, test_set2.event,
+					&error),
+				==, tests[i].result);
+		test_assert_strcmp(error, tests[i].error);
+		test_assert_ucmp(test_mech_equal_calls, ==, tests[i].calls);
+
+		settings_simple_deinit(&test_set2);
+		settings_simple_deinit(&test_set1);
+		test_end();
+	}
+}
+
+#ifdef HAVE_GSSAPI
+static void test_sasl_client_gssapi_settings_equal(void)
+{
+	static const char *const global_default[] = {
+		"client_auth_mechanism", "GSSAPI",
+		NULL,
+	};
+	static const char *const global_no_cbind[] = {
+		"client_auth_mechanism", "GSSAPI",
+		"client_auth_gssapi_channel_binding", "no",
+		NULL,
+	};
+	static const char *const filter_default[] = {
+		"client_auth", "GSSAPI",
+		"client_auth/GSSAPI/mechanism", "GSSAPI",
+		NULL,
+	};
+	static const char *const filter_no_cbind[] = {
+		"client_auth", "GSSAPI",
+		"client_auth/GSSAPI/mechanism", "GSSAPI",
+		"client_auth/GSSAPI/gssapi_channel_binding", "no",
+		NULL,
+	};
+	static const char *const filter_authid[] = {
+		"client_auth", "GSSAPI",
+		"client_auth/GSSAPI/mechanism", "GSSAPI",
+		"client_auth/GSSAPI/authid", "user",
+		NULL,
+	};
+	static const char *const bad_value[] = {
+		"client_auth_mechanism", "GSSAPI",
+		"client_auth_gssapi_channel_binding", "maybe",
+		NULL,
+	};
+	static const char *const spnego_default[] = {
+		"client_auth", "GSS-SPNEGO",
+		"client_auth/GSS-SPNEGO/mechanism", "GSS-SPNEGO",
+		NULL,
+	};
+	static const char *const spnego_no_cbind[] = {
+		"client_auth", "GSS-SPNEGO",
+		"client_auth/GSS-SPNEGO/mechanism", "GSS-SPNEGO",
+		"client_auth/GSS-SPNEGO/gssapi_channel_binding", "no",
+		NULL,
+	};
+	static const struct settings_equal_test tests[] = {
+		{ "GSSAPI global setting differs",
+		  global_default, global_no_cbind, 0, NULL },
+		{ "GSSAPI global setting identical",
+		  global_no_cbind, global_no_cbind, 1, NULL },
+		{ "GSSAPI filter setting differs",
+		  filter_default, filter_no_cbind, 0, NULL },
+		{ "GSSAPI filter without the setting",
+		  filter_authid, filter_authid, 1, NULL },
+		{ "GSS-SPNEGO filter setting differs",
+		  spnego_default, spnego_no_cbind, 0, NULL },
+		{ "invalid value", bad_value, global_default, -1,
+		  "dsasl_client_gssapi settings: Failed to override configuration from hardcoded: "
+		  "Invalid client_auth_gssapi_channel_binding=maybe: "
+		  "Invalid boolean value: maybe (use yes or no)" },
+	};
+
+	test_settings_equal_run(tests, N_ELEMENTS(tests));
+}
+#endif
+
+static void test_sasl_client_is_finished(void)
+{
+	static const char *const sasl_set_fmt[] = {
+		"client_auth_authid=testuser",
+		"client_auth_password=testpassword",
+		NULL
+	};
+	static const char *const mechs[] = {
+		"PLAIN", "EXTERNAL", "OAUTHBEARER", "XOAUTH2",
+	};
+	const unsigned char *output;
+	struct dsasl_client *client;
+	struct dsasl_client_session *session;
+	const char *error;
+	size_t olen;
+
+	test_begin("sasl client is finished");
+	client = dsasl_client_create(NULL);
+
+	/* the client output ends these */
+	for (unsigned int i = 0; i < N_ELEMENTS(mechs); i++) {
+		const char *settings[] = {
+			sasl_set_fmt[0], sasl_set_fmt[1],
+			t_strconcat("client_auth_mechanism=", mechs[i], NULL),
+			NULL
+		};
+
+		session = test_init_sasl_session(client, settings, &error);
+		i_assert(session != NULL);
+		test_assert_idx(!dsasl_client_session_is_finished(session), i);
+		test_assert_idx(dsasl_client_session_output(
+			session, &output, &olen, &error) ==
+			DSASL_CLIENT_RESULT_OK, i);
+		test_assert_idx(dsasl_client_session_is_finished(session), i);
+		dsasl_client_session_destroy(&session);
+	}
+
+	/* the challenge has to come first */
+	static const char *const cram_set[] = {
+		"client_auth_mechanism=CRAM-MD5",
+		"client_auth_authid=testuser",
+		"client_auth_password=testpassword",
+		NULL
+	};
+	const unsigned char challenge[] = "<1234@example.com>";
+
+	session = test_init_sasl_session(client, cram_set, &error);
+	i_assert(session != NULL);
+	test_assert(!dsasl_client_session_is_finished(session));
+	test_assert(dsasl_client_session_verify_success(session, &error) < 0);
+	test_assert_strcmp(error, "Server accepted authentication before the SASL authentication exchange finished");
+	test_assert(dsasl_client_session_input(session, challenge,
+					       sizeof(challenge) - 1, &error) ==
+		    DSASL_CLIENT_RESULT_OK);
+	test_assert(dsasl_client_session_is_finished(session));
+	error = NULL;
+	test_assert(dsasl_client_session_verify_success(session, &error) == 0);
+	test_assert(error == NULL);
+	dsasl_client_session_destroy(&session);
+
+	dsasl_client_unref(&client);
+	test_end();
+}
+
+static void test_sasl_client_is_finished_unverified(void)
+{
+	static const char *const login_set[] = {
+		"client_auth_mechanism=LOGIN",
+		"client_auth_authid=testuser",
+		"client_auth_password=testpassword",
+		NULL
+	};
+	static const char *const scram_set[] = {
+		"client_auth_mechanism=SCRAM-SHA-1",
+		"client_auth_authid=testuser",
+		"client_auth_password=testpassword",
+		NULL
+	};
+	static const char *const digest_set[] = {
+		"client_auth_mechanism=DIGEST-MD5",
+		"client_auth_authid=testuser",
+		"client_auth_password=testpassword",
+		NULL
+	};
+	static const struct dsasl_client_parameters digest_params = {
+		.protocol = "imap",
+		.host = "mail.example.com",
+	};
+	const unsigned char digest_challenge[] =
+		"nonce=\"abcdef\",qop=\"auth\",charset=utf-8,algorithm=md5-sess";
+	const unsigned char digest_final[] =
+		"rspauth=00000000000000000000000000000000";
+	const unsigned char scram_final[] = "v=AAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+	const unsigned char *output;
+	struct dsasl_client *client;
+	struct dsasl_client_session *session;
+	const char *error;
+	size_t olen;
+
+	test_begin("sasl client is finished without server proof");
+	client = dsasl_client_create(NULL);
+
+	/* LOGIN needs both prompts */
+	session = test_init_sasl_session(client, login_set, &error);
+	i_assert(session != NULL);
+	test_assert(dsasl_client_session_input(session, (const void *)"User",
+					       4, &error) ==
+		    DSASL_CLIENT_RESULT_OK);
+	test_assert(!dsasl_client_session_is_finished(session));
+	test_assert(dsasl_client_session_input(session, (const void *)"Pass",
+					       4, &error) ==
+		    DSASL_CLIENT_RESULT_OK);
+	test_assert(dsasl_client_session_is_finished(session));
+	dsasl_client_session_destroy(&session);
+
+	/* SCRAM needs the server's signature */
+	session = test_init_sasl_session(client, scram_set, &error);
+	i_assert(session != NULL);
+	test_assert(dsasl_client_session_output(session, &output, &olen,
+						&error) ==
+		    DSASL_CLIENT_RESULT_OK);
+	const char *client_first = t_strndup(output, olen);
+	const char *nonce = strstr(client_first, ",r=");
+	i_assert(nonce != NULL);
+	const char *server_first = t_strdup_printf(
+		"r=%sSERVER,s=c2FsdHNhbHQ=,i=4096", nonce + 3);
+	test_assert(dsasl_client_session_input(
+		session, (const void *)server_first, strlen(server_first),
+		&error) == DSASL_CLIENT_RESULT_OK);
+	test_assert(!dsasl_client_session_is_finished(session));
+	test_assert(dsasl_client_session_output(session, &output, &olen,
+						&error) ==
+		    DSASL_CLIENT_RESULT_OK);
+	test_assert(!dsasl_client_session_is_finished(session));
+	test_assert(dsasl_client_session_input(session, scram_final,
+					       sizeof(scram_final) - 1,
+					       &error) ==
+		    DSASL_CLIENT_RESULT_ERR_PROTOCOL);
+	test_assert(!dsasl_client_session_is_finished(session));
+	dsasl_client_session_destroy(&session);
+
+	/* DIGEST-MD5 needs a valid rspauth */
+	session = test_init_sasl_session_params(client, &digest_params,
+						digest_set, &error);
+	i_assert(session != NULL);
+	test_assert(dsasl_client_session_input(session, digest_challenge,
+					       sizeof(digest_challenge) - 1,
+					       &error) ==
+		    DSASL_CLIENT_RESULT_OK);
+	test_assert(dsasl_client_session_output(session, &output, &olen,
+						&error) ==
+		    DSASL_CLIENT_RESULT_OK);
+	test_assert(!dsasl_client_session_is_finished(session));
+	test_assert(dsasl_client_session_input(session, digest_final,
+					       sizeof(digest_final) - 1,
+					       &error) ==
+		    DSASL_CLIENT_RESULT_AUTH_FAILED);
+	test_assert(!dsasl_client_session_is_finished(session));
+	dsasl_client_session_destroy(&session);
+
+	dsasl_client_unref(&client);
+	test_end();
+}
+
+static void
+test_sasl_client_digest_md5_rspauth(const char *response, string_t *rspauth_r)
+{
+	char *copy = t_strdup_noconst(response);
+	const char *key, *value;
+	const char *username = NULL, *realm = NULL, *nonce = NULL;
+	const char *cnonce = NULL, *nc = NULL, *qop = NULL, *uri = NULL;
+	unsigned char a1_secret[MD5_RESULTLEN];
+
+	while (*copy != '\0') {
+		if (auth_digest_parse_keyvalue(&copy, &key, &value)) {
+			if (strcmp(key, "username") == 0)
+				username = value;
+			else if (strcmp(key, "realm") == 0)
+				realm = value;
+			else if (strcmp(key, "nonce") == 0)
+				nonce = value;
+			else if (strcmp(key, "cnonce") == 0)
+				cnonce = value;
+			else if (strcmp(key, "nc") == 0)
+				nc = value;
+			else if (strcmp(key, "qop") == 0)
+				qop = value;
+			else if (strcmp(key, "digest-uri") == 0)
+				uri = value;
+		}
+		if (*copy == ',')
+			copy++;
+	}
+	i_assert(username != NULL && realm != NULL && nonce != NULL &&
+		 cnonce != NULL && nc != NULL && qop != NULL && uri != NULL);
+
+	auth_digest_get_hash_a1_secret(&hash_method_md5, username, realm,
+				       "testpassword", a1_secret);
+	const char *a1_hex = auth_digest_get_hash_a1(&hash_method_md5,
+						     a1_secret, nonce, cnonce,
+						     NULL);
+	str_append(rspauth_r, "rspauth=");
+	str_append(rspauth_r, auth_digest_get_server_response(
+		&hash_method_md5, a1_hex, uri, qop, nonce, nc, cnonce, NULL));
+}
+
+static void test_sasl_client_digest_md5_unexpected_input(void)
+{
+	static const char *const sasl_set[] = {
+		"client_auth_mechanism=DIGEST-MD5",
+		"client_auth_authid=testuser@example.com",
+		"client_auth_password=testpassword",
+		NULL
+	};
+	static const struct dsasl_client_parameters params = {
+		.protocol = "imap",
+		.host = "example.com",
+	};
+	static const char challenge[] =
+		"realm=\"example.com\",nonce=\"OA6MG9tEQGm2hh\",qop=\"auth\","
+		"charset=utf-8,algorithm=md5-sess";
+	const unsigned char *chal = (const unsigned char *)challenge;
+	size_t chal_len = sizeof(challenge) - 1;
+	struct dsasl_client *client;
+	struct dsasl_client_session *session;
+	const unsigned char *output;
+	size_t olen;
+	const char *error;
+
+	test_begin("sasl client DIGEST-MD5 unexpected input");
+
+	client = dsasl_client_create(NULL);
+
+	/* second challenge before the client response */
+	session = test_init_sasl_session_params(client, &params, sasl_set,
+						&error);
+	i_assert(session != NULL);
+	test_assert(dsasl_client_session_input(session, chal, chal_len,
+		&error) == DSASL_CLIENT_RESULT_OK);
+	error = NULL;
+	test_assert(dsasl_client_session_input(session, chal, chal_len,
+		&error) == DSASL_CLIENT_RESULT_ERR_PROTOCOL);
+	test_assert_strcmp(error, "Server sent unexpected data");
+	/* the rejected input doesn't change the state */
+	test_assert(dsasl_client_session_output(session, &output, &olen,
+		&error) == DSASL_CLIENT_RESULT_OK);
+	test_assert(olen > 0 &&
+		    str_begins_with(t_strndup(output, olen),
+				    "realm=\"example.com\",username=\"testuser\","));
+	dsasl_client_session_destroy(&session);
+
+	/* more data after the completed exchange */
+	session = test_init_sasl_session_params(client, &params, sasl_set,
+						&error);
+	i_assert(session != NULL);
+	test_assert(dsasl_client_session_input(session, chal, chal_len,
+		&error) == DSASL_CLIENT_RESULT_OK);
+	test_assert(dsasl_client_session_output(session, &output, &olen,
+		&error) == DSASL_CLIENT_RESULT_OK);
+
+	string_t *rspauth = t_str_new(64);
+	test_sasl_client_digest_md5_rspauth(t_strndup(output, olen), rspauth);
+	test_assert(dsasl_client_session_input(session, rspauth->data,
+		rspauth->used, &error) == DSASL_CLIENT_RESULT_OK);
+
+	/* second rspauth before the client's empty response */
+	error = NULL;
+	test_assert(dsasl_client_session_input(session, rspauth->data,
+		rspauth->used, &error) == DSASL_CLIENT_RESULT_ERR_PROTOCOL);
+	test_assert_strcmp(error, "Server sent unexpected data");
+
+	test_assert(dsasl_client_session_output(session, &output, &olen,
+		&error) == DSASL_CLIENT_RESULT_OK);
+	test_assert(olen == 0);
+	error = NULL;
+	test_assert(dsasl_client_session_input(session, uchar_empty_ptr, 0,
+		&error) == DSASL_CLIENT_RESULT_ERR_PROTOCOL);
+	test_assert_strcmp(error, "Server didn't finish authentication");
+	dsasl_client_session_destroy(&session);
+
+	dsasl_client_unref(&client);
+	test_end();
+}
+
+#ifdef HAVE_GSSAPI
+static void test_sasl_client_gss_spnego_is_finished(void)
+{
+	static const char *const set[] = {
+		"client_auth_mechanism=GSS-SPNEGO",
+		NULL
+	};
+	static const struct dsasl_client_parameters params = {
+		.protocol = "imap",
+		.host = "mail.example.com",
+	};
+	struct dsasl_client *client;
+	struct dsasl_client_session *session;
+	const char *error;
+
+	test_begin("sasl client is finished - GSS-SPNEGO");
+	client = dsasl_client_create(NULL);
+	dsasl_client_init_gssapi(client);
+	gss_dummy_kinit("user@EXAMPLE.COM");
+#ifndef HAVE_GSS_SET_CRED_OPTION
+	/* Pretend the library doesn't set the integrity and confidentiality
+	   flags. */
+	gss_dummy_set_ret_flags(0, GSS_C_INTEG_FLAG | GSS_C_CONF_FLAG);
+#endif
+
+	session = test_init_sasl_session_params(client, &params, set, &error);
+#ifdef HAVE_GSS_SET_NEG_MECHS
+	const unsigned char *output;
+	size_t olen;
+
+	i_assert(session != NULL);
+	/* the context is established with the acceptor's reply to the first
+	   token */
+	test_assert(!dsasl_client_session_is_finished(session));
+	test_assert(dsasl_client_session_output(session, &output, &olen,
+						&error) ==
+		    DSASL_CLIENT_RESULT_OK);
+	test_assert(olen > 0);
+	test_assert(!dsasl_client_session_is_finished(session));
+	test_assert(dsasl_client_session_input(
+			session, (const unsigned char *)GSS_DUMMY_MUTUAL_TOKEN,
+			strlen(GSS_DUMMY_MUTUAL_TOKEN), &error) ==
+		    DSASL_CLIENT_RESULT_OK);
+	test_assert(dsasl_client_session_is_finished(session));
+	/* there is no security layer negotiation */
+	test_assert(dsasl_client_session_input(session, output, olen,
+					       &error) ==
+		    DSASL_CLIENT_RESULT_ERR_PROTOCOL);
+	test_assert_strcmp(error,
+			   "Server sent unexpected data");
+	dsasl_client_session_destroy(&session);
+#else
+	test_assert(session == NULL);
+	test_assert_strcmp(error, "GSS-SPNEGO can't be restricted to Kerberos "
+		"(gss_set_neg_mechs() not available in the GSSAPI library)");
+#endif
+
+	gss_dummy_deinit();
+	dsasl_client_unref(&client);
+	test_end();
+}
+
+static void test_sasl_client_gssapi_no_password(void)
+{
+	static const char *const mechs[] = { "GSSAPI", "GSS-SPNEGO" };
+	struct settings_simple test_set;
+	struct dsasl_client *client;
+	struct dsasl_client_parameters params;
+	struct dsasl_client_session *session;
+	const char *error;
+
+	for (unsigned int i = 0; i < N_ELEMENTS(mechs); i++) T_BEGIN {
+		test_begin(t_strdup_printf(
+			"sasl client check settings - %s without password",
+			mechs[i]));
+		const char *settings[] = {
+			"client_auth_mechanism", mechs[i],
+			"client_auth_authid", "",
+			"client_auth_authzid", "",
+			"client_auth_password", "",
+			NULL,
+		};
+		settings_simple_init(&test_set, settings);
+		event_set_forced_debug(test_set.event, debug);
+
+		client = dsasl_client_create(test_set.event);
+		dsasl_client_init_gssapi(client);
+		error = NULL;
+		test_assert(dsasl_client_check_settings(client, &error) == 0);
+		test_assert_strcmp(error, NULL);
+
+		dsasl_client_unref(&client);
+		settings_simple_deinit(&test_set);
+		test_end();
+	} T_END;
+
+	test_begin("sasl client check settings - PLAIN without password");
+	static const char *settings_plain[] = {
+		"client_auth_mechanism", "PLAIN",
+		"client_auth_authid", "",
+		"client_auth_authzid", "testuser",
+		"client_auth_password", "",
+		NULL,
+	};
+	settings_simple_init(&test_set, settings_plain);
+	event_set_forced_debug(test_set.event, debug);
+
+	client = dsasl_client_create(test_set.event);
+	dsasl_client_init_gssapi(client);
+	test_assert(dsasl_client_check_settings(client, &error) < 0);
+	test_assert_strcmp(error, "Missing client_auth_password");
+
+	dsasl_client_unref(&client);
+	settings_simple_deinit(&test_set);
+	test_end();
+
+	test_begin("sasl client mech select - GSSAPI is not a default");
+	static const char *settings_default[] = {
+		"client_auth_mechanism", "",
+		"client_auth_authid", "",
+		"client_auth_authzid", "testuser",
+		"client_auth_password", "frop",
+		NULL,
+	};
+	settings_simple_init(&test_set, settings_default);
+	event_set_forced_debug(test_set.event, debug);
+
+	client = dsasl_client_create(NULL);
+	dsasl_client_init_gssapi(client);
+
+	static const char *server_mechs[] = {
+		"GSSAPI", "GSS-SPNEGO", "LOGIN", NULL,
+	};
+	i_zero(&params);
+	params.server_mechanisms = server_mechs;
+
+	session = NULL;
+	test_assert(dsasl_client_session_create_auto(
+		client, test_set.event, &params, &session, &error) > 0);
+	if (session != NULL) {
+		test_assert_strcmp(dsasl_client_session_get_mech_name(session),
+				   "LOGIN");
+		dsasl_client_session_destroy(&session);
+	}
+	dsasl_client_unref(&client);
+	settings_simple_deinit(&test_set);
+	test_end();
+}
+#endif
+
+#ifdef HAVE_GSSAPI
+static unsigned int module_load_calls;
+static const struct dsasl_client_module *module_load_last;
+static const char *module_load_error;
+
+/* Replaces the real function, which loads the installed module. */
+int dsasl_client_module_load(struct dsasl_client *client,
+			     const struct dsasl_client_module *module,
+			     const char **error_r)
+{
+	module_load_calls++;
+	module_load_last = module;
+	if (module_load_error != NULL) {
+		*error_r = module_load_error;
+		return -1;
+	}
+	dsasl_client_init_gssapi(client);
+	return 0;
+}
+
+static void test_sasl_client_gssapi_load(void)
+{
+	static const char *const mechs[] = { "GSSAPI", "gss-spnego" };
+	struct settings_simple test_set;
+	struct dsasl_client *client;
+	const char *error;
+
+	for (unsigned int i = 0; i < N_ELEMENTS(mechs); i++) T_BEGIN {
+		test_begin(t_strdup_printf("sasl client load GSSAPI - %s",
+					   mechs[i]));
+		const char *const settings[] = {
+			"client_auth_mechanism", mechs[i],
+			"client_auth_authid", "",
+			"client_auth_authzid", "",
+			"client_auth_password", "",
+			NULL,
+		};
+		settings_simple_init(&test_set, settings);
+		event_set_forced_debug(test_set.event, debug);
+
+		/* The mechanism is loaded when it is configured. */
+		client = dsasl_client_create(test_set.event);
+		module_load_calls = 0;
+		module_load_error = NULL;
+		error = NULL;
+		test_assert(dsasl_client_check_settings(client, &error) == 0);
+		test_assert_strcmp(error, NULL);
+		test_assert_ucmp(module_load_calls, ==, 1);
+		i_assert(module_load_last != NULL);
+		test_assert_strcmp(module_load_last->name, "dovecot-gssapi");
+		test_assert_strcmp(module_load_last->init_symbol,
+				   "dsasl_client_init_gssapi");
+
+		/* It isn't loaded again. */
+		test_assert(dsasl_client_check_settings(client, &error) == 0);
+		test_assert_ucmp(module_load_calls, ==, 1);
+		dsasl_client_unref(&client);
+
+		/* It isn't loaded if it's already registered. */
+		client = dsasl_client_create(test_set.event);
+		dsasl_client_init_gssapi(client);
+		module_load_calls = 0;
+		test_assert(dsasl_client_check_settings(client, &error) == 0);
+		test_assert_ucmp(module_load_calls, ==, 0);
+		dsasl_client_unref(&client);
+
+		/* The error is returned if it can't be loaded. */
+		client = dsasl_client_create(test_set.event);
+		module_load_error = "Failed to load SASL mechanism module test";
+		test_assert(dsasl_client_check_settings(client, &error) < 0);
+		test_assert_strcmp(error, module_load_error);
+		dsasl_client_unref(&client);
+
+		settings_simple_deinit(&test_set);
+		test_end();
+	} T_END;
+}
+
+static void test_sasl_client_non_gssapi_not_loaded(void)
+{
+	static const char *const settings[] = {
+		"client_auth_mechanism", "FROP",
+		"client_auth_authid", "",
+		"client_auth_authzid", "",
+		"client_auth_password", "",
+		NULL,
+	};
+	struct settings_simple test_set;
+	struct dsasl_client *client;
+	const char *error = NULL;
+
+	test_begin("sasl client check settings - unknown mechanism");
+	settings_simple_init(&test_set, settings);
+	event_set_forced_debug(test_set.event, debug);
+
+	client = dsasl_client_create(test_set.event);
+	module_load_calls = 0;
+	test_assert(dsasl_client_check_settings(client, &error) < 0);
+	test_assert_strcmp(error, "Configured SASL mechanism 'FROP' is not supported by client");
+	test_assert_ucmp(module_load_calls, ==, 0);
+
+	dsasl_client_unref(&client);
+	settings_simple_deinit(&test_set);
+	test_end();
+}
+#else
+static void test_sasl_client_gssapi_not_built(void)
+{
+	static const char *const settings[] = {
+		"client_auth_mechanism", "GSSAPI",
+		"client_auth_authid", "",
+		"client_auth_authzid", "",
+		"client_auth_password", "",
+		NULL,
+	};
+	struct settings_simple test_set;
+	struct dsasl_client *client;
+	const char *error = NULL;
+
+	test_begin("sasl client check settings - GSSAPI not built");
+	settings_simple_init(&test_set, settings);
+	event_set_forced_debug(test_set.event, debug);
+
+	client = dsasl_client_create(test_set.event);
+	test_assert(dsasl_client_check_settings(client, &error) < 0);
+	test_assert_strcmp(error, "Configured SASL mechanism 'GSSAPI' is not supported by client");
+
+	dsasl_client_unref(&client);
+	settings_simple_deinit(&test_set);
+	test_end();
+}
+#endif
+
 int main(int argc ATTR_UNUSED, char *argv[])
 {
 	int c;
@@ -760,6 +1574,20 @@ int main(int argc ATTR_UNUSED, char *argv[])
 		test_sasl_client_oauthbearer,
 		test_sasl_client_xoauth2,
 		test_sasl_client_mech_select,
+		test_sasl_client_settings_equal,
+		test_sasl_client_mech_settings_equal,
+		test_sasl_client_is_finished,
+		test_sasl_client_is_finished_unverified,
+		test_sasl_client_digest_md5_unexpected_input,
+#ifdef HAVE_GSSAPI
+		test_sasl_client_gss_spnego_is_finished,
+		test_sasl_client_gssapi_no_password,
+		test_sasl_client_gssapi_load,
+		test_sasl_client_non_gssapi_not_loaded,
+		test_sasl_client_gssapi_settings_equal,
+#else
+		test_sasl_client_gssapi_not_built,
+#endif
 		NULL
 	};
 

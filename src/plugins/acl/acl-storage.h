@@ -4,6 +4,7 @@
 #include "mail-storage.h"
 
 struct acl_rights_update;
+struct acl_backend;
 
 enum acl_storage_rights {
 	ACL_STORAGE_RIGHT_LOOKUP,
@@ -46,5 +47,16 @@ acl_attribute_iter_init(struct mailbox *box, enum mail_attribute_type type,
 			const char *prefix);
 const char *acl_attribute_iter_next(struct mailbox_attribute_iter *iter);
 int acl_attribute_iter_deinit(struct mailbox_attribute_iter *iter);
+
+bool acl_backend_get_root_dir(struct acl_backend *backend,
+			      const char **root_dir_r,
+			      enum mailbox_list_path_type *type_r);
+
+enum mailbox_list_path_type
+mail_storage_get_acl_list_path_type(struct mail_storage *storage);
+/* Returns TRUE if the backend's storage has
+   MAIL_STORAGE_CLASS_FLAG_CACHED_FILES: a mailbox's ACL file that isn't
+   locally available may still exist. */
+bool acl_backend_storage_has_cached_files(struct acl_backend *backend);
 
 #endif

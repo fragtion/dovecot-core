@@ -345,7 +345,7 @@ int pop3c_client_settings_match(struct event *event1, struct event *event2,
 		/* The authentication settings are used only when the
 		   mailbox/connection is created, so they must be compared here
 		   as well. */
-		ret = client_auth_settings_equal(event1f, event2f, error_r);
+		ret = dsasl_client_settings_equal(event1f, event2f, error_r);
 	}
 	event_unref(&event1f);
 	event_unref(&event2f);
@@ -721,7 +721,7 @@ static int
 pop3c_client_prelogin_input_line(struct pop3c_client *client, const char *line)
 {
 	bool success = line[0] == '+';
-	const char *reply, *capa_params;
+	const char *reply, *capa_params, *error;
 
 	switch (client->state) {
 	case POP3C_CLIENT_STATE_CONNECTING:
@@ -774,6 +774,10 @@ pop3c_client_prelogin_input_line(struct pop3c_client *client, const char *line)
 				return -1;
 			break;
 		}
+		if (success &&
+		    dsasl_client_session_verify_success(client->sasl_session,
+							&error) < 0)
+			return pop3c_client_auth_failed(client, error);
 		dsasl_client_session_destroy(&client->sasl_session);
 		i_free(client->sasl_ir);
 		client->state = POP3C_CLIENT_STATE_PASS;

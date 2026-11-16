@@ -397,6 +397,19 @@ static const struct valid_imap_url_test valid_url_tests[] = {
 		},
 	},
 	{
+		.url = "Drafts",
+		.url_base = {
+			.host = { .name = "example.com" },
+			.userid = "user",
+			.mailbox = "",
+		},
+		.url_parsed = {
+			.host = { .name = "example.com" },
+			.userid = "user",
+			.mailbox = "Drafts",
+		},
+	},
+	{
 		.url = "../Drafts",
 		.url_base = {
 			.host = { .name = "example.com" },
@@ -1419,12 +1432,38 @@ static void test_imap_url_parse_create(void)
 }
 
 
+static void test_imap_url_empty_base_mailbox(void)
+{
+	struct imap_url url_base = {
+		.host = { .name = "example.com" },
+		.userid = "user",
+	};
+	struct imap_url *urlp;
+	const char *error = NULL;
+	char *mailbox;
+
+	test_begin("imap url empty base mailbox");
+	/* Use a heap-allocated empty mailbox name, so valgrind/asan catches
+	   reads before the beginning of the string. */
+	mailbox = i_strdup("");
+	url_base.mailbox = mailbox;
+	T_BEGIN {
+		int ret = imap_url_parse("Drafts", &url_base, 0, &urlp, &error);
+		test_out_reason("imap_url_parse(Drafts)", ret == 0, error);
+		if (ret == 0)
+			test_assert_strcmp(urlp->mailbox, "Drafts");
+	} T_END;
+	i_free(mailbox);
+	test_end();
+}
+
 int main(void)
 {
 	static void (*const test_functions[])(void) = {
 		test_imap_url_valid,
 		test_imap_url_invalid,
 		test_imap_url_parse_create,
+		test_imap_url_empty_base_mailbox,
 		NULL
 	};
 	return test_run(test_functions);

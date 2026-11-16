@@ -104,8 +104,17 @@ void login_proxy_redirect_finish(struct login_proxy *proxy,
 bool login_proxy_failed(struct login_proxy *proxy, struct event *event,
 			enum login_proxy_failure_type type, const char *reason);
 
+/* Enable TLS channel binding for client->proxy_sasl_session, if the connection
+   to the backend uses TLS. Call after creating the session. */
+void login_proxy_sasl_enable_channel_binding(struct client *client);
 /* Handle SASL input in str, and write the SASL output to str. */
 int login_proxy_sasl_step(struct client *client, string_t *str);
+/* Call when the backend reports a successful SASL authentication. Fails the
+   proxy and returns -1 if the success can't be trusted, e.g. because the SASL
+   mechanism hasn't finished, i.e. the backend skipped a part of the
+   authentication. Returns 0 if the success can be trusted or the proxy isn't
+   using SASL. */
+int login_proxy_sasl_verify_success(struct client *client);
 
 /* Return TRUE if host/port/destuser combination points to same as current
    connection. */
@@ -127,6 +136,10 @@ bool login_proxy_failed_because_invalid_cert(struct login_proxy *proxy);
 void login_proxy_multiplex_input_start(struct login_proxy *proxy);
 /* Returns TRUE if login_proxy_multiplex_input_start() has been called. */
 bool login_proxy_multiplex_input_started(struct login_proxy *proxy);
+/* Client enabled compression (e.g. IMAP COMPRESS) using the given mechanism
+   name. It's added to the disconnection log line and to the
+   proxy_session_finished event. */
+void login_proxy_set_compression(struct login_proxy *proxy, const char *name);
 
 void login_proxy_replace_client_iostream_pre(struct login_proxy *proxy);
 void login_proxy_replace_client_iostream_post(struct login_proxy *proxy,

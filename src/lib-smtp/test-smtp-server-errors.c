@@ -105,10 +105,15 @@ test_run_client_server(struct smtp_server_settings *server_set,
 
 /* client */
 
-static void test_slow_server_input(struct client_connection *conn ATTR_UNUSED)
+static void test_slow_server_input(struct client_connection *conn)
 {
-	/* do nothing */
-	sleep(10);
+	struct istream *input = conn->conn.input;
+
+	/* ignore the replies */
+	while (i_stream_read(input) > 0)
+		i_stream_skip(input, i_stream_get_data_size(input));
+	if (input->eof)
+		io_loop_stop(ioloop);
 }
 
 static void test_slow_server_connected(struct client_connection *conn)
@@ -3735,7 +3740,7 @@ static void (*const test_functions[])(void) = {
 
 static int client_connection_init_ssl(struct client_connection *conn)
 {
-	struct ssl_iostream_settings ssl_set;
+	struct ssl_iostream_settings *ssl_client_set;
 	const char *error;
 
 	if (test_ssl_host == NULL)
@@ -3743,15 +3748,16 @@ static int client_connection_init_ssl(struct client_connection *conn)
 
 	connection_input_halt(&conn->conn);
 
-	ssl_iostream_test_settings_client(&ssl_set);
-	ssl_set.allow_invalid_cert = TRUE;
+	ssl_client_set = ssl_iostream_test_settings_client();
+	ssl_client_set->allow_invalid_cert = TRUE;
 
 	if (client_ssl_ctx == NULL &&
-	    ssl_iostream_context_init_client(&ssl_set, &client_ssl_ctx,
+	    ssl_iostream_context_init_client(ssl_client_set, &client_ssl_ctx,
 					     &error) < 0) {
 		i_error("SSL context initialization failed: %s", error);
 		return -1;
 	}
+	settings_free(ssl_client_set);
 
 	if (io_stream_create_ssl_client(client_ssl_ctx, test_ssl_host,
 					conn->conn.event, 0,

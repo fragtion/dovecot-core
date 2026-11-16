@@ -7,6 +7,12 @@
 
 /* Padding to leave in X-Keywords header when rewriting mbox */
 #define MBOX_HEADER_PADDING 50
+/* Highest UID mbox assigns or accepts from X-UID/X-IMAPbase. Index sync
+   transactions run on a dummy view with UINT32_MAX - 2 messages, so a flag
+   update for UID UINT32_MAX - 1 or UINT32_MAX is taken as an update of a new
+   (appended) record and fails an assert in
+   mail_index_transaction_lookup() on every sync. */
+#define MBOX_MAX_UID (UINT32_MAX - 2)
 /* Don't write Content-Length header unless it's value is larger than this. */
 #define MBOX_MIN_CONTENT_LENGTH_SIZE 1024
 
@@ -86,19 +92,21 @@ extern struct mail_vfuncs mbox_mail_vfuncs;
 extern const char *mbox_hide_headers[], *mbox_save_drop_headers[];
 extern unsigned int mbox_hide_headers_count, mbox_save_drop_headers_count;
 
-void mbox_set_syscall_error(struct mbox_mailbox *mbox, const char *function);
+void mbox_set_syscall_error(struct mbox_mailbox *mbox, const char *function)
+	ATTR_COLD;
 void mbox_istream_set_syscall_error(struct mbox_mailbox *mbox,
 				    struct istream *input,
-				    const char *function);
+				    const char *function) ATTR_COLD;
 void mbox_ostream_set_syscall_error(struct mbox_mailbox *mbox,
 				    struct ostream *output,
-				    const char *function);
+				    const char *function) ATTR_COLD;
 
 struct mailbox_sync_context *
 mbox_storage_sync_init(struct mailbox *box, enum mailbox_sync_flags flags);
 
 struct mail_save_context *
 mbox_save_alloc(struct mailbox_transaction_context *_t);
+int mbox_copy(struct mail_save_context *ctx, struct mail *mail);
 int mbox_save_begin(struct mail_save_context *ctx, struct istream *input);
 int mbox_save_continue(struct mail_save_context *ctx);
 int mbox_save_finish(struct mail_save_context *ctx);

@@ -49,6 +49,12 @@ void dsasl_client_unref(struct dsasl_client **_client);
 int dsasl_client_check_settings(struct dsasl_client *client,
 				const char **error_r);
 
+/* Returns 1 if the settings that clients created with the events use for
+   authentication are equal, 0 if not and -1 with an error if getting them
+   failed. The events must have a settings root. */
+int dsasl_client_settings_equal(struct event *event1, struct event *event2,
+				const char **error_r);
+
 void dsasl_client_init_gssapi(struct dsasl_client *client);
 
 /*
@@ -90,6 +96,22 @@ enum dsasl_client_result
 dsasl_client_session_output(struct dsasl_client_session *session,
 			    const unsigned char **output_r, size_t *output_len_r,
 			    const char **error_r);
+
+/* Returns TRUE if the exchange is complete from the client's point of view:
+   no further challenge from the server is expected and the data that proves
+   the identity of the server, if the mechanism has any, has been verified. A
+   protocol that tells the end of the authentication on its own may trust a
+   success of the server only if this returns TRUE, since otherwise the server
+   may have skipped a part of the exchange. The server may still send data
+   afterwards, e.g. the error of OAUTHBEARER, and the client output may still
+   be pending. Mechanisms that don't implement this are assumed to be
+   finished. */
+bool dsasl_client_session_is_finished(struct dsasl_client_session *session);
+/* Call when the server reports a successful authentication. Returns 0 if the
+   success can be trusted. Returns -1 and sets error_r if it can't, e.g.
+   because dsasl_client_session_is_finished() returns FALSE. */
+int dsasl_client_session_verify_success(struct dsasl_client_session *session,
+					const char **error_r);
 
 /* Call for getting extra result information.
   -1 = error, 0 = not found, 1 = ok */

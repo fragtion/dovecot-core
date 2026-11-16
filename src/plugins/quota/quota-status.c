@@ -14,8 +14,7 @@
 #include "mail-storage-settings.h"
 #include "mail-storage-service.h"
 #include "smtp-address.h"
-#include "quota-private.h"
-#include "quota-plugin.h"
+#include "quota-status.h"
 #include "quota-status-settings.h"
 
 enum quota_protocol {
@@ -73,10 +72,17 @@ static struct event_category event_category_quota_status = {
 	.name = "quota-status"
 };
 
+static quota_status_check_func_t *quota_status_check = NULL;
+
 static const struct quota_status_settings *quota_status_settings;
 static enum quota_protocol protocol;
 static struct mail_storage_service_ctx *storage_service;
 static struct connection_list *clients;
+
+void quota_status_set_check(quota_status_check_func_t *check)
+{
+	quota_status_check = check;
+}
 
 static void client_connected(struct master_service_connection *conn)
 {
@@ -100,37 +106,6 @@ static void client_reset(struct quota_client *client)
 	i_free(client->recipient);
 }
 
-static enum quota_alloc_result
-quota_check(struct mail_user *user, uoff_t mail_size, const char **error_r)
-{
-	struct quota_user *quser = QUOTA_USER_CONTEXT(user);
-	struct mail_namespace *ns;
-	struct mailbox *box;
-	struct quota_transaction_context *ctx;
-	enum quota_alloc_result ret;
-
-	if (quser == NULL) {
-		/* no quota for user */
-		e_debug(user->event, "User has no quota");
-		return QUOTA_ALLOC_RESULT_OK;
-	}
-
-	ns = mail_namespace_find_inbox(user->namespaces);
-	box = mailbox_alloc(ns->list, "INBOX", MAILBOX_FLAG_POST_SESSION);
-
-	ctx = quota_transaction_begin(box);
-	const char *internal_error;
-	ret = quota_test_alloc(ctx, I_MAX(1, mail_size), NULL, 0,
-			       QUOTA_ALLOC_FLAGS_NONE, NULL, &internal_error);
-	if (ret == QUOTA_ALLOC_RESULT_TEMPFAIL)
-		e_error(user->event, "quota check failed: %s", internal_error);
-	*error_r = quota_alloc_result_errstr(ret, ctx);
-	quota_transaction_rollback(&ctx);
-
-	mailbox_free(&box);
-	return ret;
-}
-
 static int client_check_mta_state(struct quota_client *client)
 {
 	if (client->state == NULL ||
@@ -150,6 +125,13 @@ static int client_check_mta_state(struct quota_client *client)
 
 static void client_handle_request(struct quota_client *client)
 {
+	/* The quota check is done by the quota_status plugin, which requires
+	   the quota plugin. Load them even if they're not in mail_plugins. */
+	static const char *const code_override_fields[] = {
+		"mail_plugins/quota=yes",
+		"mail_plugins/quota_status=yes",
+		NULL
+	};
 	struct mail_storage_service_input input;
 	struct mail_user *user;
 	struct smtp_address *rcpt;
@@ -190,6 +172,7 @@ static void client_handle_request(struct quota_client *client)
 
 	i_zero(&input);
 	input.event_parent = client->event;
+	input.code_override_fields = code_override_fields;
 	smtp_address_detail_parse_temp(quota_status_settings->recipient_delimiter,
 				       rcpt, &input.username, &delim,
 				       &detail);
@@ -200,8 +183,9 @@ static void client_handle_request(struct quota_client *client)
 		e_debug(client->event, "User `%s' not found", input.username);
 		value = quota_status_settings->quota_status_nouser;
 	} else if (ret > 0) {
-		enum quota_alloc_result qret = quota_check(user, client->size,
-							   &error);
+		i_assert(quota_status_check != NULL);
+		enum quota_alloc_result qret =
+			quota_status_check(user, client->size, &error);
 		if (qret == QUOTA_ALLOC_RESULT_OK) {
 			e_debug(client->event,
 				"Message is acceptable");

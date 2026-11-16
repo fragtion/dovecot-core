@@ -25,7 +25,7 @@ struct event_category event_category_smtp_client = {
  * Client
  */
 
-struct smtp_client *smtp_client_init(const struct smtp_client_settings *set)
+struct smtp_client *smtp_client_init(struct event *event_parent)
 {
 	struct smtp_client *client;
 	pool_t pool;
@@ -34,55 +34,12 @@ struct smtp_client *smtp_client_init(const struct smtp_client_settings *set)
 	client = p_new(pool, struct smtp_client, 1);
 	client->pool = pool;
 
-	client->set.my_ip = set->my_ip;
-	client->set.my_hostname = p_strdup(pool, set->my_hostname);
-
-	client->set.forced_capabilities = set->forced_capabilities;
-	if (set->extra_capabilities != NULL) {
-		client->set.extra_capabilities =
-			p_strarray_dup(pool, set->extra_capabilities);
-	}
-
-	client->set.dns_client = set->dns_client;
-	client->set.rawlog_dir = p_strdup_empty(pool, set->rawlog_dir);
-
-	if (set->ssl != NULL) {
-		client->set.ssl = set->ssl;
-		pool_ref(client->set.ssl->pool);
-	}
-	client->set.ssl_allow_invalid_cert = set->ssl_allow_invalid_cert;
-
-	client->set.master_user = p_strdup_empty(pool, set->master_user);
-	client->set.username = p_strdup_empty(pool, set->username);
-	client->set.sasl_mechanisms = p_strdup(pool, set->sasl_mechanisms);
-
-	client->set.connect_timeout_msecs = set->connect_timeout_msecs != 0 ?
-		set->connect_timeout_msecs :
-		SMTP_DEFAULT_CONNECT_TIMEOUT_MSECS;
-	client->set.command_timeout_msecs = set->command_timeout_msecs != 0 ?
-		set->command_timeout_msecs :
-		SMTP_DEFAULT_COMMAND_TIMEOUT_MSECS;
-	client->set.max_reply_size = set->max_reply_size != 0 ?
-		set->max_reply_size : SMTP_DEFAULT_MAX_REPLY_SIZE;
-	client->set.max_data_chunk_size = set->max_data_chunk_size != 0 ?
-		set->max_data_chunk_size : SMTP_DEFAULT_MAX_DATA_CHUNK_SIZE;
-	client->set.max_data_chunk_pipeline = set->max_data_chunk_pipeline != 0 ?
-		set->max_data_chunk_pipeline : SMTP_DEFAULT_MAX_DATA_CHUNK_PIPELINE;
-
-	client->set.socket_send_buffer_size = set->socket_send_buffer_size;
-	client->set.socket_recv_buffer_size = set->socket_recv_buffer_size;
-	client->set.debug = set->debug;
-	client->set.verbose_user_errors = set->verbose_user_errors;
-
-	smtp_proxy_data_merge(pool, &client->set.proxy_data, &set->proxy_data);
-
 	client->conn_list = smtp_client_connection_list_init();
 
 	/* There is no event log prefix added here, since the client itself does
 	   not log anything and the prefix is protocol-dependent. */
-	client->event = event_create(set->event_parent);
+	client->event = event_create(event_parent);
 	event_add_category(client->event, &event_category_smtp_client);
-	event_set_forced_debug(client->event, set->debug);
 
 	return client;
 }
@@ -93,13 +50,26 @@ void smtp_client_deinit(struct smtp_client **_client)
 
 	connection_list_deinit(&client->conn_list);
 
-	settings_free(client->set.ssl);
-	if (client->ssl_ctx != NULL)
-		ssl_iostream_context_unref(&client->ssl_ctx);
+	ssl_iostream_context_unref(&client->ssl_ctx);
+	settings_free(client->ssl_set);
 	dsasl_client_unref(&client->sasl_client);
 	event_unref(&client->event);
 	pool_unref(&client->pool);
 	*_client = NULL;
+}
+
+void smtp_client_set_ssl_settings(struct smtp_client *client,
+				  const struct ssl_iostream_settings *ssl)
+{
+	settings_free(client->ssl_set);
+	client->ssl_set = ssl;
+	pool_ref(client->ssl_set->pool);
+}
+
+void smtp_client_set_dns_client(struct smtp_client *client,
+				struct dns_client *dns_client)
+{
+	client->dns_client = dns_client;
 }
 
 void smtp_client_switch_ioloop(struct smtp_client *client)
@@ -123,12 +93,12 @@ int smtp_client_init_ssl_ctx(struct smtp_client *client, const char **error_r)
 	if (client->ssl_ctx != NULL)
 		return 0;
 
-	if (client->set.ssl != NULL) {
-		return ssl_iostream_client_context_cache_get(client->set.ssl,
+	if (client->ssl_set != NULL) {
+		return ssl_iostream_client_context_cache_get(client->ssl_set,
 			NULL, &client->ssl_ctx, error_r);
 	}
-	/* no ssl settings given via smtp_client_settings -
-	   look them up automatically */
+
+	/* no ssl settings given via smtp_client_set_ssl_settings() */
 	if (ssl_client_settings_get(client->event, &ssl_set, error_r) < 0)
 		return -1;
 	ssl_client_settings_to_iostream_set(ssl_set, &set);

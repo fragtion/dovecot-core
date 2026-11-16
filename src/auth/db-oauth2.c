@@ -674,6 +674,34 @@ db_oauth2_field_find(const ARRAY_TYPE(oauth2_field) *fields, const char *name)
 	return NULL;
 }
 
+static enum passdb_result
+db_oauth2_failure_result(const struct oauth2_request_result *result)
+{
+	/* lib-oauth2 sets result->error also when the server replied with
+	   an error field, so the error code must be looked up from the
+	   fields. Errors caused by the user's credentials must not be
+	   treated as internal failures, because that would allow falling
+	   back to expired auth cache entries. */
+	const char *error_code = result->fields == NULL ? NULL :
+		db_oauth2_field_find(result->fields, "error");
+	if (error_code == NULL)
+		return PASSDB_RESULT_INTERNAL_FAILURE;
+
+	/* RFC 6749 section 5.2: The credentials were rejected, e.g. wrong
+	   password or disabled user. */
+	if (strcmp(error_code, "invalid_grant") == 0)
+		return PASSDB_RESULT_PASSWORD_MISMATCH;
+	/* RFC 6750 section 3.1: The token is expired, revoked or otherwise
+	   invalid. */
+	if (strcmp(error_code, "invalid_token") == 0)
+		return PASSDB_RESULT_PASSWORD_MISMATCH;
+	/* RFC 6750 section 3.1: The token doesn't have the required scope.
+	   This matches the result of a failed oauth2_scope check. */
+	if (strcmp(error_code, "insufficient_scope") == 0)
+		return PASSDB_RESULT_USER_DISABLED;
+	return PASSDB_RESULT_INTERNAL_FAILURE;
+}
+
 static void db_oauth2_callback(struct db_oauth2_request *req,
 			       enum passdb_result result,
 			       const char *error_prefix, const char *error)
@@ -900,8 +928,16 @@ db_oauth2_introspect_continue(struct oauth2_request_result *result,
 	req->req = NULL;
 
 	if (result->error != NULL) {
-		/* fail here */
-		passdb_result = PASSDB_RESULT_INTERNAL_FAILURE;
+		/* With introspection_mode=get_auth the user's token is the
+		   Bearer credential, so RFC 6750 errors describe it. In the
+		   other modes the Authorization header carries Dovecot's
+		   client credentials, so the errors are configuration
+		   problems. */
+		if (req->db->oauth2_set.introspection_mode ==
+		    INTROSPECTION_MODE_GET_AUTH)
+			passdb_result = db_oauth2_failure_result(result);
+		else
+			passdb_result = PASSDB_RESULT_INTERNAL_FAILURE;
 		error = result->error;
 	} else {
 		e_debug(authdb_event(req->auth_request),
@@ -996,7 +1032,7 @@ db_oauth2_lookup_continue(struct oauth2_request_result *result,
 	req->req = NULL;
 
 	if (result->error != NULL) {
-		db_oauth2_callback(req, PASSDB_RESULT_INTERNAL_FAILURE,
+		db_oauth2_callback(req, db_oauth2_failure_result(result),
 				   "Token validation failed: ", result->error);
 	} else if (!result->valid) {
 		db_oauth2_callback(req, PASSDB_RESULT_PASSWORD_MISMATCH,
@@ -1036,17 +1072,11 @@ db_oauth2_lookup_passwd_grant(struct oauth2_request_result *result,
 		return;
 	}
 
-	passdb_result = PASSDB_RESULT_INTERNAL_FAILURE;
-	if (result->error != NULL)
-		error = result->error;
-	else {
-		passdb_result = PASSDB_RESULT_INTERNAL_FAILURE;
-		error = db_oauth2_field_find(result->fields, "error");
-		if (error == NULL)
-			error = "OAuth2 server returned failure without error field";
-		else if (strcmp("invalid_grant", error) == 0)
-			passdb_result = PASSDB_RESULT_PASSWORD_MISMATCH;
-	}
+	passdb_result = db_oauth2_failure_result(result);
+	/* lib-oauth2 copies the error field to result->error, so if it's
+	   NULL the reply had no error field. */
+	error = result->error != NULL ? result->error :
+		"OAuth2 server returned failure without error field";
 	db_oauth2_callback(req, passdb_result,
 			   "Password grant failed: ", error);
 }

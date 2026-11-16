@@ -503,6 +503,12 @@ quota_root_iter_init(struct mailbox *box)
 
 bool quota_root_is_visible(struct quota_root *root, struct mailbox *box)
 {
+	struct mail_namespace *ns = box->list->ns;
+	struct mail_user *box_user = ns->owner != NULL ? ns->owner : ns->user;
+
+	/* e.g. the source mailbox of a MOVE into another user's shared mailbox */
+	if (root->quota->user != box_user)
+		return FALSE;
 	if (root->quota->user == box->storage->user) {
 		if (array_lsearch_ptr(&root->namespaces, box->list->ns) == NULL)
 			return FALSE;
@@ -678,15 +684,15 @@ struct quota_transaction_context *quota_transaction_begin(struct mailbox *box)
 	}
 
 	ctx->box = box;
-	ctx->bytes_ceil = (uint64_t)-1;
-	ctx->bytes_ceil2 = (uint64_t)-1;
-	ctx->count_ceil = (uint64_t)-1;
+	ctx->bytes_ceil = UINT64_MAX;
+	ctx->bytes_ceil2 = UINT64_MAX;
+	ctx->count_ceil = UINT64_MAX;
 
 	ctx->auto_updating = TRUE;
 	for (i = 0; i < roots_count; i++) {
-		ctx->roots[i].bytes_ceil = (uint64_t)-1;
-		ctx->roots[i].bytes_ceil2 = (uint64_t)-1;
-		ctx->roots[i].count_ceil = (uint64_t)-1;
+		ctx->roots[i].bytes_ceil = UINT64_MAX;
+		ctx->roots[i].bytes_ceil2 = UINT64_MAX;
+		ctx->roots[i].count_ceil = UINT64_MAX;
 
 		if (!quota_root_is_visible(roots[i], ctx->box))
 			continue;

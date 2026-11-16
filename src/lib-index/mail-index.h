@@ -244,7 +244,18 @@ enum mail_index_sync_flags {
 	MAIL_INDEX_SYNC_FLAG_TRY_DELETING_INDEX	= 0x40,
 	/* Update header's tail_offset to head_offset, even if it's the only
 	   thing we do and there's no strict need for it. */
-	MAIL_INDEX_SYNC_FLAG_UPDATE_TAIL_OFFSET	= 0x80
+	MAIL_INDEX_SYNC_FLAG_UPDATE_TAIL_OFFSET	= 0x80,
+	/* Don't lock the transaction log. The sync can only be used for
+	   reading the sync records, and it must be rolled back. Other
+	   processes can write to the transaction log during the sync, but
+	   the sync doesn't see their changes. If the index is found to be
+	   broken, it's still fscked, which locks the transaction log for the
+	   duration of the fsck. */
+	MAIL_INDEX_SYNC_FLAG_READ_ONLY		= 0x100,
+	/* With mail_index_sync_begin_to(), return sync records only up to
+	   the given log_file_seq+offset and update the tail offset only up
+	   to it. The changes after it are left for the following syncs. */
+	MAIL_INDEX_SYNC_FLAG_STOP_AT_OFFSET	= 0x200,
 };
 
 enum mail_index_view_sync_flags {
@@ -417,6 +428,10 @@ int mail_index_unlink(struct mail_index *index);
 
 /* Returns TRUE if index is currently in memory. */
 bool mail_index_is_in_memory(struct mail_index *index);
+/* Returns TRUE if the index can't be written to, either because it was opened
+   with MAIL_INDEX_OPEN_FLAG_READONLY or because its transaction log couldn't
+   be opened for writing. */
+bool mail_index_is_readonly(struct mail_index *index);
 /* Move the index into memory. Returns 0 if ok, -1 if error occurred. */
 int mail_index_move_to_memory(struct mail_index *index);
 
@@ -513,7 +528,13 @@ int mail_index_sync_begin(struct mail_index *index,
    synchronized up to the given log_file_seq+offset, the synchronization isn't
    started and this function returns 0. This should be done when you wish to
    sync your committed transaction instead of doing a full mailbox
-   synchronization. */
+   synchronization.
+
+   With MAIL_INDEX_SYNC_FLAG_STOP_AT_OFFSET the synchronization is started
+   even if there is nothing to sync, and it syncs only up to the given
+   log_file_seq+offset. It returns 0 if the synchronization can't stop at the
+   given position, because the transaction log was rotated after it or needs
+   to be rotated. The caller should then sync up to the log head. */
 int mail_index_sync_begin_to(struct mail_index *index,
 			     struct mail_index_sync_ctx **ctx_r,
 			     struct mail_index_view **view_r,
@@ -525,7 +546,9 @@ bool mail_index_sync_have_any(struct mail_index *index,
 			      enum mail_index_sync_flags flags);
 /* Returns TRUE if it currently looks like syncing would return expunges. */
 bool mail_index_sync_have_any_expunges(struct mail_index *index);
-/* Returns the log file seq+offsets for the area which this sync is handling. */
+/* Returns the log file seq+offsets for the area which this sync is handling.
+   With MAIL_INDEX_SYNC_FLAG_READ_ONLY the transaction log may already
+   have newer changes. */
 void mail_index_sync_get_offsets(struct mail_index_sync_ctx *ctx,
 				 uint32_t *seq1_r, uoff_t *offset1_r,
 				 uint32_t *seq2_r, uoff_t *offset2_r);
@@ -576,6 +599,22 @@ void mail_index_mark_corrupted(struct mail_index *index) ATTR_COLD;
 /* Check and fix any found problems. Returns -1 if we couldn't lock for sync,
    0 if everything went ok. */
 int mail_index_fsck(struct mail_index *index) ATTR_COLD;
+/* Verify that all the message records in the index have valid UIDs:
+   non-zero, ascending and lower than next_uid. Opening the index doesn't
+   verify them, because it would be too slow for large indexes. This can be
+   called after the index files may have been replaced with untrusted ones,
+   e.g. when they were downloaded from a remote storage. If the records are
+   invalid, the index is fsck'd. Views that are already open keep seeing the
+   old records until they're synced. The records are verified only once,
+   so calling this again is cheap until the index is re-read from the file.
+   Returns 1 if the records were valid, 0 if they were fixed with fsck, -1
+   if fsck failed. */
+int mail_index_verify_records(struct mail_index *index);
+/* Like mail_index_verify_records(), but verify the records visible in the
+   view. Returns TRUE if the records are valid. If not, the index is fsck'd
+   (unless its latest map is already valid) and FALSE is returned. The view
+   still sees the invalid records until it's synced. */
+bool mail_index_view_verify_records(struct mail_index_view *view);
 /* Returns TRUE if mail_index_fsck() has been called since the last
    mail_index_reset_fscked() call. */
 bool mail_index_reset_fscked(struct mail_index *index);
@@ -642,16 +681,20 @@ void mail_index_append(struct mail_index_transaction *t, uint32_t uid,
    UIDs are >= first_new_uid, and also greater than the highest seen uid (i.e. it
    doesn't try to fill UID gaps). Assumes that mailbox is locked in a way that
    UIDs can be safely assigned. Returns UIDs for all assigned messages, in
-   their sequence order (so UIDs are not necessary ascending). */
-void mail_index_append_finish_uids_full(struct mail_index_transaction *t,
-					uint32_t min_allowed_uid,
-					uint32_t first_new_uid,
-					ARRAY_TYPE(seq_range) *uids_r);
+   their sequence order (so UIDs are not necessary ascending). Returns 0 on
+   success, -1 if the UIDs would become too large (e.g. next_uid is
+   corrupted). Nothing is assigned on failure. */
+int mail_index_append_finish_uids_full(struct mail_index_transaction *t,
+				       uint32_t min_allowed_uid,
+				       uint32_t first_new_uid,
+				       ARRAY_TYPE(seq_range) *uids_r)
+	ATTR_WARN_UNUSED_RESULT;
 /* Call mail_index_append_finish_uids_full() with first_uid used for both
    min_allowed_uid and first_new_uid. */
-void mail_index_append_finish_uids(struct mail_index_transaction *t,
-				   uint32_t first_uid,
-				   ARRAY_TYPE(seq_range) *uids_r);
+int mail_index_append_finish_uids(struct mail_index_transaction *t,
+				  uint32_t first_uid,
+				  ARRAY_TYPE(seq_range) *uids_r)
+	ATTR_WARN_UNUSED_RESULT;
 /* Expunge record from index. Note that this doesn't affect sequence numbers
    until transaction is committed and mailbox is synced. */
 void mail_index_expunge(struct mail_index_transaction *t, uint32_t seq);
@@ -811,8 +854,8 @@ void mail_index_lookup_ext(struct mail_index_view *view, uint32_t seq,
 void mail_index_lookup_ext_full(struct mail_index_view *view, uint32_t seq,
 				uint32_t ext_id, struct mail_index_map **map_r,
 				const void **data_r, bool *expunged_r);
-/* Get current extension sizes. Returns 1 if ok, 0 if extension doesn't exist
-   in view. Any of the _r parameters may be NULL. */
+/* Get current extension sizes. The sizes are 0 if the extension doesn't exist
+   in the map. */
 void mail_index_ext_get_size(struct mail_index_map *map, uint32_t ext_id,
 			     uint32_t *hdr_size_r, uint16_t *record_size_r,
 			     uint16_t *record_align_r);

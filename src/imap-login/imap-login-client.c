@@ -294,6 +294,13 @@ static bool imap_client_input_next_cmd(struct client *_client)
 		ret = cmd_authenticate(client, &parsed);
 		if (ret == 0 && !parsed)
 			return FALSE;
+		if (client->common.destroyed) {
+			/* cmd_authenticate() may have destroyed the client,
+			   e.g. if the auth response was too large. cmd_tag and
+			   cmd_name point into the freed parser pool, so don't
+			   fall through to client_invalid_command(). */
+			return FALSE;
+		}
 	} else if (strcasecmp(client->cmd_name, "ID") == 0) {
 		/* ID extensions allows max. 30 parameters,
 		   each max. 1024 bytes long. that brings us over the input
@@ -437,6 +444,9 @@ static void imap_client_destroy(struct client *client)
 	settings_free(imap_client->set);
 	i_free_and_null(imap_client->proxy_backend_capability);
 	imap_parser_unref(&imap_client->parser);
+	/* cmd_tag and cmd_name point into the now-freed parser pool. */
+	imap_client->cmd_tag = NULL;
+	imap_client->cmd_name = NULL;
 }
 
 static int

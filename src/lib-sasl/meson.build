@@ -29,11 +29,15 @@ lib_sasl = static_library(
   'sasl-oauth2.c',
   client_mechanisms,
   'dsasl-client.c',
+  'dsasl-client-gssapi-settings.c',
+  'dsasl-client-module.c',
+  'dsasl-client-module-load.c',
   server_mechanisms,
   'sasl-server-mech.c',
   'sasl-server-request.c',
   'sasl-server.c',
   dependencies: deps,
+  c_args: f'-DMODULE_DIR="@dovecot_moduledir@"',
 )
 
 dep_sasl = declare_dependency(
@@ -48,6 +52,7 @@ install_headers(
   'dsasl-client.h',
   'dsasl-client-protected.h',
   'dsasl-client-private.h',
+  'dsasl-client-gssapi-settings.h',
   'sasl-server.h',
   'sasl-server-gssapi.h',
   'sasl-server-oauth2.h',
@@ -90,6 +95,15 @@ if have_gssapi
   sasl_gssapi_test_deps = [dep_auth_gssapi]
 endif
 
+# test-sasl-client only needs the client mechs.
+sasl_gssapi_client_test_sources = []
+if have_gssapi
+  sasl_gssapi_client_test_sources = [
+    'gssapi-dummy.c',
+    'dsasl-client-mech-gssapi.c',
+  ]
+endif
+
 tests = ['client', 'oauth2']
 
 foreach test_name : tests
@@ -100,7 +114,11 @@ foreach test_name : tests
     executable(
       exe,
       src,
-      dependencies: test_deps,
+      test_name == 'client' ? sasl_gssapi_client_test_sources : [],
+      dependencies: [
+        test_deps,
+        test_name == 'client' ? sasl_gssapi_test_deps : [],
+      ],
     ),
     suite: 'sasl',
   )

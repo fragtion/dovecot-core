@@ -18,11 +18,11 @@
 #include "settings.h"
 #include "master-service.h"
 #include "imap-keepalive.h"
+#include "imap-reply.h"
 #include "imap-resp-code.h"
 #include "imap-util.h"
 #include "imap-urlauth.h"
 #include "mail-error.h"
-#include "smtp-submit-settings.h"
 #include "mail-namespace.h"
 #include "mail-storage-service.h"
 #include "mail-autoexpunge.h"
@@ -65,7 +65,7 @@ static_assert_array_size(client_command_state_names,
 static void client_idle_timeout(struct client *client)
 {
 	if (client->output_cmd_lock == NULL)
-		client_send_line(client, "* BYE Disconnected for inactivity.");
+		client_send_line(client, IMAP_REPLY_BYE_INACTIVITY);
 	client_destroy(client, t_strdup_printf(
 		"Inactivity - no input for %"PRIdTIME_T" secs",
 		ioloop_time - client->last_input));
@@ -119,7 +119,6 @@ struct client *client_create(int fd_in, int fd_out,
 			     enum client_create_flags flags,
 			     struct event *event, struct mail_user *user,
 			     const struct imap_settings *set,
-			     const struct smtp_submit_settings *smtp_set,
 			     const buffer_t *input_buf)
 {
 	struct client *client;
@@ -137,7 +136,6 @@ struct client *client_create(int fd_in, int fd_out,
 	event_ref(client->event);
 	client->unhibernated = (flags & CLIENT_CREATE_FLAG_UNHIBERNATED) != 0;
 	client->set = set;
-	client->smtp_set = smtp_set;
 	client->fd_in = fd_in;
 	client->fd_out = fd_out;
 	client->input = i_stream_create_fd(fd_in,
@@ -610,7 +608,6 @@ static void client_default_destroy(struct client *client, const char *reason)
 	DLLIST_REMOVE(&imap_clients, client);
 
 	settings_free(client->set);
-	settings_free(client->smtp_set);
 	event_unref(&client->event);
 	i_free(client->last_cmd_name);
 	pool_unref(&client->pool);
@@ -703,9 +700,11 @@ client_cmd_append_timing_stats(struct client_command_context *cmd,
 	command_stats_flush(cmd);
 
 	ioloop_wait_usecs = io_loop_get_wait_usecs(current_ioloop);
-	msecs_in_cmd = (cmd->stats.running_usecs + 999) / 1000;
+	/* Round to the nearest millisecond, so commands that do practically
+	   no work report 0.000 secs instead of always rounding up to 0.001. */
+	msecs_in_cmd = (cmd->stats.running_usecs + 500) / 1000;
 	msecs_in_ioloop = (ioloop_wait_usecs -
-			   cmd->stats.start_ioloop_wait_usecs + 999) / 1000;
+			   cmd->stats.start_ioloop_wait_usecs + 500) / 1000;
 	msecs_since_cmd = timeval_diff_msecs(&ioloop_timeval,
 					     &cmd->stats.last_run_timeval);
 

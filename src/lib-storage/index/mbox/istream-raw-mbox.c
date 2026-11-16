@@ -117,6 +117,10 @@ static int mbox_read_from_line(struct raw_mbox_istream *rstream)
 		i_stream_skip(rstream->istream.parent, pos);
 
 		while ((ret = i_stream_read_memarea(rstream->istream.parent)) > 0) {
+			/* the read may have moved or replaced the buffer:
+			   buf and pos still describe the data that was just
+			   skipped */
+			buf = i_stream_get_data(rstream->istream.parent, &pos);
 			p = memchr(buf, '\n', pos);
 			if (p != NULL)
 				break;
@@ -208,19 +212,29 @@ static ssize_t i_stream_raw_mbox_read(struct istream_private *stream)
 		}
 		ret = i_stream_read_memarea(stream->parent);
 	} while (ret > 0);
+	/* the last read may have moved or replaced the buffer */
+	buf = i_stream_get_data(stream->parent, &pos);
 	stream->istream.stream_errno = stream->parent->stream_errno;
 
 	if (ret < 0) {
 		if (ret == -1)
 			mbox_istream_log_read_error(rstream);
 		if (ret == -2) {
-			if (stream->skip == stream->pos) {
-				/* From_-line is longer than our input buffer.
-				   finish the check without seeing the LF. */
+			if (stream->pos <= 1) {
+				/* Our caller holds at most one byte. A reader
+				   that needs more bytes than it holds (e.g.
+				   message_get_body_size()) can't consume it,
+				   so it would never be satisfied. Scan the
+				   buffer: data in front of a From_-line is
+				   returned first, and a From_-line longer
+				   than the buffer is checked without seeing
+				   the LF. */
 			} else if (stream->istream.v_offset + pos ==
 				   rstream->input_peak_offset) {
 				/* we've read everything our parent stream
-				   has to offer. */
+				   has to offer. The caller must consume what
+				   it holds before we can verify a From_-line
+				   that was cut off by the buffer end. */
 				stream->buffer = buf;
 				return -2;
 			}
@@ -298,28 +312,32 @@ static ssize_t i_stream_raw_mbox_read(struct istream_private *stream)
 			rstream->body_offset = stream->istream.v_offset + i + 1;
 			eoh_char = -1;
 		}
-		if ((char)buf[i] == *fromp) {
+		if (*fromp != '\0' && (char)buf[i] == *fromp) {
 			if (*++fromp == '\0') {
 				/* potential From-line, see if we have the
 				   rest of the line buffered. */
-				i++;
-				if (i >= 7 && buf[i-7] == '\r') {
+				const size_t after = i + 1;
+
+				if (after >= 7 && buf[after-7] == '\r') {
 					/* CR also belongs to it. */
 					crlf_ending = TRUE;
-					from_start_pos = i - 7;
+					from_start_pos = after - 7;
 				} else {
 					crlf_ending = FALSE;
-					from_start_pos = i - 6;
+					from_start_pos = after - 6;
 				}
 
 				if (rstream->mail_size == UOFF_T_MAX ||
 				    rstream->hdr_offset + rstream->mail_size ==
 				    stream->istream.v_offset + from_start_pos) {
-					from_after_pos = i;
-					if (ret == -2) {
-						/* even if we don't have the
-						   whole line, we need to
-						   finish this check now. */
+					from_after_pos = after;
+					if (ret == -2 &&
+					    from_start_pos <= stream->pos) {
+						/* nothing in front of the line
+						   can be returned, so even if
+						   we don't have the whole line,
+						   we need to finish this check
+						   now. */
 						goto mbox_verify;
 					}
 				}
@@ -380,7 +398,10 @@ static ssize_t i_stream_raw_mbox_read(struct istream_private *stream)
 		rstream->eof = TRUE;
 		rstream->corrupted = TRUE;
 		rstream->istream.istream.stream_errno = EINVAL;
-		stream->pos = 0;
+		/* The caller still holds the bytes we returned earlier, so
+		   stream->pos must not shrink. */
+		i_assert(stream->pos <= pos);
+		stream->buffer = buf;
 		return -1;
 	}
 
@@ -471,38 +492,48 @@ struct istream *i_stream_create_raw_mbox(struct istream *input)
 static int istream_raw_mbox_is_valid_from(struct raw_mbox_istream *rstream)
 {
 	const unsigned char *data;
-	size_t size = 0;
+	size_t size = 0, skip;
 	time_t received_time;
 	char *sender;
 	int tz;
 	ssize_t ret = 0;
 
-	/* minimal: "From x Thu Nov 29 22:33:52 2001" = 31 chars */
+	/* The parent stream is positioned one byte before the offset to
+	   check, so that a CR in front of it is seen. minimal: "From x Thu
+	   Nov 29 22:33:52 2001" = 31 chars, plus CR+LF and the byte before */
 	do {
 		data = i_stream_get_data(rstream->istream.parent, &size);
-		if (size >= 31)
+		if (size >= 1 + 2 + 31)
 			break;
 	} while ((ret = i_stream_read_memarea(rstream->istream.parent)) > 0);
+	/* the last read may have moved or replaced the buffer */
+	data = i_stream_get_data(rstream->istream.parent, &size);
 	if (ret == -1)
 		mbox_istream_log_read_error(rstream);
 
-	if ((size == 1 && data[0] == '\n') ||
-	    (size == 2 && data[0] == '\r' && data[1] == '\n')) {
+	if (size > 1 && data[0] == '\r' && data[1] == '\n') {
+		/* The CR belongs to the line break that ends the mail, so the
+		   offset can't be between the CR and the LF. */
+		return 0;
+	}
+	if ((size == 2 && data[1] == '\n') ||
+	    (size == 3 && data[1] == '\r' && data[2] == '\n')) {
 		/* EOF */
 		return 1;
 	}
 
-	if (size > 31 && memcmp(data, "\nFrom ", 6) == 0) {
-		data += 6;
-		size -= 6;
-	} else if (size > 32 && memcmp(data, "\r\nFrom ", 7) == 0) {
-		data += 7;
-		size -= 7;
-	} else {
+	if (size > 1 + 31 && memcmp(data + 1, "\nFrom ", 6) == 0)
+		skip = 1 + 6;
+	else if (size > 1 + 32 && memcmp(data + 1, "\r\nFrom ", 7) == 0)
+		skip = 1 + 7;
+	else
 		return 0;
-	}
 
-	while (memchr(data, '\n', size) == NULL) {
+	/* i_stream_read_bytes() returns the data from the beginning of the
+	   stream position again, i.e. including the byte before the [CR]LF +
+	   "From " prefix. Keep skipping over it, or a From_-line that crosses
+	   the read buffer's end is never seen as valid. */
+	while (memchr(data + skip, '\n', size - skip) == NULL) {
 		ret = i_stream_read_bytes(rstream->istream.parent,
 					  &data, &size, size+1);
 		if (ret < 0) {
@@ -512,7 +543,8 @@ static int istream_raw_mbox_is_valid_from(struct raw_mbox_istream *rstream)
 		}
 	}
 
-	if (mbox_from_parse(data, size, &received_time, &tz, &sender) < 0)
+	if (mbox_from_parse(data + skip, size - skip,
+			    &received_time, &tz, &sender) < 0)
 		return 0;
 
 	rstream->next_received_time = received_time;
@@ -611,6 +643,16 @@ int istream_raw_mbox_get_body_size(struct istream *stream,
 		rstream->mail_size - (rstream->body_offset -
 				      rstream->hdr_offset);
 	old_offset = stream->v_offset;
+	if (expected_body_size != UOFF_T_MAX &&
+	    expected_body_size > (uoff_t)OFF_T_MAX - body_offset - 2) {
+		/* expected_body_size typically comes from the untrusted
+		   Content-Length header. A value this large can't point to
+		   a valid offset in the file. Without this check
+		   next_body_offset could wrap around to an earlier From_-line
+		   or become a negative off_t, either of which breaks the
+		   mailbox sync permanently. */
+		expected_body_size = UOFF_T_MAX;
+	}
 	if (expected_body_size != UOFF_T_MAX) {
 		/* if we already have the existing body size, use it as long as
 		   it's >= expected body_size. otherwise the previous parsing
@@ -632,12 +674,17 @@ int istream_raw_mbox_get_body_size(struct istream *stream,
 			next_body_offset += rstream->crlf_ending ? 2 : 1;
 		}
 
-		i_stream_seek(rstream->istream.parent, next_body_offset);
+		i_stream_seek(rstream->istream.parent, next_body_offset - 1);
 		if (istream_raw_mbox_is_valid_from(rstream) > 0) {
 			rstream->mail_size =
 				next_body_offset - rstream->hdr_offset;
 			i_stream_seek(stream, old_offset);
-			*body_size_r = expected_body_size;
+			/* With header_missing_eoh the body also contains the
+			   empty line. Callers use body_offset + body_size as
+			   the next message's offset (and as the number of
+			   bytes to move or expunge), so it must be included
+			   here. */
+			*body_size_r = next_body_offset - rstream->body_offset;
 			return 0;
 		}
 		/* invalid expected_body_size */

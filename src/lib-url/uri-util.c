@@ -137,7 +137,7 @@ uri_parse_pct_encoded_data(struct uri_parser *parser,
 {
 	int value;
 
-	if (**p != '%' || (pend != NULL && *p >= pend))
+	if ((pend != NULL && *p >= pend) || **p != '%')
 		return 0;
 	*p += 1;
 
@@ -254,22 +254,18 @@ bool uri_data_decode(struct uri_parser *parser, const char *data,
 	string_t *decoded;
 	int ret;
 
-	if (pend == NULL) {
-		/* NULL means unlimited; solely rely on '\0' */
-		pend = (const unsigned char *)SIZE_MAX;
-	}
-
-	if (p >= pend || *p == '\0') {
+	/* NULL pend means unlimited; solely rely on '\0' */
+	if ((pend != NULL && p >= pend) || *p == '\0') {
 		if (decoded_r != NULL)
 			*decoded_r = "";
 		return TRUE;
 	}
 
 	decoded = uri_parser_get_tmpbuf(parser, 256);
-	while (p < pend && *p != '\0') {
+	while ((pend == NULL || p < pend) && *p != '\0') {
 		unsigned char ch;
 
-		ret = uri_parse_pct_encoded_data(parser, &p, NULL, &ch);
+		ret = uri_parse_pct_encoded_data(parser, &p, pend, &ch);
 		if (ret != 0) {
 			if (ret < 0)
 				return FALSE;
@@ -644,7 +640,7 @@ uri_parse_ip_literal(struct uri_parser *parser, string_t *literal,
 			"Future IP host address '%s' not supported", address);
 		return -1;
 	}
-	if (net_addr2ip(address, &ip6) < 0) {
+	if (net_addr2ip(address, &ip6) < 0 || ip6.family != AF_INET6) {
 		parser->error = p_strdup_printf(
 			parser->pool, "Invalid IPv6 host address '%s'",
 			address);

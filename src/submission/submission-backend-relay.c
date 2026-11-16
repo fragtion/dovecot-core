@@ -3,6 +3,7 @@
 #include "submission-common.h"
 #include "str.h"
 #include "str-sanitize.h"
+#include "hostpid.h"
 #include "settings.h"
 #include "mail-user.h"
 #include "iostream-ssl.h"
@@ -1071,70 +1072,67 @@ backend_relay_cmd_quit(struct submission_backend *backend,
  * Relay backend
  */
 
-struct submission_backend_relay *
-submission_backend_relay_create(
-	struct client *client,
-	const struct submision_backend_relay_settings *set)
+int submission_backend_relay_create(
+	struct client *client, struct submission_backend_relay **rbackend_r)
 {
 	struct submission_backend_relay *rbackend;
+	struct submission_backend *backend;
 	struct mail_user *user = client->user;
-	struct smtp_client_settings smtp_set;
+	const char *error;
 	pool_t pool;
+	int ret;
 
 	pool = pool_alloconly_create("submission relay backend", 1024);
 	rbackend = p_new(pool, struct submission_backend_relay, 1);
-	submission_backend_init(&rbackend->backend, pool, client,
-				&backend_relay_vfuncs);
+	backend = &rbackend->backend;
+	submission_backend_init(backend, pool, client, &backend_relay_vfuncs);
 
-	event_set_append_log_prefix(rbackend->backend.event, "relay: ");
+	struct event *event = rbackend->backend.event;
+
+	event_set_append_log_prefix(event, "relay: ");
+	settings_event_add_filter_name(event, SUBMISSION_RELAY_SETTINGS_FILTER);
 
 	/* make relay connection */
-	i_zero(&smtp_set);
-	smtp_set.my_hostname = set->my_hostname;
-	smtp_set.extra_capabilities = set->extra_capabilities;
-	smtp_set.ssl_allow_invalid_cert = !set->ssl_verify;
-	smtp_set.debug = event_want_debug(rbackend->backend.event);
-	smtp_set.event_parent = rbackend->backend.event;
+	struct smtp_client_parameters smtp_params = {
+		.xclient_defer = TRUE,
+	};
+	ret = smtp_client_connection_create_auto(smtp_client, event,
+						 SMTP_PROTOCOL_SMTP,
+						 &smtp_params,
+						 &rbackend->conn, &error);
+	if (ret < 0) {
+		e_error(event, "%s", error);
+		submission_backend_fail(backend, NULL, "4.4.0",
+					"Failed to establish relay connection");
+		return -1;
+	}
+	if (ret == 0) {
+		e_error(event, "No SMTP relay configured");
+		submission_backend_fail(backend, NULL, "4.4.0",
+					"Failed to establish relay connection");
+		return -1;
+	}
 
-	smtp_set.rawlog_dir = set->rawlog_dir;
-
-	if (set->trusted) {
+	if (smtp_client_connection_is_trusted(rbackend->conn)) {
 		rbackend->trusted = TRUE;
-		smtp_set.peer_trusted = TRUE;
+
+		struct smtp_proxy_data proxy_data;
 
 		smtp_server_connection_get_proxy_data(client->conn,
-						      &smtp_set.proxy_data);
+						      &proxy_data);
 
 		if (user->conn.remote_ip != NULL) {
-			smtp_set.proxy_data.source_ip =
-				*user->conn.remote_ip;
-			smtp_set.proxy_data.source_port =
-				user->conn.remote_port;
+			proxy_data.source_ip = *user->conn.remote_ip;
+			proxy_data.source_port = user->conn.remote_port;
 		}
-		smtp_set.proxy_data.login = user->username;
-		smtp_set.xclient_defer = TRUE;
+		proxy_data.login = user->username;
+
+		smtp_client_connection_update_proxy_data(rbackend->conn,
+							 &proxy_data);
 	}
 
-	smtp_set.username = set->user;
-	smtp_set.master_user = set->master_user;
-	smtp_set.password = set->password;
-	smtp_set.connect_timeout_msecs = set->connect_timeout_msecs;
-	smtp_set.command_timeout_msecs = set->command_timeout_msecs;
-
-	if (set->path != NULL) {
-		rbackend->conn = smtp_client_connection_create_unix(
-			smtp_client, set->protocol, set->path, &smtp_set);
-	} else if (set->ip.family == 0) {
-		rbackend->conn = smtp_client_connection_create(
-			smtp_client, set->protocol, set->host, set->port,
-			set->ssl_mode, &smtp_set);
-	} else {
-		rbackend->conn = smtp_client_connection_create_ip(
-			smtp_client, set->protocol, &set->ip, set->port,
-			set->host, set->ssl_mode, &smtp_set);
-	}
-
-	return rbackend;
+	*rbackend_r = rbackend;
+	return 0;
 }
 
 struct submission_backend *

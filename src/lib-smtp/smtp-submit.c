@@ -15,13 +15,12 @@
 #include "smtp-client-connection.h"
 #include "smtp-client-transaction.h"
 #include "smtp-submit.h"
+#include "smtp-submit-settings.h"
 
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sysexits.h>
 #include <signal.h>
-
-#define DEFAULT_SUBMISSION_PORT 25
 
 static struct event_category event_category_smtp_submit = {
 	.name = "smtp-submit"
@@ -29,8 +28,11 @@ static struct event_category event_category_smtp_submit = {
 
 struct smtp_submit_session {
 	pool_t pool;
-	struct smtp_submit_settings set;
 	struct event *event;
+	struct settings_instance *set_instance;
+	unsigned int timeout_msecs;
+
+	struct smtp_client *smtp_client;
 };
 
 struct smtp_submit {
@@ -50,7 +52,7 @@ struct smtp_submit {
 	const char *error;
 
 	struct program_client *prg_client;
-	struct smtp_client *smtp_client;
+	struct smtp_client_connection *smtp_conn;
 	struct smtp_client_transaction *smtp_trans;
 
 	smtp_submit_callback_t *callback;
@@ -59,9 +61,73 @@ struct smtp_submit {
 	bool simple:1;
 };
 
-struct smtp_submit_session *
-smtp_submit_session_init(const struct smtp_submit_input *input,
-			 const struct smtp_submit_settings *set)
+static struct settings_instance *
+smtp_submit_session_init_settings(struct smtp_submit_session *session)
+{
+	if (session->set_instance != NULL)
+		return session->set_instance;
+
+	session->set_instance = settings_instance_new_from_event(session->event);
+	event_set_ptr(session->event, SETTINGS_EVENT_INSTANCE,
+		      session->set_instance);
+	return session->set_instance;
+}
+
+static void
+smtp_submit_session_handle_deprecated_settings(
+	struct smtp_submit_session *session,
+	const struct smtp_submit_settings *set)
+{
+	struct settings_instance *set_instance;
+	int ret;
+
+	if (*set->submission_host != '\0') {
+		const char *host;
+		in_port_t port;
+
+		ret = net_str2hostport(set->submission_host, 25, &host, &port);
+		i_assert(ret == 0); /* already checked */
+
+		set_instance = smtp_submit_session_init_settings(session);
+		settings_override(set_instance,
+			"mail_submit/smtp_client_host", host,
+			SETTINGS_OVERRIDE_TYPE_DEFAULT);
+		settings_override(set_instance,
+			"mail_submit/smtp_client_port", dec2str(port),
+			SETTINGS_OVERRIDE_TYPE_DEFAULT);
+	}
+
+	if (*set->sendmail_path != '\0') {
+		const char *args = strchr(set->sendmail_path, ' ');
+		const char *path = (args == NULL ? set->sendmail_path :
+				    t_strdup_until(set->sendmail_path, args));
+
+		set_instance = smtp_submit_session_init_settings(session);
+		settings_override(set_instance,
+			"mail_submit/execute", "sendmail",
+			SETTINGS_OVERRIDE_TYPE_CODE);
+		settings_override(set_instance,
+			"mail_submit/execute/sendmail/name", "sendmail",
+			SETTINGS_OVERRIDE_TYPE_CODE);
+		settings_override(set_instance,
+			"mail_submit/execute/sendmail/driver", "fork",
+			SETTINGS_OVERRIDE_TYPE_CODE);
+		settings_override(set_instance,
+			"mail_submit/execute/sendmail/fork_path", path,
+			SETTINGS_OVERRIDE_TYPE_CODE);
+		if (args != NULL)
+			args = t_str_ltrim(args + 1, " ");
+		if (args != NULL && *args != '\0') {
+			settings_override(set_instance,
+				"mail_submit/execute/sendmail/args", args,
+				SETTINGS_OVERRIDE_TYPE_CODE);
+		}
+	}
+}
+
+int smtp_submit_session_init(const struct smtp_submit_input *input,
+			     struct smtp_submit_session **session_r,
+			     const char **error_r)
 {
 	struct smtp_submit_session *session;
 	pool_t pool;
@@ -70,21 +136,27 @@ smtp_submit_session_init(const struct smtp_submit_input *input,
 	session = p_new(pool, struct smtp_submit_session, 1);
 	session->pool = pool;
 
-	session->set = *set;
-	session->set.hostname =
-		p_strdup_empty(pool, set->hostname);
-	session->set.submission_host =
-		p_strdup_empty(pool, set->submission_host);
-	session->set.sendmail_path =
-		p_strdup_empty(pool, set->sendmail_path);
-	session->set.submission_ssl =
-		p_strdup_empty(pool, set->submission_ssl);
-
 	session->event = event_create(input->event_parent);
-	event_set_forced_debug(session->event, set->mail_debug);
 	event_add_category(session->event, &event_category_smtp_submit);
+	settings_event_add_filter_name(session->event,
+				       SMTP_SUBMIT_SETTINGS_FILTER);
 
-	return session;
+	const struct smtp_submit_settings *set;
+
+	if (settings_get(session->event, &smtp_submit_setting_parser_info, 0,
+			 &set, error_r) < 0) {
+		event_unref(&session->event);
+		pool_unref(&pool);
+		return -1;
+	}
+
+	session->timeout_msecs = set->timeout_msecs;
+	event_set_forced_debug(session->event, set->mail_debug);
+	smtp_submit_session_handle_deprecated_settings(session, set);
+	settings_free(set);
+
+	*session_r = session;
+	return 0;
 }
 
 void smtp_submit_session_deinit(struct smtp_submit_session **_session)
@@ -93,8 +165,20 @@ void smtp_submit_session_deinit(struct smtp_submit_session **_session)
 
 	*_session = NULL;
 
+	if (session->smtp_client != NULL)
+		smtp_client_deinit(&session->smtp_client);
+
 	event_unref(&session->event);
+	settings_instance_free(&session->set_instance);
 	pool_unref(&session->pool);
+}
+
+static struct smtp_client *
+smtp_submit_session_get_smtp_client(struct smtp_submit_session *session)
+{
+	if (session->smtp_client == NULL)
+		session->smtp_client = smtp_client_init(session->event);
+	return session->smtp_client;
 }
 
 struct smtp_submit *
@@ -119,18 +203,24 @@ smtp_submit_init(struct smtp_submit_session *session,
 	return subm;
 }
 
-struct smtp_submit *
-smtp_submit_init_simple(const struct smtp_submit_input *input,
-			const struct smtp_submit_settings *set,
-			const struct smtp_address *mail_from)
+int smtp_submit_init_simple(const struct smtp_submit_input *input,
+			    const struct smtp_address *mail_from,
+			    struct smtp_submit **subm_r,
+			    const char **error_r)
 {
 	struct smtp_submit_session *session;
 	struct smtp_submit *subm;
 
-	session = smtp_submit_session_init(input, set);
+	*subm_r = NULL;
+	*error_r = NULL;
+
+	if (smtp_submit_session_init(input, &session, error_r) < 0)
+		return -1;
 	subm = smtp_submit_init(session, mail_from);
 	subm->simple = TRUE;
-	return subm;
+
+	*subm_r = subm;
+	return 0;
 }
 
 void smtp_submit_deinit(struct smtp_submit **_subm)
@@ -148,8 +238,8 @@ void smtp_submit_deinit(struct smtp_submit **_subm)
 		program_client_destroy(&subm->prg_client);
 	if (subm->smtp_trans != NULL)
 		smtp_client_transaction_destroy(&subm->smtp_trans);
-	if (subm->smtp_client != NULL)
-		smtp_client_deinit(&subm->smtp_client);
+	if (subm->smtp_conn != NULL)
+		smtp_client_connection_unref(&subm->smtp_conn);
 
 	timeout_remove(&subm->to_error);
 
@@ -178,9 +268,9 @@ struct ostream *smtp_submit_send(struct smtp_submit *subm)
 
 	event_add_int(subm->event, "recipients", array_count(&subm->rcpt_to));
 
-	subm->output = iostream_temp_create
-		(t_strconcat("/tmp/dovecot.",
-			master_service_get_name(master_service), NULL), 0);
+	subm->output = iostream_temp_create(
+		t_strconcat("/tmp/dovecot.",
+			    master_service_get_name(master_service), NULL), 0);
 	o_stream_set_no_error_handling(subm->output, TRUE);
 	return subm->output;
 }
@@ -213,15 +303,13 @@ smtp_submit_callback(struct smtp_submit *subm, int status,
 	callback(&result, subm->context);
 }
 
-static void
-smtp_submit_delayed_error_callback(struct smtp_submit *subm)
+static void smtp_submit_delayed_error_callback(struct smtp_submit *subm)
 {
 	smtp_submit_callback(subm, -1, subm->error);
 }
 
 static void
-smtp_submit_delayed_error(struct smtp_submit *subm,
-			  const char *error)
+smtp_submit_delayed_error(struct smtp_submit *subm, const char *error)
 {
 	subm->status = -1;
 	subm->error = p_strdup(subm->pool, error);
@@ -230,38 +318,34 @@ smtp_submit_delayed_error(struct smtp_submit *subm,
 }
 
 static void
-smtp_submit_error(struct smtp_submit *subm,
-		  int status, const char *error)
+smtp_submit_error(struct smtp_submit *subm, int status, const char *error)
 {
-	const struct smtp_submit_settings *set = &subm->session->set;
 	i_assert(status <= 0);
 	if (subm->error != NULL)
 		return;
 
 	subm->status = status;
-	subm->error = p_strdup_printf(subm->pool,
-		"smtp(%s): %s",
-		set->submission_host, error);
+	subm->error = p_strdup_printf(
+		subm->pool, "smtp(%s): %s",
+		smtp_client_connection_get_name(subm->smtp_conn), error);
 }
 
-static void
-smtp_submit_success(struct smtp_submit *subm)
+static void smtp_submit_success(struct smtp_submit *subm)
 {
 	if (subm->error != NULL)
 		return;
 	subm->status = 1;
 }
 
-static void
-smtp_submit_send_host_finished(struct smtp_submit *subm)
+static void smtp_submit_send_host_finished(struct smtp_submit *subm)
 {
 	i_assert(subm->status > 0 || subm->error != NULL);
 	smtp_submit_callback(subm, subm->status, subm->error);
+	smtp_client_connection_unref(&subm->smtp_conn);
 	subm->smtp_trans = NULL;
 }
 
-static bool
-reply_is_temp_fail(const struct smtp_reply *reply)
+static bool reply_is_temp_fail(const struct smtp_reply *reply)
 {
 	return (smtp_reply_is_temp_fail(reply) ||
 		!smtp_reply_is_remote(reply));
@@ -272,22 +356,19 @@ rcpt_to_callback(const struct smtp_reply *reply,
 		 struct smtp_submit *subm)
 {
 	if (!smtp_reply_is_success(reply)) {
-		smtp_submit_error(subm,
-			(reply_is_temp_fail(reply) ? -1 : 0),
-			t_strdup_printf("RCPT TO failed: %s",
-				smtp_reply_log(reply)));
+		smtp_submit_error(subm, (reply_is_temp_fail(reply) ? -1 : 0),
+				  t_strdup_printf("RCPT TO failed: %s",
+						  smtp_reply_log(reply)));
 	}
 }
 
 static void
-data_callback(const struct smtp_reply *reply,
-	      struct smtp_submit *subm)
+data_callback(const struct smtp_reply *reply, struct smtp_submit *subm)
 {
 	if (!smtp_reply_is_success(reply)) {
-		smtp_submit_error(subm,
-			(reply_is_temp_fail(reply) ? -1 : 0),
-			t_strdup_printf("DATA failed: %s",
-				smtp_reply_log(reply)));
+		smtp_submit_error(subm, (reply_is_temp_fail(reply) ? -1 : 0),
+				  t_strdup_printf("DATA failed: %s",
+						  smtp_reply_log(reply)));
 		return;
 	}
 
@@ -301,61 +382,51 @@ data_dummy_callback(const struct smtp_reply *reply ATTR_UNUSED,
 	/* nothing */
 }
 
-static void
-smtp_submit_send_host(struct smtp_submit *subm)
+static int smtp_submit_send_host(struct smtp_submit *subm)
 {
-	const struct smtp_submit_settings *set = &subm->session->set;
-	struct smtp_client_settings smtp_set;
+	struct smtp_submit_session *session = subm->session;
 	struct smtp_client *smtp_client;
 	struct smtp_client_connection *smtp_conn;
 	struct smtp_client_transaction *smtp_trans;
-	enum smtp_client_connection_ssl_mode ssl_mode;
 	struct smtp_address *rcpt;
-	const char *host;
-	in_port_t port;
+	const char *error;
+	int ret;
 
-	if (net_str2hostport(set->submission_host,
-			     DEFAULT_SUBMISSION_PORT, &host, &port) < 0) {
-		smtp_submit_delayed_error(subm, t_strdup_printf(
-			"Invalid submission_host: %s", host));
-		return;
+	smtp_client = smtp_submit_session_get_smtp_client(session);
+
+	struct smtp_client_parameters smtp_params = {
+		.overrides = {
+			.connect_timeout_msecs = session->timeout_msecs,
+			.command_timeout_msecs = session->timeout_msecs,
+		},
+	};
+	ret = smtp_client_connection_create_auto(
+		smtp_client, subm->event, SMTP_PROTOCOL_SMTP,
+		&smtp_params, &smtp_conn, &error);
+	if (ret < 0) {
+		smtp_submit_delayed_error(subm,
+			t_strdup_printf("Failed to establish SMTP connection: %s",
+					error));
+		return -1;
 	}
-
-	i_zero(&smtp_set);
-	smtp_set.my_hostname = set->hostname;
-	smtp_set.connect_timeout_msecs = set->submission_timeout*1000;
-	smtp_set.command_timeout_msecs = set->submission_timeout*1000;
-	smtp_set.debug = set->mail_debug;
-	smtp_set.event_parent = subm->event;
-
-	ssl_mode = SMTP_CLIENT_SSL_MODE_NONE;
-	if (set->submission_ssl != NULL) {
-		if (strcasecmp(set->submission_ssl, "smtps") == 0 ||
-			strcasecmp(set->submission_ssl, "submissions") == 0)
-			ssl_mode = SMTP_CLIENT_SSL_MODE_IMMEDIATE;
-		else if (strcasecmp(set->submission_ssl, "starttls") == 0)
-			ssl_mode = SMTP_CLIENT_SSL_MODE_STARTTLS;
-	}
-
-	smtp_client = smtp_client_init(&smtp_set);
-	smtp_conn = smtp_client_connection_create(smtp_client,
-		  SMTP_PROTOCOL_SMTP, host, port, ssl_mode, NULL);
+	if (ret == 0)
+		return 0;
 
 	smtp_trans = smtp_client_transaction_create(smtp_conn,
 		subm->mail_from, NULL, 0, smtp_submit_send_host_finished, subm);
-	smtp_client_connection_unref(&smtp_conn);
 
 	array_foreach_elem(&subm->rcpt_to, rcpt) {
 		smtp_client_transaction_add_rcpt(smtp_trans,
 			rcpt, NULL, rcpt_to_callback, data_dummy_callback, subm);
 	}
 
-	subm->smtp_client = smtp_client;
+	subm->smtp_conn = smtp_conn;
 	subm->smtp_trans = smtp_trans;
 
-	smtp_client_transaction_send
-		(smtp_trans, subm->input, data_callback, subm);
+	smtp_client_transaction_send(smtp_trans, subm->input,
+				     data_callback, subm);
 	i_stream_unref(&subm->input);
+	return 1;
 }
 
 static void
@@ -376,23 +447,17 @@ smtp_submit_sendmail_callback(enum program_client_exit_status status,
 	smtp_submit_callback(subm, 1, NULL);
 }
 
-static void
-smtp_submit_send_sendmail(struct smtp_submit *subm)
+static int smtp_submit_send_sendmail(struct smtp_submit *subm)
 {
-	const struct smtp_submit_settings *set = &subm->session->set;
-	const char *const *sendmail_args, *sendmail_bin, *str;
+	struct smtp_submit_session *session = subm->session;
+	const char *str, *error;
 	ARRAY_TYPE(const_string) args;
 	struct smtp_address *rcpt;
-	unsigned int i;
 	struct program_client_parameters pc_params;
 	struct program_client *pc;
+	int ret;
 
-	sendmail_args = t_strsplit(set->sendmail_path, " ");
 	t_array_init(&args, 16);
-	i_assert(sendmail_args[0] != NULL);
-	sendmail_bin = sendmail_args[0];
-	for (i = 1; sendmail_args[i] != NULL; i++)
-		array_push_back(&args, &sendmail_args[i]);
 
 	str = "-i"; array_push_back(&args, &str); /* ignore dots */
 	str = "-f"; array_push_back(&args, &str);
@@ -408,11 +473,20 @@ smtp_submit_send_sendmail(struct smtp_submit *subm)
 	array_append_zero(&args);
 
 	i_zero(&pc_params);
-	pc_params.client_connect_timeout_msecs = set->submission_timeout * 1000;
-	pc_params.input_idle_timeout_msecs = set->submission_timeout * 1000;
+	pc_params.append_args = array_idx(&args, 0);
+	pc_params.client_connect_timeout_msecs = session->timeout_msecs;
+	pc_params.input_idle_timeout_msecs = session->timeout_msecs;
 
-	pc = program_client_local_create(subm->event, sendmail_bin,
-					 array_front(&args), &pc_params);
+	ret = program_client_create_auto(subm->event, &pc_params,
+					 &pc, &error);
+	if (ret < 0) {
+		smtp_submit_delayed_error(subm,
+			t_strdup_printf("Failed to execute sendmail binary: %s",
+					error));
+		return -1;
+	}
+	if (ret == 0)
+		return 0;
 
 	program_client_set_input(pc, subm->input);
 	i_stream_unref(&subm->input);
@@ -420,6 +494,7 @@ smtp_submit_send_sendmail(struct smtp_submit *subm)
 	subm->prg_client = pc;
 
 	program_client_run_async(pc, smtp_submit_sendmail_callback, subm);
+	return 1;
 }
 
 struct smtp_submit_run_context {
@@ -436,8 +511,7 @@ smtp_submit_run_callback(const struct smtp_submit_result *result,
 	io_loop_stop(current_ioloop);
 }
 
-int smtp_submit_run(struct smtp_submit *subm,
-		    const char **error_r)
+int smtp_submit_run(struct smtp_submit *subm, const char **error_r)
 {
 	struct smtp_submit_run_context rctx;
 	struct ioloop *ioloop;
@@ -446,8 +520,7 @@ int smtp_submit_run(struct smtp_submit *subm,
 	io_loop_set_running(ioloop);
 
 	i_zero(&rctx);
-	smtp_submit_run_async(subm,
-		smtp_submit_run_callback, &rctx);
+	smtp_submit_run_async(subm, smtp_submit_run_callback, &rctx);
 
 	if (io_loop_is_running(ioloop))
 		io_loop_run(ioloop);
@@ -468,15 +541,13 @@ int smtp_submit_run(struct smtp_submit *subm,
 void smtp_submit_run_async(struct smtp_submit *subm,
 			   smtp_submit_callback_t *callback, void *context)
 {
-	const struct smtp_submit_settings *set = &subm->session->set;
 	uoff_t data_size;
 
 	subm->callback = callback;
 	subm->context = context;
 
 	/* the mail has been written to a file. now actually send it. */
-	subm->input = iostream_temp_finish
-		(&subm->output, IO_BLOCK_SIZE);
+	subm->input = iostream_temp_finish(&subm->output, IO_BLOCK_SIZE);
 
 	if (i_stream_get_size(subm->input, TRUE, &data_size) > 0)
 		event_add_int(subm->event, "data_size", data_size);
@@ -486,9 +557,10 @@ void smtp_submit_run_async(struct smtp_submit *subm,
 		set_name("smtp_submit_started");
 	e_debug(e->event(), "Started sending message");
 
-	if (set->submission_host != NULL) {
-		smtp_submit_send_host(subm);
-	} else {
-		smtp_submit_send_sendmail(subm);
+	if (smtp_submit_send_host(subm) == 0 &&
+	    smtp_submit_send_sendmail(subm) == 0) {
+		smtp_submit_delayed_error(subm,
+			"No means to submit mail configured");
+		return;
 	}
 }

@@ -191,28 +191,27 @@ void mail_index_append(struct mail_index_transaction *t, uint32_t uid,
 	}
 }
 
-void mail_index_append_finish_uids(struct mail_index_transaction *t,
-				   uint32_t first_uid,
-				   ARRAY_TYPE(seq_range) *uids_r)
+int mail_index_append_finish_uids(struct mail_index_transaction *t,
+				  uint32_t first_uid,
+				  ARRAY_TYPE(seq_range) *uids_r)
 {
 	return mail_index_append_finish_uids_full(t, first_uid, first_uid, uids_r);
 }
 
-void mail_index_append_finish_uids_full(struct mail_index_transaction *t,
-					uint32_t min_allowed_uid,
-					uint32_t first_new_uid,
-					ARRAY_TYPE(seq_range) *uids_r)
+int mail_index_append_finish_uids_full(struct mail_index_transaction *t,
+				       uint32_t min_allowed_uid,
+				       uint32_t first_new_uid,
+				       ARRAY_TYPE(seq_range) *uids_r)
 {
 	struct mail_index_record *recs;
-	unsigned int i, count;
+	unsigned int i, count, missing_count = 0;
 	struct seq_range *range;
 	uint32_t next_uid;
 
 	if (!array_is_created(&t->appends))
-		return;
+		return 0;
 
 	i_assert(min_allowed_uid <= first_new_uid);
-	i_assert(first_new_uid < (uint32_t)-1);
 
 	/* first find the highest assigned uid */
 	recs = array_get_modifiable(&t->appends, &count);
@@ -220,15 +219,24 @@ void mail_index_append_finish_uids_full(struct mail_index_transaction *t,
 
 	next_uid = first_new_uid;
 	for (i = 0; i < count; i++) {
+		if (recs[i].uid == UINT32_MAX)
+			return -1;
 		if (next_uid <= recs[i].uid)
 			next_uid = recs[i].uid + 1;
+		if (recs[i].uid == 0 || recs[i].uid < min_allowed_uid)
+			missing_count++;
 	}
-	i_assert(next_uid > 0 && next_uid < (uint32_t)-1);
+	/* The UIDs must stay below UINT32_MAX. The next_uid may be
+	   too large if the index is corrupted. */
+	if (missing_count > 0) {
+		i_assert(next_uid > 0);
+		if (next_uid > UINT32_MAX - missing_count)
+			return -1;
+	}
 
 	/* assign missing uids */
 	for (i = 0; i < count; i++) {
 		if (recs[i].uid == 0 || recs[i].uid < min_allowed_uid) {
-			i_assert(next_uid < (uint32_t)-1);
 			recs[i].uid = next_uid++;
 			if (t->highest_append_uid < recs[i].uid)
 				t->highest_append_uid = recs[i].uid;
@@ -249,6 +257,7 @@ void mail_index_append_finish_uids_full(struct mail_index_transaction *t,
 			range->seq1 = range->seq2 = recs[i].uid;
 		}
 	}
+	return 0;
 }
 
 void mail_index_update_modseq(struct mail_index_transaction *t, uint32_t seq,
@@ -775,7 +784,7 @@ void mail_index_ext_resize(struct mail_index_transaction *t, uint32_t ext_id,
 	/* get ext_id from transaction's map if it's there */
 	if (!mail_index_map_get_ext_idx(t->view->map, ext_id, &intro.ext_id)) {
 		/* have to create it */
-		intro.ext_id = (uint32_t)-1;
+		intro.ext_id = UINT32_MAX;
 		old_record_align = rext->record_align;
 		old_header_size = rext->hdr_size;
 	} else {
@@ -803,7 +812,7 @@ void mail_index_ext_resize(struct mail_index_transaction *t, uint32_t ext_id,
 		old_record_size = rext->record_size;
 	}
 
-	if (record_size != old_record_size && record_size != (uint16_t)-1) {
+	if (record_size != old_record_size && record_size != UINT16_MAX) {
 		/* if record_size grows, we'll just resize the existing
 		   ext_rec_updates array. it's not possible to shrink
 		   record_size without data loss. */
@@ -816,13 +825,13 @@ void mail_index_ext_resize(struct mail_index_transaction *t, uint32_t ext_id,
 	if (!array_is_created(&t->ext_resizes))
 		i_array_init(&t->ext_resizes, ext_id + 2);
 
-	intro.hdr_size = hdr_size != (uint32_t)-1 ? hdr_size : old_header_size;
-	if (record_size != (uint16_t)-1) {
-		i_assert(record_align != (uint16_t)-1);
+	intro.hdr_size = hdr_size != UINT32_MAX ? hdr_size : old_header_size;
+	if (record_size != UINT16_MAX) {
+		i_assert(record_align != UINT16_MAX);
 		intro.record_size = record_size;
 		intro.record_align = record_align;
 	} else {
-		i_assert(record_align == (uint16_t)-1);
+		i_assert(record_align == UINT16_MAX);
 		intro.record_size = old_record_size;
 		intro.record_align = old_record_align;
 	}
@@ -833,7 +842,7 @@ void mail_index_ext_resize(struct mail_index_transaction *t, uint32_t ext_id,
 void mail_index_ext_resize_hdr(struct mail_index_transaction *t,
 			       uint32_t ext_id, uint32_t hdr_size)
 {
-	mail_index_ext_resize(t, ext_id, hdr_size, (uint16_t)-1, (uint16_t)-1);
+	mail_index_ext_resize(t, ext_id, hdr_size, UINT16_MAX, UINT16_MAX);
 }
 
 void mail_index_ext_reset(struct mail_index_transaction *t, uint32_t ext_id,
@@ -860,7 +869,7 @@ void mail_index_ext_reset_inc(struct mail_index_transaction *t, uint32_t ext_id,
 {
 	uint32_t expected_reset_id = prev_reset_id + 1;
 
-	mail_index_ext_reset(t, ext_id, (uint32_t)-1, clear_data);
+	mail_index_ext_reset(t, ext_id, UINT32_MAX, clear_data);
 
 	if (!array_is_created(&t->ext_reset_atomic))
 		i_array_init(&t->ext_reset_atomic, ext_id + 2);
@@ -993,8 +1002,8 @@ void mail_index_update_header_ext(struct mail_index_transaction *t,
 	size_t new_size;
 
 	i_assert(size > 0);
-	i_assert(offset <= (uint32_t)-1 && size <= (uint32_t)-1 &&
-		 offset + size <= (uint32_t)-1);
+	i_assert(offset <= UINT32_MAX && size <= UINT32_MAX &&
+		 offset + size <= UINT32_MAX);
 
 	if (!array_is_created(&t->ext_hdr_updates))
 		i_array_init(&t->ext_hdr_updates, ext_id + 2);
@@ -1088,6 +1097,22 @@ int mail_index_atomic_inc_ext(struct mail_index_transaction *t,
 }
 
 static bool
+keyword_update_seq_has_updates(struct mail_index_transaction *t, uint32_t seq)
+{
+	const struct mail_index_transaction_keyword_update *u;
+
+	array_foreach(&t->keyword_updates, u) {
+		if (array_is_created(&u->add_seq) &&
+		    seq_range_exists(&u->add_seq, seq))
+			return TRUE;
+		if (array_is_created(&u->remove_seq) &&
+		    seq_range_exists(&u->remove_seq, seq))
+			return TRUE;
+	}
+	return FALSE;
+}
+
+static bool
 keyword_update_has_changes(struct mail_index_transaction *t, uint32_t seq,
 			   enum modify_type modify_type,
 			   struct mail_keywords *keywords)
@@ -1096,6 +1121,13 @@ keyword_update_has_changes(struct mail_index_transaction *t, uint32_t seq,
 	const unsigned int *existing_idx;
 	unsigned int i, j, existing_count;
 	bool found;
+
+	/* The existing keywords are looked up from the index, so they don't
+	   include this transaction's earlier changes to the message. If there
+	   are any, this update may need to cancel them even if it doesn't
+	   change the keywords in the index. */
+	if (keyword_update_seq_has_updates(t, seq))
+		return TRUE;
 
 	t_array_init(&existing, 32);
 	if (seq < t->first_new_seq)

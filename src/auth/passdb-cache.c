@@ -6,24 +6,26 @@
 #include "restrict-process-size.h"
 #include "auth-worker-connection.h"
 #include "password-scheme.h"
+#include "auth-secrets.h"
 #include "passdb.h"
 #include "passdb-cache.h"
 #include "passdb-blocking.h"
 
 struct auth_cache *passdb_cache = NULL;
 
-static void
-passdb_cache_log_hit(struct auth_request *request, const char *value)
+static const char *
+passdb_cache_hide_secrets(const struct auth_request *request, const char *value)
 {
 	const char *p;
 
-	if (!request->set->debug_passwords &&
-	    *value != '\0' && *value != '\t') {
+	if (request->set->debug_passwords)
+		return value;
+	if (*value != '\0' && *value != '\t') {
 		/* hide the password */
 		p = strchr(value, '\t');
 		value = t_strconcat(PASSWORD_HIDDEN_STR, p, NULL);
 	}
-	e_debug(authdb_event(request), "cache hit: %s", value);
+	return auth_field_line_hide_secrets(value);
 }
 
 static bool
@@ -45,7 +47,7 @@ passdb_cache_use_password_mismatch(enum passdb_result result,
 
 static bool
 passdb_cache_lookup(struct auth_request *request, const char *key,
-		    bool use_expired, struct auth_cache_node **node_r,
+		    struct auth_cache_node **node_r,
 		    const char **value_r, bool *neg_expired_r)
 {
 	const char *value;
@@ -56,13 +58,14 @@ passdb_cache_lookup(struct auth_request *request, const char *key,
 	/* value = password \t ... */
 	value = auth_cache_lookup(passdb_cache, request, key, node_r,
 				  &expired, neg_expired_r);
-	if (value == NULL || (expired && !use_expired)) {
+	if (value == NULL || expired) {
 		e_debug(authdb_event(request),
 			value == NULL ? "cache miss" :
 			"cache expired");
 		return FALSE;
 	}
-	passdb_cache_log_hit(request, value);
+	e_debug(authdb_event(request), "cache hit: %s",
+		passdb_cache_hide_secrets(request, value));
 	request->passdb_cache_result = AUTH_REQUEST_CACHE_HIT;
 
 	*value_r = value;
@@ -72,7 +75,6 @@ passdb_cache_lookup(struct auth_request *request, const char *key,
 struct passdb_cache_verify_plain_ctx {
 	struct auth_request *request;
 	const char *key;
-	bool use_expired;
 	verify_plain_passdb_callback_t *fallback;
 };
 
@@ -103,8 +105,7 @@ passdb_cache_verify_plain_callback(struct auth_worker_connection *conn ATTR_UNUS
 		struct auth_cache_node *node;
 		const char *value;
 		bool neg_expired;
-		bool found = passdb_cache_lookup(request, ctx->key,
-						 ctx->use_expired, &node,
+		bool found = passdb_cache_lookup(request, ctx->key, &node,
 						 &value, &neg_expired);
 		bool do_fallback = !found ||
 			!passdb_cache_use_password_mismatch(result, node,
@@ -122,7 +123,7 @@ passdb_cache_verify_plain_callback(struct auth_worker_connection *conn ATTR_UNUS
 }
 
 void passdb_cache_verify_plain(struct auth_request *request, const char *key,
-			       const char *password, bool use_expired,
+			       const char *password,
 			       verify_plain_passdb_callback_t *fallback)
 {
 	const char *value, *cached_pw, *scheme, *const *list;
@@ -136,14 +137,10 @@ void passdb_cache_verify_plain(struct auth_request *request, const char *key,
 		return;
 	}
 
-	if (!passdb_cache_lookup(request, key, use_expired,
-				 &node, &value, &neg_expired)) {
+	if (!passdb_cache_lookup(request, key, &node, &value, &neg_expired)) {
 		fallback(request);
 		return;
 	}
-
-	if (use_expired)
-		e_info(authdb_event(request), "Falling back to expired data from cache");
 
 	if (*value == '\0') {
 		/* negative cache entry */
@@ -184,7 +181,6 @@ void passdb_cache_verify_plain(struct auth_request *request, const char *key,
 			    struct passdb_cache_verify_plain_ctx, 1);
 		ctx->request = request;
 		ctx->key = p_strdup(request->pool, key);
-		ctx->use_expired = use_expired;
 		ctx->fallback = fallback;
 		auth_worker_call(request->pool, request->fields.user, str_c(str),
 				 passdb_cache_verify_plain_callback, ctx);
@@ -214,8 +210,7 @@ void passdb_cache_verify_plain(struct auth_request *request, const char *key,
 bool passdb_cache_lookup_credentials(struct auth_request *request,
 				     const char *key, const char **password_r,
 				     const char **scheme_r,
-				     enum passdb_result *result_r,
-				     bool use_expired)
+				     enum passdb_result *result_r)
 {
 	const char *value, *const *list;
 	struct auth_cache_node *node;
@@ -224,8 +219,7 @@ bool passdb_cache_lookup_credentials(struct auth_request *request,
 	if (passdb_cache == NULL || key == NULL)
 		return FALSE;
 
-	if (!passdb_cache_lookup(request, key, use_expired,
-				 &node, &value, &neg_expired))
+	if (!passdb_cache_lookup(request, key, &node, &value, &neg_expired))
 		return FALSE;
 
 	if (*value == '\0') {

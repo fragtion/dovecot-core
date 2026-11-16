@@ -9,6 +9,7 @@
 #include "buffer.h"
 #include "istream.h"
 #include "str.h"
+#include "strnum.h"
 #include "write-full.h"
 #include "message-parser.h"
 #include "mail-index.h"
@@ -163,6 +164,8 @@ static bool parse_x_imap_base(struct mbox_sync_mail_context *ctx,
 {
 	size_t i, j, uid_last_pos;
 	uint32_t uid_validity, uid_last;
+	uintmax_t num;
+	const unsigned char *end;
 
 	if (ctx->seq != 1 || ctx->seen_imapbase ||
 	    ctx->sync_ctx->renumber_uids) {
@@ -191,14 +194,23 @@ static bool parse_x_imap_base(struct mbox_sync_mail_context *ctx,
 	}
 	uid_last_pos = i;
 
-	for (uid_last = 0, j = 0; i < hdr->full_value_len; i++, j++) {
-		if (hdr->full_value[i] < '0' || hdr->full_value[i] > '9') {
-			if (!IS_LWSP_LF(hdr->full_value[i]))
-				return FALSE;
-			break;
-		}
-		uid_last = uid_last * 10 + (hdr->full_value[i] - '0');
+	uid_last = 0; j = 0;
+	if (i < hdr->full_value_len &&
+	    hdr->full_value[i] >= '0' && hdr->full_value[i] <= '9') {
+		/* An overflow or a UID that can't be used (see MBOX_MAX_UID)
+		   makes the header broken. It may come from an untrusted
+		   incoming mail. */
+		if (str_parse_data_uintmax(hdr->full_value + i,
+					   hdr->full_value_len - i,
+					   &num, &end) < 0 ||
+		    num > MBOX_MAX_UID)
+			return FALSE;
+		uid_last = num;
+		j = end - (hdr->full_value + i);
+		i += j;
 	}
+	if (i < hdr->full_value_len && !IS_LWSP_LF(hdr->full_value[i]))
+		return FALSE;
 
 	if (j != 10 ||
 	    hdr->full_value_offset != ctx->hdr_offset + str_len(ctx->header)) {
@@ -314,6 +326,18 @@ static bool parse_x_keywords_real(struct mbox_sync_mail_context *ctx,
 		array_append_array(&ctx->mail.keywords, &keyword_list);
 	}
 
+	if (ctx->sync_ctx->dest_first_mail && ctx->seq != 1) {
+		/* we're expunging the first mail, and this one becomes the
+		   first. X-IMAPbase, which defines the keyword names, is
+		   appended after the existing headers, so it would end up
+		   after this X-Keywords. When the mbox is read again with an
+		   index that doesn't know the names yet, the keywords would
+		   be taken as foreign and the header deleted. Delete it now
+		   and keep the parsed keywords: the header is added back
+		   after X-IMAPbase (the same is done for X-UID). */
+		return FALSE;
+	}
+
 	ctx->hdr_pos[MBOX_HDR_X_KEYWORDS] = str_len(ctx->header);
 	parse_trailing_whitespace(ctx, hdr);
 	return TRUE;
@@ -334,23 +358,27 @@ static bool parse_x_uid(struct mbox_sync_mail_context *ctx,
 			struct message_header_line *hdr)
 {
 	uint32_t value = 0;
-	size_t i;
+	uintmax_t num;
+	const unsigned char *end, *end_of_value;
 
 	if (ctx->mail.uid != 0) {
 		/* duplicate */
 		return FALSE;
 	}
 
-	for (i = 0; i < hdr->full_value_len; i++) {
-		if (hdr->full_value[i] < '0' || hdr->full_value[i] > '9')
-			break;
-		value = value*10 + (hdr->full_value[i] - '0');
-	}
-
-	for (; i < hdr->full_value_len; i++) {
-		if (!IS_LWSP_LF(hdr->full_value[i])) {
-			/* broken value */
-			return FALSE;
+	/* no digits or too large */
+	const bool unparsable =
+		str_parse_data_uintmax(hdr->full_value, hdr->full_value_len,
+				       &num, &end) < 0 ||
+		num > UINT32_MAX;
+	if (!unparsable) {
+		value = num;
+		end_of_value = hdr->full_value + hdr->full_value_len;
+		for (; end < end_of_value; end++) {
+			if (!IS_LWSP_LF(*end)) {
+				/* broken value */
+				return FALSE;
+			}
 		}
 	}
 
@@ -369,7 +397,19 @@ static bool parse_x_uid(struct mbox_sync_mail_context *ctx,
 		return FALSE;
 	}
 
-	if (value == ctx->sync_ctx->next_uid) {
+	if (unparsable) {
+		ctx->mail.uid_broken = TRUE;
+		return FALSE;
+	}
+
+	if (value > MBOX_MAX_UID) {
+		/* Past MBOX_MAX_UID (a sync then fails an assert), or
+		   next_uid would wrap to 0. The X-UID may come from an
+		   untrusted incoming mail, so treat it as broken. The mail
+		   then gets a new UID. */
+		ctx->mail.uid_broken = TRUE;
+		return FALSE;
+	} else if (value == ctx->sync_ctx->next_uid) {
 		/* X-UID is the next expected one. allow it because
 		   we'd just use this UID anyway. X-IMAPbase header
 		   still needs to be updated for this. */
@@ -420,6 +460,10 @@ static bool parse_content_length(struct mbox_sync_mail_context *ctx,
 	for (i = 0; i < hdr->full_value_len; i++) {
 		if (hdr->full_value[i] < '0' || hdr->full_value[i] > '9')
 			break;
+		if (value > ((uoff_t)OFF_T_MAX - 9) / 10) {
+			/* too large - can't be a valid size in this file */
+			return FALSE;
+		}
 		value = value*10 + (hdr->full_value[i] - '0');
 	}
 
@@ -450,6 +494,17 @@ static int mbox_sync_bsearch_header_func_cmp(const void *p1, const void *p2)
 	const struct mbox_sync_header_func *func = p2;
 
 	return strcasecmp(key, func->header);
+}
+
+static struct mbox_sync_header_func *
+mbox_sync_find_header_func(const struct message_header_line *hdr)
+{
+	/* "Status\0foo" isn't our Status header */
+	if (memchr(hdr->name, '\0', hdr->name_len) != NULL)
+		return NULL;
+	return bsearch(hdr->name, header_funcs, N_ELEMENTS(header_funcs),
+		       sizeof(*header_funcs),
+		       mbox_sync_bsearch_header_func_cmp);
 }
 
 int mbox_sync_parse_next_mail(struct istream *input,
@@ -490,14 +545,15 @@ int mbox_sync_parse_next_mail(struct istream *input,
 
 		if (!hdr->continued) {
 			line_start_pos = str_len(ctx->header);
-			str_append(ctx->header, hdr->name);
+			/* The name may contain NULs. Copy all of it, or the
+			   rewritten header would be shorter than the one in
+			   the file and all the offsets after it would be
+			   wrong. */
+			str_append_data(ctx->header, hdr->name, hdr->name_len);
 			str_append_data(ctx->header, hdr->middle, hdr->middle_len);
 		}
 
-		func = bsearch(hdr->name, header_funcs,
-			       N_ELEMENTS(header_funcs), sizeof(*header_funcs),
-			       mbox_sync_bsearch_header_func_cmp);
-
+		func = mbox_sync_find_header_func(hdr);
 		if (func != NULL) {
 			if (hdr->continues) {
 				hdr->use_full_value = TRUE;
@@ -561,7 +617,7 @@ bool mbox_sync_parse_match_mail(struct mbox_mailbox *mbox,
         struct mbox_sync_mail_context ctx;
 	struct message_header_parser_ctx *hdr_ctx;
 	struct message_header_line *hdr;
-	struct header_func *func;
+	struct mbox_sync_header_func *func;
 	struct mbox_md5_context *mbox_md5_ctx;
 	const void *data;
 	bool expunged;
@@ -585,9 +641,7 @@ bool mbox_sync_parse_match_mail(struct mbox_mailbox *mbox,
 		if (hdr->eoh)
 			break;
 
-		func = bsearch(hdr->name, header_funcs,
-			       N_ELEMENTS(header_funcs), sizeof(*header_funcs),
-			       mbox_sync_bsearch_header_func_cmp);
+		func = mbox_sync_find_header_func(hdr);
 		if (func != NULL) {
 			if (strcasecmp(hdr->name, "X-UID") == 0) {
 				if (hdr->continues) {

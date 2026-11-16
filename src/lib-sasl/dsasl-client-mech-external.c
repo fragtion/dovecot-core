@@ -59,6 +59,15 @@ mech_external_auth_output(struct dsasl_client_mech_session *msession,
 	return DSASL_CLIENT_RESULT_OK;
 }
 
+static bool
+mech_external_auth_is_finished(struct dsasl_client_mech_session *msession)
+{
+	struct external_sasl_session *esession =
+		container_of(msession, struct external_sasl_session, session);
+
+	return esession->output_sent;
+}
+
 const struct dsasl_client_mech dsasl_client_mech_external = {
 	.name = SASL_MECH_NAME_EXTERNAL,
 	.flags = DSASL_MECH_SEC_NO_PASSWORD,
@@ -66,4 +75,5 @@ const struct dsasl_client_mech dsasl_client_mech_external = {
 	.auth_new = mech_external_auth_new,
 	.auth_input = mech_external_auth_input,
 	.auth_output = mech_external_auth_output,
+	.auth_is_finished = mech_external_auth_is_finished,
 };

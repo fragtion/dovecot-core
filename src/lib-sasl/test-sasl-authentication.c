@@ -32,10 +32,53 @@ struct test_sasl {
 
 	unsigned int repeat;
 
+	/* The client is expected to fail with this error, instead of the
+	   authentication succeeding. */
+	const char *client_error;
+	/* The server is expected to log this error. */
+	const char *server_error;
+	/* GSSAPI dummy behavior */
+	struct {
+		/* Flags the dummy adds to and removes from the context flags
+		   it returns. */
+		unsigned int ret_flags_add, ret_flags_remove;
+		/* The major status that the acceptor returns on success. */
+		unsigned int accept_status;
+		/* The acceptor returns no output token. */
+		bool accept_no_token;
+		/* The acceptor requires this application data in the channel
+		   bindings. */
+		const char *require_cbind_data;
+		/* The dummy fails acquiring the initiator credential or
+		   restricting the negotiated mechanisms. */
+		bool fail_acquire_cred:1;
+		bool fail_set_neg_mechs:1;
+		/* The acceptor requires the tls-server-end-point channel
+		   binding with the data that the client got from its
+		   callback. */
+		bool require_cbind:1;
+	} gss;
+	/* Settings of the mechanism: name and value pairs, ended with NULL. The
+	   names are inside the client_auth/<mechanism> filter. */
+	const char *const *mech_settings;
+
 	bool failure:1;
 	bool no_cbind:1;
 	bool server_no_plus:1;
 	bool expect_cbind:1;
+	/* The server's first output is an empty challenge. The exchange ends
+	   there, because the dummy acceptor would return the same status for
+	   any further token. */
+	bool expect_empty_challenge:1;
+	/* The server sends data along with the success. */
+	bool expect_success_data:1;
+	/* The channel binding callback fails. */
+	bool cbind_callback_fails:1;
+	/* Give the client_auth settings to the session as a struct, like some
+	   users do, instead of letting it read them from the event. */
+	bool manual_set:1;
+	/* The client event has no settings root. Needs manual_set. */
+	bool no_settings_root:1;
 };
 
 struct test_sasl_context {
@@ -50,10 +93,12 @@ struct test_sasl_context {
 	const char *authid;
 	const char *authzid;
 	const char *realm;
+	unsigned int challenges;
 	const char *cbind_type;
 	buffer_t *cbind_data;
 
 	bool server_cbinding:1;
+	bool client_failed:1;
 	bool auth_initial:1;
 	bool out_of_band_cycle:1;
 	bool finished:1;
@@ -240,6 +285,16 @@ test_server_request_lookup_credentials(
 }
 
 static void
+test_client_expect_error(struct test_sasl_context *tctx,
+			 enum dsasl_client_result result, const char *error)
+{
+	test_assert(result == DSASL_CLIENT_RESULT_ERR_PROTOCOL);
+	test_assert_strcmp(error, tctx->test->client_error);
+	tctx->client_failed = TRUE;
+	tctx->finished = TRUE;
+}
+
+static void
 test_server_request_output(struct sasl_server_req_ctx *rctx,
 			   const struct sasl_server_output *output)
 {
@@ -264,10 +319,20 @@ test_server_request_output(struct sasl_server_req_ctx *rctx,
 		break;
 	case SASL_SERVER_OUTPUT_SUCCESS:
 		expected = !test->failure;
+		if (test->expect_success_data)
+			test_assert(output->data_size > 0);
 		tctx->finished = TRUE;
 		break;
 	case SASL_SERVER_OUTPUT_CONTINUE:
 		expected = TRUE;
+		/* Without an initial response the first challenge is empty
+		   anyway. The challenge to check is the one after the token. */
+		if (test->expect_empty_challenge &&
+		    ++tctx->challenges == (tctx->auth_initial ? 1 : 2)) {
+			test_assert(output->data != NULL);
+			test_assert(output->data_size == 0);
+			tctx->finished = TRUE;
+		}
 		break;
 	}
 
@@ -283,8 +348,18 @@ test_server_request_output(struct sasl_server_req_ctx *rctx,
 
 		result = dsasl_client_session_input(
 			tctx->session, output->data, output->data_size, &error);
+		if (result != DSASL_CLIENT_RESULT_OK &&
+		    test->client_error != NULL) {
+			test_client_expect_error(tctx, result, error);
+			return;
+		}
 		test_out_reason_quiet("client input",
 				      result == DSASL_CLIENT_RESULT_OK, error);
+	}
+	if (output->status == SASL_SERVER_OUTPUT_SUCCESS && !test->failure &&
+	    !test_has_failed()) {
+		test_out_quiet("client is finished",
+			       dsasl_client_session_is_finished(tctx->session));
 	}
 }
 
@@ -342,12 +417,49 @@ test_client_channel_binding_callback(const char *type, void *context,
 {
 	struct test_sasl_context *tctx = context;
 
+	if (tctx->test->cbind_callback_fails) {
+		*error_r = "Channel binding not available";
+		return -1;
+	}
 	*error_r = NULL;
 
 	test_create_channel_binding_data(tctx, type);
 	*data_r = tctx->cbind_data;
+#ifdef HAVE_GSSAPI
+	if (tctx->test->gss.require_cbind) {
+		const char *app_data = t_strdup_printf(
+			"%s:%s", type, str_c(tctx->cbind_data));
+		gss_dummy_require_channel_bindings(app_data, strlen(app_data));
+	}
+#endif
 	return 0;
 }
+
+#ifdef HAVE_GSSAPI
+static void test_gss_check_channel_binding(struct test_sasl_context *tctx)
+{
+	const struct test_sasl *test = tctx->test;
+	const buffer_t *token_cbind = gss_dummy_get_token_channel_bindings();
+
+	/* The GSSAPI acceptor has no server callbacks. The binding was used if
+	   the token had one. */
+	tctx->server_cbinding = token_cbind != NULL;
+	if (test->no_cbind || test->cbind_callback_fails)
+		test_assert(token_cbind == NULL);
+	if (token_cbind == NULL)
+		return;
+
+	test_assert_strcmp(tctx->cbind_type, "tls-server-end-point");
+	if (tctx->cbind_data != NULL) {
+		test_assert_strcmp(
+			t_strndup(token_cbind->data, token_cbind->used),
+			t_strdup_printf("tls-server-end-point:%s",
+					str_c(tctx->cbind_data)));
+	}
+}
+#endif
+
+#define TEST_SASL_MAX_ROUNDS 20
 
 static void test_sasl_interact(struct test_sasl_context *tctx)
 {
@@ -359,6 +471,11 @@ static void test_sasl_interact(struct test_sasl_context *tctx)
 	if (tctx->auth_initial) {
 		result = dsasl_client_session_output(
 			tctx->session, &sasl_data, &sasl_data_size, &error);
+		if (result != DSASL_CLIENT_RESULT_OK &&
+		    tctx->test->client_error != NULL) {
+			test_client_expect_error(tctx, result, error);
+			return;
+		}
 		test_out_reason_quiet("client initial",
 				      result == DSASL_CLIENT_RESULT_OK, error);
 		if (test_has_failed())
@@ -367,7 +484,13 @@ static void test_sasl_interact(struct test_sasl_context *tctx)
 	sasl_server_request_initial(&tctx->ssrctx,
 				    sasl_data, sasl_data_size);
 
-	while (!test_has_failed() && !tctx->finished) {
+	/* A broken exchange could otherwise go on forever. */
+	for (unsigned int rounds = 0;
+	     !test_has_failed() && !tctx->finished; rounds++) {
+		if (rounds >= TEST_SASL_MAX_ROUNDS) {
+			test_assert(FALSE);
+			break;
+		}
 		sasl_data = NULL;
 		sasl_data_size = 0;
 
@@ -375,6 +498,11 @@ static void test_sasl_interact(struct test_sasl_context *tctx)
 			result = dsasl_client_session_output(
 				tctx->session, &sasl_data, &sasl_data_size,
 				&error);
+			if (result != DSASL_CLIENT_RESULT_OK &&
+			    tctx->test->client_error != NULL) {
+				test_client_expect_error(tctx, result, error);
+				return;
+			}
 			test_out_reason_quiet("client output",
 					      result == DSASL_CLIENT_RESULT_OK,
 					      error);
@@ -448,8 +576,17 @@ test_sasl_run_once(const struct test_sasl *test,
 	settings_root_override(set_root,
 		t_strdup_printf("client_auth/%s/mechanism", test->mech),
 		test->mech, SETTINGS_OVERRIDE_TYPE_CODE);
+	for (unsigned int i = 0; test->mech_settings != NULL &&
+				 test->mech_settings[i] != NULL; i += 2) {
+		settings_root_override(set_root,
+			t_strdup_printf("client_auth/%s/%s", test->mech,
+					test->mech_settings[i]),
+			test->mech_settings[i + 1],
+			SETTINGS_OVERRIDE_TYPE_CODE);
+	}
 	event = event_create(test_event);
-	event_set_ptr(event, SETTINGS_EVENT_ROOT, set_root);
+	if (!test->no_settings_root)
+		event_set_ptr(event, SETTINGS_EVENT_ROOT, set_root);
 
 	struct dsasl_client_parameters client_params = {
 		.protocol = "imap",
@@ -457,10 +594,34 @@ test_sasl_run_once(const struct test_sasl *test,
 		.server_mechanisms =
 			sasl_server_instance_mech_get_list(server_inst),
 	};
-	if (dsasl_client_session_create_auto(tctx.client, event,
-					     &client_params, &tctx.session,
-					     &error) < 0)
-		i_fatal("Failed to create SASL session: %s", error);
+	const struct client_auth_settings manual_set = {
+		.mechanism = test->mech,
+		.authid = authid,
+		.authzid = authzid,
+		.password = password,
+	};
+	int ret;
+
+	if (test->manual_set) {
+		ret = dsasl_client_session_create(tctx.client, event,
+						  &client_params, &manual_set,
+						  &tctx.session, &error);
+	} else {
+		ret = dsasl_client_session_create_auto(tctx.client, event,
+						       &client_params,
+						       &tctx.session, &error);
+	}
+	if (ret < 0) {
+		if (test->client_error == NULL)
+			i_fatal("Failed to create SASL session: %s", error);
+		test_assert_strcmp(error, test->client_error);
+		event_unref(&event);
+		settings_root_deinit(&set_root);
+		dsasl_client_unref(&tctx.client);
+		sasl_server_request_destroy(&tctx.ssrctx);
+		pool_unref(&tctx.pool);
+		return;
+	}
 	i_assert(tctx.session != NULL);
 
 	if (!test->no_cbind) {
@@ -469,7 +630,16 @@ test_sasl_run_once(const struct test_sasl *test,
 			test_client_channel_binding_callback, &tctx);
 	}
 
+	if (test->server_error != NULL)
+		test_expect_error_string(test->server_error);
 	test_sasl_interact(&tctx);
+	if (test->server_error != NULL)
+		test_expect_no_more_errors();
+#ifdef HAVE_GSSAPI
+	if (strcasecmp(test->mech, SASL_MECH_NAME_GSSAPI) == 0 ||
+	    strcasecmp(test->mech, SASL_MECH_NAME_GSS_SPNEGO) == 0)
+		test_gss_check_channel_binding(&tctx);
+#endif
 
 	dsasl_client_session_destroy(&tctx.session);
 	event_unref(&event);
@@ -478,6 +648,7 @@ test_sasl_run_once(const struct test_sasl *test,
 	sasl_server_request_destroy(&tctx.ssrctx);
 
 	test_assert(test->expect_cbind == tctx.server_cbinding);
+	test_assert((test->client_error != NULL) == tctx.client_failed);
 
 	pool_unref(&tctx.pool);
 }
@@ -491,6 +662,20 @@ test_sasl_run(const struct test_sasl *test, const char *label,
 	struct sasl_server_instance *server_inst;
 	unsigned int i;
 
+#if defined(HAVE_GSSAPI) && !defined(HAVE_GSS_SET_NEG_MECHS)
+	struct test_sasl no_neg_mechs_test;
+
+	/* The client can't restrict GSS-SPNEGO to Kerberos, so it refuses
+	   to start. */
+	if (strcasecmp(test->mech, SASL_MECH_NAME_GSS_SPNEGO) == 0) {
+		no_neg_mechs_test = *test;
+		no_neg_mechs_test.client_error =
+			"GSS-SPNEGO can't be restricted to Kerberos "
+			"(gss_set_neg_mechs() not available in the GSSAPI library)";
+		test = &no_neg_mechs_test;
+	}
+#endif
+
 	i = 0;
 	if (test->server.realm != NULL)
 		server_realms[i++] = test->server.realm;
@@ -499,9 +684,13 @@ test_sasl_run(const struct test_sasl *test, const char *label,
 		server_realms[i++] = test->client.realm;
 	server_realms[i] = NULL;
 
-	test_begin(t_strdup_printf("sasl %s %s%s",
+	test_begin(t_strdup_printf("sasl %s %s%s%s%s",
 				   label, test->mech,
-				   (auth_initial ? " (initial)" : "")));
+				   (auth_initial ? " (initial)" : ""),
+				   (test->client_error != NULL ?
+				    " client error: " : ""),
+				   (test->client_error != NULL ?
+				    test->client_error : "")));
 
 	const struct sasl_server_settings server_set = {
 		.realms = server_realms,
@@ -551,6 +740,28 @@ test_sasl_run(const struct test_sasl *test, const char *label,
 	if (strcasecmp(test->mech, SASL_MECH_NAME_GSSAPI) == 0 ||
 	    strcasecmp(test->mech, SASL_MECH_NAME_GSS_SPNEGO) == 0) {
 		gss_dummy_add_principal(test->server.authid);
+		OM_uint32 ret_flags_remove = test->gss.ret_flags_remove;
+#ifndef HAVE_GSS_SET_CRED_OPTION
+		/* The client can't ask for a credential without the integrity
+		   and confidentiality flags. Pretend the library doesn't set
+		   them. */
+		if (strcasecmp(test->mech, SASL_MECH_NAME_GSS_SPNEGO) == 0) {
+			ret_flags_remove |= GSS_C_INTEG_FLAG |
+					    GSS_C_CONF_FLAG;
+		}
+#endif
+		gss_dummy_set_ret_flags(test->gss.ret_flags_add,
+					ret_flags_remove);
+		gss_dummy_set_accept_status(test->gss.accept_status);
+		gss_dummy_set_accept_no_token(test->gss.accept_no_token);
+		gss_dummy_set_initiator_cred_failures(
+			test->gss.fail_acquire_cred,
+			test->gss.fail_set_neg_mechs);
+		if (test->gss.require_cbind_data != NULL) {
+			gss_dummy_require_channel_bindings(
+				test->gss.require_cbind_data,
+				strlen(test->gss.require_cbind_data));
+		}
 		gss_dummy_kinit(test->client.authid != NULL ?
 				test->client.authid : test->server.authid);
 	}
@@ -573,6 +784,27 @@ test_sasl_run(const struct test_sasl *test, const char *label,
 /*
  * Successful authentication
  */
+
+#ifdef HAVE_GSSAPI
+#  ifdef HAVE_GSS_SET_CRED_OPTION
+#    define GSS_SPNEGO_LAYER_ERROR \
+	"GSS-SPNEGO security layer is not supported"
+#  else
+#    define GSS_SPNEGO_LAYER_ERROR \
+	"GSS-SPNEGO security layer is not supported " \
+	"(gss_set_cred_option() not available in the GSSAPI library)"
+#  endif
+#  define GSS_CBIND_ERROR \
+	"Failed to get the TLS channel binding: " \
+	"Channel binding not available"
+#endif
+
+#ifdef HAVE_GSSAPI
+static const char *const gssapi_no_cbind_settings[] = {
+	"gssapi_channel_binding", "no",
+	NULL
+};
+#endif
 
 static const struct test_sasl success_tests[] = {
 	/* PLAIN */
@@ -619,6 +851,7 @@ static const struct test_sasl success_tests[] = {
 			.authid = "user",
 			.password = "pass",
 		},
+		.expect_success_data = TRUE,
 	},
 	{
 		.mech = "DIGEST-MD5",
@@ -628,6 +861,7 @@ static const struct test_sasl success_tests[] = {
 			.authzid = "user",
 			.password = "pass",
 		},
+		.expect_success_data = TRUE,
 	},
 	{
 		.mech = "DIGEST-MD5",
@@ -637,6 +871,7 @@ static const struct test_sasl success_tests[] = {
 			.realm = "example.org",
 			.password = "pass",
 		},
+		.expect_success_data = TRUE,
 	},
 	{
 		.mech = "DIGEST-MD5",
@@ -647,6 +882,7 @@ static const struct test_sasl success_tests[] = {
 			.realm = "example.org",
 			.password = "pass",
 		},
+		.expect_success_data = TRUE,
 	},
 	/* SCRAM-SHA-1 */
 	{
@@ -657,6 +893,7 @@ static const struct test_sasl success_tests[] = {
 			.password = "pass",
 		},
 		.expect_cbind = TRUE,
+		.expect_success_data = TRUE,
 	},
 	{
 		.mech = "SCRAM-SHA-1",
@@ -667,6 +904,7 @@ static const struct test_sasl success_tests[] = {
 			.password = "pass",
 		},
 		.expect_cbind = TRUE,
+		.expect_success_data = TRUE,
 	},
 	/* SCRAM-SHA-256 */
 	{
@@ -677,6 +915,7 @@ static const struct test_sasl success_tests[] = {
 			.password = "pass",
 		},
 		.expect_cbind = TRUE,
+		.expect_success_data = TRUE,
 	},
 	{
 		.mech = "SCRAM-SHA-256",
@@ -687,6 +926,7 @@ static const struct test_sasl success_tests[] = {
 			.password = "pass",
 		},
 		.expect_cbind = TRUE,
+		.expect_success_data = TRUE,
 	},
 	/* SCRAM-SHA-1 */
 	{
@@ -697,6 +937,7 @@ static const struct test_sasl success_tests[] = {
 			.password = "pass",
 		},
 		.server_no_plus = TRUE,
+		.expect_success_data = TRUE,
 	},
 	{
 		.mech = "SCRAM-SHA-1",
@@ -707,6 +948,7 @@ static const struct test_sasl success_tests[] = {
 			.password = "pass",
 		},
 		.server_no_plus = TRUE,
+		.expect_success_data = TRUE,
 	},
 	/* SCRAM-SHA-256 */
 	{
@@ -717,6 +959,7 @@ static const struct test_sasl success_tests[] = {
 			.password = "pass",
 		},
 		.server_no_plus = TRUE,
+		.expect_success_data = TRUE,
 	},
 	{
 		.mech = "SCRAM-SHA-256",
@@ -727,6 +970,7 @@ static const struct test_sasl success_tests[] = {
 			.password = "pass",
 		},
 		.server_no_plus = TRUE,
+		.expect_success_data = TRUE,
 	},
 	/* SCRAM-SHA-1 */
 	{
@@ -737,6 +981,7 @@ static const struct test_sasl success_tests[] = {
 			.password = "pass",
 		},
 		.no_cbind = TRUE,
+		.expect_success_data = TRUE,
 	},
 	{
 		.mech = "SCRAM-SHA-1",
@@ -747,6 +992,7 @@ static const struct test_sasl success_tests[] = {
 			.password = "pass",
 		},
 		.no_cbind = TRUE,
+		.expect_success_data = TRUE,
 	},
 	/* SCRAM-SHA-256 */
 	{
@@ -757,6 +1003,7 @@ static const struct test_sasl success_tests[] = {
 			.password = "pass",
 		},
 		.no_cbind = TRUE,
+		.expect_success_data = TRUE,
 	},
 	{
 		.mech = "SCRAM-SHA-256",
@@ -767,6 +1014,7 @@ static const struct test_sasl success_tests[] = {
 			.password = "pass",
 		},
 		.no_cbind = TRUE,
+		.expect_success_data = TRUE,
 	},
 	/* SCRAM-SHA-1-PLUS */
 	{
@@ -777,6 +1025,7 @@ static const struct test_sasl success_tests[] = {
 			.password = "pass",
 		},
 		.expect_cbind = TRUE,
+		.expect_success_data = TRUE,
 	},
 	{
 		.mech = "SCRAM-SHA-1-PLUS",
@@ -787,6 +1036,7 @@ static const struct test_sasl success_tests[] = {
 			.password = "pass",
 		},
 		.expect_cbind = TRUE,
+		.expect_success_data = TRUE,
 	},
 	/* SCRAM-SHA-256-PLUS */
 	{
@@ -797,6 +1047,7 @@ static const struct test_sasl success_tests[] = {
 			.password = "pass",
 		},
 		.expect_cbind = TRUE,
+		.expect_success_data = TRUE,
 	},
 	{
 		.mech = "SCRAM-SHA-256-PLUS",
@@ -807,6 +1058,7 @@ static const struct test_sasl success_tests[] = {
 			.password = "pass",
 		},
 		.expect_cbind = TRUE,
+		.expect_success_data = TRUE,
 	},
 	/* OAUTHBEARER */
 	{
@@ -846,6 +1098,48 @@ static const struct test_sasl success_tests[] = {
 			.authid = "user",
 			.password = "",
 		},
+		.expect_cbind = TRUE,
+	},
+	/* GSS-SPNEGO: The server sends the final context token with the
+	   success, and no security layer negotiation. */
+	{
+		.mech = "GSS-SPNEGO",
+		.authid_type = SASL_SERVER_AUTHID_TYPE_USERNAME,
+		.server = {
+			.authid = "user",
+			.password = "",
+		},
+		.expect_cbind = TRUE,
+		.expect_success_data = TRUE,
+	},
+	{
+		.mech = "GSSAPI",
+		.authid_type = SASL_SERVER_AUTHID_TYPE_USERNAME,
+		.server = {
+			.authid = "user",
+			.password = "",
+		},
+		.gss = { .require_cbind = TRUE },
+		.expect_cbind = TRUE,
+	},
+	{
+		.mech = "GSSAPI",
+		.authid_type = SASL_SERVER_AUTHID_TYPE_USERNAME,
+		.server = {
+			.authid = "user",
+			.password = "",
+		},
+		.no_cbind = TRUE,
+	},
+	{
+		.mech = "GSSAPI",
+		.authid_type = SASL_SERVER_AUTHID_TYPE_USERNAME,
+		.server = {
+			.authid = "user",
+			.password = "",
+		},
+		.cbind_callback_fails = TRUE,
+		.client_error = GSS_CBIND_ERROR,
 	},
 	{
 		.mech = "GSS-SPNEGO",
@@ -854,6 +1148,142 @@ static const struct test_sasl success_tests[] = {
 			.authid = "user",
 			.password = "",
 		},
+		.cbind_callback_fails = TRUE,
+		.client_error = GSS_CBIND_ERROR,
+	},
+	/* The setting is read also when the settings are given as a struct */
+	{
+		.mech = "GSSAPI",
+		.authid_type = SASL_SERVER_AUTHID_TYPE_USERNAME,
+		.server = {
+			.authid = "user",
+			.password = "",
+		},
+		.manual_set = TRUE,
+		.mech_settings = gssapi_no_cbind_settings,
+		.cbind_callback_fails = TRUE,
+	},
+	{
+		.mech = "GSSAPI",
+		.authid_type = SASL_SERVER_AUTHID_TYPE_USERNAME,
+		.server = {
+			.authid = "user",
+			.password = "",
+		},
+		.manual_set = TRUE,
+		.cbind_callback_fails = TRUE,
+		.client_error = GSS_CBIND_ERROR,
+	},
+	/* Without a settings root the binding is sent by default */
+	{
+		.mech = "GSSAPI",
+		.authid_type = SASL_SERVER_AUTHID_TYPE_USERNAME,
+		.server = {
+			.authid = "user",
+			.password = "",
+		},
+		.manual_set = TRUE,
+		.no_settings_root = TRUE,
+		.expect_cbind = TRUE,
+	},
+	{
+		.mech = "GSSAPI",
+		.authid_type = SASL_SERVER_AUTHID_TYPE_USERNAME,
+		.server = {
+			.authid = "user",
+			.password = "",
+		},
+		.manual_set = TRUE,
+		.no_settings_root = TRUE,
+		.cbind_callback_fails = TRUE,
+		.client_error = GSS_CBIND_ERROR,
+	},
+	/* gssapi_channel_binding=no: no binding is sent with TLS, not even
+	   to be able to fail getting it */
+	{
+		.mech = "GSSAPI",
+		.authid_type = SASL_SERVER_AUTHID_TYPE_USERNAME,
+		.server = {
+			.authid = "user",
+			.password = "",
+		},
+		.mech_settings = gssapi_no_cbind_settings,
+	},
+	{
+		.mech = "GSSAPI",
+		.authid_type = SASL_SERVER_AUTHID_TYPE_USERNAME,
+		.server = {
+			.authid = "user",
+			.password = "",
+		},
+		.mech_settings = gssapi_no_cbind_settings,
+		.cbind_callback_fails = TRUE,
+	},
+	{
+		.mech = "GSS-SPNEGO",
+		.authid_type = SASL_SERVER_AUTHID_TYPE_USERNAME,
+		.server = {
+			.authid = "user",
+			.password = "",
+		},
+		.mech_settings = gssapi_no_cbind_settings,
+		.cbind_callback_fails = TRUE,
+		.expect_success_data = TRUE,
+	},
+	{
+		.mech = "GSS-SPNEGO",
+		.authid_type = SASL_SERVER_AUTHID_TYPE_USERNAME,
+		.server = {
+			.authid = "user",
+			.password = "",
+		},
+		.gss = { .require_cbind = TRUE },
+		.expect_cbind = TRUE,
+		.expect_success_data = TRUE,
+	},
+	{
+		.mech = "GSS-SPNEGO",
+		.authid_type = SASL_SERVER_AUTHID_TYPE_USERNAME,
+		.server = {
+			.authid = "user",
+			.password = "",
+		},
+		.expect_cbind = TRUE,
+		.gss = { .ret_flags_add = GSS_C_INTEG_FLAG },
+		.client_error = GSS_SPNEGO_LAYER_ERROR,
+	},
+	{
+		.mech = "GSS-SPNEGO",
+		.authid_type = SASL_SERVER_AUTHID_TYPE_USERNAME,
+		.server = {
+			.authid = "user",
+			.password = "",
+		},
+		.expect_cbind = TRUE,
+		.gss = { .ret_flags_remove = GSS_C_MUTUAL_FLAG },
+		.client_error = "GSS-SPNEGO server was not authenticated",
+	},
+	{
+		.mech = "GSS-SPNEGO",
+		.authid_type = SASL_SERVER_AUTHID_TYPE_USERNAME,
+		.server = {
+			.authid = "user",
+			.password = "",
+		},
+		.gss = { .fail_acquire_cred = TRUE },
+		.client_error = "While acquiring the initiator credential: "
+			"No valid credentials.; Kerberos5 dummy says no.",
+	},
+	{
+		.mech = "GSS-SPNEGO",
+		.authid_type = SASL_SERVER_AUTHID_TYPE_USERNAME,
+		.server = {
+			.authid = "user",
+			.password = "",
+		},
+		.gss = { .fail_set_neg_mechs = TRUE },
+		.client_error = "While restricting the negotiation to Kerberos: "
+			"Kerberos5 dummy says no.",
 	},
 #endif
 	/* NTLM */
@@ -1592,6 +2022,7 @@ static const struct test_sasl bad_creds_tests[] = {
 		.client = {
 			.authid = "userb",
 		},
+		.expect_cbind = TRUE,
 		.failure = TRUE,
 	},
 	/* GSS-SPNEGO */
@@ -1605,7 +2036,95 @@ static const struct test_sasl bad_creds_tests[] = {
 		.client = {
 			.authid = "userb",
 		},
+		.expect_cbind = TRUE,
 		.failure = TRUE,
+	},
+	/* GSSAPI: the acceptor returns an unexpected status */
+	{
+		.mech = "GSSAPI",
+		.authid_type = SASL_SERVER_AUTHID_TYPE_USERNAME,
+		.server = {
+			.authid = "user",
+			.password = "",
+		},
+		.gss = { .accept_status = GSS_S_DUPLICATE_TOKEN },
+		.server_error = "Received unexpected major status",
+		.expect_cbind = TRUE,
+		.failure = TRUE,
+	},
+	/* GSSAPI: the context is incomplete and the acceptor has no token */
+	{
+		.mech = "GSSAPI",
+		.authid_type = SASL_SERVER_AUTHID_TYPE_USERNAME,
+		.server = {
+			.authid = "user",
+			.password = "",
+		},
+		.gss = {
+			.accept_status = GSS_S_CONTINUE_NEEDED,
+			.accept_no_token = TRUE,
+		},
+		.expect_empty_challenge = TRUE,
+		.expect_cbind = TRUE,
+	},
+	/* GSSAPI: wrong channel binding */
+	{
+		.mech = "GSSAPI",
+		.authid_type = SASL_SERVER_AUTHID_TYPE_USERNAME,
+		.server = {
+			.authid = "user",
+			.password = "",
+		},
+		.gss = { .require_cbind_data = "tls-server-end-point:wrong" },
+		.expect_cbind = TRUE,
+		.failure = TRUE,
+	},
+	{
+		.mech = "GSS-SPNEGO",
+		.authid_type = SASL_SERVER_AUTHID_TYPE_USERNAME,
+		.server = {
+			.authid = "user",
+			.password = "",
+		},
+		.gss = { .require_cbind_data = "tls-server-end-point:wrong" },
+		.expect_cbind = TRUE,
+		.failure = TRUE,
+	},
+	/* GSSAPI: required channel binding, but no TLS */
+	{
+		.mech = "GSSAPI",
+		.authid_type = SASL_SERVER_AUTHID_TYPE_USERNAME,
+		.server = {
+			.authid = "user",
+			.password = "",
+		},
+		.gss = { .require_cbind_data = "tls-server-end-point:wrong" },
+		.no_cbind = TRUE,
+		.failure = TRUE,
+	},
+	/* GSSAPI: required channel binding, but it's disabled */
+	{
+		.mech = "GSSAPI",
+		.authid_type = SASL_SERVER_AUTHID_TYPE_USERNAME,
+		.server = {
+			.authid = "user",
+			.password = "",
+		},
+		.gss = { .require_cbind_data = "tls-server-end-point:wrong" },
+		.mech_settings = gssapi_no_cbind_settings,
+		.failure = TRUE,
+	},
+	/* GSSAPI: required channel binding, but getting it fails */
+	{
+		.mech = "GSSAPI",
+		.authid_type = SASL_SERVER_AUTHID_TYPE_USERNAME,
+		.server = {
+			.authid = "user",
+			.password = "",
+		},
+		.gss = { .require_cbind_data = "tls-server-end-point:wrong" },
+		.cbind_callback_fails = TRUE,
+		.client_error = GSS_CBIND_ERROR,
 	},
 #endif
 	/* NTLM */

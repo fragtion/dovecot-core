@@ -72,6 +72,15 @@ mech_plain_auth_output(struct dsasl_client_mech_session *msession,
 	return 0;
 }
 
+static bool
+mech_plain_auth_is_finished(struct dsasl_client_mech_session *msession)
+{
+	struct plain_sasl_session *psession =
+		container_of(msession, struct plain_sasl_session, session);
+
+	return psession->output_sent;
+}
+
 const struct dsasl_client_mech dsasl_client_mech_plain = {
 	.name = SASL_MECH_NAME_PLAIN,
 
@@ -79,4 +88,5 @@ const struct dsasl_client_mech dsasl_client_mech_plain = {
 	.auth_check = mech_plain_auth_check,
 	.auth_input = mech_plain_auth_input,
 	.auth_output = mech_plain_auth_output,
+	.auth_is_finished = mech_plain_auth_is_finished,
 };

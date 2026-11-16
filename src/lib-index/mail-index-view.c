@@ -158,7 +158,13 @@ static const struct mail_index_record *
 view_lookup_full(struct mail_index_view *view, uint32_t seq,
 		 struct mail_index_map **map_r, bool *expunged_r)
 {
-	static struct mail_index_record broken_rec;
+	/* Callers may read extension records from the returned record, so
+	   it must be large enough for any record. Extension records are
+	   always within the record_size. */
+	static union {
+		struct mail_index_record rec;
+		uint64_t data[MAIL_INDEX_RECORD_MAX_SIZE / sizeof(uint64_t)];
+	} broken_rec;
 	struct mail_index_map *map;
 	const struct mail_index_record *rec, *head_rec;
 
@@ -173,13 +179,19 @@ view_lookup_full(struct mail_index_view *view, uint32_t seq,
 				view->index->filepath, seq);
 			(void)mail_index_fsck(view->index);
 			view->inconsistent = TRUE;
+			/* The map may be shared by other views, such as
+			   the transaction's parent view. Their sequences
+			   can't be trusted anymore either, and committing a
+			   transaction would fail converting the sequence to
+			   a UID. */
+			view->index->inconsistency_id++;
 		}
 
 		/* we'll need to return something so the caller doesn't crash */
 		*map_r = view->map;
 		if (expunged_r != NULL)
 			*expunged_r = TRUE;
-		return &broken_rec;
+		return &broken_rec.rec;
 	}
 	if (view->map == view->index->map) {
 		/* view's mapping is latest. we can use it directly. */
@@ -298,9 +310,8 @@ mail_index_data_lookup_keywords(struct mail_index_map *map,
 		/* no keywords at all in index */
 		return;
 	}
-	(void)mail_index_ext_get_size(map, map->index->keywords_ext_id,
-				      &hdr_size, &record_size,
-				      &record_align);
+	mail_index_ext_get_size(map, map->index->keywords_ext_id,
+				&hdr_size, &record_size, &record_align);
 
 	/* keyword_idx_map[] contains file => index keyword mapping */
 	if (!array_is_created(&map->keyword_idx_map))

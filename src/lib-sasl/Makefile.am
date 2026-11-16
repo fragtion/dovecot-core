@@ -16,6 +16,7 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-json \
 	-I$(top_srcdir)/src/lib-ssl-iostream \
 	-I$(top_srcdir)/src/lib-auth \
+	-DMODULE_DIR=\""$(moduledir)"\" \
 	-DTEST_WINBIND_HELPER_PATH=\""$(abs_builddir)/ntlm_dummy"\"
 
 client_mechanisms = \
@@ -44,6 +45,9 @@ libsasl_la_SOURCES = \
 	sasl-oauth2.c \
 	$(client_mechanisms) \
 	dsasl-client.c \
+	dsasl-client-gssapi-settings.c \
+	dsasl-client-module.c \
+	dsasl-client-module-load.c \
 	$(server_mechanisms) \
 	sasl-server-mech.c \
 	sasl-server-request.c \
@@ -70,6 +74,7 @@ headers = \
 	dsasl-client.h \
 	dsasl-client-protected.h \
 	dsasl-client-private.h \
+	dsasl-client-gssapi-settings.h \
 	sasl-server.h \
 	sasl-server-gssapi.h \
 	sasl-server-oauth2.h \
@@ -128,6 +133,15 @@ test_sasl_oauth2_DEPENDENCIES = $(test_deps)
 test_sasl_client_SOURCES = test-sasl-client.c
 test_sasl_client_LDADD = $(test_libs) $(LIBDOVECOT_TEST_LIBS)
 test_sasl_client_DEPENDENCIES = $(test_deps)
+if HAVE_GSSAPI
+test_sasl_client_SOURCES += \
+	gssapi-dummy.c \
+	dsasl-client-mech-gssapi.c
+test_sasl_client_LDADD += \
+       ../lib-auth/libauth-gssapi.la
+test_sasl_client_DEPENDENCIES += \
+       ../lib-auth/libauth-gssapi.la
+endif
 
 test_sasl_authentication_SOURCES = \
 	dsasl-client-mech-ntlm-dummy.c \

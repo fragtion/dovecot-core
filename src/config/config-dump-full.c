@@ -9,6 +9,7 @@
 #include "wildcard-match.h"
 #include "safe-mkstemp.h"
 #include "ostream.h"
+#include "module-dir.h"
 #include "settings.h"
 #include "config-bin-filter.h"
 #include "master-service-settings.h"
@@ -43,6 +44,9 @@
 
    <32bit: all setting keys size>
    <all setting keys - see below>
+
+   <32bit: plugin infos size>
+   <plugin infos - see below>
 
    <0..3 bytes for 32bit alignment>
    <32bit: filter count>
@@ -117,6 +121,20 @@
    <32bit: enum setting_type>
    <32bit: setting blocks count>
      <32bit: setting block name index>
+
+   Plugin infos
+   ------------
+
+   Information about the plugins loaded via mail_plugins setting (struct
+   setting_plugin_info). Only plugins that have required plugins are
+   written. The plugin names are the names used in mail_plugins setting,
+   i.e. without the "lib<nn>_" prefix and "_plugin" suffix. The
+   <plugin infos> contents are:
+
+   Repeat until "plugin infos size" is reached:
+     <NUL-terminated string: plugin name>
+     <NUL-terminated string: required plugin name>[1..n]
+     <NUL: end of required plugins>
 
    Filters
    -------
@@ -261,9 +279,19 @@ config_dump_full_write_cache_paths(struct ostream *output,
 		return;
 	}
 
-	num32 = array_count(config_parsed_get_paths(config));
+	/* The defaults pseudo path can't be stat()ed by the reader, which
+	   would see the cache as always out of date. The defaults change
+	   only when the binaries change, which the cache doesn't track for
+	   config files either. */
+	num32 = 0;
+	array_foreach(config_parsed_get_paths(config), path) {
+		if (strcmp(path->path, MASTER_SERVICE_BINARY_CONFIG_DEFAULTS) != 0)
+			num32++;
+	}
 	o_stream_nsend(output, &num32, sizeof(num32));
 	array_foreach(config_parsed_get_paths(config), path) {
+		if (strcmp(path->path, MASTER_SERVICE_BINARY_CONFIG_DEFAULTS) == 0)
+			continue;
 		o_stream_nsend(output, path->path, strlen(path->path) + 1);
 		uint64_t num64 = path->st.st_ino;
 		o_stream_nsend(output, &num64, sizeof(num64));
@@ -468,6 +496,34 @@ config_dump_full_write_all_keys(struct ostream *output,
 	o_stream_nsend(output, &set_size, sizeof(set_size));
 	o_stream_nsend(output, buf->data, buf->used);
 	buffer_free(&buf);
+}
+
+static void config_dump_full_write_plugin_infos(struct ostream *output)
+{
+	buffer_t *buf = t_buffer_create(256);
+	const char *const *required;
+
+	for (unsigned int i = 0; all_plugin_infos[i] != NULL; i++) {
+		const struct setting_plugin_info *info = all_plugin_infos[i];
+
+		if (info->required_plugins == NULL ||
+		    info->required_plugins[0] == NULL)
+			continue;
+		const char *name = module_file_get_plugin_name(info->plugin);
+		i_assert(name[0] != '\0');
+		buffer_append(buf, name, strlen(name) + 1);
+		for (required = info->required_plugins; *required != NULL;
+		     required++) {
+			i_assert((*required)[0] != '\0');
+			buffer_append(buf, *required, strlen(*required) + 1);
+		}
+		buffer_append_c(buf, '\0');
+	}
+
+	i_assert(buf->used <= UINT32_MAX);
+	uint32_t size = buf->used;
+	o_stream_nsend(output, &size, sizeof(size));
+	o_stream_nsend(output, buf->data, buf->used);
 }
 
 static void
@@ -944,10 +1000,15 @@ int config_dump_full(struct config_parsed *config,
 		str_append_c(path, '.');
 		break;
 	}
-	case CONFIG_DUMP_FULL_DEST_TEMPDIR:
-		/* create an unlinked file to /tmp */
-		str_append(path, "/tmp/doveconf.");
+	case CONFIG_DUMP_FULL_DEST_TEMPDIR: {
+		/* Create an unlinked file to /tmp. If the binary config cache
+		   is written, create the file to the cache directory instead,
+		   so it can be renamed there. */
+		const char *cache_dir = config_get_cache_dir(flags);
+		str_append(path, cache_dir != NULL ? cache_dir : "/tmp");
+		str_append(path, "/doveconf.");
 		break;
+	}
 	case CONFIG_DUMP_FULL_DEST_STDOUT:
 		dump_ctx.output = o_stream_create_fd(STDOUT_FILENO, IO_BLOCK_SIZE);
 		o_stream_set_name(dump_ctx.output, "<stdout>");
@@ -1010,6 +1071,7 @@ int config_dump_full(struct config_parsed *config,
 		if (cache_path != NULL)
 			final_path = cache_path;
 		config_dump_full_write_all_keys(output, config);
+		config_dump_full_write_plugin_infos(output);
 		config_bin_filters_write(output, ctx.filters, ctx.pool,
 					 &ctx.filter_primary_names);
 	}
@@ -1189,6 +1251,7 @@ int config_dump_full(struct config_parsed *config,
 		if (rename(str_c(path), final_path) < 0) {
 			i_error("rename(%s, %s) failed: %m",
 				str_c(path), final_path);
+			i_unlink(str_c(path));
 			/* the fd is still readable, so don't return failure */
 		}
 	}

@@ -442,9 +442,16 @@ mail_cache_map_full(struct mail_cache *cache, size_t offset, size_t size,
 	}
 
 	cache->remap_counter++;
-	if (cache->map_with_read)
-		return mail_cache_map_with_read(cache, offset, size, data_r,
-						corrupted_r);
+	if (cache->map_with_read) {
+		ret = mail_cache_map_with_read(cache, offset, size, data_r,
+					       corrupted_r);
+		if (ret > 0 && offset + orig_size > cache->mmap_length) {
+			/* requested offset/size points outside file. size may
+			   have been truncated to the file size. */
+			return 0;
+		}
+		return ret;
+	}
 
 	if (cache->file_cache != NULL) {
 		ret = file_cache_read(cache->file_cache, offset, size);
@@ -466,7 +473,9 @@ mail_cache_map_full(struct mail_cache *cache, size_t offset, size_t size,
 					  &cache->mmap_length);
 		*data_r = offset > cache->mmap_length ? NULL :
 			CONST_PTR_OFFSET(data, offset);
-		return mail_cache_map_finish(cache, offset, size,
+		/* use orig_size, since size may have been truncated to the
+		   file size */
+		return mail_cache_map_finish(cache, offset, orig_size,
 					     offset == 0 ? data : NULL, TRUE,
 					     corrupted_r);
 	}
@@ -943,6 +952,11 @@ int mail_cache_append(struct mail_cache *cache, const void *data, size_t size,
 			return -1;
 		}
 		*offset = st.st_size;
+		/* Everything in the cache file is 32bit aligned. If the file
+		   size isn't, the last write was only partial. Append after
+		   it at an aligned offset. */
+		if ((*offset & 3) != 0)
+			*offset += 4 - (*offset & 3);
 	}
 	if (*offset >= cache->index->optimization_set.cache.max_size ||
 	    cache->index->optimization_set.cache.max_size - *offset < size) {
@@ -1006,7 +1020,7 @@ uint32_t mail_cache_get_first_new_seq(struct mail_index_view *view)
 		return 1;
 
 	if (!mail_index_lookup_seq_range(view, idx_hdr->day_first_uid[7],
-					 (uint32_t)-1, &first_new_seq,
+					 UINT32_MAX, &first_new_seq,
 					 &message_count)) {
 		/* all messages are too old */
 		return idx_hdr->messages_count+1;

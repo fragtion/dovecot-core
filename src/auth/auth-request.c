@@ -23,6 +23,7 @@
 #include "auth-client-connection.h"
 #include "auth-master-connection.h"
 #include "auth-policy.h"
+#include "auth-secrets.h"
 #include "passdb.h"
 #include "passdb-blocking.h"
 #include "passdb-cache.h"
@@ -1137,17 +1138,9 @@ auth_request_verify_plain_callback_finish(enum passdb_result result,
 	}
 }
 
-static void
-auth_request_verify_plain_internal_failure(struct auth_request *request)
-{
-	auth_request_verify_plain_callback_finish(PASSDB_RESULT_INTERNAL_FAILURE, request);
-}
-
 void auth_request_verify_plain_passdb_callback(enum passdb_result result,
 					struct auth_request *request)
 {
-	struct auth_passdb *passdb = request->passdb;
-
 	i_assert(request->state == AUTH_REQUEST_STATE_PASSDB);
 
 	auth_request_set_state(request, AUTH_REQUEST_STATE_MECH_CONTINUE);
@@ -1156,17 +1149,9 @@ void auth_request_verify_plain_passdb_callback(enum passdb_result result,
 	    auth_fields_exists(request->fields.extra_fields, "noauthenticate"))
 		result = PASSDB_RESULT_NEXT;
 
-	if (result != PASSDB_RESULT_INTERNAL_FAILURE) {
+	if (result != PASSDB_RESULT_INTERNAL_FAILURE)
 		auth_request_save_cache(request, result);
-		auth_request_verify_plain_callback_finish(result, request);
-		return;
-	}
-
-	/* lookup failed. if we're looking here only because the request was
-	   expired in cache, fallback to using cached expired record. */
-	passdb_cache_verify_plain(request, passdb->cache_key,
-				  request->mech_password, TRUE,
-				  auth_request_verify_plain_internal_failure);
+	auth_request_verify_plain_callback_finish(result, request);
 }
 
 static bool password_has_illegal_chars(const char *password)
@@ -1357,7 +1342,7 @@ void auth_request_default_verify_plain_continue(
 	request->private_callback.verify_plain = callback;
 
 	cache_key = passdb_cache == NULL ? NULL : passdb->cache_key;
-	passdb_cache_verify_plain(request, cache_key, password, FALSE,
+	passdb_cache_verify_plain(request, cache_key, password,
 				  auth_request_verify_plain_passdb);
 }
 
@@ -1414,9 +1399,6 @@ void auth_request_lookup_credentials_callback(enum passdb_result result,
 					      size_t size, const char *scheme,
 					      struct auth_request *request)
 {
-	struct auth_passdb *passdb = request->passdb;
-	const char *cache_cred, *cache_scheme;
-
 	i_assert(request->state == AUTH_REQUEST_STATE_PASSDB);
 
 	auth_request_set_state(request, AUTH_REQUEST_STATE_MECH_CONTINUE);
@@ -1427,24 +1409,6 @@ void auth_request_lookup_credentials_callback(enum passdb_result result,
 
 	if (result != PASSDB_RESULT_INTERNAL_FAILURE)
 		auth_request_save_cache(request, result);
-	else {
-		/* lookup failed. if we're looking here only because the
-		   request was expired in cache, fallback to using cached
-		   expired record. */
-		const char *cache_key = passdb->cache_key;
-
-		if (passdb_cache_lookup_credentials(request, cache_key,
-						    &cache_cred, &cache_scheme,
-						    &result, TRUE)) {
-			e_info(authdb_event(request),
-			       "Falling back to expired data from cache");
-			passdb_handle_credentials(
-				result, cache_cred, cache_scheme,
-				auth_request_lookup_credentials_finish,
-				request);
-			return;
-		}
-	}
 
 	auth_request_lookup_credentials_finish(result, credentials, size,
 					       scheme, request);
@@ -1516,7 +1480,7 @@ auth_request_lookup_credentials_policy_continue(
 	if (cache_key != NULL) {
 		if (passdb_cache_lookup_credentials(request, cache_key,
 						    &cache_cred, &cache_scheme,
-						    &result, FALSE)) {
+						    &result)) {
 			request->passdb_cache_result = AUTH_REQUEST_CACHE_HIT;
 			passdb_handle_credentials(
 				result, cache_cred, cache_scheme,
@@ -1584,7 +1548,7 @@ auth_request_userdb_save_cache(struct auth_request *request,
 
 static bool
 auth_request_lookup_user_cache(struct auth_request *request, const char *key,
-			       enum userdb_result *result_r, bool use_expired)
+			       enum userdb_result *result_r)
 {
 	const char *value;
 	struct auth_cache_node *node;
@@ -1592,7 +1556,7 @@ auth_request_lookup_user_cache(struct auth_request *request, const char *key,
 
 	value = auth_cache_lookup(passdb_cache, request, key, &node,
 				  &expired, &neg_expired);
-	if (value == NULL || (expired && !use_expired)) {
+	if (value == NULL || expired) {
 		request->userdb_cache_result = AUTH_REQUEST_CACHE_MISS;
 		e_debug(request->event,
 			value == NULL ? "%suserdb cache miss" :
@@ -1603,7 +1567,9 @@ auth_request_lookup_user_cache(struct auth_request *request, const char *key,
 	request->userdb_cache_result = AUTH_REQUEST_CACHE_HIT;
 	e_debug(request->event,
 		"%suserdb cache hit: %s",
-		auth_request_get_log_prefix_db(request), value);
+		auth_request_get_log_prefix_db(request),
+		request->set->debug_passwords ? value :
+		auth_field_line_hide_secrets(value));
 
 	if (*value == '\0') {
 		/* negative cache entry */
@@ -1728,22 +1694,6 @@ void auth_request_userdb_callback(enum userdb_result result,
 		/* userdb lookup succeeded, but it either returned tempfail
 		   or one of its fields was invalid. Looking up the user from
 		   cache isn't probably a good idea. */
-	} else if (result == USERDB_RESULT_INTERNAL_FAILURE &&
-		   (passdb_cache != NULL && userdb->cache_key != NULL)) {
-		/* lookup failed. if we're looking here only because the
-		   request was expired in cache, fallback to using cached
-		   expired record. */
-		const char *cache_key = userdb->cache_key;
-
-		if (auth_request_lookup_user_cache(request, cache_key,
-						   &result, TRUE)) {
-			e_info(request->event,
-			       "%sFalling back to expired data from cache",
-				auth_request_get_log_prefix_db(request));
-		} else {
-			internal_failure_delay =
-				auth_request_get_internal_failure_delay(request);
-		}
 	} else if (result == USERDB_RESULT_INTERNAL_FAILURE) {
 		internal_failure_delay =
 			auth_request_get_internal_failure_delay(request);
@@ -1778,8 +1728,7 @@ void auth_request_lookup_user(struct auth_request *request,
 	if (cache_key != NULL) {
 		enum userdb_result result;
 
-		if (auth_request_lookup_user_cache(request, cache_key,
-						   &result, FALSE)) {
+		if (auth_request_lookup_user_cache(request, cache_key, &result)) {
 			request->userdb_cache_result = AUTH_REQUEST_CACHE_HIT;
 			auth_request_userdb_callback(result, request);
 			return;
@@ -1961,6 +1910,14 @@ auth_request_try_update_username(struct auth_request *request,
 	if (new_value[0] == '\0') {
 		e_error(authdb_event(request),
 			"username attempted to be changed to empty");
+		request->failed = TRUE;
+		return TRUE;
+	}
+	if (str_has_dots_component(new_value, "/@")) {
+		e_error(authdb_event(request),
+			"username attempted to be changed to one with a path "
+			"component consisting only of dots: %s",
+			str_sanitize(new_value, AUTH_USERNAME_LOG_MAX_LEN));
 		request->failed = TRUE;
 		return TRUE;
 	}
@@ -2318,7 +2275,7 @@ void auth_request_set_userdb_field_values(struct auth_request *request,
 		if (values[1] != NULL) {
 			e_warning(authdb_event(request),
 				  "Multiple values found for '%s', "
-				  "using value '%s'", name, *values);
+				  "using the first one", name);
 		}
 		auth_request_set_userdb_field(request, name, *values);
 	}

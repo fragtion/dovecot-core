@@ -4,6 +4,7 @@
 #include "array.h"
 #include "ioloop.h"
 #include "fdpass.h"
+#include "fd-util.h"
 #include "hostpid.h"
 #include "connection.h"
 #include "iostream.h"
@@ -22,18 +23,19 @@
 #include "master-service-settings.h"
 #include "imap-keepalive.h"
 #include "imap-master-connection.h"
-#include "imap-parser.h"
+#include "imap-reply.h"
+#include "imap-client-input.h"
 #include "imap-client.h"
 
 #include <unistd.h>
 
 #define IMAP_MASTER_SOCKET_NAME "imap-master"
 
-/* IDLE clients need only enough for "DONE\r\n<tag> IDLE\r\n". Non-IDLE
-   clients' input is read only to notice that there is some. Whatever is
-   read is passed to the new imap process, and the rest stays in the
+/* Enough for a few pipelined commands handled by imap-hibernate, e.g.
+   "DONE\r\n<tag> NOOP\r\n<tag> IDLE\r\n", or a single line with a long tag.
+   Other input is passed to the new imap process, and the rest stays in the
    socket. */
-#define IMAP_MAX_INBUF 12 + 1 + 128 /* DONE\r\nIDLE\r\n + ' ' + <tag> */
+#define IMAP_MAX_INBUF 256
 #define IMAP_MAX_OUTBUF 1024
 
 /* If client has sent input and we can't recreate imap process in this
@@ -49,13 +51,15 @@
 #define IMAP_CLIENT_BUFFER_FULL_ERROR "Client output buffer is full"
 #define IMAP_CLIENT_UNHIBERNATE_ERROR "Failed to unhibernate client"
 
-enum imap_client_input_state {
-	IMAP_CLIENT_INPUT_STATE_UNKNOWN,
-	IMAP_CLIENT_INPUT_STATE_BAD,
-	IMAP_CLIENT_INPUT_STATE_DONE_LF,
-	IMAP_CLIENT_INPUT_STATE_DONE_CRLF,
-	IMAP_CLIENT_INPUT_STATE_DONEIDLE
+struct imap_client_input_line {
+	enum imap_client_input_cmd cmd;
+	const char *tag;
+	/* Command name as the client typed it */
+	const char *name;
+	/* Size of the line including the LF */
+	size_t size;
 };
+ARRAY_DEFINE_TYPE(imap_client_input_line, struct imap_client_input_line);
 
 struct imap_client_notify {
 	int fd;
@@ -86,11 +90,17 @@ struct imap_client {
 	   client is destroyed. */
 	struct imap_client **destroy_ref;
 	const char *log_prefix;
+	/* Replies to client input that was handled locally, but which must
+	   be sent by the imap process because the rest of the input is
+	   forwarded to it. */
+	buffer_t *pending_output;
 	unsigned int next_read_threshold;
 	bool bad_done, idle_done;
 	bool unhibernate_queued;
 	bool input_pending;
 	bool shutdown_fd_on_destroy;
+	/* A change notification arrived while the client wasn't in IDLE */
+	bool mailbox_changed;
 };
 
 static struct imap_client *imap_clients;
@@ -98,7 +108,7 @@ static struct imap_client *imap_clients;
 static struct str_table *capability_table;
 static struct priorityq *unhibernate_queue;
 static struct timeout *to_unhibernate;
-static const char imap_still_here_text[] = "* OK Still here\r\n";
+static const char imap_still_here_text[] = IMAP_REPLY_IDLE_STILL_HERE"\r\n";
 
 static struct event_category event_category_imap = {
 	.name = "imap",
@@ -111,6 +121,7 @@ static struct event_category event_category_imap_hibernate = {
 static void imap_client_stop(struct imap_client *client);
 void imap_client_destroy(struct imap_client **_client, const char *reason);
 static void imap_client_add_idle_keepalive_timeout(struct imap_client *client);
+static void imap_client_add_inactivity_timeout(struct imap_client *client);
 static void imap_clients_unhibernate(void *context);
 static void imap_client_stop_notify_listening(struct imap_client *client);
 
@@ -230,6 +241,12 @@ imap_client_move_back_send_callback(void *context, struct ostream *output)
 	if (input_size > 0) {
 		str_append(str, "\tclient_input=");
 		base64_encode(input_data, input_size, str);
+	}
+	if (client->pending_output != NULL &&
+	    client->pending_output->used > 0) {
+		str_append(str, "\tclient_output=");
+		base64_encode(client->pending_output->data,
+			      client->pending_output->used, str);
 	}
 	i_assert(o_stream_get_buffer_used_size(client->output) == 0);
 	if (client->idle_done) {
@@ -361,93 +378,309 @@ static void imap_client_move_back(struct imap_client *client)
 	}
 }
 
-static enum imap_client_input_state
-imap_client_input_parse_input(struct istream *input, struct imap_parser *parser,
-			      const char **tag_r)
+static void
+imap_client_input_get_lines(const unsigned char *data, size_t size,
+			    ARRAY_TYPE(imap_client_input_line) *lines,
+			    size_t *partial_size_r)
 {
-	const unsigned char *rest;
-	size_t rest_size;
-	const char *word, *tag;
-	enum imap_client_input_state state = IMAP_CLIENT_INPUT_STATE_DONE_LF;
-	int ret;
+	struct imap_client_input_line *line;
+	const unsigned char *lf;
+	size_t line_size;
 
-	/* read DONE */
-	word = imap_parser_read_word(parser);
-	if (word == NULL)
-		return IMAP_CLIENT_INPUT_STATE_UNKNOWN;
-	if (strcasecmp(word, "DONE") != 0)
-		return IMAP_CLIENT_INPUT_STATE_BAD;
-
-	/* read [\r]\n after DONE */
-	rest = i_stream_get_data(input, &rest_size);
-	if (rest_size == 0)
-		return IMAP_CLIENT_INPUT_STATE_UNKNOWN;
-	if (rest[0] == '\r') {
-		state = IMAP_CLIENT_INPUT_STATE_DONE_CRLF;
-		i_stream_skip(input, 1);
-		rest = i_stream_get_data(input, &rest_size);
-		if (rest_size == 0)
-			return IMAP_CLIENT_INPUT_STATE_UNKNOWN;
+	while ((lf = memchr(data, '\n', size)) != NULL) {
+		line_size = lf - data;
+		line = array_append_space(lines);
+		line->cmd = imap_client_input_parse_line(data, line_size,
+							 &line->tag,
+							 &line->name);
+		line->size = line_size + 1;
+		data += line->size;
+		size -= line->size;
 	}
-	if (rest[0] != '\n')
-		return IMAP_CLIENT_INPUT_STATE_BAD;
-	i_stream_skip(input, 1);
-
-	/* optionally followed by "<tag> IDLE[\r]\n" - checking this assumes
-	   that the DONE and IDLE are sent in the same IP packet, otherwise
-	   we'll unnecessarily recreate the imap process and immediately resume
-	   IDLE there. if this becomes an issue we could add a small delay to
-	   the imap process creation and wait for the IDLE command during it. */
-	if (i_stream_get_data_size(input) == 0)
-		return state;
-
-	ret = imap_parser_read_tag(parser, &tag);
-	if (ret <= 0)
-		return state;
-
-	/* read IDLE */
-	word = imap_parser_read_word(parser);
-	if (word == NULL || strcasecmp(word, "IDLE") != 0)
-		return state;
-
-	/* require [\r]\n and nothing else left */
-	rest = i_stream_get_data(input, &rest_size);
-	if (rest_size > 0 && rest[0] == '\r') {
-		i_stream_skip(input, 1);
-		rest = i_stream_get_data(input, &rest_size);
-	}
-	if (rest_size != 1 || rest[0] != '\n')
-		return state;
-
-	*tag_r = t_strdup(tag);
-	return IMAP_CLIENT_INPUT_STATE_DONEIDLE;
+	*partial_size_r = size;
 }
 
-static enum imap_client_input_state
-imap_client_input_parse(const unsigned char *data, size_t size, const char **tag_r)
+/* Returns TRUE if nothing can have changed in the selected mailbox since
+   the hibernation, i.e. the imap process would have nothing to send. */
+static bool imap_client_is_unchanged(struct imap_client *client)
 {
-	struct istream *input = i_stream_create_from_data(data, size);
-	struct imap_parser *parser =
-		imap_parser_create(input, NULL, size, NULL);
-	enum imap_client_input_state state =
-		imap_client_input_parse_input(input, parser, tag_r);
-	imap_parser_unref(&parser);
-	i_stream_unref(&input);
-	return state;
+	const struct imap_client_notify *notify;
+
+	if (client->mailbox_changed)
+		return FALSE;
+	if (client->state.mailbox_vname == NULL)
+		return TRUE;
+	/* without a notify fd the changes wouldn't be noticed */
+	if (array_count(&client->notifys) == 0)
+		return FALSE;
+	/* The notify fd may have become readable in the same ioloop run as
+	   the client input, before its callback was called. */
+	array_foreach(&client->notifys, notify) {
+		if (fd_is_readable_now(notify->fd))
+			return FALSE;
+	}
+	return TRUE;
 }
 
-static void imap_client_input_idle_cmd(struct imap_client *client)
+static bool
+imap_client_input_nonidle_line_is_local(
+	struct imap_client *client, const struct imap_client_input_line *line)
 {
-	char *old_tag;
-	const char *new_tag;
-	const char *output;
+	if (client->unhibernate_queued) {
+		/* already waiting to be moved back to an imap process */
+		return FALSE;
+	}
+	switch (line->cmd) {
+	case IMAP_CLIENT_INPUT_CMD_IDLE:
+	case IMAP_CLIENT_INPUT_CMD_NOOP:
+		return imap_client_is_unchanged(client);
+	case IMAP_CLIENT_INPUT_CMD_CHECK:
+		/* without a selected mailbox the imap process replies BAD */
+		return client->state.mailbox_vname != NULL &&
+			imap_client_is_unchanged(client);
+	case IMAP_CLIENT_INPUT_CMD_LOGOUT:
+		return TRUE;
+	case IMAP_CLIENT_INPUT_CMD_OTHER:
+	case IMAP_CLIENT_INPUT_CMD_DONE:
+		break;
+	}
+	return FALSE;
+}
+
+/* Returns TRUE if DONE in lines[0] can be answered locally. This requires
+   that all the following lines can also be answered locally. Otherwise the
+   whole input is forwarded to the imap process, which can then still send
+   any pending changes (e.g. EXPUNGEs) before finishing the IDLE. */
+static bool
+imap_client_input_done_is_local(struct imap_client *client,
+				const struct imap_client_input_line *lines,
+				unsigned int count, size_t partial_size)
+{
+	bool idle_mode = TRUE;
+	unsigned int i;
+
+	i_assert(count > 0 && lines[0].cmd == IMAP_CLIENT_INPUT_CMD_DONE);
+
+	if (partial_size > 0 || client->unhibernate_queued)
+		return FALSE;
+	for (i = 0; i < count; i++) {
+		if (idle_mode) {
+			if (lines[i].cmd != IMAP_CLIENT_INPUT_CMD_DONE)
+				return FALSE;
+			/* Unless the imap process allowed it, don't leave the
+			   client hibernated without IDLE. */
+			if (!client->state.nonidle_allowed &&
+			    (i + 1 == count ||
+			     (lines[i + 1].cmd != IMAP_CLIENT_INPUT_CMD_IDLE &&
+			      lines[i + 1].cmd != IMAP_CLIENT_INPUT_CMD_LOGOUT)))
+				return FALSE;
+			idle_mode = FALSE;
+			continue;
+		}
+		if (!imap_client_input_nonidle_line_is_local(client, &lines[i]))
+			return FALSE;
+		if (lines[i].cmd == IMAP_CLIENT_INPUT_CMD_LOGOUT) {
+			/* the rest of the input is ignored */
+			break;
+		}
+		if (lines[i].cmd == IMAP_CLIENT_INPUT_CMD_IDLE)
+			idle_mode = TRUE;
+	}
+	return TRUE;
+}
+
+/* Add a tagged reply for a command that imap-hibernate finished. The
+   command did no work, so its timing is always zero. The timing is appended
+   the same way as the imap process's client_cmd_append_timing_stats() does,
+   so the reply looks the same as when the imap process finishes a command
+   immediately. */
+static void
+imap_client_add_tagged_reply(string_t *replies, const char *tag,
+			     const char *tagged_reply)
+{
+	size_t len = strlen(tagged_reply);
+
+	if (len > 0 && tagged_reply[len-1] == '.')
+		len--;
+	str_printfa(replies, "%s %.*s (0.000 + 0.000 secs).\r\n",
+		    tag, (int)len, tagged_reply);
+}
+
+/* Add the tagged reply for a command finished by imap-hibernate and send
+   the imap_command_finished event for it. The command's output started at
+   replies' reply_start offset. cmd_input_name is the command name as the
+   client typed it. If add_timing is TRUE, the (zero) timing information is
+   added to the tagged reply. */
+static void
+imap_client_cmd_finished(struct imap_client *client, string_t *replies,
+			 size_t reply_start, const char *tag,
+			 const char *cmd_name, const char *cmd_input_name,
+			 const char *tagged_reply, bool add_timing,
+			 size_t input_size)
+{
+	if (add_timing)
+		imap_client_add_tagged_reply(replies, tag, tagged_reply);
+	else
+		str_printfa(replies, "%s %s\r\n", tag, tagged_reply);
+
+	struct event_passthrough *e =
+		event_create_passthrough(client->event)->
+		set_name("imap_command_finished")->
+		add_str("cmd_tag", tag)->
+		add_str("cmd_name", cmd_name)->
+		add_str("cmd_input_name", cmd_input_name)->
+		add_str("tagged_reply_state", t_strcut(tagged_reply, ' '))->
+		add_str("tagged_reply", tagged_reply)->
+		add_timeval("last_run_time", &ioloop_timeval)->
+		add_int("running_usecs", 0)->
+		add_int("lock_wait_usecs", 0)->
+		add_int("net_in_bytes", input_size)->
+		add_int("net_out_bytes", str_len(replies) - reply_start);
+	e_debug(e->event(), "Command finished: %s: %s", cmd_name, tagged_reply);
+}
+
+static void
+imap_client_input_done(struct imap_client *client,
+		       const struct imap_client_input_line *line,
+		       string_t *replies)
+{
+	i_assert(client->state.idle_cmd);
+
+	/* The IDLE command may have been started by the imap process, so the
+	   name the client typed isn't known. The imap process doesn't add
+	   timing information to the tagged reply when it finishes IDLE after
+	   unhibernation either. */
+	imap_client_cmd_finished(client, replies, str_len(replies),
+				 client->state.tag, "IDLE", "IDLE",
+				 "OK "IMAP_REPLY_IDLE_COMPLETED, FALSE,
+				 line->size);
+	i_free(client->state.tag);
+	client->state.idle_cmd = FALSE;
+}
+
+static void
+imap_client_input_idle(struct imap_client *client,
+		       const struct imap_client_input_line *line,
+		       string_t *replies)
+{
+	i_assert(!client->state.idle_cmd);
+	i_assert(client->state.tag == NULL);
+
+	str_append(replies, IMAP_REPLY_IDLE_CONTINUE"\r\n");
+	client->state.tag = i_strdup(line->tag);
+	client->state.idle_cmd = TRUE;
+}
+
+/* Handle the line locally if possible. Returns TRUE if it was handled,
+   FALSE if it needs to be forwarded to the imap process. */
+static bool
+imap_client_input_line(struct imap_client *client,
+		       const struct imap_client_input_line *lines,
+		       unsigned int count, size_t partial_size,
+		       string_t *replies)
+{
+	const struct imap_client_input_line *line = &lines[0];
+
+	if (client->state.idle_cmd) {
+		if (line->cmd != IMAP_CLIENT_INPUT_CMD_DONE) {
+			/* invalid input - return this to the imap process */
+			client->bad_done = TRUE;
+			client->idle_done = TRUE;
+			return FALSE;
+		}
+		if (!imap_client_input_done_is_local(client, lines, count,
+						     partial_size)) {
+			/* The imap process finishes the IDLE */
+			i_stream_skip(client->input, line->size);
+			client->idle_done = TRUE;
+			return FALSE;
+		}
+		imap_client_input_done(client, line, replies);
+		return TRUE;
+	}
+
+	if (!imap_client_input_nonidle_line_is_local(client, line))
+		return FALSE;
+	switch (line->cmd) {
+	case IMAP_CLIENT_INPUT_CMD_IDLE:
+		imap_client_input_idle(client, line, replies);
+		break;
+	case IMAP_CLIENT_INPUT_CMD_NOOP:
+		imap_client_cmd_finished(client, replies, str_len(replies),
+					 line->tag, "NOOP", line->name,
+					 IMAP_REPLY_NOOP_COMPLETED, TRUE,
+					 line->size);
+		break;
+	case IMAP_CLIENT_INPUT_CMD_CHECK:
+		imap_client_cmd_finished(client, replies, str_len(replies),
+					 line->tag, "CHECK", line->name,
+					 IMAP_REPLY_CHECK_COMPLETED, TRUE,
+					 line->size);
+		break;
+	case IMAP_CLIENT_INPUT_CMD_LOGOUT: {
+		size_t reply_start = str_len(replies);
+
+		str_append(replies, IMAP_REPLY_LOGOUT_BYE"\r\n");
+		imap_client_cmd_finished(client, replies, reply_start,
+					 line->tag, "LOGOUT", line->name,
+					 IMAP_REPLY_LOGOUT_COMPLETED, TRUE,
+					 line->size);
+		break;
+	}
+	case IMAP_CLIENT_INPUT_CMD_OTHER:
+	case IMAP_CLIENT_INPUT_CMD_DONE:
+		i_unreached();
+	}
+	return TRUE;
+}
+
+static void
+imap_client_input_forward(struct imap_client *client, const string_t *replies)
+{
+	if (str_len(replies) > 0) {
+		i_assert(client->pending_output == NULL);
+		client->pending_output =
+			buffer_create_dynamic(default_pool, str_len(replies));
+		buffer_append_buf(client->pending_output, replies, 0, SIZE_MAX);
+	}
+	timeout_remove(&client->to_inactivity);
+	client->input_pending = TRUE;
+	imap_client_move_back(client);
+}
+
+static int
+imap_client_input_send_replies(struct imap_client *client,
+			       const string_t *replies)
+{
+	ssize_t ret;
+
+	if (str_len(replies) == 0)
+		return 0;
+	ret = o_stream_flush(client->output);
+	if (ret > 0)
+		ret = o_stream_send(client->output, str_data(replies),
+				    str_len(replies));
+	if (ret < 0) {
+		imap_client_disconnected(&client);
+		return -1;
+	}
+	if ((size_t)ret != str_len(replies)) {
+		imap_client_destroy(&client, IMAP_CLIENT_BUFFER_FULL_ERROR);
+		return -1;
+	}
+	return 0;
+}
+
+static void imap_client_input(struct imap_client *client)
+{
+	ARRAY_TYPE(imap_client_input_line) lines_arr;
+	const struct imap_client_input_line *lines;
 	const unsigned char *data;
-	size_t size;
-	bool done = TRUE;
+	size_t size, partial_size;
+	unsigned int i, count;
+	bool forward = FALSE, logout = FALSE;
 	int ret;
 
-	/* we should read either DONE or disconnection. also handle if client
-	   sends DONE\nIDLE simply to recreate the IDLE. */
 	ret = i_stream_read_bytes(client->input, &data, &size,
 				  client->next_read_threshold + 1);
 	if (size == 0) {
@@ -456,69 +689,70 @@ static void imap_client_input_idle_cmd(struct imap_client *client)
 		return;
 	}
 	client->next_read_threshold = 0;
-	switch (imap_client_input_parse(data, size, &new_tag)) {
-	case IMAP_CLIENT_INPUT_STATE_UNKNOWN:
-		/* we haven't received a full DONE[\r]\n yet - wait */
-		client->next_read_threshold = size;
+	client->state.last_input = ioloop_time;
+
+	t_array_init(&lines_arr, 4);
+	imap_client_input_get_lines(data, size, &lines_arr, &partial_size);
+	string_t *replies = t_str_new(128);
+
+	lines = array_get(&lines_arr, &count);
+	for (i = 0; i < count; i++) {
+		if (!imap_client_input_line(client, &lines[i], count - i,
+					    partial_size, replies)) {
+			forward = TRUE;
+			break;
+		}
+		i_stream_skip(client->input, lines[i].size);
+		if (lines[i].cmd == IMAP_CLIENT_INPUT_CMD_LOGOUT) {
+			/* the rest of the input is ignored */
+			logout = TRUE;
+			break;
+		}
+	}
+	if (!forward && count == 0 && ret == -2) {
+		/* the buffer is full without a full line */
+		if (client->state.idle_cmd) {
+			client->bad_done = TRUE;
+			client->idle_done = TRUE;
+		}
+		forward = TRUE;
+	}
+	if (forward) {
+		imap_client_input_forward(client, replies);
 		return;
-	case IMAP_CLIENT_INPUT_STATE_BAD:
-		/* invalid input - return this to the imap process */
-		client->bad_done = TRUE;
-		break;
-	case IMAP_CLIENT_INPUT_STATE_DONE_LF:
-		i_stream_skip(client->input, 4+1);
-		break;
-	case IMAP_CLIENT_INPUT_STATE_DONE_CRLF:
-		i_stream_skip(client->input, 4+2);
-		break;
-	case IMAP_CLIENT_INPUT_STATE_DONEIDLE:
-		/* we received DONE+IDLE, so the client simply wanted to notify
-		   us that it's still there. continue hibernation. */
-		old_tag = client->state.tag;
-		client->state.tag = i_strdup(new_tag);
-		output = t_strdup_printf("%s OK Idle completed.\r\n+ idling\r\n", old_tag);
-		i_free(old_tag);
-		ret = o_stream_flush(client->output);
-		if (ret > 0)
-			ret = o_stream_send_str(client->output, output);
-		if (ret < 0) {
-			imap_client_disconnected(&client);
-			return;
-		}
-		if ((size_t)ret != strlen(output)) {
-			/* disconnect */
-			imap_client_destroy(&client, IMAP_CLIENT_BUFFER_FULL_ERROR);
-			return;
-		} else {
-			done = FALSE;
-			i_stream_skip(client->input, size);
-		}
-		break;
 	}
 
-	if (done) {
-		client->idle_done = TRUE;
-		client->input_pending = TRUE;
-		imap_client_move_back(client);
-	} else
-		imap_client_add_idle_keepalive_timeout(client);
-}
-
-static void imap_client_input_nonidle(struct imap_client *client)
-{
-	if (i_stream_read(client->input) < 0)
+	/* everything was handled locally */
+	if (imap_client_input_send_replies(client, replies) < 0)
+		return;
+	if (logout) {
+		/* The imap process would also run autoexpunge at logout.
+		   That's skipped here - it needs to be done when the client
+		   is hibernated instead. */
+		imap_client_destroy(&client, "Logged out");
+		return;
+	}
+	if (ret == -1) {
 		imap_client_disconnected(&client);
-	else {
+		return;
+	}
+	/* wait for the rest of the partial line */
+	client->next_read_threshold = partial_size;
+
+	if (client->state.idle_cmd) {
 		timeout_remove(&client->to_inactivity);
-		client->input_pending = TRUE;
-		imap_client_move_back(client);
+		imap_client_add_idle_keepalive_timeout(client);
+	} else {
+		timeout_remove(&client->to_keepalive);
+		timeout_remove(&client->to_inactivity);
+		imap_client_add_inactivity_timeout(client);
 	}
 }
 
 static void imap_client_inactivity_timeout(struct imap_client *client)
 {
 	o_stream_nsend_str(client->output,
-			   "* BYE Disconnected for inactivity.\r\n");
+			   IMAP_REPLY_BYE_INACTIVITY"\r\n");
 	imap_client_destroy(&client, t_strdup_printf(
 		"Inactivity - no input for %"PRIdTIME_T" secs",
 		ioloop_time - client->state.last_input));
@@ -548,7 +782,18 @@ static void imap_client_add_inactivity_timeout(struct imap_client *client)
 
 static void imap_client_input_notify(struct imap_client *client)
 {
-	imap_client_move_back(client);
+	if (client->state.idle_cmd) {
+		imap_client_move_back(client);
+		return;
+	}
+	/* Nobody is waiting for the changes. Remember that something may have
+	   changed, so commands that would have to send the changes are
+	   forwarded to the imap process. The notify fds aren't needed after
+	   this. */
+	e_debug(client->event, "Mailbox changed while not in IDLE");
+	client->mailbox_changed = TRUE;
+	imap_client_stop_notify_listening(client);
+	array_clear(&client->notifys);
 }
 
 static void keepalive_timeout(struct imap_client *client)
@@ -700,6 +945,7 @@ int imap_client_create(int fd, const struct imap_client_state *state,
 	client->pool = pool;
 	client->state.username = p_strdup(pool, state->username);
 	client->state.session_id = p_strdup(pool, state->session_id);
+	client->state.mailbox_vname = p_strdup(pool, state->mailbox_vname);
 	client->state.userdb_fields = p_strdup(pool, state->userdb_fields);
 	client->state.stats = p_strdup(pool, state->stats);
 	client->state.auth_token = p_strdup(pool, state->auth_token);
@@ -724,6 +970,9 @@ int imap_client_create(int fd, const struct imap_client_state *state,
 	client->state.imap_idle_notify_interval =
 		state->imap_idle_notify_interval;
 	client->state.idle_cmd = state->idle_cmd;
+	/* a client hibernated without IDLE is obviously allowed to stay so */
+	client->state.nonidle_allowed = state->nonidle_allowed ||
+		!state->idle_cmd;
 	client->state.have_notify_fd = state->have_notify_fd;
 	client->state.anvil_sent = state->anvil_sent;
 	client->state.multiplex_ostream = state->multiplex_ostream;
@@ -888,6 +1137,7 @@ void imap_client_destroy(struct imap_client **_client, const char *reason)
 
 	if (client->state.tag != NULL)
 		i_free(client->state.tag);
+	buffer_free(&client->pending_output);
 	i_free(client->state.state);
 	if (client->state.capability != NULL)
 		str_table_unref(capability_table, &client->state.capability);
@@ -932,15 +1182,12 @@ void imap_client_create_finish(struct imap_client *client)
 				      imap_client_io_deactivate_user, client);
 	io_loop_context_switch(client->ioloop_ctx);
 
-	if (client->state.idle_cmd) {
-		client->io = io_add(client->fd, IO_READ,
-				    imap_client_input_idle_cmd, client);
+	client->io = io_add(client->fd, IO_READ, imap_client_input, client);
+	if (client->state.idle_cmd)
 		imap_client_add_idle_keepalive_timeout(client);
-	} else {
+	else {
 		/* No command is running, so the client isn't expecting any
 		   keepalives. The imap process doesn't send them either. */
-		client->io = io_add(client->fd, IO_READ,
-				    imap_client_input_nonidle, client);
 		imap_client_add_inactivity_timeout(client);
 	}
 

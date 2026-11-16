@@ -6,7 +6,7 @@ dnl This file is free software; the authors give
 dnl unlimited permission to copy and/or distribute it, with or without
 dnl modifications, as long as this notice is preserved.
 
-# serial 49
+# serial 51
 
 dnl
 dnl Check for support for D_FORTIFY_SOURCE=2
@@ -164,6 +164,25 @@ AC_DEFUN([AC_LD_WHOLE_ARCHIVE], [
     AM_CONDITIONAL([HAVE_WHOLE_ARCHIVE], [test "x$LD_WHOLE_ARCHIVE" != "x"])
 ])
 
+dnl Bind the calls a shared object makes to its own functions locally instead
+dnl of through the PLT. This removes most of the GOT relocations, which are
+dnl private dirty memory in every process. Data symbols stay interposable, so
+dnl copy relocations in executables still work (unlike with -Bsymbolic).
+AC_DEFUN([DC_LD_BSYMBOLIC_FUNCTIONS], [
+    AC_CACHE_CHECK([whether the linker supports -Bsymbolic-functions],
+      [dc_cv_ld_bsymbolic_functions], [
+        old_ldflags="$LDFLAGS"
+        LDFLAGS="$LDFLAGS -Wl,-Bsymbolic-functions"
+        AC_LINK_IFELSE([AC_LANG_PROGRAM([], [])],
+          [dc_cv_ld_bsymbolic_functions=yes],
+          [dc_cv_ld_bsymbolic_functions=no])
+        LDFLAGS="$old_ldflags"
+    ])
+    AS_IF([test "$dc_cv_ld_bsymbolic_functions" = yes], [
+      LDFLAGS="$LDFLAGS -Wl,-Bsymbolic-functions"
+    ])
+])
+
 dnl
 dnl Check for -z now and -z relro linker flags
 dnl
@@ -317,20 +336,6 @@ AC_DEFUN([DC_DOVECOT_MODULEDIR],[
 	AC_SUBST(moduledir)
 ])
 
-AC_DEFUN([DC_PLUGIN_DEPS],[
-	_plugin_deps=yes
-	AC_MSG_CHECKING([whether OS supports plugin dependencies])
-	case "$host_os" in
-	  darwin*)
-	    dnl OSX loads the plugins twice, which breaks stuff
-	    _plugin_deps=no
-	    ;;
-	esac
-	AC_MSG_RESULT([$_plugin_deps])
-	AM_CONDITIONAL([DOVECOT_PLUGIN_DEPS], [test "x$_plugin_deps" = "xyes"])
-	unset _plugin_deps
-])
-
 AC_DEFUN([DC_DOVECOT_TEST_WRAPPER],[
   AC_REQUIRE_AUX_FILE([run-test.sh.in])
   AC_ARG_VAR([VALGRIND], [Path to valgrind])
@@ -470,6 +475,7 @@ AC_DEFUN([DC_DOVECOT],[
 	CC_STRICT_BOOL
 	DC_DOVECOT_CFLAGS
 	DC_DOVECOT_HARDENING
+	DC_LD_BSYMBOLIC_FUNCTIONS
 
 	AX_SUBST_L([DISTCHECK_CONFIGURE_FLAGS], [dovecotdir], [dovecot_moduledir], [dovecot_installed_moduledir], [dovecot_pkgincludedir], [dovecot_pkglibexecdir], [dovecot_pkglibdir], [dovecot_docdir], [dovecot_statedir])
 	AX_SUBST_L([DOVECOT_INSTALLED], [DOVECOT_CFLAGS], [DOVECOT_LIBS], [DOVECOT_SSL_LIBS], [DOVECOT_SQL_LIBS], [DOVECOT_LDAP_LIBS], [DOVECOT_COMPRESS_LIBS], [DOVECOT_BINARY_CFLAGS], [DOVECOT_BINARY_LDFLAGS])
@@ -489,7 +495,6 @@ AC_DEFUN([DC_DOVECOT],[
 
 	AM_CONDITIONAL(DOVECOT_INSTALLED, test "$DOVECOT_INSTALLED" = "yes")
 
-	DC_PLUGIN_DEPS
 	DC_DOVECOT_TEST_WRAPPER
 ])
 

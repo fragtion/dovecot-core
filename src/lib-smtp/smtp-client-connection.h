@@ -5,20 +5,16 @@
 #include "smtp-common.h"
 
 #include "smtp-client-command.h"
+#include "smtp-client-settings.h"
 
 enum smtp_capability;
 
 struct smtp_reply;
 struct smtp_client;
 struct smtp_client_capability_extra;
+struct smtp_client_parameters;
 struct smtp_client_settings;
 struct smtp_client_command;
-
-enum smtp_client_connection_ssl_mode {
-	SMTP_CLIENT_SSL_MODE_NONE = 0,
-	SMTP_CLIENT_SSL_MODE_IMMEDIATE,
-	SMTP_CLIENT_SSL_MODE_STARTTLS
-};
 
 enum smtp_client_connection_state {
 	/* No connection */
@@ -38,25 +34,34 @@ extern const char *const smtp_client_connection_state_names[];
 
 struct smtp_client_connection *
 smtp_client_connection_create(struct smtp_client *client,
+			      struct event *event_parent,
 			      enum smtp_protocol protocol,
 			      const char *host, in_port_t port,
 			      enum smtp_client_connection_ssl_mode ssl_mode,
-			      const struct smtp_client_settings *set)
-			      ATTR_NULL(6);
+			      const struct smtp_client_parameters *params,
+			      const struct smtp_client_settings *set);
 struct smtp_client_connection *
 smtp_client_connection_create_ip(struct smtp_client *client,
+				 struct event *event_parent,
 				 enum smtp_protocol protocol,
 				 const struct ip_addr *ip, in_port_t port,
 				 const char *hostname,
 				 enum smtp_client_connection_ssl_mode ssl_mode,
-				 const struct smtp_client_settings *set)
-				 ATTR_NULL(5, 7);
+				 const struct smtp_client_parameters *params,
+				 const struct smtp_client_settings *set);
 struct smtp_client_connection *
 smtp_client_connection_create_unix(struct smtp_client *client,
+				   struct event *event_parent,
 				   enum smtp_protocol protocol,
 				   const char *path,
-				   const struct smtp_client_settings *set)
-				   ATTR_NULL(4);
+				   const struct smtp_client_parameters *params,
+				   const struct smtp_client_settings *set);
+
+int smtp_client_connection_create_auto(
+	struct smtp_client *client, struct event *event_parent,
+	enum smtp_protocol protocol,
+	const struct smtp_client_parameters *params,
+	struct smtp_client_connection **conn_r, const char **error_r);
 
 void smtp_client_connection_ref(struct smtp_client_connection *conn);
 void smtp_client_connection_unref(struct smtp_client_connection **_conn);
@@ -78,6 +83,10 @@ void smtp_client_connection_switch_ioloop_to(
 	struct smtp_client_connection *conn, struct ioloop *ioloop);
 void smtp_client_connection_switch_ioloop(struct smtp_client_connection *conn);
 
+void smtp_client_connection_set_ssl_settings(
+	struct smtp_client_connection *conn,
+	const struct ssl_iostream_settings *ssl);
+
 enum smtp_capability
 smtp_client_connection_get_capabilities(struct smtp_client_connection *conn);
 uoff_t smtp_client_connection_get_size_capability(
@@ -92,7 +101,18 @@ smtp_client_connection_get_extra_capability(struct smtp_client_connection *conn,
 enum smtp_client_connection_state
 smtp_client_connection_get_state(struct smtp_client_connection *conn);
 
+static inline bool
+smtp_client_connection_is_ready(struct smtp_client_connection *conn)
+{
+	return (smtp_client_connection_get_state(conn) >=
+		SMTP_CLIENT_CONNECTION_STATE_READY);
+}
+
+const char *
+smtp_client_connection_get_name(struct smtp_client_connection *conn);
 void smtp_client_connection_get_remote_ip(
 	struct smtp_client_connection *conn, struct ip_addr *ip_r);
+
+bool smtp_client_connection_is_trusted(struct smtp_client_connection *conn);
 
 #endif

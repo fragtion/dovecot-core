@@ -78,16 +78,23 @@ auth_sasl_request_set_authid(struct sasl_server_req_ctx *rctx,
 		   only to fetch extra fields. This mirrors how the oauth2
 		   mechanism treats an out-of-band verified token.
 
-		   This bypasses no checks, even with
-		   auth_ssl_require_client_cert disabled: the username tested
-		   above can only come from the cert_username field (asserted
-		   above), which the login process sends only for a client
-		   certificate it has validated. With
-		   ssl_server_request_client_cert=any-cert the certificate is
-		   instead validated by the passdb's
+		   The certificate is validated by the login process, which
+		   terminates TLS and is the only component that ever sees the
+		   peer certificate. It sends the validation result in the
+		   cert_username and valid-client-cert fields. These are trusted
+		   for the same reason as everything else in
+		   auth_request_import_auth(): trust comes from which auth
+		   socket the client connected to, not from anything in the
+		   request. The auth client socket must therefore be restricted
+		   to trusted processes - a peer that reaches it can equally
+		   forge rip/real_rip (defeating passdb allow_nets), secured=tls
+		   (defeating plaintext auth policy), no-penalty and the
+		   ssl_client_cert_fp/ssl_client_cert_pubkey_fp fingerprints.
+		   That last point also means the passdb
 		   check_client_fp/check_client_cert_fp/check_client_pubkey_fp
-		   fields, which fail the request independently of
-		   skip_password_check. */
+		   fields, which are what actually validate the certificate
+		   with ssl_server_request_client_cert=any-cert, are not an
+		   independent safeguard here. */
 		auth_request_set_password_verified(request);
 		return TRUE;
 	}

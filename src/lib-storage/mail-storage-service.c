@@ -15,6 +15,7 @@
 #include "dict.h"
 #include "settings.h"
 #include "auth-master.h"
+#include "auth-secrets.h"
 #include "master-service-private.h"
 #include "mail-user.h"
 #include "mail-namespace.h"
@@ -90,11 +91,8 @@ static void set_keyvalue(struct mail_storage_service_user *user,
 		settings_override(user->set_instance, key, value,
 				  SETTINGS_OVERRIDE_TYPE_USERDB);
 	}
-	if (strstr(key, "pass") != NULL) {
-		/* possibly a password field (e.g. imapc_password).
-		   hide the value. */
+	if (auth_field_key_is_secret(key))
 		value = "<hidden>";
-	}
 	if (is_setting)
 		e_debug(user->event, "Added setting via userdb: %s=%s", key, value);
 	else
@@ -266,6 +264,7 @@ service_auth_userdb_lookup(struct mail_storage_service_ctx *ctx,
 	info.remote_port = input->remote_port;
 	info.forward_fields = input->forward_fields;
 	info.local_name = input->local_name;
+	info.event_parent = input->event_parent;
 	info.debug = input->debug;
 
 	ret = auth_master_user_lookup(ctx->conn, *user, &info, pool,
@@ -955,12 +954,52 @@ mail_storage_service_first_init(struct mail_storage_service_ctx *ctx,
 		auth_master_init(user_set->auth_socket_path, flags));
 }
 
+const char *const *
+mail_storage_service_get_required_plugins(const char *plugin_name,
+					  void *context ATTR_UNUSED)
+{
+	struct settings_root *root =
+		master_service_get_settings_root(master_service);
+
+	return settings_root_get_required_plugins(root, plugin_name);
+}
+
+int mail_storage_service_check_mail_plugins(const char *const *plugins,
+					   const char **error_r)
+{
+	const char **names, *const *required;
+	unsigned int i, j, count = str_array_length(plugins);
+
+	/* allow giving the names also in lib<nn>_<name> form */
+	names = t_new(const char *, count + 1);
+	for (i = 0; i < count; i++)
+		names[i] = module_file_get_name(plugins[i]);
+
+	for (i = 0; i < count; i++) {
+		required = mail_storage_service_get_required_plugins(names[i],
+								     NULL);
+		if (required == NULL)
+			continue;
+		for (j = 0; required[j] != NULL; j++) {
+			if (!str_array_find(names, required[j])) {
+				*error_r = t_strdup_printf(
+					"mail_plugins: Plugin %s requires "
+					"also plugin %s to be loaded",
+					names[i], required[j]);
+				return -1;
+			}
+		}
+	}
+	return 0;
+}
+
 static int
 mail_storage_service_load_modules(struct mail_storage_service_ctx *ctx,
 				  const struct mail_user_settings *user_set,
 				  const char **error_r)
 {
 	struct module_dir_load_settings mod_set;
+	const char *const *plugins;
 
 	if (!array_is_created(&user_set->mail_plugins) ||
 	    array_is_empty(&user_set->mail_plugins))
@@ -968,16 +1007,19 @@ mail_storage_service_load_modules(struct mail_storage_service_ctx *ctx,
 	if ((ctx->flags & MAIL_STORAGE_SERVICE_FLAG_NO_PLUGINS) != 0)
 		return 0;
 
+	plugins = settings_boollist_get(&user_set->mail_plugins);
+	if (mail_storage_service_check_mail_plugins(plugins, error_r) < 0)
+		return -1;
+
 	i_zero(&mod_set);
 	mod_set.abi_version = DOVECOT_ABI_VERSION;
 	mod_set.binary_name = master_service_get_name(ctx->service);
-	mod_set.setting_name = "mail_plugins";
+	mod_set.get_required_plugins = mail_storage_service_get_required_plugins;
 	mod_set.require_init_funcs = TRUE;
 	mod_set.debug = user_set->mail_debug;
 
 	return module_dir_try_load_missing(&mail_storage_service_modules,
-					   user_set->mail_plugin_dir,
-					   settings_boollist_get(&user_set->mail_plugins),
+					   user_set->mail_plugin_dir, plugins,
 					   &mod_set, error_r);
 }
 

@@ -6,7 +6,6 @@
 #include "ioloop.h"
 #include "safe-mkstemp.h"
 #include "settings.h"
-#include "client-auth-settings.h"
 #include "dsasl-client.h"
 #include "imapc-msgmap.h"
 #include "imapc-connection.h"
@@ -101,6 +100,7 @@ int imapc_client_init(const struct imapc_parameters *params,
 	if (dsasl_client_check_settings(sasl_client, error_r) < 0) {
 		dsasl_client_unref(&sasl_client);
 		settings_instance_free(&set_instance);
+		settings_free(ssl_set);
 		settings_free(set);
 		event_unref(&event);
 		return -1;
@@ -238,7 +238,7 @@ int imapc_client_settings_match(struct imapc_client *client,
 		/* The authentication settings are used only when the
 		   connection is created, so they must be compared here as
 		   well. */
-		ret = client_auth_settings_equal(client->event, event, error_r);
+		ret = dsasl_client_settings_equal(client->event, event, error_r);
 	}
 	event_unref(&event);
 	settings_instance_free(&set_instance);

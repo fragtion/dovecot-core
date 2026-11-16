@@ -414,25 +414,29 @@ int auth_scram_client_input(struct auth_scram_client *client,
 
 	switch (client->state) {
 	case AUTH_SCRAM_CLIENT_STATE_INIT:
+		if (input_len != 0) {
+			*error_r = "Server sent non-empty initial response";
+			return -1;
+		}
 		break;
-	case AUTH_SCRAM_CLIENT_STATE_CLIENT_FIRST:
-		i_unreached();
 	case AUTH_SCRAM_CLIENT_STATE_SERVER_FIRST:
 		ret = auth_scram_parse_server_first(client, input, input_len,
 						    error_r);
 		break;
-	case AUTH_SCRAM_CLIENT_STATE_CLIENT_FINAL:
-		i_unreached();
 	case AUTH_SCRAM_CLIENT_STATE_SERVER_FINAL:
 		ret = auth_scram_parse_server_final(client, input, input_len,
 						    error_r);
+		if (ret == 0)
+			client->server_final_verified = TRUE;
 		break;
+	case AUTH_SCRAM_CLIENT_STATE_CLIENT_FIRST:
+	case AUTH_SCRAM_CLIENT_STATE_CLIENT_FINAL:
+		*error_r = "Server sent unexpected data";
+		return -1;
 	case AUTH_SCRAM_CLIENT_STATE_CLIENT_FINISH:
-		*error_r = "Server didn't finish authentication";
-		ret = -1;
-		break;
 	case AUTH_SCRAM_CLIENT_STATE_END:
-		i_unreached();
+		*error_r = "Server didn't finish authentication";
+		return -1;
 	}
 	client->state++;
 
@@ -442,6 +446,11 @@ int auth_scram_client_input(struct auth_scram_client *client,
 bool auth_scram_client_state_client_first(struct auth_scram_client *client)
 {
 	return (client->state <= AUTH_SCRAM_CLIENT_STATE_CLIENT_FIRST);
+}
+
+bool auth_scram_client_is_finished(struct auth_scram_client *client)
+{
+	return client->server_final_verified;
 }
 
 void auth_scram_client_output(struct auth_scram_client *client,

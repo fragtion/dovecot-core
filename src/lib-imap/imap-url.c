@@ -513,7 +513,8 @@ imap_url_parse_path(struct imap_url_parser *url_parser,
 			uidvalidity = base->uidvalidity;
 			p = base->mailbox + strlen(base->mailbox);
 			/* mailbox has implicit trailing '/' */
-			if (p[-1] != '/' && base->uid == 0 && rel > 0)
+			if (p > base->mailbox && p[-1] != '/' &&
+			    base->uid == 0 && rel > 0)
 				rel--;
 			/* determine what to retain from base mailbox path */
 			for (; p > base->mailbox && rel > 0; p--) {

@@ -4,9 +4,15 @@
 #include "test-common.h"
 #include "test-dir.h"
 #include "istream.h"
+#include "write-full.h"
+#include "str.h"
 #include "master-service.h"
 #include "message-size.h"
+#include "message-binary-part.h"
+#include "index/index-mail.h"
+#include "index/mbox/istream-raw-mbox.h"
 #include "test-mail-storage-common.h"
+#include <fcntl.h>
 
 static int
 test_mail_save_trans(struct mailbox_transaction_context *trans,
@@ -291,14 +297,15 @@ static void test_mail_random_access(void)
 		i_rand_limit(N_ELEMENTS(potential_never_cache_fields));
 	const char *never_cache_fields =
 		potential_never_cache_fields[never_cache_field_idx];
+	const char *const extra_input[] = {
+		"mail_attachment_detection_options=add-flags",
+		t_strconcat("mail_never_cache_fields=",
+			    never_cache_fields, NULL),
+		NULL
+	};
 	struct test_mail_storage_settings set = {
 		.driver = "sdbox",
-		.extra_input = (const char *const[]) {
-			"mail_attachment_detection_options=add-flags",
-			t_strconcat("mail_never_cache_fields=",
-				    never_cache_fields, NULL),
-			NULL
-		},
+		.extra_input = extra_input,
 	};
 	struct mailbox *box;
 
@@ -334,15 +341,16 @@ static void test_mail_random_access(void)
 static void test_attachment_flags_during_header_fetch(void)
 {
 	struct test_mail_storage_ctx *ctx;
+	const char *const extra_input[] = {
+		"mail_attachment_detection_options=add-flags",
+		"mail_always_cache_fields=flags",
+		"mail_cache_fields=flags",
+		"mail_never_cache_fields=mime.parts",
+		NULL
+	};
 	struct test_mail_storage_settings set = {
 		.driver = "sdbox",
-		.extra_input = (const char *const[]) {
-			"mail_attachment_detection_options=add-flags",
-			"mail_always_cache_fields=flags",
-			"mail_cache_fields=flags",
-			"mail_never_cache_fields=mime.parts",
-			NULL
-		},
+		.extra_input = extra_input,
 	};
 
 	test_begin("mail attachment flags during header fetch");
@@ -396,13 +404,14 @@ static void test_attachment_flags_during_header_fetch(void)
 static void test_bodystructure_reparsing(void)
 {
 	struct test_mail_storage_ctx *ctx;
+	const char *const extra_input[] = {
+		"mail_attachment_detection_options=add-flags",
+		"mail_never_cache_fields=flags",
+		NULL
+	};
 	struct test_mail_storage_settings set = {
 		.driver = "sdbox",
-		.extra_input = (const char *const[]) {
-			"mail_attachment_detection_options=add-flags",
-			"mail_never_cache_fields=flags",
-			NULL
-		},
+		.extra_input = extra_input,
 	};
 	const char *value;
 
@@ -471,6 +480,675 @@ static void test_bodystructure_corruption_reparsing(void)
 
 	mail_free(&mail);
 	test_assert(mailbox_transaction_commit(&trans) == 0);
+	mailbox_free(&box);
+	test_mail_storage_deinit_user(ctx);
+	test_mail_storage_deinit(&ctx);
+	test_end();
+}
+
+static void test_binary_size_corruption_recompute(void)
+{
+	struct test_mail_storage_ctx *ctx;
+	const struct test_mail_storage_settings set = {
+		.driver = "sdbox",
+	};
+	struct message_part *parts;
+	struct mail_binary_properties bprops, bprops2;
+
+	test_begin("BINARY.SIZE corruption recompute");
+	ctx = test_mail_storage_init();
+	test_mail_storage_init_user(ctx, &set);
+
+	struct mailbox *box =
+		mailbox_alloc(ctx->user->namespaces->list, "INBOX", 0);
+	test_assert(mailbox_open(box) == 0);
+
+	test_mail_save(box,
+		       "MIME-Version: 1.0\r\n"
+		       "Content-Type: text/plain\r\n"
+		       "Content-Transfer-Encoding: base64\r\n"
+		       "\r\n"
+		       "dGVzdCBib2R5\r\n");
+
+	struct mailbox_transaction_context *trans =
+		mailbox_transaction_begin(box, 0, __func__);
+	struct mail *mail = mail_alloc(trans, 0, NULL);
+	mail_set_seq(mail, 1);
+
+	test_assert(mail_get_parts(mail, &parts) == 0);
+	test_assert(mail_get_binary_properties(mail, parts, TRUE, &bprops) == 0);
+	test_assert(bprops.converted);
+
+	/* Add a duplicate of the binary part, so the sizes don't match the
+	   MIME parts anymore. */
+	struct index_mail *imail = INDEX_MAIL(mail);
+	struct message_binary_part *dup =
+		p_new(imail->mail.data_pool, struct message_binary_part, 1);
+	*dup = *imail->data.bin_parts;
+	dup->next = imail->data.bin_parts;
+	imail->data.bin_parts = dup;
+
+	test_expect_error_string("Mailbox INBOX: UID 1: Deleting corrupted cache record: BINARY part sizes don't match MIME parts");
+	test_assert(mail_get_binary_properties(mail, parts, TRUE, &bprops2) < 0);
+	test_expect_no_more_errors();
+
+	/* The broken binary.parts were dropped, so they are calculated again */
+	test_assert(mail_get_binary_properties(mail, parts, TRUE, &bprops2) == 0);
+	test_assert_cmp(bprops2.size, ==, bprops.size);
+	test_assert_cmp(bprops2.lines, ==, bprops.lines);
+
+	mail_free(&mail);
+	test_assert(mailbox_transaction_commit(&trans) == 0);
+	mailbox_free(&box);
+	test_mail_storage_deinit_user(ctx);
+	test_mail_storage_deinit(&ctx);
+	test_end();
+}
+
+static void test_mbox_raw_istream_eof(void)
+{
+	const char *mbox =
+		"From a@example.com Thu Nov  9 22:33:52 2001\n"
+		"Subject: 1\n"
+		"\n"
+		"body\n";
+	struct istream *input, *raw_input;
+	uoff_t size;
+
+	test_begin("mbox raw istream EOF");
+	input = test_istream_create(mbox);
+	raw_input = i_stream_create_raw_mbox(input);
+	istream_raw_mbox_set_locked(raw_input);
+
+	/* The read that finds EOF may move the parent's buffer. Only a memory
+	   checker such as valgrind or AddressSanitizer notices a stale buffer:
+	   the size comes out the same. */
+	test_assert(istream_raw_mbox_seek(raw_input, 0) == 0);
+	test_assert(istream_raw_mbox_get_body_size(raw_input, UOFF_T_MAX,
+						   &size) == 0);
+	test_assert_cmp(size, ==, strlen("body"));
+
+	i_stream_unref(&raw_input);
+	i_stream_unref(&input);
+	test_end();
+}
+
+static void test_mbox_raw_istream_expected_size_at_eof(void)
+{
+	const char *mbox =
+		"From a@example.com Thu Nov  9 22:33:52 2001\n"
+		"Subject: 1\n"
+		"Content-Length: 5\n"
+		"\n"
+		"body\n"
+		"\n";
+	struct istream *input, *raw_input;
+	uoff_t size;
+
+	test_begin("mbox raw istream expected body size at EOF");
+	input = test_istream_create(mbox);
+	raw_input = i_stream_create_raw_mbox(input);
+	istream_raw_mbox_set_locked(raw_input);
+
+	/* Checking what follows the body reads up to EOF, which may move the
+	   parent's buffer. Only a memory checker such as valgrind or
+	   AddressSanitizer notices a stale buffer: the fallback read of the
+	   whole body gives the same size. */
+	test_assert(istream_raw_mbox_seek(raw_input, 0) == 0);
+	test_assert(istream_raw_mbox_get_body_size(raw_input, strlen("body\n"),
+						   &size) == 0);
+	test_assert_cmp(size, ==, strlen("body\n"));
+
+	i_stream_unref(&raw_input);
+	i_stream_unref(&input);
+	test_end();
+}
+
+static void test_mbox_raw_istream_from_after_empty_from(void)
+{
+	const char *mbox =
+		"From a@example.com Thu Nov  9 22:33:52 2001\n"
+		"Subject: 1\n"
+		"\n"
+		"body\n"
+		"From \n"
+		"From b@example.com Thu Nov  9 22:33:52 2001\n"
+		"Subject: 2\n"
+		"\n"
+		"body2\n";
+	struct istream *input, *raw_input;
+	uoff_t size;
+
+	test_begin("mbox raw istream From_ right after an invalid one");
+	input = test_istream_create(mbox);
+	raw_input = i_stream_create_raw_mbox(input);
+	istream_raw_mbox_set_locked(raw_input);
+
+	/* The LF right after "From " ends the invalid From_ line and begins
+	   the valid one. */
+	test_assert(istream_raw_mbox_seek(raw_input, 0) == 0);
+	test_assert(istream_raw_mbox_get_body_size(raw_input, UOFF_T_MAX,
+						   &size) == 0);
+	test_assert_cmp(size, ==, strlen("body\nFrom "));
+	test_assert(istream_raw_mbox_next(raw_input, UOFF_T_MAX) == 0);
+	test_assert_strcmp(istream_raw_mbox_get_sender(raw_input),
+			   "b@example.com");
+
+	i_stream_unref(&raw_input);
+	i_stream_unref(&input);
+	test_end();
+}
+
+static void test_mbox_raw_istream_crlf_from_at_buffer_end(void)
+{
+	const char *from1 = "From a@b Thu Nov  9 22:33:52 2001\n";
+	const char *from2 = "From x Thu Nov 29 22:33:52 2001\r\n";
+	const size_t buffer_size = 40;
+	struct istream *input, *raw_input;
+	const unsigned char *data;
+	size_t size;
+	ssize_t ret;
+	string_t *mbox = t_str_new(256);
+
+	/* A line without an LF fills the parent's buffer up to the CR+LF
+	   and "From " of the second mail. */
+	str_append(mbox, from1);
+	for (size_t i = 0; i < buffer_size - strlen("\r\nFrom "); i++)
+		str_append_c(mbox, 'x');
+	str_append(mbox, "\r\n");
+	str_append(mbox, from2);
+	str_append(mbox, "Subject: 2\r\n\r\nbody2\r\n");
+
+	test_begin("mbox raw istream CRLF From_ at buffer end");
+	input = test_istream_create(str_c(mbox));
+	test_istream_set_max_buffer_size(input, buffer_size);
+	raw_input = i_stream_create_raw_mbox(input);
+	istream_raw_mbox_set_locked(raw_input);
+
+	test_assert(istream_raw_mbox_seek(raw_input, 0) == 0);
+	/* The reader holds the line until it can't get more, and then
+	   consumes it except for a trailing CR, which might belong to a CR+LF.
+	   The CR before "\nFrom " must not end up in the reader's hands. */
+	for (unsigned int i = 0; i < 10; i++) {
+		ret = i_stream_read(raw_input);
+		if (ret == -1)
+			break;
+		data = i_stream_get_data(raw_input, &size);
+		if (ret != -2 && size <= buffer_size - strlen("\r\nFrom "))
+			continue;
+		if (size > 0 && data[size-1] == '\r')
+			size--;
+		i_stream_skip(raw_input, size);
+	}
+	test_assert_cmp(ret, ==, -1);
+	test_assert(raw_input->stream_errno == 0);
+	test_assert(istream_raw_mbox_next(raw_input, UOFF_T_MAX) == 0);
+	test_assert_strcmp(istream_raw_mbox_get_sender(raw_input), "x");
+
+	i_stream_unref(&raw_input);
+	i_stream_unref(&input);
+	test_end();
+}
+
+static void test_mbox_raw_istream_invalid_expected_size(void)
+{
+	const char *mbox =
+		"From a@b Thu Nov  9 22:33:52 2001\n"
+		"Subject: 1\n"
+		"\n"
+		"\n"
+		"From c@d Thu Nov  9 22:33:52 2001\n"
+		"Subject: 2\n"
+		"\n"
+		"body2\n"
+		"\n"
+		"From x Thu Nov  9 22:33:52 2001\n"
+		"Subject: 3\n"
+		"\n"
+		"body3\n";
+	const size_t buffer_size = 40;
+	struct istream *input, *raw_input;
+	uoff_t body_size;
+	ssize_t ret;
+
+	test_begin("mbox raw istream invalid expected body size");
+	input = test_istream_create(mbox);
+	test_istream_set_max_buffer_size(input, buffer_size);
+	raw_input = i_stream_create_raw_mbox(input);
+	istream_raw_mbox_set_locked(raw_input);
+
+	test_assert(istream_raw_mbox_seek(raw_input, 0) == 0);
+	for (unsigned int mail = 0; mail < 2; mail++) {
+		for (unsigned int i = 0;; i++) {
+			ret = i_stream_read(raw_input);
+			if (ret == -1)
+				break;
+			if (mail == 1 && i == 1) {
+				/* The Content-Length is invalid. Checking it
+				   moved the parent stream, so the next read
+				   finds its buffer full of the end of the mail
+				   and a cut-off From_ line. The end of the mail
+				   has to be returned before the line can be
+				   checked. */
+				test_assert(istream_raw_mbox_get_body_size(
+					raw_input, 3, &body_size) == 0);
+				test_assert_cmp(body_size, ==, strlen("body2\n"));
+				ret = i_stream_read(raw_input);
+				if (ret == -1)
+					break;
+			}
+			i_stream_skip(raw_input,
+				      i_stream_get_data_size(raw_input));
+		}
+		i_stream_skip(raw_input, i_stream_get_data_size(raw_input));
+		test_assert(istream_raw_mbox_next(raw_input, UOFF_T_MAX) == 0);
+	}
+	test_assert_strcmp(istream_raw_mbox_get_sender(raw_input), "x");
+
+	i_stream_unref(&raw_input);
+	i_stream_unref(&input);
+	test_end();
+}
+
+static void test_mbox_raw_istream_expected_size_inside_crlf(void)
+{
+	static const struct {
+		const char *mbox;
+		uoff_t expected_size;
+		uoff_t body_size;
+	} tests[] = {
+		/* ends between the CR and LF of the blank line */
+		{ "From a@b Thu Nov  9 22:33:52 2001\r\n"
+		  "Subject: 1\r\n"
+		  "\r\n"
+		  "xxxxxxxx\r\n"
+		  "\r\n"
+		  "From c@d Thu Nov  9 22:33:52 2001\r\n"
+		  "Subject: 2\r\n",
+		  11, 10 },
+		/* ends between the CR and LF of the last body line */
+		{ "From a@b Thu Nov  9 22:33:52 2001\n"
+		  "Subject: 1\n"
+		  "\n"
+		  "abc\r\n"
+		  "From c@d Thu Nov  9 22:33:52 2001\n"
+		  "Subject: 2\n",
+		  4, 3 },
+		/* includes the CR+LF of the last body line */
+		{ "From a@b Thu Nov  9 22:33:52 2001\n"
+		  "Subject: 1\n"
+		  "\n"
+		  "abc\r\n"
+		  "\n"
+		  "From c@d Thu Nov  9 22:33:52 2001\n"
+		  "Subject: 2\n",
+		  5, 5 },
+	};
+	struct istream *input, *raw_input;
+	uoff_t size;
+
+	test_begin("mbox raw istream expected body size inside CR+LF");
+	for (unsigned int i = 0; i < N_ELEMENTS(tests); i++) {
+		input = test_istream_create(tests[i].mbox);
+		raw_input = i_stream_create_raw_mbox(input);
+		istream_raw_mbox_set_locked(raw_input);
+
+		/* The CR belongs to the line break, so the mail ends before
+		   it. */
+		test_assert_idx(istream_raw_mbox_seek(raw_input, 0) == 0, i);
+		test_assert_idx(istream_raw_mbox_get_body_size(raw_input,
+			tests[i].expected_size, &size) == 0, i);
+		test_assert_idx(size == tests[i].body_size, i);
+		test_assert_idx(istream_raw_mbox_next(raw_input,
+						      UOFF_T_MAX) == 0, i);
+		test_assert_strcmp_idx(istream_raw_mbox_get_sender(raw_input),
+				       "c@d", i);
+
+		i_stream_unref(&raw_input);
+		i_stream_unref(&input);
+	}
+	test_end();
+}
+
+static void test_mbox_out_of_uids(void)
+{
+	struct test_mail_storage_ctx *ctx;
+	const char *const extra_input[] = {
+		"mail_inbox_path=%{home}/inbox",
+		NULL
+	};
+	const struct test_mail_storage_settings set = {
+		.driver = "mbox",
+		.extra_input = extra_input,
+	};
+	struct mailbox_update update = { .min_next_uid = 4294967294U };
+	struct mailbox_status status;
+	const char *mail_input = "From: <test1@example.com>\n\ntest body\n";
+
+	test_begin("mbox out of UIDs");
+	ctx = test_mail_storage_init();
+	test_mail_storage_init_user(ctx, &set);
+
+	struct mailbox *box =
+		mailbox_alloc(ctx->user->namespaces->list, "INBOX", 0);
+	test_assert(mailbox_open(box) == 0);
+	/* make the mbox empty, but keep it existing */
+	test_mail_save(box, mail_input);
+	struct mailbox_transaction_context *trans =
+		mailbox_transaction_begin(box, 0, __func__);
+	struct mail *mail = mail_alloc(trans, 0, NULL);
+	mail_set_seq(mail, 1);
+	mail_expunge(mail);
+	mail_free(&mail);
+	test_assert(mailbox_transaction_commit(&trans) == 0);
+	test_assert(mailbox_sync(box, 0) == 0);
+
+	mailbox_get_open_status(box, STATUS_UIDVALIDITY, &status);
+	uint32_t orig_uid_validity = status.uidvalidity;
+
+	/* The next UID is past the highest usable one. Saving renumbers the
+	   mbox instead of failing. The log has "Out of UIDs, renumbering them
+	   in mbox" errors and "UIDVALIDITY changed" warnings from the
+	   syncs. */
+	test_expect_errors(3);
+	test_assert(mailbox_update(box, &update) == 0);
+	test_expect_no_more_errors();
+	test_expect_errors(2);
+	test_mail_save(box, mail_input);
+	test_expect_no_more_errors();
+
+	mailbox_get_open_status(box, STATUS_UIDNEXT | STATUS_UIDVALIDITY,
+				&status);
+	test_assert_cmp(status.uidnext, <, 1000);
+	test_assert_cmp(status.uidvalidity, !=, orig_uid_validity);
+
+	mailbox_free(&box);
+	test_mail_storage_deinit_user(ctx);
+	test_mail_storage_deinit(&ctx);
+	test_end();
+}
+
+static void test_mbox_x_uid_overflow(void)
+{
+	struct test_mail_storage_ctx *ctx;
+	const char *mbox =
+		"From a@example.com Thu Nov  9 22:33:52 2001\n"
+		"X-IMAPbase: 1 2\n"
+		"X-UID: 1\n"
+		"Subject: 1\n"
+		"\n"
+		"body\n"
+		"\n"
+		"From b@example.com Thu Nov  9 22:33:52 2001\n"
+		"X-UID: 4294967298\n"
+		"Subject: 2\n"
+		"\n"
+		"body2\n"
+		"\n";
+	int fd;
+
+	test_begin("mbox X-UID overflow");
+	ctx = test_mail_storage_init();
+	const char *path = t_strdup_printf("%stestuser/inbox", ctx->home_root);
+	const char *const extra_input[] = {
+		t_strdup_printf("mail_inbox_path=%s", path),
+		NULL
+	};
+	const struct test_mail_storage_settings set = {
+		.driver = "mbox",
+		.extra_input = extra_input,
+	};
+	test_mail_storage_init_user(ctx, &set);
+
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd == -1)
+		i_fatal("open(%s) failed: %m", path);
+	if (write_full(fd, mbox, strlen(mbox)) < 0)
+		i_fatal("write(%s) failed: %m", path);
+	i_close_fd(&fd);
+
+	struct mailbox *box =
+		mailbox_alloc(ctx->user->namespaces->list, "INBOX", 0);
+	test_assert(mailbox_open(box) == 0);
+	test_assert(mailbox_sync(box, 0) == 0);
+
+	/* The X-UID doesn't fit in 32 bits. It must not wrap around to a UID
+	   that looks valid, so the mail gets a new UID. */
+	struct mailbox_transaction_context *trans =
+		mailbox_transaction_begin(box, 0, __func__);
+	struct mail *mail = mail_alloc(trans, 0, NULL);
+	mail_set_seq(mail, 2);
+	test_assert_cmp(mail->uid, ==, 3);
+	mail_free(&mail);
+	test_assert(mailbox_transaction_commit(&trans) == 0);
+
+	mailbox_free(&box);
+	test_mail_storage_deinit_user(ctx);
+	test_mail_storage_deinit(&ctx);
+	test_end();
+}
+
+static void test_mbox_update_min_next_uid_unsynced(void)
+{
+	struct test_mail_storage_ctx *ctx;
+	const char *const extra_input[] = {
+		"mail_inbox_path=%{home}/inbox",
+		NULL
+	};
+	const struct test_mail_storage_settings set = {
+		.driver = "mbox",
+		.extra_input = extra_input,
+	};
+	struct mailbox_update update = { .min_next_uid = 100 };
+	struct mailbox_status status;
+
+	test_begin("mbox min_next_uid update of unsynced mailbox");
+	ctx = test_mail_storage_init();
+	test_mail_storage_init_user(ctx, &set);
+
+	struct mailbox *box =
+		mailbox_alloc(ctx->user->namespaces->list, "INBOX", 0);
+	test_assert(mailbox_update(box, &update) == 0);
+
+	test_assert(mailbox_sync(box, 0) == 0);
+	mailbox_get_open_status(box, STATUS_UIDNEXT | STATUS_UIDVALIDITY,
+				&status);
+	test_assert_cmp(status.uidvalidity, !=, 0);
+	test_assert_cmp(status.uidnext, ==, 100);
+
+	mailbox_free(&box);
+	test_mail_storage_deinit_user(ctx);
+	test_mail_storage_deinit(&ctx);
+	test_end();
+}
+
+static void test_mbox_raw_istream_reader_holds_data(void)
+{
+	const char *from2 = "From c@d Thu Nov  9 22:33:52 2001\n";
+	const size_t buffer_size = 35;
+	struct istream *input, *raw_input;
+	ssize_t ret;
+	string_t *mbox = t_str_new(256);
+
+	str_append(mbox, "From a@b Thu Nov  9 22:33:52 2001\n");
+	str_append(mbox, "Subject: 1\n\n");
+	for (unsigned int i = 0; i < 24; i++)
+		str_append_c(mbox, 'x');
+	str_append_c(mbox, '\n');
+	str_append(mbox, from2);
+	str_append(mbox, "Subject: 2\n\nbody2\n");
+
+	test_begin("mbox raw istream reader holds a few bytes");
+	input = test_istream_create(str_c(mbox));
+	test_istream_set_max_buffer_size(input, buffer_size);
+	raw_input = i_stream_create_raw_mbox(input);
+	istream_raw_mbox_set_locked(raw_input);
+
+	/* The reader holds everything it has read until it gets -2. At one
+	   point it holds two bytes and the buffer is full of the beginning of
+	   the next From_ line, which can't be verified before the reader has
+	   consumed them. */
+	test_assert(istream_raw_mbox_seek(raw_input, 0) == 0);
+	for (unsigned int i = 0; i < 100; i++) {
+		ret = i_stream_read(raw_input);
+		if (ret == -1)
+			break;
+		if (ret == -2) {
+			i_stream_skip(raw_input,
+				      i_stream_get_data_size(raw_input));
+		}
+	}
+	test_assert_cmp(ret, ==, -1);
+	test_assert(istream_raw_mbox_next(raw_input, UOFF_T_MAX) == 0);
+	test_assert_strcmp(istream_raw_mbox_get_sender(raw_input), "c@d");
+
+	i_stream_unref(&raw_input);
+	i_stream_unref(&input);
+	test_end();
+}
+
+static void test_mbox_raw_istream_body_size_long_from(void)
+{
+	const size_t buffer_size = 40;
+	struct istream *input, *raw_input;
+	struct message_size full_size, small_size;
+	bool has_nuls;
+	string_t *mbox = t_str_new(256);
+
+	str_append(mbox, "From a@b Thu Nov  9 22:33:52 2001\n");
+	str_append(mbox, "Subject: 1\n\n\nFrom ");
+	for (unsigned int i = 0; i < 90; i++)
+		str_append_c(mbox, 'q');
+	str_append(mbox, "\nFrom c@d Thu Nov  9 22:33:52 2001\n");
+	str_append(mbox, "Subject: 2\n\nbody2\n");
+
+	test_begin("mbox raw istream body size with a long From_ line");
+	input = test_istream_create(str_c(mbox));
+	raw_input = i_stream_create_raw_mbox(input);
+	istream_raw_mbox_set_locked(raw_input);
+	test_assert(istream_raw_mbox_seek(raw_input, 0) == 0);
+	test_assert(message_get_body_size(raw_input, &full_size,
+					  &has_nuls) == 0);
+	i_stream_unref(&raw_input);
+	i_stream_unref(&input);
+
+	/* message_get_body_size() leaves one byte unconsumed and asks for
+	   two, so it can't consume anything when the buffer is full. */
+	input = test_istream_create(str_c(mbox));
+	test_istream_set_max_buffer_size(input, buffer_size);
+	raw_input = i_stream_create_raw_mbox(input);
+	istream_raw_mbox_set_locked(raw_input);
+	test_assert(istream_raw_mbox_seek(raw_input, 0) == 0);
+	test_assert(message_get_body_size(raw_input, &small_size,
+					  &has_nuls) == 0);
+	test_assert_cmp(small_size.physical_size, ==, full_size.physical_size);
+
+	i_stream_unref(&raw_input);
+	i_stream_unref(&input);
+	test_end();
+}
+
+static void test_mbox_raw_istream_nul_after_from(void)
+{
+	const char *from1 = "From a@b Thu Nov  9 22:33:52 2001\n";
+	const char *hdr = "Subject: 1\n\n";
+	const size_t buffer_size = 40;
+	struct istream *input, *raw_input;
+	string_t *mbox = t_str_new(256);
+	uoff_t size;
+
+	str_append(mbox, from1);
+	str_append(mbox, hdr);
+	/* A From_ line that doesn't parse and is longer than the buffer, with
+	   a NUL byte right after "\nFrom ". */
+	str_append_data(mbox, "\nFrom \0", 7);
+	for (unsigned int i = 0; i < 2 * buffer_size; i++)
+		str_append_c(mbox, 'x');
+
+	test_begin("mbox raw istream NUL after From_");
+	input = test_istream_create_data(str_data(mbox), str_len(mbox));
+	test_istream_set_max_buffer_size(input, buffer_size);
+	raw_input = i_stream_create_raw_mbox(input);
+	istream_raw_mbox_set_locked(raw_input);
+
+	/* The NUL byte must not match the end of the "\nFrom " string. The
+	   over-read is in static data, so only AddressSanitizer notices it. */
+	test_assert(istream_raw_mbox_seek(raw_input, 0) == 0);
+	test_assert(istream_raw_mbox_get_body_size(raw_input, UOFF_T_MAX,
+						   &size) == 0);
+	test_assert_cmp(size, ==, 7 + 2 * buffer_size);
+
+	i_stream_unref(&raw_input);
+	i_stream_unref(&input);
+	test_end();
+}
+
+static void test_mbox_save_from_header_lines(void)
+{
+	/* The sender is too long for a header name, so the line has no name. */
+	string_t *long_from = t_str_new(1200);
+	str_append(long_from, "From ");
+	for (unsigned int i = 0; i < 1100; i++)
+		str_append_c(long_from, 'a');
+	str_append(long_from, "@example.com Mon Jan  1 00:00:00 2024");
+
+	const struct {
+		const char *line;
+		bool kept;
+	} tests[] = {
+		{ "From user@example.com Mon Jan  1 00:00:00 2024", FALSE },
+		{ "From :x Mon Jan  1 00:00:00 2024", FALSE },
+		{ str_c(long_from), FALSE },
+		{ "From: a@b", TRUE },
+		{ "From :a@b", TRUE },
+		{ "Fromx Mon Jan  1 00:00:00 2024", TRUE },
+	};
+	struct test_mail_storage_ctx *ctx;
+	const char *const extra_input[] = {
+		"mail_inbox_path=%{home}/inbox",
+		NULL
+	};
+	const struct test_mail_storage_settings set = {
+		.driver = "mbox",
+		.extra_input = extra_input,
+	};
+	struct mailbox_status status;
+	struct istream *input;
+	const unsigned char *data;
+	size_t size;
+
+	test_begin("mbox save From_ header lines");
+	ctx = test_mail_storage_init();
+	test_mail_storage_init_user(ctx, &set);
+
+	struct mailbox *box =
+		mailbox_alloc(ctx->user->namespaces->list, "INBOX", 0);
+	test_assert(mailbox_open(box) == 0);
+
+	for (unsigned int i = 0; i < N_ELEMENTS(tests); i++) {
+		test_mail_save(box, t_strdup_printf(
+			"Subject: test\n%s\n\nbody\n", tests[i].line));
+
+		/* the mail must not be split into two */
+		mailbox_get_open_status(box, STATUS_MESSAGES, &status);
+		test_assert_cmp_idx(status.messages, ==, i + 1, i);
+
+		struct mailbox_transaction_context *trans =
+			mailbox_transaction_begin(box, 0, __func__);
+		struct mail *mail = mail_alloc(trans, 0, NULL);
+		mail_set_seq(mail, i + 1);
+		test_assert_idx(mail_get_hdr_stream(mail, NULL, &input) == 0, i);
+		string_t *hdr = t_str_new(1200);
+		while (i_stream_read_more(input, &data, &size) > 0) {
+			str_append_data(hdr, data, size);
+			i_stream_skip(input, size);
+		}
+		bool found = strstr(str_c(hdr), tests[i].line) != NULL;
+		test_assert_cmp_idx(found, ==, tests[i].kept, i);
+		mail_free(&mail);
+		test_assert(mailbox_transaction_commit(&trans) == 0);
+	}
+
 	mailbox_free(&box);
 	test_mail_storage_deinit_user(ctx);
 	test_mail_storage_deinit(&ctx);
@@ -732,6 +1410,20 @@ int main(int argc, char **argv)
 		test_attachment_flags_during_header_fetch,
 		test_bodystructure_reparsing,
 		test_bodystructure_corruption_reparsing,
+		test_binary_size_corruption_recompute,
+		test_mbox_raw_istream_eof,
+		test_mbox_raw_istream_expected_size_at_eof,
+		test_mbox_raw_istream_from_after_empty_from,
+		test_mbox_raw_istream_crlf_from_at_buffer_end,
+		test_mbox_raw_istream_invalid_expected_size,
+		test_mbox_raw_istream_expected_size_inside_crlf,
+		test_mbox_out_of_uids,
+		test_mbox_x_uid_overflow,
+		test_mbox_update_min_next_uid_unsynced,
+		test_mbox_raw_istream_reader_holds_data,
+		test_mbox_raw_istream_body_size_long_from,
+		test_mbox_raw_istream_nul_after_from,
+		test_mbox_save_from_header_lines,
 		test_mail_set_critical,
 		test_mail_set_critical_different_mailboxes,
 		test_mail_get_last_internal_error,

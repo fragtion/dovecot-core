@@ -11,6 +11,7 @@
 #include "settings.h"
 #include "mailbox-list-private.h"
 #include "acl-api-private.h"
+#include "acl-cache.h"
 #include "acl-plugin.h"
 
 #include <sys/stat.h>
@@ -128,8 +129,8 @@ acl_mailbox_create(struct mailbox *box, const struct mailbox_update *update,
 
 	if (!mailbox_is_autocreated(box)) {
 		/* we're looking up CREATE permission from our parent's rights */
-		ret = acl_mailbox_list_have_right(box->list, box->name, TRUE,
-						  ACL_STORAGE_RIGHT_CREATE);
+		ret = acl_mailbox_list_have_right_opened(box->list, box->name,
+				TRUE, ACL_STORAGE_RIGHT_CREATE);
 	} else {
 		/* mailbox is autocreated, so we need to treat it as if it
 		   already exists. ignore the "create" ACL here. */
@@ -214,7 +215,13 @@ acl_mailbox_rename(struct mailbox *src, struct mailbox *dest)
 	struct acl_mailbox *abox = ACL_CONTEXT_REQUIRE(src);
 	int ret;
 
-	/* renaming requires rights to delete the old mailbox */
+	/* Renaming requires rights to delete the old mailbox. The mailbox
+	   isn't open, so make sure they don't come from the rights cache. */
+	if (!abox->skip_acl_checks &&
+	    acl_mailbox_list_read_acl_opened(src->list, abox->aclobj) < 0) {
+		mail_storage_set_internal_error(src->storage);
+		return -1;
+	}
 	ret = acl_mailbox_right_lookup(src, ACL_STORAGE_RIGHT_DELETE);
 	if (ret <= 0) {
 		if (ret == 0)
@@ -224,8 +231,8 @@ acl_mailbox_rename(struct mailbox *src, struct mailbox *dest)
 
 	/* and create the new one under the parent mailbox */
 	T_BEGIN {
-		ret = acl_mailbox_list_have_right(dest->list, dest->name, TRUE,
-						ACL_STORAGE_RIGHT_CREATE);
+		ret = acl_mailbox_list_have_right_opened(dest->list,
+				dest->name, TRUE, ACL_STORAGE_RIGHT_CREATE);
 	} T_END;
 
 	if (ret <= 0) {
@@ -601,11 +608,33 @@ static int acl_mailbox_open_check_acl(struct mailbox *box)
 static int acl_mailbox_open(struct mailbox *box)
 {
 	struct acl_mailbox *abox = ACL_CONTEXT_REQUIRE(box);
+	int ret;
 
 	if (acl_mailbox_open_check_acl(box) < 0)
 		return -1;
 
-	return abox->module_ctx.super.open(box);
+	if (abox->module_ctx.super.open(box) < 0)
+		return -1;
+	if ((box->storage->class_flags &
+	     MAIL_STORAGE_CLASS_FLAG_CACHED_FILES) == 0)
+		return 0;
+
+	/* The storage has the mailbox's files locally only while the mailbox
+	   is open, so the check above may have used the rights cache and
+	   only decided whether the mailbox may be fetched. Now the ACL file
+	   is there and up to date: read it and check again. */
+	abox->no_read_right = FALSE;
+	acl_cache_flush(abox->aclobj->backend->cache, abox->aclobj->name);
+	abox->aclobj->mailbox_open = TRUE;
+	ret = acl_mailbox_open_check_acl(box);
+	abox->aclobj->mailbox_open = FALSE;
+	if (ret < 0) {
+		mail_storage_last_error_push(box->storage);
+		mailbox_close(box);
+		mail_storage_last_error_pop(box->storage);
+		return -1;
+	}
+	return 0;
 }
 
 static int acl_mailbox_get_status(struct mailbox *box,
@@ -614,6 +643,12 @@ static int acl_mailbox_get_status(struct mailbox *box,
 {
 	struct acl_mailbox *abox = ACL_CONTEXT_REQUIRE(box);
 
+	/* The status may be answered without opening the mailbox, e.g. from
+	   the mailbox list index. Require the rights that opening it needs.
+	   A quota check alone doesn't look into the mailbox. */
+	if (!box->opened && items != STATUS_CHECK_OVER_QUOTA &&
+	    acl_mailbox_open_check_acl(box) < 0)
+		return -1;
 	if (abox->module_ctx.super.get_status(box, items, status_r) < 0)
 		return -1;
 
@@ -729,11 +764,17 @@ int acl_mailbox_update_acl(struct mailbox_transaction_context *t,
 	const char *key;
 	time_t ts = update->last_change != 0 ?
 		update->last_change : ioloop_time;
+	int ret;
 
 	key = t_strdup_printf(MAILBOX_ATTRIBUTE_PREFIX_ACL"%s",
 			      acl_rights_get_id(&update->rights));
 	aclobj = acl_mailbox_get_aclobj(t->box);
-	if (acl_object_update(aclobj, update) < 0) {
+	/* the transaction's mailbox is open: the update reads the ACL file
+	   as it is now, also with a storage that has cached files */
+	aclobj->mailbox_open = TRUE;
+	ret = acl_object_update(aclobj, update);
+	aclobj->mailbox_open = FALSE;
+	if (ret < 0) {
 		mailbox_set_critical(t->box, "Failed to update ACL object");
 		return -1;
 	}

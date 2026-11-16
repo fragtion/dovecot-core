@@ -339,14 +339,35 @@ static int
 cmd_acl_recalc_run(struct doveadm_mail_cmd_context *ctx, struct mail_user *user)
 {
 	struct acl_user *auser = ACL_USER_CONTEXT(user);
+	struct mail_namespace *ns;
+	struct acl_backend *backend;
+	int ret = 0;
 
 	if (auser == NULL) {
 		e_error(user->event, "ACL not enabled for %s", user->username);
 		doveadm_mail_failed_error(ctx, MAIL_ERROR_NOTFOUND);
 		return -1;
 	}
+	/* Rebuild the rights caches first, so the dict is built from the
+	   mailboxes' current ACL files rather than from whatever the caches
+	   hold. A failed rebuild keeps the old cache, which the dict
+	   rebuild then uses without removing anything. */
+	for (ns = user->namespaces; ns != NULL; ns = ns->next) {
+		if ((ns->flags & NAMESPACE_FLAG_NOACL) != 0 ||
+		    ACL_LIST_CONTEXT(ns->list) == NULL)
+			continue;
+		backend = acl_mailbox_list_get_backend(ns->list);
+		if (acl_backend_nonowner_lookups_rebuild(backend, TRUE) < 0) {
+			e_error(user->event, "Failed to rebuild the ACL rights cache of namespace %s",
+				ns->set->name);
+			ret = -1;
+		}
+	}
 	if (acl_lookup_dict_rebuild(auser->acl_lookup_dict, FALSE) < 0) {
 		e_error(user->event, "Failed to recalculate ACL dicts");
+		ret = -1;
+	}
+	if (ret < 0) {
 		doveadm_mail_failed_error(ctx, MAIL_ERROR_TEMP);
 		return -1;
 	}
@@ -420,7 +441,6 @@ static bool cmd_acl_debug_mailbox(struct mailbox *box, bool *retry_r)
 	const char *const *rights, *name, *path;
 	enum mail_flags private_flags_mask;
 	string_t *str;
-	int ret;
 	bool all_ok = TRUE;
 
 	*retry_r = FALSE;
@@ -462,21 +482,37 @@ static bool cmd_acl_debug_mailbox(struct mailbox *box, bool *retry_r)
 		return TRUE;
 	}
 
+	bool found = FALSE;
+
 	iter = acl_backend_nonowner_lookups_iter_init(backend);
 	while (acl_backend_nonowner_lookups_iter_next(iter, &name)) {
-		if (strcmp(name, box->name) == 0)
+		if (strcmp(name, box->name) == 0) {
+			found = TRUE;
 			break;
+		}
 	}
-	if ((ret = acl_backend_nonowner_lookups_iter_deinit(&iter))<0)
-		i_fatal("ACL non-owner iteration failed");
-	if (ret == 0) {
-		e_error(box->event, "Mailbox not found from dovecot-acl-list, rebuilding");
-		if (acl_backend_nonowner_lookups_rebuild(backend) < 0)
-			i_fatal("dovecot-acl-list rebuilding failed");
+	if (acl_backend_nonowner_lookups_iter_deinit(&iter) < 0) {
+		/* There is no usable rights cache. From a shared namespace
+		   that is normal until the owner's cache has been created,
+		   and so it is for a namespace whose ACL root can't be
+		   written. */
+		if (ns->owner != NULL) {
+			e_error(box->event, "The ACL rights cache of %s is missing or unusable - run doveadm acl recalc -u %s",
+				ns->owner->username, ns->owner->username);
+		} else {
+			e_error(box->event, "The ACL rights cache of namespace %s is missing or unusable",
+				ns->set->name);
+		}
+		return FALSE;
+	}
+	if (!found) {
+		e_error(box->event, "Mailbox not found from the ACL rights cache, rebuilding");
+		if (acl_backend_nonowner_lookups_rebuild(backend, FALSE) < 0)
+			i_fatal("ACL rights cache rebuilding failed");
 		all_ok = FALSE;
 		*retry_r = TRUE;
 	} else {
-		e_info(box->event, "Mailbox found from dovecot-acl-list");
+		e_info(box->event, "Mailbox found from the ACL rights cache");
 	}
 
 	if (ns->type == MAIL_NAMESPACE_TYPE_PUBLIC) {

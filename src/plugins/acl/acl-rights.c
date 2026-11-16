@@ -184,10 +184,39 @@ const char *acl_rights_export(const struct acl_rights *rights)
 }
 
 /* <settings checks> */
+int acl_rights_parse_fields(const char *id_str, const char *right_names_str,
+			    pool_t pool, struct acl_rights *rights_r,
+			    const char **error_r)
+{
+	const char *const *right_names, *error = NULL;
+
+	i_zero(rights_r);
+
+	right_names = acl_right_names_parse(pool, right_names_str, &error);
+	if (*id_str != '-')
+		rights_r->rights = right_names;
+	else {
+		id_str++;
+		rights_r->neg_rights = right_names;
+	}
+
+	if (acl_identifier_parse(id_str, rights_r) < 0)
+		error = t_strdup_printf("Unknown ID '%s'", id_str);
+
+	if (error != NULL) {
+		*error_r = error;
+		return -1;
+	}
+
+	/* identifier points into a temp buffer; copy into the pool */
+	rights_r->identifier = p_strdup(pool, rights_r->identifier);
+	return 0;
+}
+
 int acl_rights_parse_line(const char *line, pool_t pool,
 			  struct acl_rights *rights_r, const char **error_r)
 {
-	const char *id_str, *const *right_names, *error = NULL;
+	const char *id_str;
 
 	/* [ \t]["]<id>["] [<imap acls>] [:<named acls>]
 	 * Tokens can be separated by spaces or tabs.
@@ -213,27 +242,7 @@ int acl_rights_parse_line(const char *line, pool_t pool,
 			id_str = t_strdup_until(id_str, line);
 	}
 
-	i_zero(rights_r);
-
-	right_names = acl_right_names_parse(pool, line, &error);
-	if (*id_str != '-')
-		rights_r->rights = right_names;
-	else {
-		id_str++;
-		rights_r->neg_rights = right_names;
-	}
-
-	if (acl_identifier_parse(id_str, rights_r) < 0)
-		error = t_strdup_printf("Unknown ID '%s'", id_str);
-
-	if (error != NULL) {
-		*error_r = error;
-		return -1;
-	}
-
-	/* identifier points into a temp buffer; copy into the pool */
-	rights_r->identifier = p_strdup(pool, rights_r->identifier);
-	return 0;
+	return acl_rights_parse_fields(id_str, line, pool, rights_r, error_r);
 }
 /* </settings checks> */
 
@@ -496,3 +505,34 @@ bool acl_right_names_modify(pool_t pool,
 	return old_rights[i] != NULL || new_rights[i] != NULL;
 }
 
+void acl_rights_sort(ARRAY_TYPE(acl_rights) *rights, pool_t pool)
+{
+	unsigned int count, i, dest;
+	struct acl_rights *_rights;
+
+	array_sort(rights, acl_rights_cmp);
+
+	/* merge identical identifiers */
+	_rights = array_get_modifiable(rights, &count);
+	for (dest = 0, i = 1; i < count; i++) {
+		if (acl_rights_cmp(&_rights[i], &_rights[dest]) == 0) {
+			/* add i's rights to dest and delete i */
+			if (_rights[i].rights != NULL) {
+				acl_right_names_merge(pool,
+						      &_rights[dest].rights,
+						      _rights[i].rights, FALSE);
+			}
+			if (_rights[i].neg_rights != NULL) {
+				acl_right_names_merge(pool,
+						      &_rights[dest].neg_rights,
+						      _rights[i].neg_rights,
+						      FALSE);
+			}
+		} else {
+			if (++dest != i)
+				_rights[dest] = _rights[i];
+		}
+	}
+	if (++dest < count)
+		array_delete(rights, dest, count - dest);
+}

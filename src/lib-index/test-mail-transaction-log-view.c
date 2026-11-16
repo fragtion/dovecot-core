@@ -19,7 +19,7 @@ test_transaction_log_file_add(uint32_t file_seq)
 	file->hdr.file_seq = file_seq;
 	file->hdr.hdr_size = file->sync_offset = sizeof(file->hdr);
 	file->hdr.prev_file_seq = file_seq - 1;
-	file->hdr.prev_file_offset = (uint32_t)-1;
+	file->hdr.prev_file_offset = UINT32_MAX;
 	file->log = log;
 	file->fd = -1;
 	file->buffer = buffer_create_dynamic(default_pool, 256);
@@ -42,8 +42,15 @@ void mail_index_set_error(struct mail_index *index ATTR_UNUSED,
 }
 
 void mail_transaction_log_file_set_corrupted(struct mail_transaction_log_file *file ATTR_UNUSED,
-					     const char *fmt ATTR_UNUSED, ...)
+					     const char *fmt, ...)
 {
+	va_list args;
+
+	va_start(args, fmt);
+	T_BEGIN {
+		i_error("%s", t_strdup_vprintf(fmt, args));
+	} T_END;
+	va_end(args);
 }
 
 void mail_transaction_logs_clean(struct mail_transaction_log *log ATTR_UNUSED)
@@ -138,14 +145,14 @@ add_append_record(struct mail_transaction_log_file *file,
 }
 
 static size_t
-add_attribute_update_record(struct mail_transaction_log_file *file,
-			    const void *data, size_t data_size)
+add_record(struct mail_transaction_log_file *file,
+	   enum mail_transaction_type type, const void *data, size_t data_size)
 {
 	struct mail_transaction_header hdr;
 	size_t size;
 
 	i_zero(&hdr);
-	hdr.type = MAIL_TRANSACTION_ATTRIBUTE_UPDATE | MAIL_TRANSACTION_EXTERNAL;
+	hdr.type = type;
 	hdr.size = mail_index_uint32_to_offset(sizeof(hdr) + data_size);
 
 	buffer_append(file->buffer, &hdr, sizeof(hdr));
@@ -154,6 +161,34 @@ add_attribute_update_record(struct mail_transaction_log_file *file,
 	size = sizeof(hdr) + data_size;
 	file->sync_offset += size;
 	return size;
+}
+
+static size_t
+add_attribute_update_record(struct mail_transaction_log_file *file,
+			    const void *data, size_t data_size)
+{
+	return add_record(file, MAIL_TRANSACTION_ATTRIBUTE_UPDATE |
+			  MAIL_TRANSACTION_EXTERNAL, data, data_size);
+}
+
+static void
+add_keyword_update_record(struct mail_transaction_log_file *file,
+			  uint8_t modify_type)
+{
+	struct {
+		struct mail_transaction_keyword_update u;
+		char name[4];
+		uint32_t uids[2];
+	} rec;
+
+	i_zero(&rec);
+	rec.u.modify_type = modify_type;
+	rec.u.name_size = 3;
+	memcpy(rec.name, "foo", 3);
+	rec.uids[0] = 1;
+	rec.uids[1] = 2;
+	(void)add_record(file, MAIL_TRANSACTION_KEYWORD_UPDATE,
+			 &rec, sizeof(rec));
 }
 
 static void test_mail_transaction_log_view(void)
@@ -193,7 +228,7 @@ static void test_mail_transaction_log_view(void)
 
 	/* we have files 1-3 opened */
 	test_begin("set all");
-	test_assert(mail_transaction_log_view_set(view, 0, 0, (uint32_t)-1, UOFF_T_MAX, &reset, &reason) == 1 &&
+	test_assert(mail_transaction_log_view_set(view, 0, 0, UINT32_MAX, UOFF_T_MAX, &reset, &reason) == 1 &&
 		    reset && view_is_file_refed(1) && view_is_file_refed(2) &&
 		    view_is_file_refed(3) &&
 		    !mail_transaction_log_view_is_corrupted(view));
@@ -219,7 +254,7 @@ static void test_mail_transaction_log_view(void)
 	test_end();
 
 	test_begin("set end");
-	test_assert(mail_transaction_log_view_set(view, 3, last_log_size, (uint32_t)-1, UOFF_T_MAX, &reset, &reason) == 1);
+	test_assert(mail_transaction_log_view_set(view, 3, last_log_size, UINT32_MAX, UOFF_T_MAX, &reset, &reason) == 1);
 	mail_transaction_log_view_get_prev_pos(view, &seq, &offset);
 	test_assert(seq == 3 && offset == last_log_size);
 	test_assert(mail_transaction_log_view_next(view, &hdr, &data) == 0);
@@ -241,16 +276,16 @@ static void test_mail_transaction_log_view(void)
 	/* --- first file has been removed --- */
 
 	test_begin("set 2-3");
-	test_assert(mail_transaction_log_view_set(view, 2, 0, (uint32_t)-1, UOFF_T_MAX, &reset, &reason) == 1);
+	test_assert(mail_transaction_log_view_set(view, 2, 0, UINT32_MAX, UOFF_T_MAX, &reset, &reason) == 1);
 	test_end();
 
 	test_begin("missing log handing");
-	test_assert(mail_transaction_log_view_set(view, 0, 0, (uint32_t)-1, UOFF_T_MAX, &reset, &reason) == 0);
+	test_assert(mail_transaction_log_view_set(view, 0, 0, UINT32_MAX, UOFF_T_MAX, &reset, &reason) == 0);
 	test_end();
 
 	test_begin("closed log handling");
 	view->log = NULL;
-	test_assert(mail_transaction_log_view_set(view, 0, 0, (uint32_t)-1, UOFF_T_MAX, &reset, &reason) == 0);
+	test_assert(mail_transaction_log_view_set(view, 0, 0, UINT32_MAX, UOFF_T_MAX, &reset, &reason) == 0);
 	view->log = log;
 	test_end();
 
@@ -304,13 +339,15 @@ static void test_mail_transaction_log_view_attribute_update(void)
 	view = mail_transaction_log_view_open(log);
 	i_assert(view != NULL);
 
-	test_assert(mail_transaction_log_view_set(view, 0, 0, (uint32_t)-1,
+	test_assert(mail_transaction_log_view_set(view, 0, 0, UINT32_MAX,
 						  UOFF_T_MAX, &reset,
 						  &reason) == 1);
 	test_assert(mail_transaction_log_view_next(view, &hdr, &data) == 1);
 	test_assert(hdr->type == (MAIL_TRANSACTION_ATTRIBUTE_UPDATE |
 				  MAIL_TRANSACTION_EXTERNAL));
+	test_expect_error_string("Key not NUL-terminated");
 	test_assert(mail_transaction_log_view_next(view, &hdr, &data) == -1);
+	test_expect_no_more_errors();
 
 	mail_transaction_log_view_close(&view);
 	i_free(log->index);
@@ -325,11 +362,131 @@ static void test_mail_transaction_log_view_attribute_update(void)
 	test_end();
 }
 
+static void test_log_view_free(void)
+{
+	void *oldfile;
+
+	mail_transaction_log_view_close(&view);
+	i_free(log->index);
+	while (log->files != NULL) {
+		oldfile = log->files;
+		buffer_free(&log->files->buffer);
+		log->files = log->files->next;
+		i_free(oldfile);
+	}
+	i_free(log);
+}
+
+/* Add a valid keyword update record followed by the given record. If error is
+   NULL, the record is expected to be valid. Otherwise reading it must fail
+   with the given error. */
+static void
+test_keyword_update_record(void (*add_record_func)(struct mail_transaction_log_file *file),
+			   const char *error)
+{
+	const struct mail_transaction_header *hdr;
+	const void *data;
+	const char *reason;
+	bool reset;
+
+	log = i_new(struct mail_transaction_log, 1);
+	log->index = i_new(struct mail_index, 1);
+	log->index->log = log;
+	log->index->log_sync_locked = TRUE;
+	test_transaction_log_file_add(1);
+
+	add_keyword_update_record(log->head, MODIFY_ADD);
+	add_record_func(log->head);
+
+	view = mail_transaction_log_view_open(log);
+	i_assert(view != NULL);
+
+	test_assert(mail_transaction_log_view_set(view, 0, 0, UINT32_MAX,
+						  UOFF_T_MAX, &reset,
+						  &reason) == 1);
+	test_assert(mail_transaction_log_view_next(view, &hdr, &data) == 1);
+	test_assert(hdr->type == MAIL_TRANSACTION_KEYWORD_UPDATE);
+	if (error == NULL) {
+		test_assert(mail_transaction_log_view_next(view, &hdr,
+							   &data) == 1);
+		test_assert(hdr->type == MAIL_TRANSACTION_KEYWORD_UPDATE);
+	} else {
+		test_expect_error_string(error);
+		test_assert(mail_transaction_log_view_next(view, &hdr,
+							   &data) == -1);
+		test_expect_no_more_errors();
+	}
+	test_log_view_free();
+}
+
+static void add_keyword_update_remove(struct mail_transaction_log_file *file)
+{
+	add_keyword_update_record(file, MODIFY_REMOVE);
+}
+
+static void add_keyword_update_replace(struct mail_transaction_log_file *file)
+{
+	add_keyword_update_record(file, MODIFY_REPLACE);
+}
+
+static void add_keyword_update_no_uids(struct mail_transaction_log_file *file)
+{
+	struct {
+		struct mail_transaction_keyword_update u;
+		char name[4];
+	} rec;
+
+	i_zero(&rec);
+	rec.u.modify_type = MODIFY_ADD;
+	rec.u.name_size = 3;
+	memcpy(rec.name, "foo", 3);
+	(void)add_record(file, MAIL_TRANSACTION_KEYWORD_UPDATE,
+			 &rec, sizeof(rec));
+}
+
+static void add_keyword_update_nul_name(struct mail_transaction_log_file *file)
+{
+	struct {
+		struct mail_transaction_keyword_update u;
+		char name[4];
+		uint32_t uids[2];
+	} rec;
+
+	i_zero(&rec);
+	rec.u.modify_type = MODIFY_ADD;
+	rec.u.name_size = 3;
+	memcpy(rec.name, "\0ab", 3);
+	rec.uids[0] = 1;
+	rec.uids[1] = 2;
+	(void)add_record(file, MAIL_TRANSACTION_KEYWORD_UPDATE,
+			 &rec, sizeof(rec));
+}
+
+static void test_mail_transaction_log_view_keyword_update(void)
+{
+	test_begin("keyword update record validation");
+	test_keyword_update_record(add_keyword_update_remove, NULL);
+	/* Only adding and removing keywords is supported. Syncing the
+	   record would crash. */
+	test_keyword_update_record(add_keyword_update_replace,
+				   "Invalid keyword update modify type 2");
+	/* The UID ranges are missing. The helper functions rely on this
+	   being rejected. */
+	test_keyword_update_record(add_keyword_update_no_uids,
+				   "No UID ranges (type=0x400)");
+	/* The keyword name would be truncated to an empty string, which
+	   crashes when syncing the record. */
+	test_keyword_update_record(add_keyword_update_nul_name,
+				   "Keyword name contains NUL");
+	test_end();
+}
+
 int main(void)
 {
 	static void (*const test_functions[])(void) = {
 		test_mail_transaction_log_view,
 		test_mail_transaction_log_view_attribute_update,
+		test_mail_transaction_log_view_keyword_update,
 		NULL
 	};
 	return test_run(test_functions);

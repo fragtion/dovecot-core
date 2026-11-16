@@ -52,8 +52,45 @@ struct acl_backend *acl_mailbox_list_get_backend(struct mailbox_list *list)
 	return alist->rights.backend;
 }
 
-int acl_mailbox_list_have_right(struct mailbox_list *list, const char *name,
-				bool parent, unsigned int acl_storage_right_idx)
+int acl_mailbox_list_read_acl_opened(struct mailbox_list *list,
+				     struct acl_object *aclobj)
+{
+	struct mailbox *box;
+	enum mail_error error;
+	const char *errstr;
+	int ret = 0;
+
+	if (*aclobj->name == '\0' ||
+	    !acl_backend_storage_has_cached_files(aclobj->backend)) {
+		/* The namespace root's rights never come from the rights
+		   cache, or the mailboxes' files are always locally
+		   available. */
+		return 0;
+	}
+
+	box = mailbox_alloc(list, mailbox_list_get_vname(list, aclobj->name),
+			    MAILBOX_FLAG_READONLY | MAILBOX_FLAG_IGNORE_ACLS);
+	if (mailbox_open(box) < 0) {
+		errstr = mailbox_get_last_internal_error(box, &error);
+		if (error != MAIL_ERROR_NOTFOUND) {
+			e_error(box->event, "acl: Failed to open mailbox: %s",
+				errstr);
+			ret = -1;
+		}
+	} else {
+		acl_cache_flush(aclobj->backend->cache, aclobj->name);
+		aclobj->mailbox_open = TRUE;
+		ret = aclobj->backend->v->object_refresh_cache(aclobj);
+		aclobj->mailbox_open = FALSE;
+	}
+	mailbox_free(&box);
+	return ret;
+}
+
+static int
+acl_mailbox_list_have_right_full(struct mailbox_list *list, const char *name,
+				 bool parent, bool read_acl_opened,
+				 unsigned int acl_storage_right_idx)
 {
 	struct acl_mailbox_list *alist = ACL_LIST_CONTEXT_REQUIRE(list);
 	struct acl_backend *backend = alist->rights.backend;
@@ -67,13 +104,34 @@ int acl_mailbox_list_have_right(struct mailbox_list *list, const char *name,
 	aclobj = !parent ?
 		acl_object_init_from_name(backend, name) :
 		acl_object_init_from_parent(backend, name);
-	ret = acl_object_have_right(aclobj, idx_arr[acl_storage_right_idx]);
+	if (read_acl_opened &&
+	    acl_mailbox_list_read_acl_opened(list, aclobj) < 0)
+		ret = -1;
+	else {
+		ret = acl_object_have_right(aclobj,
+					    idx_arr[acl_storage_right_idx]);
+	}
 
 	acl_object_deinit(&aclobj);
 
 	if (ret < 0)
 		mailbox_list_set_internal_error(list);
 	return ret;
+}
+
+int acl_mailbox_list_have_right(struct mailbox_list *list, const char *name,
+				bool parent, unsigned int acl_storage_right_idx)
+{
+	return acl_mailbox_list_have_right_full(list, name, parent, FALSE,
+						acl_storage_right_idx);
+}
+
+int acl_mailbox_list_have_right_opened(struct mailbox_list *list,
+				       const char *name, bool parent,
+				       unsigned int acl_storage_right_idx)
+{
+	return acl_mailbox_list_have_right_full(list, name, parent, TRUE,
+						acl_storage_right_idx);
 }
 
 static void
@@ -220,7 +278,8 @@ acl_mailbox_list_iter_next_info(struct mailbox_list_iterate_context *_ctx)
 		    mailbox_tree_lookup(ctx->lookup_boxes, info->vname) != NULL)
 			break;
 		e_debug(_ctx->list->event,
-			"acl: Mailbox not in dovecot-acl-list: %s", info->vname);
+			"acl: Mailbox not in the ACL rights cache: %s",
+			info->vname);
 	}
 
 	return info;
@@ -461,6 +520,48 @@ static void acl_mailbox_list_deinit(struct mailbox_list *list)
 	alist->module_ctx.super.deinit(list);
 }
 
+static int
+acl_mailbox_list_delete_mailbox(struct mailbox_list *list, const char *name)
+{
+	struct acl_mailbox_list *alist = ACL_LIST_CONTEXT_REQUIRE(list);
+
+	if (alist->module_ctx.super.delete_mailbox(list, name) < 0)
+		return -1;
+
+	/* A failure here only leaves the list stale, so don't fail the
+	   delete. */
+	(void)acl_backend_nonowner_lookups_rename(alist->rights.backend, name,
+						  NULL, NULL);
+	return 0;
+}
+
+static int
+acl_mailbox_list_rename_mailbox(struct mailbox_list *oldlist,
+				const char *oldname,
+				struct mailbox_list *newlist,
+				const char *newname)
+{
+	struct acl_mailbox_list *alist = ACL_LIST_CONTEXT_REQUIRE(oldlist);
+	struct acl_mailbox_list *newalist;
+	struct acl_backend *dest_backend = NULL;
+
+	if (alist->module_ctx.super.rename_mailbox(oldlist, oldname,
+						   newlist, newname) < 0)
+		return -1;
+
+	/* The destination list has no ACL context when ACLs are disabled for
+	   its namespace (no acl_driver), and so no nonowner lookup list of
+	   its own. */
+	newalist = ACL_LIST_CONTEXT(newlist);
+	if (newalist != NULL)
+		dest_backend = newalist->rights.backend;
+
+	(void)acl_backend_nonowner_lookups_rename(alist->rights.backend,
+						  oldname, dest_backend,
+						  newname);
+	return 0;
+}
+
 static void acl_storage_rights_ctx_init(struct acl_storage_rights_context *ctx,
 					struct acl_backend *backend)
 {
@@ -527,6 +628,21 @@ static void acl_mailbox_list_init_default(struct mailbox_list *list)
 	v->iter_init = acl_mailbox_list_iter_init;
 	v->iter_next = acl_mailbox_list_iter_next;
 	v->iter_deinit = acl_mailbox_list_iter_deinit;
+	/* Hooked at the list layer, not the mailbox layer: the list vfuncs are
+	   installed per list, so they also see the renames done internally for
+	   NFC normalization, which allocate the mailbox with
+	   MAILBOX_FLAG_IGNORE_ACLS.
+
+	   A secondary list is left alone. imapc keeps one over the same mail
+	   root and delegates its renames to it, so both lists would update
+	   the backend's nonowner lookup list. The two lists name mailboxes
+	   differently, so the secondary list's update can only match by
+	   coincidence, and a coincidental match moves an unrelated mailbox's
+	   entry. */
+	if ((list->flags & MAILBOX_LIST_FLAG_SECONDARY) == 0) {
+		v->rename_mailbox = acl_mailbox_list_rename_mailbox;
+		v->delete_mailbox = acl_mailbox_list_delete_mailbox;
+	}
 
 	acl_storage_rights_ctx_init(&alist->rights, backend);
 

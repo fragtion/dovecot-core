@@ -115,6 +115,13 @@ int mailbox_list_index_index_open(struct mailbox_list *list)
 	}
 	if (ret == 1)
 		ilist->index_created = TRUE;
+	/* The list index is small, so verify all the records' UIDs. Zero or
+	   unordered UIDs would break UID lookups. */
+	if (mail_index_verify_records(ilist->index) < 0) {
+		mailbox_list_index_set_index_error(list);
+		mail_index_close(ilist->index);
+		return -1;
+	}
 	ilist->opened = TRUE;
 	return 0;
 }
@@ -351,6 +358,8 @@ int mailbox_list_index_name_iter_next(struct mailbox_list_index_name_iter *iter,
 		/* allow extra space in the end as long as last id=0 */
 		return id == 0 ? 0 : -1;
 	}
+	if (id > MAILBOX_LIST_INDEX_MAX_NAME_ID)
+		return -1;
 	iter->prev_id = id;
 
 	/* get name. It's NUL-terminated within the header, so it can be
@@ -508,7 +517,8 @@ static int mailbox_list_index_parse_records(struct mailbox_list_index *ilist,
 		irec = data;
 
 		node->name_id = irec->name_id;
-		if (node->name_id == 0) {
+		if (node->name_id == 0 ||
+		    node->name_id > MAILBOX_LIST_INDEX_MAX_NAME_ID) {
 			/* invalid name_id - assign a new one */
 			node->name_id = ++ilist->highest_name_id;
 			node->corrupted_ext = TRUE;
@@ -703,6 +713,20 @@ mailbox_list_index_parse_full(struct mailbox_list *list,
 	ilist->sync_log_file_seq = hdr->log_file_seq;
 	ilist->sync_log_file_offset = hdr->log_file_head_offset;
 
+	if (hdr->next_uid == UINT32_MAX) {
+		/* No new mailboxes could be added. The UIDs are only used
+		   internally, so they can't really run out. */
+		if (!handle_corruption)
+			return -1;
+		mailbox_list_set_critical(list,
+			"Corrupted mailbox list index %s: next_uid=%u",
+			ilist->path, hdr->next_uid);
+		if (ilist->has_backing_store) {
+			mail_index_mark_corrupted(ilist->index);
+			return -1;
+		}
+		ilist->call_corruption_callback = TRUE;
+	}
 	if (mailbox_list_index_parse_header(ilist, view) < 0) {
 		if (!handle_corruption)
 			return -1;

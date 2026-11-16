@@ -214,15 +214,19 @@ int maildir_sync_index_begin(struct maildir_mailbox *mbox,
 	struct mail_index_view *view;
 	struct mail_index_transaction *trans;
 	enum mail_index_sync_flags sync_flags;
+	int ret;
 
 	sync_flags = index_storage_get_sync_flags(&mbox->box);
 	/* don't drop recent messages if we're saving messages */
 	if (maildir_sync_ctx == NULL)
 		sync_flags &= ENUM_NEGATE(MAIL_INDEX_SYNC_FLAG_DROP_RECENT);
 
-	if (index_storage_expunged_sync_begin(_box, &sync_ctx, &view,
-					      &trans, sync_flags) < 0)
-		return -1;
+	ret = index_storage_expunged_sync_begin(_box, &sync_ctx, &view,
+						&trans, sync_flags);
+	if (ret <= 0) {
+		*ctx_r = NULL;
+		return ret;
+	}
 
 	ctx = i_new(struct maildir_index_sync_context, 1);
 	ctx->mbox = mbox;
@@ -238,7 +242,7 @@ int maildir_sync_index_begin(struct maildir_mailbox *mbox,
 	ctx->start_time = time(NULL);
 
 	*ctx_r = ctx;
-	return 0;
+	return 1;
 }
 
 static bool
@@ -622,7 +626,7 @@ int maildir_sync_index(struct maildir_index_sync_context *ctx,
 	/* add \Recent flags. use updated view so it contains newly
 	   appended messages. */
 	view2 = mail_index_transaction_open_updated_view(trans);
-	if (mail_index_lookup_seq_range(view2, first_recent_uid, (uint32_t)-1,
+	if (mail_index_lookup_seq_range(view2, first_recent_uid, UINT32_MAX,
 					&seq, &seq2) && seq2 >= first_uid) {
 		if (seq < first_uid) {
 			/* UIDVALIDITY changed, skip over the old messages */
@@ -682,7 +686,7 @@ static unsigned int
 maildir_list_get_ext_id(struct maildir_mailbox *mbox,
 			struct mail_index_view *view)
 {
-	if (mbox->maildir_list_index_ext_id == (uint32_t)-1) {
+	if (mbox->maildir_list_index_ext_id == UINT32_MAX) {
 		mbox->maildir_list_index_ext_id =
 			mail_index_ext_register(mail_index_view_get_index(view),
 				"maildir", 0,

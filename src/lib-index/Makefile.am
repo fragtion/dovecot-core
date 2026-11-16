@@ -68,6 +68,7 @@ test_programs = \
 	test-mail-cache-fields \
 	test-mail-cache-purge \
 	test-mail-index \
+	test-mail-index-corruption \
 	test-mail-index-map \
 	test-mail-index-modseq \
 	test-mail-index-sync-ext \
@@ -104,6 +105,12 @@ test_mail_cache_purge_DEPENDENCIES = $(test_deps)
 test_mail_index_SOURCES = test-mail-index.c
 test_mail_index_LDADD = $(noinst_LTLIBRARIES) $(test_libs)
 test_mail_index_DEPENDENCIES = $(test_deps)
+
+test_mail_index_corruption_SOURCES = \
+	test-mail-index-corruption.c \
+	test-mail-index-corruption-common.c
+test_mail_index_corruption_LDADD = $(noinst_LTLIBRARIES) $(test_libs)
+test_mail_index_corruption_DEPENDENCIES = $(test_deps)
 
 test_mail_index_map_SOURCES = test-mail-index-map.c
 test_mail_index_map_LDADD = $(noinst_LTLIBRARIES) $(test_libs)
@@ -145,9 +152,28 @@ test_mailbox_log_SOURCES = test-mailbox-log.c
 test_mailbox_log_LDADD = mailbox-log.lo $(test_libs)
 test_mailbox_log_DEPENDENCIES = $(test_deps)
 
+fuzz_programs =
+
+if USE_FUZZER
+fuzz_programs += fuzz-mail-index
+
+nodist_EXTRA_fuzz_mail_index_SOURCES = force-cxx-linking.cxx
+
+fuzz_mail_index_CPPFLAGS = $(FUZZER_CPPFLAGS)
+fuzz_mail_index_LDFLAGS = $(FUZZER_LDFLAGS)
+fuzz_mail_index_SOURCES = \
+	fuzz-mail-index.c \
+	test-mail-index-corruption-common.c
+fuzz_mail_index_LDADD = $(noinst_LTLIBRARIES) $(test_libs)
+fuzz_mail_index_DEPENDENCIES = $(test_deps)
+endif
+
+noinst_PROGRAMS += $(fuzz_programs)
+
 pkginc_libdir=$(pkgincludedir)
 pkginc_lib_HEADERS = $(headers)
 
 noinst_HEADERS = \
 	test-mail-cache.h \
-	test-mail-index.h
+	test-mail-index.h \
+	test-mail-index-corruption-common.h

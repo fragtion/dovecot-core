@@ -3793,6 +3793,11 @@ dcrypt_openssl_digest(const char *algorithm, const void *data, size_t data_len,
 	return ret;
 }
 
+static inline size_t dcrypt_openssl_ec_rs_len(const EC_KEY *ec_key)
+{
+	return ((size_t)EC_GROUP_order_bits(EC_KEY_get0_group(ec_key)) + 7) / 8;
+}
+
 static bool
 dcrypt_openssl_sign_ecdsa(struct dcrypt_private_key *key, const char *algorithm,
 			  const void *data, size_t data_len, buffer_t *signature_r,
@@ -3801,7 +3806,7 @@ dcrypt_openssl_sign_ecdsa(struct dcrypt_private_key *key, const char *algorithm,
 	EVP_PKEY *pkey = key->key;
 	EC_KEY *ec_key = EVP_PKEY_get0_EC_KEY(pkey);
 	bool ret;
-	int rs_len = (EC_GROUP_order_bits(EC_KEY_get0_group(ec_key)) + 7) / 8;
+	size_t rs_len = dcrypt_openssl_ec_rs_len(ec_key);
 
 	/* digest data */
 	buffer_t *digest = t_buffer_create(64);
@@ -3819,18 +3824,18 @@ dcrypt_openssl_sign_ecdsa(struct dcrypt_private_key *key, const char *algorithm,
 
 	ECDSA_SIG_get0(ec_sig, &r, &s);
 
-	int r_len = BN_num_bytes(r);
+	size_t r_len = BN_num_bytes(r);
 	i_assert(rs_len >= r_len);
 
 	/* write r */
 	unsigned char *buf = buffer_append_space_unsafe(signature_r, rs_len);
-	if (BN_bn2bin(r, buf + (rs_len - r_len)) != r_len) {
+	if (BN_bn2bin(r, buf + (rs_len - r_len)) != (int)r_len) {
 		ret = dcrypt_openssl_error(error_r);
 	} else {
 		buf = buffer_append_space_unsafe(signature_r, rs_len);
-		int s_len = BN_num_bytes(s);
+		size_t s_len = BN_num_bytes(s);
 		i_assert(rs_len >= s_len);
-		if (BN_bn2bin(s, buf + (rs_len - s_len)) != s_len) {
+		if (BN_bn2bin(s, buf + (rs_len - s_len)) != (int)s_len) {
 			ret = dcrypt_openssl_error(error_r);
 		} else {
 			ret = TRUE;
@@ -3886,10 +3891,15 @@ dcrypt_openssl_sign(struct dcrypt_private_key *key, const char *algorithm,
 	dctx = EVP_MD_CTX_create();
 
 	/* NB! Padding is set only on RSA signatures
-	   ECDSA signatures use whatever is default */
+	   ECDSA signatures use whatever is default. A PSS salt is as long as
+	   the digest on every OpenSSL version (RFC 7518 section 3.5). */
 	if (EVP_DigestSignInit(dctx, &pctx, md, NULL, key->key) != 1 ||
 	    (EVP_PKEY_base_id(key->key) == EVP_PKEY_RSA &&
 	     EVP_PKEY_CTX_set_rsa_padding(pctx, pad) != 1) ||
+	    (EVP_PKEY_base_id(key->key) == EVP_PKEY_RSA &&
+	     pad == RSA_PKCS1_PSS_PADDING &&
+	     EVP_PKEY_CTX_set_rsa_pss_saltlen(pctx,
+					      RSA_PSS_SALTLEN_DIGEST) != 1) ||
 	    EVP_DigestSign(dctx, NULL, &siglen, data, data_len) != 1) {
 		ret = dcrypt_openssl_error(error_r);
 	} else {
@@ -3918,39 +3928,35 @@ dcrypt_openssl_verify_ecdsa(struct dcrypt_public_key *key, const char *algorithm
 			    const unsigned char *signature, size_t signature_len,
 			    bool *valid_r, const char **error_r)
 {
-        if ((signature_len % 2) != 0) {
-                *error_r = "Truncated signature";
-                return FALSE;
-        }
-
 	EVP_PKEY *pkey = key->key;
 	EC_KEY *ec_key = EVP_PKEY_get0_EC_KEY(pkey);
+	size_t rs_len = dcrypt_openssl_ec_rs_len(ec_key);
 	int ec;
+
+	if (signature_len != 2 * rs_len) {
+		*error_r = "Invalid x9.62 signature";
+		return FALSE;
+	}
 
 	/* digest data */
 	buffer_t *digest = t_buffer_create(64);
 	if (!dcrypt_openssl_digest(algorithm, data, data_len, digest, error_r))
 		return FALSE;
 
-	BIGNUM *r = BN_new();
-	BIGNUM *s = BN_new();
-	/* attempt to decode BIGNUMs */
-	if (BN_bin2bn(signature, signature_len / 2, r) == NULL) {
-		BN_free(r);
-		BN_free(s);
-		return dcrypt_openssl_error(error_r);
-	}
-	/* then next */
-	if (BN_bin2bn(CONST_PTR_OFFSET(signature, signature_len / 2),
-		      signature_len / 2, s) == NULL) {
-		BN_free(r);
-		BN_free(s);
-		return dcrypt_openssl_error(error_r);
-	}
-
-	/* reconstruct signature */
+	BIGNUM *r = BN_bin2bn(signature, rs_len, NULL);
+	BIGNUM *s = BN_bin2bn(CONST_PTR_OFFSET(signature, rs_len), rs_len,
+			      NULL);
 	ECDSA_SIG *ec_sig = ECDSA_SIG_new();
-	ECDSA_SIG_set0(ec_sig, r, s);
+
+	/* reconstruct signature. ECDSA_SIG_set0() takes the ownership of the
+	   BIGNUMs on success. */
+	if (r == NULL || s == NULL || ec_sig == NULL ||
+	    ECDSA_SIG_set0(ec_sig, r, s) != 1) {
+		BN_free(r);
+		BN_free(s);
+		ECDSA_SIG_free(ec_sig);
+		return dcrypt_openssl_error(error_r);
+	}
 
 	/* verify it */
 	ec = ECDSA_do_verify(digest->data, digest->used, ec_sig, ec_key);

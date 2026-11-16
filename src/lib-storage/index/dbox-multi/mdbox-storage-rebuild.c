@@ -104,11 +104,23 @@ mdbox_storage_rebuild_init(struct mdbox_storage *storage,
 	return ctx;
 }
 
+static void rebuild_msg_mailbox_rollback(struct rebuild_msg_mailbox *msg)
+{
+	if (msg->box == NULL)
+		return;
+	mail_index_sync_rollback(&msg->sync_ctx);
+	mailbox_free(&msg->box);
+	i_zero(msg);
+}
+
 static void
 mdbox_storage_rebuild_deinit(struct mdbox_storage_rebuild_context *ctx)
 {
 	i_assert(ctx->storage->rebuilding_storage);
 
+	/* do this while rebuilding_storage is still set, so closing the
+	   mailbox won't start another rebuild */
+	rebuild_msg_mailbox_rollback(&ctx->prev_msg);
 	ctx->storage->rebuilding_storage = FALSE;
 
 	hash_table_destroy(&ctx->guid_hash);
@@ -264,6 +276,12 @@ rebuild_rename_file(struct mdbox_storage_rebuild_context *ctx,
 
 	old_path = t_strconcat(dir, "/", fname, NULL);
 	do {
+		if (ctx->highest_file_id >= MDBOX_MAP_MAX_FILE_ID) {
+			e_error(event, "rebuild: Can't rename %s: "
+				"highest_file_id=%u is too large",
+				old_path, ctx->highest_file_id);
+			return -1;
+		}
 		new_path = t_strdup_printf("%s/"MDBOX_MAIL_FILE_FORMAT,
 					   dir, ++ctx->highest_file_id);
 		/* use link()+unlink() instead of rename() to make sure we
@@ -303,7 +321,14 @@ static int rebuild_add_file(struct mdbox_storage_rebuild_context *ctx,
 		}
 		return 0;
 	}
-	if (!seq_range_exists(&ctx->seen_file_ids, file_id)) {
+	if (file_id > MDBOX_MAP_MAX_FILE_ID) {
+		/* give the file a new ID, so new file_ids can still be
+		   allocated after it */
+		e_warning(event, "rebuild: File ID is too large: %s/%s",
+			  dir, fname);
+		if (rebuild_rename_file(ctx, dir, &fname, &file_id) < 0)
+			return -1;
+	} else if (!seq_range_exists(&ctx->seen_file_ids, file_id)) {
 		if (ctx->highest_file_id < file_id)
 			ctx->highest_file_id = file_id;
 	} else {
@@ -325,17 +350,28 @@ static int rebuild_add_file(struct mdbox_storage_rebuild_context *ctx,
 	return ret < 0 ? -1 : 0;
 }
 
-static void
+static int
 rebuild_add_missing_map_uids(struct mdbox_storage_rebuild_context *ctx,
 			     uint32_t next_uid)
 {
 	struct mdbox_rebuild_msg **msgs;
 	struct mdbox_map_mail_index_record rec;
-	unsigned int i, count;
+	unsigned int i, count, missing_count = 0;
 	uint32_t seq;
 
 	i_zero(&rec);
 	msgs = array_get_modifiable(&ctx->msgs, &count);
+	for (i = 0; i < count; i++) {
+		if (msgs[i]->map_uid == 0)
+			missing_count++;
+	}
+	if (missing_count > 0 && next_uid >= UINT32_MAX - missing_count) {
+		/* the new map_uids would wrap to 0 */
+		mail_storage_set_critical(&ctx->storage->storage.storage,
+			"mdbox map %s: next_uid=%u is too large",
+			ctx->storage->map->index_path, next_uid);
+		return -1;
+	}
 	for (i = 0; i < count; i++) {
 		if (msgs[i]->map_uid != 0)
 			continue;
@@ -351,9 +387,10 @@ rebuild_add_missing_map_uids(struct mdbox_storage_rebuild_context *ctx,
 				      ctx->storage->map->map_ext_id,
 				      &rec, NULL);
 	}
+	return 0;
 }
 
-static void rebuild_apply_map(struct mdbox_storage_rebuild_context *ctx)
+static int rebuild_apply_map(struct mdbox_storage_rebuild_context *ctx)
 {
 	struct mdbox_map *map = ctx->storage->map;
 	const struct mail_index_header *hdr;
@@ -396,11 +433,13 @@ static void rebuild_apply_map(struct mdbox_storage_rebuild_context *ctx)
 				(*pos)->seen_zero_ref_in_map = TRUE;
 		}
 	}
-	rebuild_add_missing_map_uids(ctx, hdr->next_uid);
+	if (rebuild_add_missing_map_uids(ctx, hdr->next_uid) < 0)
+		return -1;
 
 	/* afterwards we're interested in looking up map_uids.
 	   re-sort the messages to make it easier. */
 	array_sort(&ctx->msgs, mdbox_rebuild_msg_uid_cmp);
+	return 0;
 }
 
 static struct mdbox_rebuild_msg *
@@ -679,12 +718,16 @@ static int rebuild_mailboxes(struct mdbox_storage_rebuild_context *ctx)
 
 static int rebuild_msg_mailbox_commit(struct rebuild_msg_mailbox *msg)
 {
+	int ret = 0;
+
 	mail_index_sync_set_reason(msg->sync_ctx, "mdbox storage rebuild");
-	if (mail_index_sync_commit(&msg->sync_ctx) < 0)
-		return -1;
+	if (mail_index_sync_commit(&msg->sync_ctx) < 0) {
+		mailbox_set_index_error(msg->box);
+		ret = -1;
+	}
 	mailbox_free(&msg->box);
 	i_zero(msg);
-	return 0;
+	return ret;
 }
 
 static int rebuild_restore_msg(struct mdbox_storage_rebuild_context *ctx,
@@ -769,8 +812,10 @@ static int rebuild_restore_msg(struct mdbox_storage_rebuild_context *ctx,
 
 	/* switch the mailbox cache if necessary */
 	if (box != ctx->prev_msg.box && ctx->prev_msg.box != NULL) {
-		if (rebuild_msg_mailbox_commit(&ctx->prev_msg) < 0)
+		if (rebuild_msg_mailbox_commit(&ctx->prev_msg) < 0) {
+			mailbox_free(&box);
 			return -1;
+		}
 	}
 	if (ctx->prev_msg.box == NULL) {
 		ret = mail_index_sync_begin(box->index,
@@ -786,6 +831,14 @@ static int rebuild_restore_msg(struct mdbox_storage_rebuild_context *ctx,
 		ctx->prev_msg.box = box;
 		hdr = mail_index_get_header(ctx->prev_msg.view);
 		ctx->prev_msg.next_uid = hdr->next_uid;
+	}
+
+	if (ctx->prev_msg.next_uid >= UINT32_MAX) {
+		/* the new UID would wrap to 0 */
+		mailbox_set_critical(box,
+			"mdbox rebuild: next_uid=%u is too large",
+			ctx->prev_msg.next_uid);
+		return -1;
 	}
 
 	/* add the new message */
@@ -948,6 +1001,7 @@ mdbox_storage_rebuild_scan_prepare(struct mdbox_storage_rebuild_context *ctx,
 {
 	const void *data;
 	size_t data_size;
+	int ret;
 
 	if (mdbox_map_open_or_create(ctx->storage->map) < 0)
 		return -1;
@@ -956,6 +1010,27 @@ mdbox_storage_rebuild_scan_prepare(struct mdbox_storage_rebuild_context *ctx,
 	   rebuild at the same time. */
 	if (mdbox_map_atomic_lock(ctx->atomic, "mdbox storage rebuild") < 0)
 		return -1;
+
+	/* The rebuild relies on the map UIDs being ordered. Verifying them is
+	   cheap compared to the rebuild itself. This needs to be done after
+	   locking, so the locked view sees the same records. */
+	ret = mail_index_verify_records(ctx->storage->map->index);
+	if (ret <= 0) {
+		if (ret == 0) {
+			/* The invalid records were fixed with fsck, but the
+			   locked view still has the old records, so fail this
+			   rebuild. Mark the storage corrupted, so the next
+			   sync rebuilds again. */
+			mdbox_map_set_corrupted(ctx->storage->map,
+				"Invalid records - retrying rebuild");
+		} else {
+			mail_storage_set_index_error(
+				&ctx->storage->storage.storage,
+				ctx->storage->map->index);
+		}
+		mdbox_map_atomic_set_failed(ctx->atomic);
+		return -1;
+	}
 
 	/* get storage rebuild counter after locking */
 	ctx->rebuild_count = mdbox_map_get_rebuild_count(ctx->storage->map);
@@ -991,6 +1066,14 @@ mdbox_storage_rebuild_scan_prepare(struct mdbox_storage_rebuild_context *ctx,
 		       I_MIN(data_size, sizeof(ctx->orig_map_hdr)));
 	}
 	ctx->highest_file_id = ctx->orig_map_hdr.highest_file_id;
+	if (ctx->highest_file_id > MDBOX_MAP_MAX_FILE_ID) {
+		/* Corrupted. Use only the file IDs found from the storage,
+		   so new file_ids can be allocated again. */
+		e_warning(ctx->storage->storage.storage.event,
+			  "rebuild: Ignoring too large highest_file_id=%u "
+			  "in map header", ctx->highest_file_id);
+		ctx->highest_file_id = 0;
+	}
 	return 1;
 }
 
@@ -1016,8 +1099,8 @@ static int mdbox_storage_rebuild_scan(struct mdbox_storage_rebuild_context *ctx,
 			return -1;
 	}
 
-	rebuild_apply_map(ctx);
-	if (rebuild_mailboxes(ctx) < 0 ||
+	if (rebuild_apply_map(ctx) < 0 ||
+	    rebuild_mailboxes(ctx) < 0 ||
 	    rebuild_finish(ctx) < 0) {
 		mdbox_map_atomic_set_failed(ctx->atomic);
 		return -1;

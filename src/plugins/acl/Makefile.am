@@ -24,12 +24,19 @@ lib01_acl_plugin_la_LDFLAGS = -module -avoid-version
 module_LTLIBRARIES = \
 	lib01_acl_plugin.la
 
-lib01_acl_plugin_la_SOURCES = \
+# The plugin as a convenience library, reused both by the loadable module and
+# by unit tests that link the plugin statically.
+noinst_LTLIBRARIES = \
+	libacl_plugin_static.la
+
+lib01_acl_plugin_la_SOURCES =
+lib01_acl_plugin_la_LIBADD = libacl_plugin_static.la
+
+libacl_plugin_static_la_SOURCES = \
 	acl-api.c \
 	acl-attributes.c \
 	acl-backend.c \
 	acl-backend-vfile.c \
-	acl-backend-vfile-acllist.c \
 	acl-backend-vfile-update.c \
 	acl-cache.c \
 	acl-lookup-dict.c \
@@ -39,7 +46,8 @@ lib01_acl_plugin_la_SOURCES = \
 	acl-rights.c \
 	acl-settings.c \
 	acl-shared-storage.c \
-	acl-storage.c
+	acl-storage.c \
+	acl-rights-cache.c
 
 noinst_HEADERS = \
 	acl-backend-vfile.h \
@@ -55,7 +63,8 @@ pkginc_lib_HEADERS = \
 	acl-plugin.h \
 	acl-rights.h \
 	acl-settings.h \
-	acl-storage.h
+	acl-storage.h \
+	acl-rights-cache.h
 
 doveadm_module_LTLIBRARIES = \
 	lib10_doveadm_acl_plugin.la
@@ -66,15 +75,17 @@ lib10_doveadm_acl_plugin_la_SOURCES = \
 test_programs = \
 	test-acl \
 	test-acl-cache \
+	test-acl-rights-cache \
 	test-acl-vfile \
-	test-acl-vfile-update
+	test-acl-vfile-update \
+	test-acl-shared
 
 test_libs = \
-	$(module_LTLIBRARIES) \
+	libacl_plugin_static.la \
 	$(LIBDOVECOT_STORAGE) \
 	$(LIBDOVECOT)
 test_deps = \
-	$(module_LTLIBRARIES) \
+	libacl_plugin_static.la \
 	$(LIBDOVECOT_STORAGE_DEPS) \
 	$(LIBDOVECOT_DEPS)
 
@@ -86,6 +97,10 @@ test_acl_cache_SOURCES = test-acl-cache.c
 test_acl_cache_LDADD = $(test_libs)
 test_acl_cache_DEPENDENCIES = $(test_deps)
 
+test_acl_rights_cache_SOURCES = test-acl-rights-cache.c test-acl-common.c
+test_acl_rights_cache_LDADD = $(test_libs)
+test_acl_rights_cache_DEPENDENCIES = $(test_deps)
+
 test_acl_vfile_SOURCES = test-acl-vfile.c test-acl-common.c
 test_acl_vfile_LDADD = $(test_libs)
 test_acl_vfile_DEPENDENCIES = $(test_deps)
@@ -93,3 +108,7 @@ test_acl_vfile_DEPENDENCIES = $(test_deps)
 test_acl_vfile_update_SOURCES = test-acl-vfile-update.c test-acl-common.c
 test_acl_vfile_update_LDADD = $(test_libs)
 test_acl_vfile_update_DEPENDENCIES = $(test_deps)
+
+test_acl_shared_SOURCES = test-acl-shared.c
+test_acl_shared_LDADD = $(test_libs)
+test_acl_shared_DEPENDENCIES = $(test_deps)

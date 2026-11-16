@@ -370,7 +370,7 @@ index_list_try_get_metadata(struct mailbox *box,
 		if ((ret = index_list_get_cached_first_saved(box, &first_saved)) <= 0)
 			return ret;
 		metadata_r->first_save_date =
-			first_saved.timestamp == (uint32_t)-1 ? (time_t)-1 :
+			first_saved.timestamp == UINT32_MAX ? (time_t)-1 :
 			(time_t)first_saved.timestamp;
 	}
 	return 1;
@@ -437,7 +437,7 @@ index_list_update_fill_changes(struct mailbox *box,
 	changes_r->status.deleted = hdr->deleted_messages_count;
 
 	if (!mail_index_lookup_seq_range(view, hdr->first_recent_uid,
-					 (uint32_t)-1, &seq1, &seq2))
+					 UINT32_MAX, &seq1, &seq2))
 		changes_r->status.recent = 0;
 	else
 		changes_r->status.recent = seq2 - seq1 + 1;
@@ -495,11 +495,10 @@ index_list_has_changed(struct mailbox *box, struct mail_index_view *list_view,
 	i_zero(&old_status);
 	i_zero(&old_vsize);
 	memset(old_guid, 0, sizeof(old_guid));
-	bool all_cached = mailbox_list_index_status(box->list, list_view,
-						    changes->seq,
-						    CACHED_STATUS_ITEMS,
-						    &old_status, old_guid,
-						    &old_vsize, &reason);
+	(void)mailbox_list_index_status(box->list, list_view, changes->seq,
+					CACHED_STATUS_ITEMS,
+					&old_status, old_guid,
+					&old_vsize, &reason);
 
 	changes->rec_changed =
 		old_status.uidvalidity != changes->status.uidvalidity &&
@@ -522,10 +521,16 @@ index_list_has_changed(struct mailbox *box, struct mail_index_view *list_view,
 	changes->hmodseq_changed =
 		old_status.highest_modseq != changes->status.highest_modseq;
 
-	/* same for deleted count */
-	changes->deleted_changed =
-		old_status.deleted != changes->status.deleted ||
-		(changes->status.deleted == 0 && !all_cached);
+	/* write the deleted count also when its record is missing or empty,
+	   which reads as 0 above */
+	struct mailbox_status deleted_status;
+	i_zero(&deleted_status);
+	bool deleted_cached =
+		mailbox_list_index_status(box->list, list_view, changes->seq,
+					  STATUS_DELETED, &deleted_status,
+					  NULL, NULL, &reason);
+	changes->deleted_changed = !deleted_cached ||
+		deleted_status.deleted != changes->status.deleted;
 
 	if (memcmp(&old_vsize, &changes->vsize, sizeof(old_vsize)) != 0)
 		changes->vsize_changed = TRUE;
@@ -550,7 +555,7 @@ index_list_update_first_saved(struct mailbox *box,
 	int ret = 0;
 
 	i_zero(&first_saved);
-	first_saved.timestamp = (uint32_t)-1;
+	first_saved.timestamp = UINT32_MAX;
 
 	if (changes->first_uid != 0) {
 		t = mailbox_transaction_begin(box, 0, __func__);

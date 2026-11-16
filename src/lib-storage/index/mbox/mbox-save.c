@@ -15,6 +15,7 @@
 #include "istream-concat.h"
 #include "message-parser.h"
 #include "mail-user.h"
+#include "mail-copy.h"
 #include "index-mail.h"
 #include "mbox-storage.h"
 #include "mbox-file.h"
@@ -315,6 +316,14 @@ mbox_save_init_file(struct mbox_save_context *ctx,
 		if (mbox_sync(mbox, 0) < 0)
 			return -1;
 		mbox_save_init_sync(_t);
+		if (ctx->next_uid > MBOX_MAX_UID) {
+			/* The index's next_uid may have been raised without
+			   the mbox changing, in which case the sync above
+			   skipped the renumbering. Force it. */
+			if (mbox_sync(mbox, MBOX_SYNC_FORCE_SYNC) < 0)
+				return -1;
+			mbox_save_init_sync(_t);
+		}
 	}
 
 	/* the syncing above could have changed the append offset */
@@ -331,13 +340,58 @@ mbox_save_init_file(struct mbox_save_context *ctx,
 	return 0;
 }
 
+static bool
+mbox_save_header_line_may_be_from(const struct message_header_line *hdr)
+{
+	/* The header parser splits the line at the first ':', so a From_ line
+	   has either the name "From" followed by " :", or no name at all (no
+	   ':' or a too long name). The caller drops names beginning with
+	   "From " (such as "From foo: bar") with their continuation lines. */
+	if (hdr->name_len == 4) {
+		return memcmp(hdr->name, "From", 4) == 0 &&
+			hdr->middle_len > 0 && hdr->middle[0] == ' ';
+	}
+	if (hdr->name_len == 0)
+		return hdr->value_len >= 5 && memcmp(hdr->value, "From ", 5) == 0;
+	return FALSE;
+}
+
+static bool mbox_save_header_line_is_from(const struct message_header_line *hdr)
+{
+	string_t *line;
+	const unsigned char *data;
+	char *sender;
+	time_t received_time;
+	int tz;
+	bool ret;
+
+	if (hdr->continued || hdr->eoh ||
+	    !mbox_save_header_line_may_be_from(hdr))
+		return FALSE;
+
+	/* The name isn't enough: "From :x Mon Jan  1 00:00:00 2024" has the
+	   name "From". Check the whole line the way the mbox reader does. */
+	line = t_str_new(hdr->name_len + hdr->middle_len + hdr->value_len + 1);
+	str_append_data(line, hdr->name, hdr->name_len);
+	str_append_data(line, hdr->middle, hdr->middle_len);
+	str_append_data(line, hdr->value, hdr->value_len);
+	str_append_c(line, '\n');
+
+	data = str_data(line);
+	ret = mbox_from_parse(CONST_PTR_OFFSET(data, 5), str_len(line) - 5,
+			      &received_time, &tz, &sender) == 0;
+	i_free(sender);
+	return ret;
+}
+
 static void
 save_header_callback(struct header_filter_istream *input ATTR_UNUSED,
 		     struct message_header_line *hdr,
 		     bool *matched, struct mbox_save_context *ctx)
 {
 	if (hdr != NULL) {
-		if (str_begins_with(hdr->name, "From ")) {
+		if (str_begins_with(hdr->name, "From ") ||
+		    mbox_save_header_line_is_from(hdr)) {
 			/* we can't allow From_-lines in headers. there's no
 			   legitimate reason for allowing them in any case,
 			   so just drop them. */
@@ -443,6 +497,30 @@ mbox_save_alloc(struct mailbox_transaction_context *t)
 	return t->save_ctx;
 }
 
+int mbox_copy(struct mail_save_context *_ctx, struct mail *mail)
+{
+	struct mbox_save_context *ctx = MBOX_SAVECTX(_ctx);
+	struct mbox_transaction_context *t = MBOX_TRANSCTX(_ctx->transaction);
+
+	if (mail->box == _ctx->transaction->box) {
+		/* Copying within the same mbox. The source mail's stream is
+		   a view to the mailbox's shared raw mbox stream, which
+		   mbox_save_begin() may move or invalidate when it locks and
+		   syncs the mbox to get the next UID (e.g. because another
+		   session or the MDA appended mails). Reading the source mail
+		   afterwards then fails an assert in istream-raw-mbox or reads
+		   from the wrong offset. Lock and sync before the source
+		   mail's stream is opened, so it's opened against the synced
+		   mbox. */
+		if (mbox_save_init_file(ctx, t) < 0) {
+			ctx->failed = TRUE;
+			mailbox_save_cancel(&_ctx);
+			return -1;
+		}
+	}
+	return mail_storage_copy(_ctx, mail);
+}
+
 int mbox_save_begin(struct mail_save_context *_ctx, struct istream *input)
 {
 	struct mbox_save_context *ctx = MBOX_SAVECTX(_ctx);
@@ -462,6 +540,15 @@ int mbox_save_begin(struct mail_save_context *_ctx, struct istream *input)
 		ctx->failed = TRUE;
 		return -1;
 	}
+	if (ctx->synced && I_MAX(ctx->next_uid, mdata->uid) > MBOX_MAX_UID) {
+		/* the mails need to be renumbered first (see MBOX_MAX_UID).
+		   mdata->uid (a wanted UID) would become next_uid below. */
+		mail_storage_set_error(_ctx->transaction->box->storage,
+				       MAIL_ERROR_NOTPOSSIBLE,
+				       "Out of UIDs, mbox needs renumbering");
+		ctx->failed = TRUE;
+		return -1;
+	}
 
 	save_flags = mdata->flags;
 	if (mdata->uid == 0)
@@ -473,6 +560,14 @@ int mbox_save_begin(struct mail_save_context *_ctx, struct istream *input)
 		if (ctx->next_uid < mdata->uid) {
 			/* we can use the wanted UID */
 			ctx->next_uid = mdata->uid;
+		}
+		if (ctx->next_uid == UINT32_MAX) {
+			/* corrupted next_uid in index */
+			mailbox_set_critical(&ctx->mbox->box,
+				"Mailbox index next_uid=%u is too large",
+				ctx->next_uid);
+			ctx->failed = TRUE;
+			return -1;
 		}
 		if (ctx->output->offset == 0) {
 			/* writing the first mail. Insert X-IMAPbase as well. */
@@ -762,8 +857,10 @@ int mbox_transaction_save_commit_pre(struct mail_save_context *_ctx)
 
 	if (ctx->synced) {
 		_t->changes->uid_validity = ctx->uid_validity;
-		mail_index_append_finish_uids(ctx->trans, 0,
-					      &_t->changes->saved_uids);
+		/* mbox sync has already assigned valid UIDs */
+		if (mail_index_append_finish_uids(ctx->trans, 0,
+						  &_t->changes->saved_uids) < 0)
+			i_unreached();
 
 		mail_index_update_header(ctx->trans,
 			offsetof(struct mail_index_header, next_uid),

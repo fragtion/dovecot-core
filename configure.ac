@@ -334,6 +334,7 @@ AC_CHECK_HEADERS(strings.h stdint.h unistd.h dirent.h malloc.h \
 CC_CLANG
 CC_STRICT_BOOL
 AC_LD_WHOLE_ARCHIVE
+DC_LD_BSYMBOLIC_FUNCTIONS
 DC_DOVECOT_HARDENING
 DC_DOVECOT_FUZZER
 DC_DOVECOT_CFLAGS
@@ -384,7 +385,6 @@ DOVECOT_GLIBC
 DOVECOT_SCHED
 
 dnl * OS specific options
-DC_PLUGIN_DEPS
 case "$host_os" in
 	linux*|darwin*)
 		AC_DEFINE(PROCTITLE_HACK,, [Define if process title can be changed by modifying argv])
@@ -780,7 +780,7 @@ libdovecot_headers=
 libdovecot_c_files=
 non_libdovecot_headers=
 non_libdovecot_c_files=
-all_files=`find $srcdir/src -name '*.[[ch]]' | $GREP -v '/src/config/all-settings.c' | $GREP -v '/src/lib-settings/' | $GREP -v '/test-' | xargs $GREP -e 'struct setting_parser_info [[a-z]]' -e 'struct service_settings [[a-z]]' -e '<settings checks>' | $SED 's/:.*//' | sort | uniq`
+all_files=`find $srcdir/src -name '*.[[ch]]' | $GREP -v '/src/config/all-settings.c' | $GREP -v '/src/lib-settings/' | $GREP -v '/test-' | xargs $GREP -e 'struct setting_parser_info [[a-z]]' -e 'struct setting_plugin_info [[a-z]]' -e 'struct service_settings [[a-z]]' -e '<settings checks>' | $SED 's/:.*//' | sort | uniq`
 for file in $all_files; do
   dir=`echo "$file" | $SED 's:/[[^/]]*$::'`
   if echo "$libdovecot_dirs" | $GREP "$dir" >/dev/null; then

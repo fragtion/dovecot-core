@@ -855,15 +855,22 @@ void doveadm_mail_init_finish(void)
 	mod_set.require_init_funcs = TRUE;
 	mod_set.debug = doveadm_debug;
 	mod_set.binary_name = "doveadm";
+	mod_set.get_required_plugins = mail_storage_service_get_required_plugins;
 
 	/* load all configured mail plugins */
 	if (array_is_created(&doveadm_settings->mail_plugins) &&
 	    array_not_empty(&doveadm_settings->mail_plugins)) {
+		const char *const *plugins =
+			settings_boollist_get(&doveadm_settings->mail_plugins);
+		const char *error;
+
+		if (mail_storage_service_check_mail_plugins(plugins,
+							    &error) < 0)
+			i_fatal("%s", error);
 		mail_storage_service_modules =
 			module_dir_load_missing(mail_storage_service_modules,
 						doveadm_settings->mail_plugin_dir,
-						settings_boollist_get(&doveadm_settings->mail_plugins),
-						&mod_set);
+						plugins, &mod_set);
 	}
 	/* keep mail_storage_init() referenced so that its _deinit() doesn't
 	   try to free doveadm plugins' hooks too early. */

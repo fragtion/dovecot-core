@@ -102,40 +102,24 @@ module_check_wrong_binary_dependency(const struct module_dir_load_settings *set,
 }
 
 static bool
-module_check_missing_plugin_dependencies(const struct module_dir_load_settings *set,
-					 struct module *module,
-					 struct module *all_modules,
-					 const char **error_r)
+module_check_required_plugins(const struct module_dir_load_settings *set,
+			      const char *name, struct module *all_modules,
+			      const char **error_r)
 {
-	const char **deps;
-	struct module *m;
-	string_t *errmsg;
-	size_t len;
+	const char *const *required;
 
-	deps = dlsym(module->handle,
-		     t_strconcat(module->name, "_dependencies", NULL));
-	if (deps == NULL)
+	if (set->get_required_plugins == NULL)
 		return TRUE;
-
-	for (; *deps != NULL; deps++) {
-		len = strlen(*deps);
-		for (m = all_modules; m != NULL; m = m->next) {
-			if (strncmp(m->name, *deps, len) == 0 &&
-			    (m->name[len] == '\0' ||
-			     strcmp(m->name+len, "_plugin") == 0))
-				break;
-		}
-		if (m == NULL) {
-			errmsg = t_str_new(128);
-			str_printfa(errmsg, "Plugin %s must be loaded also",
-				    *deps);
-			if (set->setting_name != NULL) {
-				str_printfa(errmsg,
-					    " (you must set: %s=$%s %s)",
-					    set->setting_name,
-					    set->setting_name, *deps);
-			}
-			*error_r = str_c(errmsg);
+	required = set->get_required_plugins(module_name_drop_suffix(name),
+					     set->get_required_plugins_context);
+	if (required == NULL)
+		return TRUE;
+	for (; *required != NULL; required++) {
+		if (module_dir_find(all_modules, *required) == NULL) {
+			*error_r = t_strdup_printf(
+				"Plugin %s must be loaded before this plugin "
+				"(plugins are loaded in filename order)",
+				*required);
 			return FALSE;
 		}
 	}
@@ -191,6 +175,11 @@ module_load(const char *path, const char *name,
 	*module_r = NULL;
 	*error_r = NULL;
 
+	/* Check this before dlopen(), which would fail with a less clear
+	   error about undefined symbols. */
+	if (!module_check_required_plugins(set, name, all_modules, error_r))
+		return -1;
+
 	if (set->ignore_dlopen_errors) {
 		handle = quiet_dlopen(path, RTLD_GLOBAL | RTLD_NOW);
 		if (handle == NULL) {
@@ -209,8 +198,12 @@ module_load(const char *path, const char *name,
 			*error_r = t_strdup_printf("dlopen() failed: %s",
 						   dlerror());
 #ifdef RTLD_LAZY
-			/* try to give a better error message by lazily loading
-			   the plugin and checking its dependencies */
+			/* The plugin probably has undefined symbols. Try to
+			   give a better error message by lazily loading it
+			   and checking its ABI version and binary dependency.
+			   If those are fine, the dlopen() error is used.
+			   Note that undefined data symbols still fail the
+			   lazy loading. */
 			handle = dlopen(path, RTLD_LAZY);
 			if (handle == NULL)
 				return -1;
@@ -255,9 +248,6 @@ module_load(const char *path, const char *name,
 			"Module doesn't have %s function",
 			module->init == NULL ? "init" : "deinit");
 	} else if (!module_check_wrong_binary_dependency(set, module, error_r)) {
-		/* failed */
-	} else if (!module_check_missing_plugin_dependencies(set, module,
-							     all_modules, error_r)) {
 		/* failed */
 	}
 
@@ -381,7 +371,7 @@ module_dir_load_real(struct module **_modules,
 {
 	DIR *dirp;
 	struct dirent *d;
-	const char *name, *p, *error, *const *names_p;
+	const char *name, *p, *error, *load_error = NULL, *const *names_p;
 	struct module *modules, *module, **module_pos, *old_modules = *_modules;
 	unsigned int i, count;
 	ARRAY_TYPE(const_string) names;
@@ -461,8 +451,9 @@ module_dir_load_real(struct module **_modules,
 			if (ret >= 0)
 				;
 			else if (module_names != NULL) {
-				*error_r = t_strdup_printf("Couldn't load required plugin %s: %s",
-							   path, error);
+				load_error = t_strdup_printf(
+					"Couldn't load required plugin %s: %s",
+					path, error);
 				i = count;
 			} else {
 				i_error("Couldn't load plugin %s: %s", path, error);
@@ -473,8 +464,10 @@ module_dir_load_real(struct module **_modules,
 			*module_pos = module;
 			module_pos = &module->next;
 		}
-	} T_END;
+	} T_END_PASS_STR_IF(load_error != NULL, &load_error);
 	pool_unref(&pool);
+	if (load_error != NULL)
+		*error_r = load_error;
 
 	if (module_names != NULL && *error_r == NULL && !set->ignore_missing) {
 		/* make sure all modules were found */
@@ -625,4 +618,9 @@ static const char *module_name_drop_suffix(const char *name)
 const char *module_get_plugin_name(struct module *module)
 {
 	return module_name_drop_suffix(module->name);
+}
+
+const char *module_file_get_plugin_name(const char *fname)
+{
+	return module_name_drop_suffix(module_file_get_name(fname));
 }

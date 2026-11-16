@@ -9,6 +9,7 @@
 #include "str-sanitize.h"
 #include "compression.h"
 #include "imap-util.h"
+#include "imap-reply.h"
 #include "mail-search-build.h"
 #include "mail-namespace.h"
 #include "mail-storage-private.h"
@@ -148,8 +149,7 @@ imap_state_export_check_delayed_expunges(struct client *client,
 	return 1;
 }
 
-static int
-imap_state_export_check_nonidle(struct client *client, const char **error_r)
+int imap_state_export_check_nonidle(struct client *client, const char **error_r)
 {
 	i_assert(!client->syncing);
 
@@ -460,14 +460,9 @@ int imap_state_export_base(struct client *client, bool internal,
 		buffer_append(dest, namespaces, strlen(namespaces) + 1);
 	}
 
-	if (client->mailbox != NULL) {
-		ret = imap_state_export_mailbox(dest, client,
-						client->mailbox, error_r);
-		if (ret <= 0)
-			return ret;
-	}
-
-	/* IMAP features */
+	/* IMAP features. These must be imported before the mailbox, so the
+	   mailbox is opened with them and the unhibernation catch-up uses
+	   them, e.g. VANISHED instead of EXPUNGE with QRESYNC. */
 	const char *const *features = client_enabled_features(client);
 	if (features != NULL) {
 		for (unsigned int i = 0; features[i] != NULL; i++) {
@@ -475,6 +470,14 @@ int imap_state_export_base(struct client *client, bool internal,
 			buffer_append(dest, features[i], strlen(features[i])+1);
 		}
 	}
+
+	if (client->mailbox != NULL) {
+		ret = imap_state_export_mailbox(dest, client,
+						client->mailbox, error_r);
+		if (ret <= 0)
+			return ret;
+	}
+
 	if (internal) {
 		if (client->id_logged)
 			buffer_append_c(dest, IMAP_STATE_TYPE_ID_LOGGED);
@@ -637,7 +640,7 @@ import_send_expunges(struct client *client,
 			str_printfa(str, "* %u EXPUNGE", seqs[i-1]);
 			client_send_line(client, str_c(str));
 		}
-	} else {
+	} else if (expunge_count > 0) {
 		str = str_new(default_pool, 128);
 		str_append(str, "* VANISHED ");
 		imap_write_seq_range(str, &expunged_uids);
@@ -1093,7 +1096,7 @@ void imap_state_import_idle_cmd_tag(struct client *client, const char *tag)
 	} else {
 		/* we're finishing IDLE command */
 		client_send_line(client, t_strdup_printf(
-			"%s %s Idle completed.", tag,
+			"%s %s "IMAP_REPLY_IDLE_COMPLETED, tag,
 			client->state_import_bad_idle_done ? "BAD" : "OK"));
 	}
 }

@@ -52,7 +52,6 @@ int mail_send_rejection(struct mail_deliver_context *ctx,
 	struct mail_user *user = ctx->rcpt_user;
 	struct mail *mail = ctx->src_mail;
 	struct istream *input;
-	struct smtp_submit_input smtp_input;
 	struct smtp_submit *smtp_submit;
 	struct ostream *output;
 	const struct message_address *postmaster_addr;
@@ -98,8 +97,17 @@ int mail_send_rejection(struct mail_deliver_context *ctx,
 		.event = ctx->event,
 	};
 
-	i_zero(&smtp_input);
-	smtp_submit = smtp_submit_init_simple(&smtp_input, ctx->smtp_set, NULL);
+	struct smtp_submit_input smtp_input = {
+		.event_parent = ctx->event,
+	};
+	if (smtp_submit_init_simple(&smtp_input, NULL,
+				    &smtp_submit, &error) < 0) {
+		e_error(ctx->event,
+			"msgid=%s: Failed to send rejection: %s",
+			orig_msgid == NULL ? "" : str_sanitize(orig_msgid, 80),
+			error);
+		return -1;
+	}
 	smtp_submit_add_rcpt(smtp_submit, return_addr);
 	output = smtp_submit_send(smtp_submit);
 

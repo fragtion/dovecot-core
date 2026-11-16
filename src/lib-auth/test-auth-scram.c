@@ -253,14 +253,13 @@ test_auth_client_output(struct backend_context *bctx,
  * Success
  */
 
-static void
-test_auth_success_one(const struct hash_method *hmethod, const char *authid,
-		      const char *authzid, const char *password,
-		      const char *cbind_type)
+static struct backend_context *
+test_auth_init(const struct hash_method *hmethod, const char *authid,
+	       const char *authzid, const char *password,
+	       const char *cbind_type)
 {
 	struct backend_context *bctx;
 	pool_t pool;
-	int ret;
 
 	pool = pool_alloconly_create_clean(
 		MEMPOOL_GROWING"auth_scram_client", 1024);
@@ -310,6 +309,28 @@ test_auth_success_one(const struct hash_method *hmethod, const char *authid,
 	}
 
 	auth_scram_server_init(&bctx->asserver, pool, &server_set, &backend);
+	return bctx;
+}
+
+static void test_auth_deinit(struct backend_context **_bctx)
+{
+	struct backend_context *bctx = *_bctx;
+	pool_t pool = bctx->pool;
+
+	*_bctx = NULL;
+	auth_scram_server_deinit(&bctx->asserver);
+	auth_scram_client_deinit(&bctx->asclient);
+	pool_unref(&pool);
+}
+
+static void
+test_auth_success_one(const struct hash_method *hmethod, const char *authid,
+		      const char *authzid, const char *password,
+		      const char *cbind_type)
+{
+	struct backend_context *bctx =
+		test_auth_init(hmethod, authid, authzid, password, cbind_type);
+	int ret;
 
 	while (!test_has_failed()) {
 		const unsigned char *data;
@@ -329,6 +350,7 @@ test_auth_success_one(const struct hash_method *hmethod, const char *authid,
 
 		server_end = auth_scram_server_output(&bctx->asserver,
 						      &data, &data_size);
+		test_assert(!auth_scram_client_is_finished(&bctx->asclient));
 		ret = test_auth_client_input(bctx, data, data_size, &error);
 		test_out_reason(t_strdup_printf("client input success (C=%u)",
 						bctx->cycle),
@@ -340,11 +362,9 @@ test_auth_success_one(const struct hash_method *hmethod, const char *authid,
 			break;
 		bctx->cycle++;
 	}
+	test_assert(auth_scram_client_is_finished(&bctx->asclient));
 
-	auth_scram_server_deinit(&bctx->asserver);
-	auth_scram_client_deinit(&bctx->asclient);
-
-	pool_unref(&pool);
+	test_auth_deinit(&bctx);
 }
 
 static void test_auth_success(void)
@@ -497,6 +517,7 @@ test_auth_server_error_one(const struct hash_method *hmethod,
 			break;
 		bctx->cycle++;
 	}
+	test_assert(!auth_scram_client_is_finished(&bctx->asclient));
 
 	auth_scram_server_deinit(&bctx->asserver);
 	auth_scram_client_deinit(&bctx->asclient);
@@ -601,11 +622,114 @@ static void test_auth_server_error(void)
 	test_end();
 }
 
+/*
+ * Unexpected server input
+ */
+
+static const struct {
+	const char *name;
+	/* Input before anything has been output */
+	bool input_first;
+	/* Number of complete client/server round trips to run */
+	unsigned int rounds;
+	/* Send the final empty client response */
+	bool finish;
+	const char *error;
+} unexpected_input_tests[] = {
+	{
+		.name = "before client-first output",
+		.input_first = TRUE,
+		.error = "Server sent unexpected data",
+	},
+	{
+		.name = "after server-first",
+		.rounds = 1,
+		.error = "Server sent unexpected data",
+	},
+	{
+		.name = "after server-final",
+		.rounds = 2,
+		.error = "Server didn't finish authentication",
+	},
+	{
+		.name = "after authentication",
+		.rounds = 2,
+		.finish = TRUE,
+		.error = "Server didn't finish authentication",
+	},
+};
+
+static void test_auth_unexpected_input(void)
+{
+	test_begin("auth unexpected input");
+	for (unsigned int i = 0; i < N_ELEMENTS(unexpected_input_tests); i++) {
+		const char *error = NULL;
+		struct backend_context *bctx;
+		const unsigned char *data;
+		size_t data_size;
+
+		bctx = test_auth_init(&hash_method_sha1, "user", NULL, "frop",
+				      NULL);
+
+		if (unexpected_input_tests[i].input_first) {
+			test_assert_idx(test_auth_client_input(
+				bctx, uchar_empty_ptr, 0, &error) == 0, i);
+		}
+		for (unsigned int r = 0;
+		     r < unexpected_input_tests[i].rounds; r++) {
+			enum auth_scram_server_error error_code;
+
+			test_auth_client_output(bctx, &data, &data_size);
+			test_assert_idx(auth_scram_server_input(
+				&bctx->asserver, data, data_size,
+				&error_code, &error) >= 0, i);
+			(void)auth_scram_server_output(&bctx->asserver, &data,
+						       &data_size);
+			test_assert_idx(test_auth_client_input(
+				bctx, data, data_size, &error) >= 0, i);
+		}
+		if (unexpected_input_tests[i].finish) {
+			test_auth_client_output(bctx, &data, &data_size);
+			test_assert_idx(data_size == 0, i);
+		}
+
+		error = NULL;
+		test_assert_idx(test_auth_client_input(
+			bctx, uchar_empty_ptr, 0, &error) < 0, i);
+		test_assert_strcmp_idx(error, unexpected_input_tests[i].error, i);
+
+		test_auth_deinit(&bctx);
+	}
+	test_end();
+}
+
+static void test_auth_nonempty_initial_input(void)
+{
+	static const unsigned char data[] = "n,,n=user,r=abc";
+	struct backend_context *bctx;
+	const char *error = NULL;
+
+	test_begin("auth non-empty initial input");
+	bctx = test_auth_init(&hash_method_sha1, "user", NULL, "frop", NULL);
+
+	test_assert(test_auth_client_input(bctx, data, sizeof(data) - 1,
+					   &error) < 0);
+	test_assert_strcmp(error, "Server sent non-empty initial response");
+	/* the rejected input doesn't change the state */
+	test_assert(test_auth_client_input(bctx, uchar_empty_ptr, 0,
+					   &error) == 0);
+
+	test_auth_deinit(&bctx);
+	test_end();
+}
+
 int main(void)
 {
 	static void (*const test_functions[])(void) = {
 		test_auth_success,
 		test_auth_server_error,
+		test_auth_unexpected_input,
+		test_auth_nonempty_initial_input,
 		NULL
 	};
 	return test_run(test_functions);

@@ -5,6 +5,7 @@
 #include "array.h"
 #include "safe-memset.h"
 #include "settings.h"
+#include "module-dir.h"
 #include "dsasl-client-private.h"
 
 struct event_category event_category_sasl_client = {
@@ -71,6 +72,7 @@ void dsasl_client_unref(struct dsasl_client **_client)
 		return;
 
 	array_free(&client->mechanisms);
+	module_dir_unload(&client->modules);
 	event_unref(&client->event);
 	pool_unref(&client->pool);
 }
@@ -149,6 +151,13 @@ dsasl_client_require_mech(struct dsasl_client *client, const char *mech_name,
 	*error_r = NULL;
 
 	mech = dsasl_client_mech_find(client, mech_name);
+	if (mech == NULL) {
+		/* The mechanisms in modules are loaded only when they are
+		   used. */
+		if (dsasl_client_module_load_mech(client, mech_name, error_r) < 0)
+			return -1;
+		mech = dsasl_client_mech_find(client, mech_name);
+	}
 	if (mech != NULL) {
 		*mech_r = mech;
 		return 0;
@@ -228,6 +237,62 @@ int dsasl_client_check_settings(struct dsasl_client *client,
 
 	settings_free(set);
 	return 0;
+}
+
+int dsasl_client_mech_name_settings_equal(
+	const char *mech_name, dsasl_client_mech_settings_equal_t *equal_func,
+	struct event *event1, struct event *event2, const char **error_r)
+{
+	struct event *mech_event1, *mech_event2;
+	int ret;
+
+	/* Use the same filter as the sessions of the mechanism do. */
+	mech_event1 = event_create(event1);
+	settings_event_add_list_filter_name(mech_event1,
+					    CLIENT_AUTH_SETTINGS_FILTER,
+					    mech_name);
+	mech_event2 = event_create(event2);
+	settings_event_add_list_filter_name(mech_event2,
+					    CLIENT_AUTH_SETTINGS_FILTER,
+					    mech_name);
+	ret = equal_func(mech_event1, mech_event2, error_r);
+	event_unref(&mech_event1);
+	event_unref(&mech_event2);
+	return ret;
+}
+
+int dsasl_client_mechs_settings_equal(
+	const struct dsasl_client_mech *const *mechs, unsigned int count,
+	struct event *event1, struct event *event2, const char **error_r)
+{
+	int ret;
+
+	for (unsigned int i = 0; i < count; i++) {
+		if (mechs[i]->settings_equal == NULL)
+			continue;
+		ret = dsasl_client_mech_name_settings_equal(
+			mechs[i]->name, mechs[i]->settings_equal,
+			event1, event2, error_r);
+		if (ret <= 0)
+			return ret;
+	}
+	return 1;
+}
+
+int dsasl_client_settings_equal(struct event *event1, struct event *event2,
+				const char **error_r)
+{
+	int ret;
+
+	ret = client_auth_settings_equal(event1, event2, error_r);
+	if (ret <= 0)
+		return ret;
+	ret = dsasl_client_mechs_settings_equal(core_mechanisms,
+						N_ELEMENTS(core_mechanisms),
+						event1, event2, error_r);
+	if (ret <= 0)
+		return ret;
+	return dsasl_client_module_settings_equal(event1, event2, error_r);
 }
 
 /*
@@ -667,6 +732,25 @@ dsasl_client_session_output(struct dsasl_client_session *session,
 
 	return msession->mech->auth_output(msession, output_r, output_len_r,
 					   error_r);
+}
+
+bool dsasl_client_session_is_finished(struct dsasl_client_session *session)
+{
+	struct dsasl_client_mech_session *msession = session->mech;
+
+	if (msession->mech->auth_is_finished == NULL)
+		return TRUE;
+	return msession->mech->auth_is_finished(msession);
+}
+
+int dsasl_client_session_verify_success(struct dsasl_client_session *session,
+					const char **error_r)
+{
+	if (!dsasl_client_session_is_finished(session)) {
+		*error_r = "Server accepted authentication before the SASL authentication exchange finished";
+		return -1;
+	}
+	return 0;
 }
 
 int dsasl_client_session_get_result(struct dsasl_client_session *session,

@@ -168,8 +168,8 @@ struct smtp_client_connection {
 	in_port_t port;
 	enum smtp_client_connection_ssl_mode ssl_mode;
 
-	struct smtp_client_settings set;
-	char *password;
+	struct smtp_client_parameters params;
+	const struct smtp_client_settings *set;
 	ARRAY(struct smtp_client_capability_extra) extra_capabilities;
 
 	pool_t cap_pool;
@@ -202,6 +202,7 @@ struct smtp_client_connection {
 	struct istream *raw_input;
 	struct ostream *raw_output, *dot_output;
 
+	const struct ssl_iostream_settings *ssl_set;
 	struct ssl_iostream_context *ssl_ctx;
 	struct ssl_iostream *ssl_iostream;
 
@@ -232,6 +233,7 @@ struct smtp_client_connection {
 
 	bool host_is_ip:1;
 	bool old_smtp:1;
+	bool no_authentication:1;
 	bool authenticated:1;
 	bool xclient_sent:1;
 	bool xclient_rejected:1;
@@ -250,11 +252,11 @@ struct smtp_client_connection {
 struct smtp_client {
 	pool_t pool;
 
-	struct smtp_client_settings set;
-
 	struct event *event;
 	struct ioloop *ioloop;
+	const struct ssl_iostream_settings *ssl_set;
 	struct ssl_iostream_context *ssl_ctx;
+	struct dns_client *dns_client;
 
 	struct connection_list *conn_list;
 
@@ -311,7 +313,7 @@ void smtp_client_connection_send_xclient(struct smtp_client_connection *conn);
 
 void smtp_client_connection_fail(struct smtp_client_connection *conn,
 				 unsigned int status, const char *error,
-				 const char *user_error) ATTR_NULL(3);
+				 const char *user_error);
 
 void smtp_client_connection_handle_output_error(
 	struct smtp_client_connection *conn);

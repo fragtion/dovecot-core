@@ -44,7 +44,18 @@ mail_index_sync_update_log_offset(struct mail_index_sync_map_ctx *ctx,
 		}
 		map->hdr.log_file_seq = prev_seq;
 	} else {
-		i_assert(ctx->view->index->log->head->hdr.file_seq == prev_seq);
+		const struct mail_transaction_log_file *head =
+			ctx->view->index->log->head;
+
+		if (head->hdr.file_seq != prev_seq) {
+			/* Syncing stopped before reaching the head log file,
+			   because an older log file was corrupted. Skip the
+			   rest of it and continue from the beginning of the
+			   head log file. */
+			i_assert(ctx->log_corrupted);
+			prev_seq = head->hdr.file_seq;
+			prev_offset = head->hdr.hdr_size;
+		}
 		if (map->hdr.log_file_seq != prev_seq) {
 			map->hdr.log_file_seq = prev_seq;
 			map->hdr.log_file_tail_offset = 0;
@@ -477,12 +488,21 @@ static int sync_flag_update(const struct mail_transaction_flag_update *u,
 	return 1;
 }
 
+static void
+mail_index_header_restore_range(struct mail_index_header *hdr,
+				const struct mail_index_header *orig_hdr,
+				size_t start_offset, size_t end_offset)
+{
+	memcpy(PTR_OFFSET(hdr, start_offset),
+	       CONST_PTR_OFFSET(orig_hdr, start_offset),
+	       end_offset - start_offset);
+}
+
 static int sync_header_update(const struct mail_transaction_header_update *u,
 			      struct mail_index_sync_map_ctx *ctx)
 {
 	struct mail_index_map *map = ctx->view->map;
-	uint32_t orig_log_file_tail_offset = map->hdr.log_file_tail_offset;
-	uint32_t orig_next_uid = map->hdr.next_uid;
+	const struct mail_index_header orig_hdr = map->hdr;
 
 	if (u->offset >= map->hdr.base_header_size ||
 	    u->offset + u->size > map->hdr.base_header_size) {
@@ -504,17 +524,37 @@ static int sync_header_update(const struct mail_transaction_header_update *u,
 		       u + 1, sizeof(map->hdr) - u->offset);
 	}
 
-	if (map->hdr.next_uid < orig_next_uid) {
+	if (map->hdr.next_uid < orig_hdr.next_uid) {
 		/* next_uid update tried to shrink its value. this can happen
 		   in some race conditions with e.g. with dsync, so just
 		   silently ignore it. */
-		map->hdr.next_uid = orig_next_uid;
+		map->hdr.next_uid = orig_hdr.next_uid;
 	}
 
 	/* the tail offset updates are intended for internal transaction
 	   log handling. we'll update the offset in the header only when
 	   the sync is finished. */
-	map->hdr.log_file_tail_offset = orig_log_file_tail_offset;
+	map->hdr.log_file_tail_offset = orig_hdr.log_file_tail_offset;
+
+	/* These fields describe the index file's structure or they're
+	   maintained internally. They're never changed with header updates,
+	   so a change can only come from a corrupted log. Ignore them, since
+	   e.g. a changed header_size or messages_count would break the
+	   map. */
+	/* major_version .. indexid */
+	mail_index_header_restore_range(&map->hdr, &orig_hdr, 0,
+		offsetof(struct mail_index_header, flags));
+	/* messages_count .. deleted_messages_count */
+	mail_index_header_restore_range(&map->hdr, &orig_hdr,
+		offsetof(struct mail_index_header, messages_count),
+		offsetof(struct mail_index_header, first_recent_uid));
+	/* log_file_seq .. log_file_head_offset */
+	mail_index_header_restore_range(&map->hdr, &orig_hdr,
+		offsetof(struct mail_index_header, log_file_seq),
+		offsetof(struct mail_index_header, unused_old_sync_size_part1));
+	/* keep hdr_copy_buf in sync with the restored fields */
+	buffer_write(map->hdr_copy_buf, 0, &map->hdr,
+		     I_MIN(sizeof(map->hdr), map->hdr.base_header_size));
 	return 1;
 }
 
@@ -719,7 +759,7 @@ mail_index_sync_record_real(struct mail_index_sync_map_ctx *ctx,
 		const struct mail_transaction_ext_rec_update *rec;
 		unsigned int i, record_size;
 
-		if (ctx->cur_ext_map_idx == (uint32_t)-1) {
+		if (ctx->cur_ext_map_idx == UINT32_MAX) {
 			mail_index_sync_set_corrupted(ctx,
 				"Extension record updated "
 				"without intro prefix");
@@ -754,7 +794,7 @@ mail_index_sync_record_real(struct mail_index_sync_map_ctx *ctx,
 	case MAIL_TRANSACTION_EXT_ATOMIC_INC: {
 		const struct mail_transaction_ext_atomic_inc *rec, *end;
 
-		if (ctx->cur_ext_map_idx == (uint32_t)-1) {
+		if (ctx->cur_ext_map_idx == UINT32_MAX) {
 			mail_index_sync_set_corrupted(ctx,
 				"Extension record updated "
 				"without intro prefix");
@@ -843,7 +883,7 @@ void mail_index_sync_map_init(struct mail_index_sync_map_ctx *sync_map_ctx,
 {
 	i_zero(sync_map_ctx);
 	sync_map_ctx->view = view;
-	sync_map_ctx->cur_ext_map_idx = (uint32_t)-1;
+	sync_map_ctx->cur_ext_map_idx = UINT32_MAX;
 	sync_map_ctx->type = type;
 	sync_map_ctx->modseq_ctx = mail_index_modseq_sync_begin(sync_map_ctx);
 
@@ -972,7 +1012,7 @@ int mail_index_sync_map(struct mail_index_map **_map,
 	view = mail_index_view_open_with_map(index, map);
 	ret = mail_transaction_log_view_set(view->log_view,
 					    map->hdr.log_file_seq, start_offset,
-					    (uint32_t)-1, UOFF_T_MAX,
+					    UINT32_MAX, UOFF_T_MAX,
 					    &reset, &reason);
 	if (ret <= 0) {
 		mail_index_view_close(&view);
@@ -991,6 +1031,7 @@ int mail_index_sync_map(struct mail_index_map **_map,
 
 	mail_transaction_log_get_head(index->log, &prev_seq, &prev_offset);
 	if (prev_seq != map->hdr.log_file_seq ||
+	    prev_offset < map->hdr.log_file_tail_offset ||
 	    prev_offset - map->hdr.log_file_tail_offset >
 	    		index->optimization_set.index.rewrite_min_log_bytes) {
 		/* we're reading more from log than we would have preferred.
@@ -1044,6 +1085,7 @@ int mail_index_sync_map(struct mail_index_map **_map,
 		/* we'll just skip over broken entries */
 		(void)mail_index_sync_record(&sync_map_ctx, thdr, tdata);
 	}
+	sync_map_ctx.log_corrupted = ret < 0;
 	map = view->map;
 
 	if (had_dirty)

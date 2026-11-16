@@ -117,6 +117,85 @@ static void test_mail_index_log_refresh_rotation_race(void)
 	test_end();
 }
 
+static void test_mail_index_log_rotate_max_file_seq(void)
+{
+	struct mail_index *index;
+	struct mail_index_view *view;
+	struct mail_index_transaction *trans;
+	const char *path;
+	uint32_t file_seq, seq;
+	uoff_t file_offset;
+	int fd;
+
+	test_begin("mail index log rotate max file_seq");
+	index = test_mail_index_init(TRUE);
+	view = mail_index_view_open(index);
+	trans = mail_index_transaction_begin(view,
+			MAIL_INDEX_TRANSACTION_FLAG_EXTERNAL);
+	uint32_t uid_validity = 1234;
+	mail_index_update_header(trans,
+		offsetof(struct mail_index_header, uid_validity),
+		&uid_validity, sizeof(uid_validity), TRUE);
+	mail_index_append(trans, 1, &seq);
+	test_assert(mail_index_transaction_commit(&trans) == 0);
+	mail_index_view_close(&view);
+
+	/* write dovecot.index without rotating */
+	test_assert(mail_transaction_log_sync_lock(index->log, "test",
+		&file_seq, &file_offset) == 0);
+	mail_index_write(index, FALSE, "test");
+	mail_transaction_log_sync_unlock(index->log, "test");
+	test_mail_index_close(&index);
+
+	/* set the highest allowed file_seq to both the log and the index */
+	file_seq = MAIL_TRANSACTION_LOG_MAX_FILE_SEQ;
+	path = t_strconcat(test_mail_index_get_dir(),
+			   "/test.dovecot.index.log", NULL);
+	fd = open(path, O_RDWR);
+	if (fd == -1)
+		i_fatal("open(%s) failed: %m", path);
+	test_assert(pwrite(fd, &file_seq, sizeof(file_seq),
+		offsetof(struct mail_transaction_log_header, file_seq)) ==
+		sizeof(file_seq));
+	i_close_fd(&fd);
+	path = t_strconcat(test_mail_index_get_dir(),
+			   "/test.dovecot.index", NULL);
+	fd = open(path, O_RDWR);
+	if (fd == -1)
+		i_fatal("open(%s) failed: %m", path);
+	test_assert(pwrite(fd, &file_seq, sizeof(file_seq),
+		offsetof(struct mail_index_header, log_file_seq)) ==
+		sizeof(file_seq));
+	i_close_fd(&fd);
+
+	index = test_mail_index_open(FALSE);
+	test_assert(index->log->head->hdr.file_seq ==
+		    MAIL_TRANSACTION_LOG_MAX_FILE_SEQ);
+
+	/* rotating must not create a log file older than the head */
+	test_assert(mail_transaction_log_sync_lock(index->log, "test",
+		&file_seq, &file_offset) == 0);
+	mail_index_write(index, TRUE, "test");
+	mail_transaction_log_sync_unlock(index->log, "test");
+	test_assert(index->log->head->hdr.file_seq >
+		    MAIL_TRANSACTION_LOG_MAX_FILE_SEQ);
+
+	/* changes written to the new log file are seen */
+	view = mail_index_view_open(index);
+	trans = mail_index_transaction_begin(view,
+			MAIL_INDEX_TRANSACTION_FLAG_EXTERNAL);
+	mail_index_append(trans, 2, &seq);
+	test_assert(mail_index_transaction_commit(&trans) == 0);
+	mail_index_view_close(&view);
+	test_assert(mail_index_refresh(index) == 0);
+	view = mail_index_view_open(index);
+	test_assert(mail_index_view_get_messages_count(view) == 2);
+	mail_index_view_close(&view);
+
+	test_mail_index_deinit(&index);
+	test_end();
+}
+
 static void
 test_mail_index_new_extension_rotate_write(struct mail_index *index2,
 					   uint32_t uid)
@@ -529,17 +608,888 @@ static void test_mail_index_map_fsck_fail_restores_map(void)
 	test_end();
 }
 
+static void
+test_mail_index_sync_add_flag(struct mail_index *index, uint32_t seq,
+			      enum mail_flags flag)
+{
+	struct mail_index_view *view;
+	struct mail_index_transaction *trans;
+
+	view = mail_index_view_open(index);
+	trans = mail_index_transaction_begin(view, 0);
+	mail_index_update_flags(trans, seq, MODIFY_ADD, flag);
+	test_assert(mail_index_transaction_commit(&trans) == 0);
+	mail_index_view_close(&view);
+}
+
+/* Read all the sync records. Returns the number of records. If there was
+   exactly one record, its first UID is returned in uid_r. */
+static unsigned int
+test_mail_index_sync_read(struct mail_index_sync_ctx *sync_ctx, uint32_t *uid_r)
+{
+	struct mail_index_sync_rec sync_rec;
+	unsigned int count = 0;
+
+	*uid_r = 0;
+	while (mail_index_sync_next(sync_ctx, &sync_rec)) {
+		test_assert(sync_rec.type == MAIL_INDEX_SYNC_TYPE_FLAGS);
+		*uid_r = sync_rec.uid1;
+		count++;
+	}
+	return count;
+}
+
+static void
+test_mail_index_sync_full(struct mail_index *index,
+			  unsigned int expected_count, uint32_t expected_uid)
+{
+	struct mail_index_sync_ctx *sync_ctx;
+	struct mail_index_view *view;
+	struct mail_index_transaction *trans;
+	uint32_t uid;
+
+	test_assert(mail_index_sync_begin(index, &sync_ctx, &view, &trans,
+					  0) == 1);
+	test_assert(test_mail_index_sync_read(sync_ctx, &uid) == expected_count);
+	if (expected_count == 1)
+		test_assert(uid == expected_uid);
+	test_assert(mail_index_sync_commit(&sync_ctx) == 0);
+}
+
+static struct mail_index *test_mail_index_sync_init(void)
+{
+	struct mail_index *index;
+	struct mail_index_view *view;
+	struct mail_index_transaction *trans;
+	uint32_t seq, uid_validity = 1;
+
+	index = test_mail_index_init(TRUE);
+	view = mail_index_view_open(index);
+	trans = mail_index_transaction_begin(view, 0);
+	mail_index_update_header(trans,
+		offsetof(struct mail_index_header, uid_validity),
+		&uid_validity, sizeof(uid_validity), TRUE);
+	mail_index_append(trans, 1, &seq);
+	mail_index_append(trans, 2, &seq);
+	test_assert(mail_index_transaction_commit(&trans) == 0);
+	mail_index_view_close(&view);
+
+	test_mail_index_sync_full(index, 0, 0);
+	return index;
+}
+
+static void test_mail_index_sync_read_only(void)
+{
+	struct mail_index *index;
+	struct mail_index_sync_ctx *sync_ctx;
+	struct mail_index_view *view;
+	struct mail_index_transaction *trans;
+	uint32_t uid, log_seq, seq1, seq2;
+	uoff_t log_offset, offset1, offset2;
+
+	test_begin("mail index sync read-only");
+	index = test_mail_index_sync_init();
+	test_mail_index_sync_add_flag(index, 1, MAIL_SEEN);
+	mail_transaction_log_get_head(index->log, &log_seq, &log_offset);
+
+	test_assert(mail_index_sync_begin(index, &sync_ctx, &view, &trans,
+					  MAIL_INDEX_SYNC_FLAG_READ_ONLY) == 1);
+	test_assert(!mail_index_is_locked(index));
+	/* the transaction log can be written to during the sync, but the
+	   sync doesn't see the change */
+	test_mail_index_sync_add_flag(index, 2, MAIL_FLAGGED);
+	test_assert(test_mail_index_sync_read(sync_ctx, &uid) == 1);
+	test_assert(uid == 1);
+	mail_index_sync_get_offsets(sync_ctx, &seq1, &offset1, &seq2, &offset2);
+	test_assert(seq2 == log_seq && offset2 == log_offset);
+	mail_index_sync_rollback(&sync_ctx);
+
+	/* the changes are still waiting to be synced */
+	test_mail_index_sync_full(index, 2, 0);
+	test_mail_index_sync_full(index, 0, 0);
+
+	test_mail_index_deinit(&index);
+	test_end();
+}
+
+/* Write the index with a tail offset beyond the head offset and close it */
+static void test_mail_index_sync_break_tail_offset(struct mail_index **index)
+{
+	struct mail_index_sync_ctx *sync_ctx;
+	struct mail_index_view *view;
+	struct mail_index_transaction *trans;
+	const char *idx_path;
+	uint32_t tail_offset;
+	int fd;
+
+	test_assert(mail_index_sync_begin(*index, &sync_ctx, &view, &trans,
+					  0) == 1);
+	mail_index_write(*index, FALSE, "test");
+	test_assert(mail_index_sync_commit(&sync_ctx) == 0);
+	tail_offset = (*index)->map->hdr.log_file_head_offset + 100;
+	test_mail_index_close(index);
+
+	idx_path = t_strconcat(test_mail_index_get_dir(),
+			       "/test.dovecot.index", NULL);
+	fd = open(idx_path, O_RDWR);
+	if (fd == -1)
+		i_fatal("open(%s) failed: %m", idx_path);
+	if (pwrite(fd, &tail_offset, sizeof(tail_offset),
+		   offsetof(struct mail_index_header,
+			    log_file_tail_offset)) != (ssize_t)sizeof(tail_offset))
+		i_fatal("pwrite(%s) failed: %m", idx_path);
+	i_close_fd(&fd);
+}
+
+static void test_mail_index_sync_read_only_fsck(void)
+{
+	struct mail_index *index;
+	struct mail_index_sync_ctx *sync_ctx;
+	struct mail_index_view *view;
+	struct mail_index_transaction *trans;
+	const struct mail_index_header *hdr;
+	uint32_t uid;
+
+	test_begin("mail index sync read-only fsck");
+	index = test_mail_index_sync_init();
+	test_mail_index_sync_add_flag(index, 1, MAIL_SEEN);
+	test_mail_index_sync_break_tail_offset(&index);
+
+	/* the broken sync positions are fixed even though the sync doesn't
+	   otherwise lock the transaction log */
+	index = test_mail_index_open(FALSE);
+	test_expect_errors(3);
+	test_assert(mail_index_sync_begin(index, &sync_ctx, &view, &trans,
+					  MAIL_INDEX_SYNC_FLAG_READ_ONLY) == 1);
+	test_expect_no_more_errors();
+	test_assert(!mail_index_is_locked(index));
+	hdr = &index->map->hdr;
+	test_assert(hdr->log_file_tail_offset <= hdr->log_file_head_offset);
+	test_assert(test_mail_index_sync_read(sync_ctx, &uid) == 0);
+	mail_index_sync_rollback(&sync_ctx);
+	test_mail_index_close(&index);
+
+	/* the fsck fails if the transaction log can't be locked */
+	index = test_mail_index_sync_init();
+	test_mail_index_sync_add_flag(index, 1, MAIL_SEEN);
+	test_mail_index_sync_break_tail_offset(&index);
+	index = mail_index_alloc(NULL, test_mail_index_get_dir(),
+				 "test.dovecot.index");
+	test_assert(mail_index_open(index, MAIL_INDEX_OPEN_FLAG_READONLY) == 1);
+	test_expect_errors(3);
+	test_assert(mail_index_sync_begin(index, &sync_ctx, &view, &trans,
+					  MAIL_INDEX_SYNC_FLAG_READ_ONLY) < 0);
+	test_expect_no_more_errors();
+	test_assert(!mail_index_is_locked(index));
+
+	test_mail_index_deinit(&index);
+	test_end();
+}
+
+static void test_mail_index_sync_stop_at_offset(void)
+{
+	struct mail_index *index;
+	struct mail_index_sync_ctx *sync_ctx;
+	struct mail_index_view *view;
+	struct mail_index_transaction *trans;
+	const struct mail_index_header *hdr;
+	uint32_t log_seq, uid, seq1, seq2;
+	uoff_t log_offset, offset1, offset2;
+
+	test_begin("mail index sync stop at offset");
+	index = test_mail_index_sync_init();
+
+	/* nothing to sync - the sync is still started */
+	mail_transaction_log_get_head(index->log, &log_seq, &log_offset);
+	test_assert(mail_index_sync_begin_to(index, &sync_ctx, &view, &trans,
+			log_seq, log_offset,
+			MAIL_INDEX_SYNC_FLAG_STOP_AT_OFFSET) == 1);
+	test_assert(test_mail_index_sync_read(sync_ctx, &uid) == 0);
+	test_assert(mail_index_sync_commit(&sync_ctx) == 0);
+
+	test_mail_index_sync_add_flag(index, 1, MAIL_SEEN);
+	mail_transaction_log_get_head(index->log, &log_seq, &log_offset);
+	test_mail_index_sync_add_flag(index, 2, MAIL_FLAGGED);
+
+	/* only the change before the offset is synced */
+	test_assert(mail_index_sync_begin_to(index, &sync_ctx, &view, &trans,
+			log_seq, log_offset,
+			MAIL_INDEX_SYNC_FLAG_STOP_AT_OFFSET) == 1);
+	mail_index_sync_get_offsets(sync_ctx, &seq1, &offset1, &seq2, &offset2);
+	test_assert(seq2 == log_seq && offset2 == log_offset);
+	test_assert(test_mail_index_sync_read(sync_ctx, &uid) == 1);
+	test_assert(uid == 1);
+	test_assert(mail_index_sync_commit(&sync_ctx) == 0);
+
+	hdr = &index->map->hdr;
+	test_assert(hdr->log_file_seq == log_seq);
+	test_assert(hdr->log_file_tail_offset == log_offset);
+
+	/* the change after the offset is synced by the next sync */
+	test_mail_index_sync_full(index, 1, 2);
+
+	/* the offset is already synced */
+	test_assert(mail_index_sync_begin_to(index, &sync_ctx, &view, &trans,
+			log_seq, log_offset,
+			MAIL_INDEX_SYNC_FLAG_STOP_AT_OFFSET) == 1);
+	test_assert(test_mail_index_sync_read(sync_ctx, &uid) == 0);
+	test_assert(mail_index_sync_commit(&sync_ctx) == 0);
+
+	test_mail_index_deinit(&index);
+	test_end();
+}
+
+static void test_mail_index_sync_stop_at_offset_write(bool rotate)
+{
+	struct mail_index *index, *index2;
+	struct mail_index_sync_ctx *sync_ctx;
+	struct mail_index_view *view;
+	struct mail_index_transaction *trans;
+	uint32_t log_seq, uid;
+	uoff_t log_offset;
+
+	test_begin(rotate ? "mail index sync stop at offset rotate" :
+		   "mail index sync stop at offset write");
+	index = test_mail_index_sync_init();
+	/* make the sync want to rewrite the index or rotate the log */
+	if (rotate)
+		index->optimization_set.log.max_size = 0;
+	else
+		index->optimization_set.index.rewrite_max_log_bytes = 0;
+
+	test_mail_index_sync_add_flag(index, 1, MAIL_SEEN);
+	mail_transaction_log_get_head(index->log, &log_seq, &log_offset);
+	test_mail_index_sync_add_flag(index, 2, MAIL_FLAGGED);
+
+	test_assert(mail_index_sync_begin_to(index, &sync_ctx, &view, &trans,
+			log_seq, log_offset,
+			MAIL_INDEX_SYNC_FLAG_STOP_AT_OFFSET) == 1);
+	test_assert(test_mail_index_sync_read(sync_ctx, &uid) == 1);
+	test_assert(uid == 1);
+	test_assert(mail_index_sync_commit(&sync_ctx) == 0);
+
+	/* another process still sees the change after the offset */
+	index2 = test_mail_index_open(FALSE);
+	test_mail_index_sync_full(index2, 1, 2);
+	test_mail_index_deinit(&index2);
+
+	test_mail_index_deinit(&index);
+	test_end();
+}
+
+static void test_mail_index_sync_stop_at_offset_index_write(void)
+{
+	test_mail_index_sync_stop_at_offset_write(FALSE);
+}
+
+static void test_mail_index_sync_stop_at_offset_rotate(void)
+{
+	test_mail_index_sync_stop_at_offset_write(TRUE);
+}
+
+static void test_mail_index_sync_stop_at_offset_log_garbage(void)
+{
+	static const unsigned char garbage[8] = { 0 };
+	struct mail_index *index;
+	struct mail_index_sync_ctx *sync_ctx;
+	struct mail_index_view *view;
+	struct mail_index_transaction *trans;
+	const char *path;
+	uint32_t log_seq, old_file_seq, uid;
+	uoff_t log_offset;
+	int fd;
+
+	test_begin("mail index sync stop at offset log garbage");
+	index = test_mail_index_sync_init();
+	old_file_seq = index->log->head->hdr.file_seq;
+
+	test_mail_index_sync_add_flag(index, 1, MAIL_SEEN);
+	mail_transaction_log_get_head(index->log, &log_seq, &log_offset);
+	test_mail_index_sync_add_flag(index, 2, MAIL_FLAGGED);
+
+	/* Simulate a transaction that another process couldn't write fully */
+	path = t_strconcat(test_mail_index_get_dir(),
+			   "/test.dovecot.index.log", NULL);
+	fd = open(path, O_RDWR | O_APPEND);
+	if (fd == -1)
+		i_fatal("open(%s) failed: %m", path);
+	test_assert(write_full(fd, garbage, sizeof(garbage)) == 0);
+	i_close_fd(&fd);
+
+	/* The log needs to be rotated, but the sync would stop in the old
+	   log file. */
+	test_assert(mail_index_sync_begin_to(index, &sync_ctx, &view, &trans,
+			log_seq, log_offset,
+			MAIL_INDEX_SYNC_FLAG_STOP_AT_OFFSET) == 0);
+	test_assert(index->log->head->hdr.file_seq == old_file_seq);
+	test_assert(!mail_index_is_locked(index));
+
+	/* Syncing up to the head rotates the log */
+	mail_transaction_log_get_head(index->log, &log_seq, &log_offset);
+	test_assert(mail_index_sync_begin_to(index, &sync_ctx, &view, &trans,
+			log_seq, log_offset,
+			MAIL_INDEX_SYNC_FLAG_STOP_AT_OFFSET) == 1);
+	test_assert(index->log->head->hdr.file_seq == old_file_seq + 1);
+	test_assert(test_mail_index_sync_read(sync_ctx, &uid) == 2);
+	test_assert(mail_index_sync_commit(&sync_ctx) == 0);
+
+	/* nothing is left to sync */
+	test_mail_index_sync_full(index, 0, 0);
+
+	test_mail_index_deinit(&index);
+	test_end();
+}
+
+static bool
+test_mail_index_has_keyword(struct mail_index *index, uint32_t seq,
+			    unsigned int idx)
+{
+	struct mail_index_view *view;
+	ARRAY_TYPE(keyword_indexes) keywords;
+	const unsigned int *kw_idx;
+	bool found = FALSE;
+
+	t_array_init(&keywords, 4);
+	test_assert(mail_index_refresh(index) == 0);
+	view = mail_index_view_open(index);
+	mail_index_lookup_keywords(view, seq, &keywords);
+	array_foreach(&keywords, kw_idx) {
+		if (*kw_idx == idx)
+			found = TRUE;
+	}
+	mail_index_view_close(&view);
+	return found;
+}
+
+static void test_mail_index_keyword_update_avoid_after_replace(void)
+{
+	static const char *const kw_names[] = { "foo", NULL };
+	struct mail_index *index;
+	struct mail_index_view *view;
+	struct mail_index_transaction *trans;
+	struct mail_keywords *keywords, *no_keywords;
+
+	test_begin("mail index keyword update after replace with AVOID_FLAG_UPDATES");
+	index = test_mail_index_sync_init();
+	keywords = mail_index_keywords_create(index, kw_names);
+	no_keywords = mail_index_keywords_create(index, NULL);
+
+	view = mail_index_view_open(index);
+	trans = mail_index_transaction_begin(view, 0);
+	mail_index_update_keywords(trans, 1, MODIFY_ADD, keywords);
+	test_assert(mail_index_transaction_commit(&trans) == 0);
+	mail_index_view_close(&view);
+	test_assert(test_mail_index_has_keyword(index, 1, keywords->idx[0]));
+
+	/* Replacing the keywords removes "foo", but adding it back within
+	   the same transaction must cancel the removal, even though the index
+	   already has it. */
+	view = mail_index_view_open(index);
+	trans = mail_index_transaction_begin(view,
+		MAIL_INDEX_TRANSACTION_FLAG_AVOID_FLAG_UPDATES);
+	mail_index_update_keywords(trans, 1, MODIFY_REPLACE, no_keywords);
+	mail_index_update_keywords(trans, 1, MODIFY_ADD, keywords);
+	test_assert(mail_index_transaction_commit(&trans) == 0);
+	mail_index_view_close(&view);
+	test_assert(test_mail_index_has_keyword(index, 1, keywords->idx[0]));
+
+	/* The same with removing a keyword that the index doesn't have
+	   after adding it within the same transaction. */
+	view = mail_index_view_open(index);
+	trans = mail_index_transaction_begin(view,
+		MAIL_INDEX_TRANSACTION_FLAG_AVOID_FLAG_UPDATES);
+	mail_index_update_keywords(trans, 2, MODIFY_REPLACE, keywords);
+	mail_index_update_keywords(trans, 2, MODIFY_REMOVE, keywords);
+	test_assert(mail_index_transaction_commit(&trans) == 0);
+	mail_index_view_close(&view);
+	test_assert(!test_mail_index_has_keyword(index, 2, keywords->idx[0]));
+
+	mail_index_keywords_unref(&keywords);
+	mail_index_keywords_unref(&no_keywords);
+	test_mail_index_deinit(&index);
+	test_end();
+}
+
+static void
+test_mail_index_verify_records_corrupt(uint32_t seq, uint32_t uid,
+				       uint32_t expected_messages_count)
+{
+	struct mail_index *index;
+	struct mail_index_view *view;
+	struct mail_index_transaction *trans;
+	struct mail_index_sync_ctx *sync_ctx;
+	uint32_t seq2;
+
+	index = test_mail_index_init(TRUE);
+	view = mail_index_view_open(index);
+	trans = mail_index_transaction_begin(view,
+			MAIL_INDEX_TRANSACTION_FLAG_EXTERNAL);
+	uint32_t uid_validity = 1234;
+	mail_index_update_header(trans,
+		offsetof(struct mail_index_header, uid_validity),
+		&uid_validity, sizeof(uid_validity), TRUE);
+	for (uint32_t i = 1; i <= 3; i++)
+		mail_index_append(trans, i * 10, &seq2);
+	test_assert(mail_index_transaction_commit(&trans) == 0);
+	mail_index_view_close(&view);
+
+	/* write dovecot.index */
+	test_assert(mail_index_sync_begin(index, &sync_ctx, &view, &trans, 0) > 0);
+	mail_index_write(index, FALSE, "test");
+	test_assert(mail_index_sync_commit(&sync_ctx) == 0);
+	uoff_t rec_offset = index->map->hdr.header_size +
+		(seq - 1) * index->map->hdr.record_size;
+	test_mail_index_close(&index);
+
+	/* corrupt the record's UID */
+	const char *path = t_strconcat(test_mail_index_get_dir(),
+				       "/test.dovecot.index", NULL);
+	int fd = open(path, O_RDWR);
+	if (fd == -1)
+		i_fatal("open(%s) failed: %m", path);
+	test_assert(pwrite(fd, &uid, sizeof(uid), rec_offset +
+			   offsetof(struct mail_index_record, uid)) ==
+		    sizeof(uid));
+	i_close_fd(&fd);
+
+	/* opening doesn't notice the corruption */
+	index = test_mail_index_open(FALSE);
+	test_assert(index->map->hdr.messages_count == 3);
+
+	/* the corruption error, fscking warning and 2 fsck errors */
+	test_expect_errors(4);
+	test_assert(mail_index_verify_records(index) == 0);
+	test_expect_no_more_errors();
+	test_assert(mail_index_reset_fscked(index));
+	test_assert_ucmp(index->map->hdr.messages_count, ==,
+			 expected_messages_count);
+
+	/* verifying again finds no errors */
+	test_assert(mail_index_verify_records(index) == 1);
+	test_assert(!mail_index_reset_fscked(index));
+	test_mail_index_deinit(&index);
+}
+
+static void test_mail_index_verify_records(void)
+{
+	test_begin("mail index verify records");
+	/* valid index */
+	struct mail_index *index = test_mail_index_init(TRUE);
+	test_assert(mail_index_verify_records(index) == 1);
+	test_assert(!mail_index_reset_fscked(index));
+	test_mail_index_deinit(&index);
+
+	/* UID=0 */
+	test_mail_index_verify_records_corrupt(1, 0, 2);
+	/* UIDs 10, 5, 30 */
+	test_mail_index_verify_records_corrupt(2, 5, 2);
+	/* UIDs 10, 30, 30 */
+	test_mail_index_verify_records_corrupt(2, 30, 2);
+	test_end();
+}
+
+static void
+test_mail_index_add_keyword(struct mail_index *index, const char *keyword)
+{
+	struct mail_index_view *view;
+	struct mail_index_transaction *trans;
+	struct mail_keywords *keywords;
+	const char *keywords_arr[] = { keyword, NULL };
+
+	view = mail_index_view_open(index);
+	trans = mail_index_transaction_begin(view, 0);
+	keywords = mail_index_keywords_create(index, keywords_arr);
+	mail_index_update_keywords(trans, 1, MODIFY_ADD, keywords);
+	mail_index_keywords_unref(&keywords);
+	test_assert(mail_index_transaction_commit(&trans) == 0);
+	mail_index_view_close(&view);
+}
+
+/* Create an index with one message having the given keywords and write it
+   to dovecot.index. Returns the path to dovecot.index. */
+static const char *
+test_mail_index_keywords_init(const char *const *keywords,
+			      uoff_t *ext_offset_r, uoff_t *hdr_offset_r,
+			      uint32_t *hdr_size_r, bool *last_ext_r)
+{
+	struct mail_index *index;
+	struct mail_index_view *view;
+	struct mail_index_transaction *trans;
+	struct mail_index_sync_ctx *sync_ctx;
+	const struct mail_index_ext *ext;
+	uint32_t seq, ext_map_idx;
+
+	index = test_mail_index_init(TRUE);
+	view = mail_index_view_open(index);
+	trans = mail_index_transaction_begin(view,
+			MAIL_INDEX_TRANSACTION_FLAG_EXTERNAL);
+	uint32_t uid_validity = 1234;
+	mail_index_update_header(trans,
+		offsetof(struct mail_index_header, uid_validity),
+		&uid_validity, sizeof(uid_validity), TRUE);
+	mail_index_append(trans, 1, &seq);
+	test_assert(mail_index_transaction_commit(&trans) == 0);
+	mail_index_view_close(&view);
+	for (; *keywords != NULL; keywords++)
+		test_mail_index_add_keyword(index, *keywords);
+
+	/* write dovecot.index */
+	test_assert(mail_index_sync_begin(index, &sync_ctx, &view,
+					  &trans, 0) > 0);
+	mail_index_write(index, FALSE, "test");
+	test_assert(mail_index_sync_commit(&sync_ctx) == 0);
+	test_assert(mail_index_map_lookup_ext(index->map,
+					      MAIL_INDEX_EXT_KEYWORDS,
+					      &ext_map_idx));
+	ext = array_idx(&index->map->extensions, ext_map_idx);
+	*ext_offset_r = ext->ext_offset;
+	*hdr_offset_r = ext->hdr_offset;
+	*hdr_size_r = ext->hdr_size;
+	*last_ext_r = ext->hdr_offset +
+		MAIL_INDEX_HEADER_SIZE_ALIGN(ext->hdr_size) ==
+		index->map->hdr.header_size;
+	test_mail_index_close(&index);
+
+	return t_strconcat(test_mail_index_get_dir(),
+			   "/test.dovecot.index", NULL);
+}
+
+static void test_mail_index_keywords_out_of_order(void)
+{
+	static const char *const keywords_arr[] = { "a", "b", NULL };
+	struct mail_index *index;
+	uoff_t ext_offset, hdr_offset;
+	uint32_t hdr_size;
+	bool last_ext;
+
+	test_begin("mail index keywords out of order");
+	const char *path =
+		test_mail_index_keywords_init(keywords_arr, &ext_offset,
+					      &hdr_offset, &hdr_size,
+					      &last_ext);
+	uoff_t kw_rec_offset = hdr_offset +
+		sizeof(struct mail_index_keyword_header);
+
+	/* swap the name_offsets, so the names are out of order */
+	int fd = open(path, O_RDWR);
+	if (fd == -1)
+		i_fatal("open(%s) failed: %m", path);
+	struct mail_index_keyword_header_rec kw_rec[2];
+	test_assert(pread(fd, kw_rec, sizeof(kw_rec), kw_rec_offset) ==
+		    sizeof(kw_rec));
+	test_assert(kw_rec[0].name_offset == 0 && kw_rec[1].name_offset == 2);
+	kw_rec[0].name_offset = 2;
+	kw_rec[1].name_offset = 0;
+	test_assert(pwrite(fd, kw_rec, sizeof(kw_rec), kw_rec_offset) ==
+		    sizeof(kw_rec));
+	i_close_fd(&fd);
+
+	/* the corruption error, fscking warning and fsck error */
+	test_expect_errors(3);
+	index = test_mail_index_open(FALSE);
+	test_expect_no_more_errors();
+	test_assert(mail_index_reset_fscked(index));
+
+	/* adding a new keyword keeps the existing ones */
+	test_mail_index_add_keyword(index, "c");
+	const ARRAY_TYPE(keywords) *keywords = mail_index_get_keywords(index);
+	test_assert(array_count(keywords) == 3);
+	test_assert(array_count(&index->map->keyword_idx_map) == 3);
+	test_mail_index_deinit(&index);
+	test_end();
+}
+
+static void test_mail_index_keywords_hdr_too_small(void)
+{
+	static const char *const keywords_arr[] = { "a", "b", NULL };
+	struct mail_index *index;
+	uoff_t ext_offset, hdr_offset;
+	uint32_t hdr_size;
+	bool last_ext;
+
+	test_begin("mail index keywords header too small");
+	const char *path =
+		test_mail_index_keywords_init(keywords_arr, &ext_offset,
+					      &hdr_offset, &hdr_size,
+					      &last_ext);
+	test_assert(last_ext);
+
+	/* drop the keywords header and set its hdr_size=0 */
+	buffer_t *buf = t_buffer_create(1024);
+	int fd = open(path, O_RDWR);
+	if (fd == -1)
+		i_fatal("open(%s) failed: %m", path);
+	struct stat st;
+	if (fstat(fd, &st) < 0)
+		i_fatal("fstat(%s) failed: %m", path);
+	void *data = buffer_append_space_unsafe(buf, st.st_size);
+	test_assert(pread(fd, data, st.st_size, 0) == st.st_size);
+
+	struct mail_index_header *hdr = buffer_get_modifiable_data(buf, NULL);
+	hdr->header_size = hdr_offset;
+	struct mail_index_ext_header *ext_hdr =
+		buffer_get_space_unsafe(buf, ext_offset, sizeof(*ext_hdr));
+	ext_hdr->hdr_size = 0;
+	buffer_delete(buf, hdr_offset, MAIL_INDEX_HEADER_SIZE_ALIGN(hdr_size));
+
+	test_assert(ftruncate(fd, 0) == 0);
+	test_assert(pwrite(fd, buf->data, buf->used, 0) == (ssize_t)buf->used);
+	i_close_fd(&fd);
+
+	/* the corruption error, fscking warning and fsck errors */
+	test_expect_errors(4);
+	index = test_mail_index_open(FALSE);
+	test_expect_no_more_errors();
+	test_assert(mail_index_reset_fscked(index));
+
+	/* the keywords were renamed, and a new one can be added */
+	test_mail_index_add_keyword(index, "c");
+	test_assert(array_count(&index->map->keyword_idx_map) == 3);
+	test_mail_index_deinit(&index);
+	test_end();
+}
+
+static void test_mail_index_keywords_no_nul_end(void)
+{
+	static const char *const keywords_arr[] = { "a", "b", "c", NULL };
+	static const char junk = 'x';
+	struct mail_index *index;
+	uoff_t ext_offset, hdr_offset;
+	uint32_t hdr_size;
+	bool last_ext;
+
+	test_begin("mail index keywords header doesn't end with NUL");
+	const char *path =
+		test_mail_index_keywords_init(keywords_arr, &ext_offset,
+					      &hdr_offset, &hdr_size,
+					      &last_ext);
+	/* keywords_count + 3 records + "a\0b\0c\0" */
+	test_assert(hdr_size > 4 + 3*4 + 6);
+
+	/* Replace the last byte of the unused space after the names with
+	   a non-NUL. The names themselves are still valid. */
+	int fd = open(path, O_RDWR);
+	if (fd == -1)
+		i_fatal("open(%s) failed: %m", path);
+	test_assert(pwrite(fd, &junk, 1, hdr_offset + hdr_size - 1) == 1);
+	i_close_fd(&fd);
+
+	/* the corruption error, fscking warning and fsck error */
+	test_expect_errors(3);
+	index = test_mail_index_open(FALSE);
+	test_expect_no_more_errors();
+	test_assert(mail_index_reset_fscked(index));
+	test_assert(array_count(&index->map->keyword_idx_map) == 3);
+	test_mail_index_close(&index);
+
+	/* the fixed index can be opened without errors */
+	index = test_mail_index_open(FALSE);
+	test_assert(!mail_index_reset_fscked(index));
+	test_assert(array_count(&index->map->keyword_idx_map) == 3);
+	test_mail_index_deinit(&index);
+	test_end();
+}
+
+static void test_mail_index_append_uid(struct mail_index *index, uint32_t uid)
+{
+	struct mail_index_view *view;
+	struct mail_index_transaction *trans;
+	uint32_t seq;
+
+	view = mail_index_view_open(index);
+	trans = mail_index_transaction_begin(view,
+			MAIL_INDEX_TRANSACTION_FLAG_EXTERNAL);
+	uint32_t uid_validity = 1234;
+	mail_index_update_header(trans,
+		offsetof(struct mail_index_header, uid_validity),
+		&uid_validity, sizeof(uid_validity), TRUE);
+	mail_index_append(trans, uid, &seq);
+	test_assert(mail_index_transaction_commit(&trans) == 0);
+	mail_index_view_close(&view);
+}
+
+static void test_mail_index_verify_records_cache(void)
+{
+	struct mail_index *index;
+	struct mail_index_view *view;
+	struct mail_index_transaction *trans;
+	struct mail_index_sync_ctx *sync_ctx;
+
+	test_begin("mail index verify records cache");
+	index = test_mail_index_init(TRUE);
+	test_mail_index_append_uid(index, 1);
+	test_assert(!index->map->records_verified);
+	test_assert(mail_index_verify_records(index) == 1);
+	test_assert(index->map->records_verified);
+
+	/* syncing new records keeps the map verified */
+	test_mail_index_append_uid(index, 2);
+	test_assert(index->map->hdr.messages_count == 2);
+	test_assert(index->map->records_verified);
+
+	/* re-reading dovecot.index requires verifying again */
+	test_assert(mail_index_sync_begin(index, &sync_ctx, &view,
+					  &trans, 0) > 0);
+	mail_index_write(index, FALSE, "test");
+	test_assert(mail_index_sync_commit(&sync_ctx) == 0);
+	test_mail_index_close(&index);
+	index = test_mail_index_open(FALSE);
+	test_assert(index->map->hdr.messages_count == 2);
+	test_assert(!index->map->records_verified);
+	test_assert(mail_index_verify_records(index) == 1);
+	test_assert(index->map->records_verified);
+	test_mail_index_deinit(&index);
+	test_end();
+}
+
+static struct mail_index *test_mail_index_open_zero_uids(void)
+{
+	struct mail_index *index;
+	struct mail_index_view *view;
+	struct mail_index_transaction *trans;
+	struct mail_index_sync_ctx *sync_ctx;
+	uint32_t seq;
+
+	index = test_mail_index_init(TRUE);
+	view = mail_index_view_open(index);
+	trans = mail_index_transaction_begin(view,
+			MAIL_INDEX_TRANSACTION_FLAG_EXTERNAL);
+	uint32_t uid_validity = 1234;
+	mail_index_update_header(trans,
+		offsetof(struct mail_index_header, uid_validity),
+		&uid_validity, sizeof(uid_validity), TRUE);
+	for (uint32_t uid = 1; uid <= 4; uid++)
+		mail_index_append(trans, uid, &seq);
+	test_assert(mail_index_transaction_commit(&trans) == 0);
+	mail_index_view_close(&view);
+
+	/* write dovecot.index */
+	test_assert(mail_index_sync_begin(index, &sync_ctx, &view,
+					  &trans, 0) > 0);
+	mail_index_write(index, FALSE, "test");
+	test_assert(mail_index_sync_commit(&sync_ctx) == 0);
+	uoff_t hdr_size = index->map->hdr.header_size;
+	uoff_t record_size = index->map->hdr.record_size;
+	test_mail_index_close(&index);
+
+	/* set the UIDs of seqs 1 and 3 to 0 */
+	const char *path = t_strconcat(test_mail_index_get_dir(),
+				       "/test.dovecot.index", NULL);
+	int fd = open(path, O_RDWR);
+	if (fd == -1)
+		i_fatal("open(%s) failed: %m", path);
+	uint32_t uid = 0;
+	for (seq = 1; seq <= 3; seq += 2) {
+		uoff_t offset = hdr_size + (seq - 1) * record_size +
+			offsetof(struct mail_index_record, uid);
+		test_assert(pwrite(fd, &uid, sizeof(uid), offset) ==
+			    sizeof(uid));
+	}
+	i_close_fd(&fd);
+
+	/* opening doesn't notice the corruption */
+	return test_mail_index_open(FALSE);
+}
+
+static void test_mail_index_commit_zero_uids(void)
+{
+	struct mail_index *index;
+	struct mail_index_view *view;
+	struct mail_index_transaction *trans;
+
+	test_begin("mail index commit updates to uid=0 records");
+	/* flag update range covering uid=0 records and a valid record */
+	index = test_mail_index_open_zero_uids();
+	view = mail_index_view_open(index);
+	trans = mail_index_transaction_begin(view, 0);
+	mail_index_update_flags_range(trans, 1, 3, MODIFY_ADD, MAIL_SEEN);
+	/* the corruption error, fscking warning and 2 fsck errors */
+	test_expect_errors(4);
+	test_assert(mail_index_transaction_commit(&trans) < 0);
+	test_expect_no_more_errors();
+	test_assert(mail_index_reset_fscked(index));
+	mail_index_view_close(&view);
+
+	/* fsck dropped the uid=0 records */
+	view = mail_index_view_open(index);
+	test_assert(mail_index_view_get_messages_count(view) == 2);
+	trans = mail_index_transaction_begin(view, 0);
+	mail_index_update_flags_range(trans, 1, 2, MODIFY_ADD, MAIL_SEEN);
+	test_assert(mail_index_transaction_commit(&trans) == 0);
+	mail_index_view_close(&view);
+	test_mail_index_deinit(&index);
+
+	/* separate flag updates to two uid=0 records */
+	index = test_mail_index_open_zero_uids();
+	view = mail_index_view_open(index);
+	trans = mail_index_transaction_begin(view, 0);
+	mail_index_update_flags(trans, 1, MODIFY_ADD, MAIL_SEEN);
+	mail_index_update_flags(trans, 3, MODIFY_ADD, MAIL_SEEN);
+	test_expect_errors(4);
+	test_assert(mail_index_transaction_commit(&trans) < 0);
+	test_expect_no_more_errors();
+	mail_index_view_close(&view);
+	test_mail_index_deinit(&index);
+	test_end();
+}
+
+static void test_mail_index_view_verify_records(void)
+{
+	struct mail_index *index;
+	struct mail_index_view *view;
+
+	test_begin("mail index view verify records");
+	index = test_mail_index_open_zero_uids();
+	view = mail_index_view_open(index);
+	/* the corruption error, fscking warning and 2 fsck errors */
+	test_expect_errors(4);
+	test_assert(!mail_index_view_verify_records(view));
+	test_expect_no_more_errors();
+	test_assert(mail_index_reset_fscked(index));
+
+	/* the view still sees the old records, but the index was already
+	   fixed, so it's not fsck'd again */
+	test_expect_errors(1);
+	test_assert(!mail_index_view_verify_records(view));
+	test_expect_no_more_errors();
+	test_assert(!mail_index_reset_fscked(index));
+	mail_index_view_close(&view);
+
+	/* a new view sees the fixed records */
+	view = mail_index_view_open(index);
+	test_assert(mail_index_view_verify_records(view));
+	test_assert(mail_index_view_get_messages_count(view) == 2);
+	mail_index_view_close(&view);
+	test_mail_index_deinit(&index);
+	test_end();
+}
+
 int main(void)
 {
 	static void (*const test_functions[])(void) = {
 		test_mail_index_rotate,
 		test_mail_index_log_refresh_rotation_race,
+		test_mail_index_log_rotate_max_file_seq,
 		test_mail_index_new_extension,
 		test_mail_index_corruption_message_count,
 		test_mail_index_corruption_record_size_zero,
 		test_mail_index_log_garbage_at_eof,
 		test_mail_index_log_rotate_at_close,
 		test_mail_index_map_fsck_fail_restores_map,
+		test_mail_index_sync_read_only,
+		test_mail_index_sync_read_only_fsck,
+		test_mail_index_sync_stop_at_offset,
+		test_mail_index_sync_stop_at_offset_index_write,
+		test_mail_index_sync_stop_at_offset_rotate,
+		test_mail_index_sync_stop_at_offset_log_garbage,
+		test_mail_index_keyword_update_avoid_after_replace,
+		test_mail_index_verify_records,
+		test_mail_index_commit_zero_uids,
+		test_mail_index_view_verify_records,
+		test_mail_index_verify_records_cache,
+		test_mail_index_keywords_out_of_order,
+		test_mail_index_keywords_hdr_too_small,
+		test_mail_index_keywords_no_nul_end,
 		NULL
 	};
 	test_dir_init("mail-index");

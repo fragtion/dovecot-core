@@ -69,7 +69,7 @@ mail_index_map_register_ext(struct mail_index_map *map,
 			    const struct mail_index_ext_header *ext_hdr)
 {
 	struct mail_index_ext *ext;
-	uint32_t idx, ext_map_idx, empty_idx = (uint32_t)-1;
+	uint32_t idx, ext_map_idx, empty_idx = UINT32_MAX;
 
 	i_assert(mail_index_ext_name_is_valid(name));
 
@@ -84,7 +84,7 @@ mail_index_map_register_ext(struct mail_index_map *map,
 	ext = array_append_space(&map->extensions);
 	ext->name = p_strdup(map->extension_pool, name);
 	ext->ext_offset = ext_offset;
-	ext->hdr_offset = ext_offset == (uint32_t)-1 ? (uint32_t)-1 :
+	ext->hdr_offset = ext_offset == UINT32_MAX ? UINT32_MAX :
 		ext_offset + mail_index_map_ext_hdr_offset(strlen(name));
 	ext->hdr_size = ext_hdr->hdr_size;
 	ext->record_offset = ext_hdr->record_offset;
@@ -92,13 +92,13 @@ mail_index_map_register_ext(struct mail_index_map *map,
 	ext->record_align = ext_hdr->record_align;
 	ext->reset_id = ext_hdr->reset_id;
 
-	ext->index_idx = mail_index_ext_register(map->index, name,
-						 ext_hdr->hdr_size,
-						 ext_hdr->record_size,
-						 ext_hdr->record_align);
+	ext->index_idx = mail_index_map_ext_register(map->index, name,
+						     ext_hdr->hdr_size,
+						     ext_hdr->record_size,
+						     ext_hdr->record_align);
 
 	/* Update index ext_id -> map ext_id mapping. Fill non-used
-	   ext_ids with (uint32_t)-1 */
+	   ext_ids with UINT32_MAX */
 	while (array_count(&map->ext_id_map) < ext->index_idx)
 		array_push_back(&map->ext_id_map, &empty_idx);
 	array_idx_set(&map->ext_id_map, ext->index_idx, &idx);
@@ -141,10 +141,13 @@ int mail_index_map_ext_get_next(struct mail_index_map *map,
 	}
 
 	/* finally make sure that the hdr_size is small enough.
-	   do this last so that we could return a usable name. */
-	offset += MAIL_INDEX_HEADER_SIZE_ALIGN(ext_hdr->hdr_size);
-	if (offset > map->hdr.header_size)
+	   do this last so that we could return a usable name. Check this
+	   without overflowing offset. */
+	if (ext_hdr->hdr_size > map->hdr.header_size - offset ||
+	    MAIL_INDEX_HEADER_SIZE_ALIGN(ext_hdr->hdr_size) >
+	    map->hdr.header_size - offset)
 		return -1;
+	offset += MAIL_INDEX_HEADER_SIZE_ALIGN(ext_hdr->hdr_size);
 
 	*offset_p = offset;
 	*ext_hdr_r = ext_hdr;
@@ -154,13 +157,17 @@ int mail_index_map_ext_get_next(struct mail_index_map *map,
 static int
 mail_index_map_ext_hdr_check_record(const struct mail_index_header *hdr,
 				    const struct mail_index_ext_header *ext_hdr,
-				    const char **error_r)
+				    bool intro, const char **error_r)
 {
 	if (ext_hdr->record_align == 0) {
 		*error_r = "Record field alignment is zero";
 		return -1;
 	}
 
+	if ((ext_hdr->record_align & (ext_hdr->record_align - 1)) != 0) {
+		*error_r = "Record alignment isn't a power of 2";
+		return -1;
+	}
 	/* until we get 128 bit CPUs having a larger alignment is pointless */
 	if (ext_hdr->record_align > sizeof(uint64_t)) {
 		*error_r = "Record alignment is too large";
@@ -173,10 +180,17 @@ mail_index_map_ext_hdr_check_record(const struct mail_index_header *hdr,
 		return -1;
 	}
 
-	if (ext_hdr->record_offset == 0) {
-		/* if we get here from extension introduction, record_offset=0
-		   and hdr->record_size hasn't been updated yet */
+	if (intro) {
+		/* extension introduction doesn't have record_offset yet and
+		   hdr->record_size hasn't been updated yet */
+		i_assert(ext_hdr->record_offset == 0);
 		return 0;
+	}
+	if (ext_hdr->record_offset < MAIL_INDEX_RECORD_MIN_SIZE) {
+		*error_r = t_strdup_printf("Record field offset %u points "
+					   "inside the base record",
+					   ext_hdr->record_offset);
+		return -1;
 	}
 
 	if (ext_hdr->record_offset + ext_hdr->record_size > hdr->record_size) {
@@ -202,9 +216,11 @@ mail_index_map_ext_hdr_check_record(const struct mail_index_header *hdr,
 	return 0;
 }
 
-int mail_index_map_ext_hdr_check(const struct mail_index_header *hdr,
-				 const struct mail_index_ext_header *ext_hdr,
-				 const char *name, const char **error_r)
+static int
+mail_index_map_ext_hdr_check_full(const struct mail_index_header *hdr,
+				  const struct mail_index_ext_header *ext_hdr,
+				  const char *name, bool intro,
+				  const char **error_r)
 {
 	if (ext_hdr->record_size == 0 && ext_hdr->hdr_size == 0) {
 		*error_r = "Invalid field values";
@@ -216,9 +232,17 @@ int mail_index_map_ext_hdr_check(const struct mail_index_header *hdr,
 	}
 
 	if (ext_hdr->record_size != 0) {
-		if (mail_index_map_ext_hdr_check_record(hdr, ext_hdr,
+		if (mail_index_map_ext_hdr_check_record(hdr, ext_hdr, intro,
 							error_r) < 0)
 			return -1;
+	} else if (ext_hdr->record_offset != 0) {
+		/* Extensions without records always have record_offset=0.
+		   Otherwise the record_offset might point outside the
+		   record. */
+		*error_r = t_strdup_printf(
+			"Record offset %u set without record size",
+			ext_hdr->record_offset);
+		return -1;
 	}
 	if (ext_hdr->hdr_size > MAIL_INDEX_EXT_HEADER_MAX_SIZE) {
 		*error_r = t_strdup_printf("Header size too large (%u)",
@@ -226,6 +250,22 @@ int mail_index_map_ext_hdr_check(const struct mail_index_header *hdr,
 		return -1;
 	}
 	return 0;
+}
+
+int mail_index_map_ext_hdr_check(const struct mail_index_header *hdr,
+				 const struct mail_index_ext_header *ext_hdr,
+				 const char *name, const char **error_r)
+{
+	return mail_index_map_ext_hdr_check_full(hdr, ext_hdr, name, FALSE,
+						 error_r);
+}
+
+int mail_index_map_ext_intro_hdr_check(const struct mail_index_header *hdr,
+				       const struct mail_index_ext_header *ext_hdr,
+				       const char *name, const char **error_r)
+{
+	return mail_index_map_ext_hdr_check_full(hdr, ext_hdr, name, TRUE,
+						 error_r);
 }
 
 static void mail_index_header_init(struct mail_index *index,
@@ -387,6 +427,7 @@ struct mail_index_map *mail_index_map_clone(const struct mail_index_map *map)
 	}
 
 	mail_index_map_copy_header(mem_map, map);
+	mem_map->records_verified = map->records_verified;
 
 	/* copy extensions */
 	if (array_is_created(&map->ext_id_map)) {
@@ -493,7 +534,7 @@ bool mail_index_map_get_ext_idx(struct mail_index_map *map,
 
 	id = array_idx(&map->ext_id_map, ext_id);
 	*idx_r = *id;
-	return *idx_r != (uint32_t)-1;
+	return *idx_r != UINT32_MAX;
 }
 
 static uint32_t mail_index_bsearch_uid(struct mail_index_map *map,

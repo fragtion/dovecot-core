@@ -54,7 +54,7 @@ mail_cache_purge_field(struct mail_cache_copy_context *ctx,
 	uint8_t *field_seen;
 
 	file_field_idx = ctx->field_file_map[field->field_idx];
-	if (file_field_idx == (uint32_t)-1)
+	if (file_field_idx == UINT32_MAX)
 		return;
 
 	cache_field = &ctx->cache->fields[field->field_idx].field;
@@ -96,6 +96,12 @@ mail_cache_purge_field(struct mail_cache_copy_context *ctx,
 		buffer_append_zero(ctx->buffer, 4 - (field->size & 3));
 }
 
+static uint32_t file_seq_next(uint32_t file_seq)
+{
+	/* file_seq=0 isn't valid */
+	return file_seq == UINT32_MAX ? 1 : file_seq + 1;
+}
+
 static uint32_t get_next_file_seq(struct mail_cache *cache)
 {
 	const struct mail_index_ext *ext;
@@ -108,13 +114,13 @@ static uint32_t get_next_file_seq(struct mail_cache *cache)
 
 	view = mail_index_view_open(cache->index);
 	ext = mail_index_view_get_ext(view, cache->ext_id);
-	file_seq = ext != NULL ? ext->reset_id + 1 : ioloop_time32;
+	file_seq = ext != NULL ? file_seq_next(ext->reset_id) : ioloop_time32;
 
 	if (cache->hdr != NULL && file_seq <= cache->hdr->file_seq)
-		file_seq = cache->hdr->file_seq + 1;
+		file_seq = file_seq_next(cache->hdr->file_seq);
 	mail_index_view_close(&view);
 
-	return file_seq != 0 ? file_seq : 1;
+	return file_seq;
 }
 
 static void
@@ -136,7 +142,7 @@ mail_cache_purge_get_fields(struct mail_cache_copy_context *ctx,
 		i_new(unsigned int, used_fields_count);
 	for (i = j = 0; i < cache->fields_count; i++) {
 		idx = cache->field_file_map[i];
-		if (idx != (uint32_t)-1) {
+		if (idx != UINT32_MAX) {
 			i_assert(idx < used_fields_count &&
 				 cache->file_field_map != NULL &&
 				 cache->file_field_map[idx] == 0);
@@ -265,7 +271,7 @@ mail_cache_copy(struct mail_cache *cache, struct mail_index_transaction *trans,
 	} else {
 		for (i = used_fields_count = 0; i < orig_fields_count; i++) {
 			if (!mail_cache_purge_check_field(&ctx, i))
-				ctx.field_file_map[i] = (uint32_t)-1;
+				ctx.field_file_map[i] = UINT32_MAX;
 			else
 				ctx.field_file_map[i] = used_fields_count++;
 		}
@@ -506,7 +512,7 @@ static int mail_cache_purge_locked(struct mail_cache *cache,
 
 	/* we've locked the cache purging now. if somebody else had just
 	   recreated the cache, reopen the cache and return success. */
-	if (purge_file_seq != (uint32_t)-1 &&
+	if (purge_file_seq != UINT32_MAX &&
 	    (ret = mail_cache_purge_has_file_changed(cache, purge_file_seq)) != 0) {
 		if (ret < 0)
 			return -1;
@@ -633,7 +639,7 @@ int mail_cache_purge(struct mail_cache *cache, uint32_t purge_file_seq,
 	trans = mail_index_transaction_begin(view,
 		MAIL_INDEX_TRANSACTION_FLAG_EXTERNAL);
 	if (ret < 0)
-		;
+		mail_index_transaction_rollback(&trans);
 	else if ((ret = mail_cache_purge_full(cache, trans, purge_file_seq,
 					      reason)) < 0)
 		mail_index_transaction_rollback(&trans);

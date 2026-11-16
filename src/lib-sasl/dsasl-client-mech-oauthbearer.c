@@ -184,6 +184,15 @@ mech_oauthbearer_auth_get_result(struct dsasl_client_mech_session *msession,
 	return 0;
 }
 
+static bool
+mech_oauthbearer_auth_is_finished(struct dsasl_client_mech_session *msession)
+{
+	struct oauthbearer_sasl_session *osession =
+		container_of(msession, struct oauthbearer_sasl_session, session);
+
+	return osession->output_sent;
+}
+
 const struct dsasl_client_mech dsasl_client_mech_oauthbearer = {
 	.name = SASL_MECH_NAME_OAUTHBEARER,
 
@@ -191,6 +200,7 @@ const struct dsasl_client_mech dsasl_client_mech_oauthbearer = {
 	.auth_check = mech_oauthbearer_auth_check,
 	.auth_input = mech_oauthbearer_auth_input,
 	.auth_output = mech_oauthbearer_auth_output,
+	.auth_is_finished = mech_oauthbearer_auth_is_finished,
 	.auth_get_result = mech_oauthbearer_auth_get_result,
 };
 
@@ -201,5 +211,6 @@ const struct dsasl_client_mech dsasl_client_mech_xoauth2 = {
 	.auth_check = mech_oauthbearer_auth_check,
 	.auth_input = mech_oauthbearer_auth_input,
 	.auth_output = mech_xoauth2_auth_output,
+	.auth_is_finished = mech_oauthbearer_auth_is_finished,
 	.auth_get_result = mech_oauthbearer_auth_get_result,
 };

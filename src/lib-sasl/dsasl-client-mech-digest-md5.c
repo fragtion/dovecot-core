@@ -38,6 +38,7 @@ struct digest_md5_sasl_session {
 
 	bool challenge_has_realm;
 	bool challenge_has_our_realm;
+	bool server_verified;
 };
 
 static const struct hash_method *const hmethod = &hash_method_md5;
@@ -480,13 +481,15 @@ mech_digest_md5_auth_input(struct dsasl_client_mech_session *msession,
 		}
 		dsession->state = DIGEST_MD5_STATE_CLIENT_FIRST;
 		return DSASL_CLIENT_RESULT_OK;
-	case DIGEST_MD5_STATE_CLIENT_FIRST:
-		i_unreached();
 	case DIGEST_MD5_STATE_SERVER_FINAL:
 		break;
+	case DIGEST_MD5_STATE_CLIENT_FIRST:
 	case DIGEST_MD5_STATE_CLIENT_FINAL:
+		*error_r = "Server sent unexpected data";
+		return DSASL_CLIENT_RESULT_ERR_PROTOCOL;
 	case DIGEST_MD5_STATE_END:
-		i_unreached();
+		*error_r = "Server didn't finish authentication";
+		return DSASL_CLIENT_RESULT_ERR_PROTOCOL;
 	}
 
 	ret = mech_digest_md5_input_final(dsession, input, input_len, error_r);
@@ -499,6 +502,7 @@ mech_digest_md5_auth_input(struct dsasl_client_mech_session *msession,
 		return DSASL_CLIENT_RESULT_AUTH_FAILED;
 	}
 	dsession->state = DIGEST_MD5_STATE_CLIENT_FINAL;
+	dsession->server_verified = TRUE;
 	return DSASL_CLIENT_RESULT_OK;
 }
 
@@ -540,6 +544,15 @@ mech_digest_md5_auth_output(struct dsasl_client_mech_session *msession,
 	return DSASL_CLIENT_RESULT_OK;
 }
 
+static bool
+mech_digest_md5_auth_is_finished(struct dsasl_client_mech_session *msession)
+{
+	struct digest_md5_sasl_session *dsession =
+		container_of(msession, struct digest_md5_sasl_session, session);
+
+	return dsession->server_verified;
+}
+
 const struct dsasl_client_mech dsasl_client_mech_digest_md5 = {
 	.name = SASL_MECH_NAME_DIGEST_MD5,
 
@@ -547,4 +560,5 @@ const struct dsasl_client_mech dsasl_client_mech_digest_md5 = {
 	.auth_check = mech_digest_md5_auth_check,
 	.auth_input = mech_digest_md5_auth_input,
 	.auth_output = mech_digest_md5_auth_output,
+	.auth_is_finished = mech_digest_md5_auth_is_finished,
 };
