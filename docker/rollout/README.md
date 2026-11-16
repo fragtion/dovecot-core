@@ -245,6 +245,25 @@ Afterwards: logrotate `postrotate` for `/var/log/dovecot*`:
 `docker exec dovecot doveadm reload`. Leave the old install, its unit and
 Syncthing disabled but in place until the operator decides to remove them.
 
+## Upgrading later
+
+Every build of the `dovecotmesh` branch is published as
+`ghcr.io/fragtion/dovecotmesh:sha-<commit>` (and as `latest`). To move to
+a new tag, one node at a time:
+
+```sh
+cd $DIR
+cat .env                                    # note the current tag
+sed -i 's|^DOVECOTMESH_IMAGE=.*|DOVECOTMESH_IMAGE=ghcr.io/fragtion/dovecotmesh:<new tag>|' .env
+docker compose pull && docker compose up -d
+docker exec dovecot doveadm mesh peers      # all "up" again
+docker exec dovecot doveadm mesh status     # until pending=0 running=0
+```
+
+Then the next node. The other nodes keep serving mail meanwhile and
+catch the node up when it's back. Going back is the same with the old
+tag. The configuration, `data/` and the mail stay as they are.
+
 ## Rollback
 
 On every node:

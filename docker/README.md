@@ -273,7 +273,7 @@ another node's files copies their mail there within a minute.
 | Reload the configuration | `docker exec dovecot doveadm reload` |
 | New certificates | certbot deploy hook: `docker exec dovecot doveadm reload` |
 | Log rotation | logrotate `postrotate`: `docker exec dovecot doveadm log reopen` |
-| Upgrade | `docker compose pull && docker compose up -d`, one node at a time |
+| Upgrade | One node at a time: set the new tag in `.env` (`DOVECOTMESH_IMAGE`; with `latest`, nothing to change), `docker compose pull && docker compose up -d`, and wait for `doveadm mesh status` to show `pending=0 running=0` before the next node |
 | Pause syncing with a node | `docker exec dovecot doveadm mesh pause <node>` on the others |
 
 See [Operating it](../src/mesh/README.md#operating-it) for the mesh
