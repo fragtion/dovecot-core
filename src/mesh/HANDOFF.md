@@ -12,8 +12,10 @@ Branch: `dovecotmesh` of `fragtion/dovecot-core`
 The image now exists: `docker/Dockerfile`, published as
 `ghcr.io/fragtion/dovecotmesh` by `.github/workflows/docker.yml`. See
 `docker/README.md` for running it next to a host's Postfix, and
-`docker/test/smoke-test.py` for a two-container test. The test plan below
-still applies.
+`docker/test/smoke-test.py` for a two-container test. Every build of the
+branch is tagged `sha-<commit>` (and `latest`); pin a `sha-` tag. Moving
+existing nodes from a host install replicated by Syncthing to the image:
+`docker/rollout/README.md`. The test plan below still applies.
 
 ## 1. What was built and its state
 
@@ -26,6 +28,8 @@ still applies.
 | dsync `dsync_features = reuse-local-mails` (mails moved or copied to another folder are copied locally, hardlinked with Maildir, instead of being transferred again) | `src/doveadm/dsync/dsync-local-mails.c` | done |
 | mesh mail plugin: change notifications, save/dsync locking, delivery wait | `src/plugins/mesh/` | done |
 | mesh service: anchor topology, leases, shared pair states, retries, periodic syncs, verifier, HTTP API, web UI, delivery route lookup, TLS | `src/mesh/` | done |
+| Users on some nodes only: each node's userdb lists its users, and a user is replicated only between the nodes that list it | `src/mesh/mesh-userlist.c` | done, `harness/partialusers.py` |
+| Stalled sessions give up after `mesh_sync_timeout` (2 min) without data, on both nodes; an interrupted import that renumbered mails is rolled back | `src/mesh/`, `src/doveadm/dsync/` | done, `harness/stall.py` |
 | `doveadm mesh status/peers/users/sync/verify/pause/resume` | `src/doveadm/doveadm-mesh.c` | done |
 | Delivery affinity (LMTP proxy to the user's anchor) | `src/mesh/mesh-route.lua` | done, needs Lua build |
 | Test harness (real nodes on one host) | `src/mesh/harness/` | done |
@@ -274,8 +278,9 @@ mesh_peer node3 {
 #log_debug = category=mesh
 ```
 
-`/etc/dovecot/users` (same on all nodes), e.g.
-`alice@mesh.example:{PLAIN}secret`. With delivery affinity, the passdb
+`/etc/dovecot/users` (here the same on all nodes; a node may also list
+only some users, which are then replicated only between the nodes that
+list them), e.g. `alice@mesh.example:{PLAIN}secret`. With delivery affinity, the passdb
 answering LMTP lookups must not return proxy fields itself; passwd-file
 doesn't.
 
@@ -406,18 +411,19 @@ See also "Limitations and known issues" in the README.
   the source folder in that session. Larger moves are copied locally.
 - Pausing a peer doesn't survive a restart.
 - meson build files don't include the mesh; use autotools.
-- No migration tooling beyond the README's steps (from the Syncthing
-  setup: stop Syncthing, replace `new -> cur` symlinks with directories,
-  start the mesh; mails existing on both nodes are matched by GUID).
+- Migrating from the Syncthing setup: `docker/rollout/README.md` (a
+  runbook, and tools that copy the mail files a node is missing before
+  the mesh starts; mails existing on both nodes are matched by GUID).
 
 ## 8. Where things are
 
 - `src/mesh/README.md`: concepts, settings, operations, API.
 - `src/mesh/harness/`: `phase1.py` (mesh tests), `moves.py` (moved
   mails mustn't be transferred again), `newmails.py` (a mail new on
-  two nodes under different UIDs gets the same flags), `cluster.py` (node
-  setup, shows a full working config), `workload.py` (load and
-  convergence checks).
+  two nodes under different UIDs gets the same flags), `idleusers.py`,
+  `overlap.py`, `partialusers.py`, `stall.py` (see the README),
+  `cluster.py` (node setup, shows a full working config), `workload.py`
+  (load and convergence checks).
 - `src/mesh/*.c`: service. `mesh-queue.c` (scheduling, retries),
   `mesh-sync.c` (sessions, leases), `mesh-http.c` (API), `mesh-verify.c`
   (fingerprints), `mesh-peer.c` (heartbeats, anchors), `mesh-state.c`
