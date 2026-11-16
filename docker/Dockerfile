@@ -54,7 +54,7 @@ RUN export VERSION="${VERSION}" \
 # tarballs of the 2.4 branch may not build.
 ARG WITH_PIGEONHOLE=yes
 ARG PIGEONHOLE_REPO=https://github.com/dovecot/pigeonhole
-ARG PIGEONHOLE_REF=dd954b08870b0a70cf30f91daaa28312809ff8b0
+ARG PIGEONHOLE_REF=1a57373a68439e323dcadc142d358515fe833e9e
 RUN if [ "${WITH_PIGEONHOLE}" = yes ]; then \
 		set -- /src/dovecot/docker/dovecot-pigeonhole-*.tar.gz \
 		&& mkdir /src/pigeonhole && cd /src/pigeonhole \
